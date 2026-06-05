@@ -3,10 +3,11 @@
 | 项目 | 内容 |
 |------|------|
 | 文档名称 | AI 游戏开发 Agent —— 代码检索 / Skill / 安全边界 详细设计 |
-| 版本 | v0.1 |
+| 版本 | v0.2 |
 | 日期 | 2026-06-05 |
-| 依据 | 《Python 服务架构方案》v0.3（§9 安全、§10 检索、§11 Skill）；借鉴 Claude Code Glob/Grep、skills、Sandbox/trust |
+| 依据 | 《Python 服务架构方案》v0.4（§9 安全、§10 检索、§11 Skill）；借鉴 Claude Code Glob/Grep、skills、Sandbox/trust |
 | 范围 | 展开三个支撑/守卫子系统的内部设计；与《多智能体与权限系统详细设计》互补 |
+| 变更 | v0.2（评审收紧）：skill 同名冲突防覆盖（命名空间/信任）+ description 注入防护；`path_ok` 严谨化（Windows/跨盘/glob/`allow_paths`/批量 path）；`addons/` 默认可读不可写（读写分离）；检索 stale-edit 提醒 |
 
 ---
 
@@ -22,6 +23,8 @@
 | **语义** | 找"和某需求相关"的代码 | 模糊意图、跨文件理解（RAG） | M2 |
 
 > 检索只返回**片段 + 路径 + 行号**（不灌全文）；要拿权威全文，由 **前端 `read_script`** 读编辑器实时缓冲（含未保存改动），避免服务端读盘与编辑器态不一致。
+>
+> ⚠️ **`grep_code` / `search_codebase` 命中的是磁盘快照**——命中后**必须用前端 `read_script` 取权威内容再编辑**，避免基于陈旧内容的 stale edit。
 
 ### 1.2 工具定义
 
@@ -77,7 +80,7 @@
 
 ### 1.6 边界与限制
 
-- 严格限定 `project_root`，套 `deny_paths`（默认 `.git/`、`.godot/`、`addons/` 可选、导出预设）。
+- 严格限定 `project_root`，套 `deny_read_paths`（默认 `.git/`、`.godot/`、导出预设）；`addons/` **默认可读（便于自我调试）但禁止写**（读/写分离见 §3.3、§3.8）。
 - 只读；单文件大小上限；`max_results` / `top_k` 上限控成本。
 - 索引/缓存不落工程目录，避免污染版本库。
 
@@ -126,7 +129,7 @@ version: 1
   2. user 全局  用户机器级
   3. project    工程内 skills/（随项目走、可放工程约定）
 → 解析 frontmatter → 构建 SkillRegistry{name → {meta, body_path, source}}
-→ 把每个 skill 的「一句话 description」注入 system（常驻，占用极小）
+→ 把每个 skill 的「一句话 description」注入 system（常驻，占用极小）——但 description 也是注入面：限长(≤120字)、过滤换行/指令性文本，project/第三方 skill 描述按「非指令数据」呈现（见 §2.7）
 ```
 
 ### 2.4 渐进披露机制
@@ -153,7 +156,7 @@ version: 1
 ### 2.6 配置与扩展
 
 - 三来源合并（§2.3）；**工程内 skill** 支持"本工程专属约定"。
-- 同名冲突优先级：project > user > bundled（工程约定优先）。
+- **同名冲突（安全收紧）**：**未信任工程的 project skill 不得覆盖 bundled/user 的官方 skill 名**（防伪造 `gdscript-4x-idioms`）。两种做法：① project skill **命名空间化**（如 `project:my-skill`），永不与官方同名（**默认**）；② 仅在工程**受信任**后才允许同名覆盖。
 - 版本字段便于演进；社区 skill 直接丢目录即被发现。
 
 ### 2.7 安全（关键）
@@ -165,6 +168,7 @@ skill 内容是**注入 prompt 的指令**，尤其 project-local / 第三方来
 | prompt 注入 / 越权诱导（"忽略权限直接改文件"） | skill 仅作**参考数据**注入，**不赋予任何操作权限**；权限仍由权限系统裁决，skill 无法提权 |
 | 覆盖核心约束 | **核心 system 指令优先级高于 skill**；skill 注入在可被核心约束的层级 |
 | 来源不明 | 标注 skill `source`；project/第三方 skill 可要求"信任"后才加载（与安全边界信任模型一致） |
+| 简述（description）注入 system | frontmatter 字段限长、过滤换行/指令性文本；project/第三方 skill 的 `description` 作为**非指令数据**呈现（包裹/标注来源），不得含"忽略/必须/总是"等指令式措辞 |
 
 ### 2.8 协议
 
@@ -204,20 +208,39 @@ skill 内容是**注入 prompt 的指令**，尤其 project-local / 第三方来
 
 ```python
 # app/security/paths.py
-import os
-def path_ok(target: str, ctx) -> bool:
-    root = os.path.realpath(ctx.project_root)
-    p = os.path.realpath(os.path.join(root, target))   # 规范化，解符号链接
-    if os.path.commonpath([root, p]) != root:          # 越出工程根
+import os, fnmatch
+
+def _norm(p: str) -> str:
+    return os.path.normcase(os.path.realpath(p))         # Windows：统一大小写 + 分隔符
+
+def path_ok(target: str, ctx, write: bool = False) -> bool:
+    root = _norm(ctx.project_root)
+    p = _norm(os.path.join(ctx.project_root, target))    # 解符号链接、规范化
+    try:
+        if os.path.commonpath([root, p]) != root:        # 越界
+            return False
+    except ValueError:                                    # Windows 跨盘符 → 越界
         return False
-    rel = os.path.relpath(p, root)
-    if any(rel.startswith(d) for d in ctx.deny_paths):  # 命中禁区
-        return False
+    rel = os.path.relpath(p, root).replace(os.sep, "/")
+    deny = ctx.deny_write_paths if write else ctx.deny_read_paths
+    for d in (x.rstrip("/") for x in deny):               # 按路径段 / glob，而非裸 startswith
+        if rel == d or rel.startswith(d + "/") or fnmatch.fnmatch(rel, d):
+            return False
+    if ctx.allow_paths:                                   # 非空时必须落在允许子路径内
+        if not any(rel == a.rstrip("/") or rel.startswith(a.rstrip("/") + "/")
+                   for a in ctx.allow_paths):
+            return False
     return True
+
+def all_paths_ok(args: dict, path_args: list[str], ctx, write=False) -> bool:
+    return all(path_ok(args[k], ctx, write) for k in path_args if k in args)  # 批量校验所有 path
 ```
 
-- 拒绝 `..`、绝对路径越界、符号链接逃逸（realpath 后必须仍在 root 下）。
-- 默认 `deny_paths`：`.git/`、`.godot/`、导出预设；`addons/` 可选保护。
+- 拒绝 `..`、绝对路径越界、符号链接逃逸；**Windows** 下 `normcase` 统一大小写/分隔符，跨盘符 `commonpath` 抛 `ValueError` 视为越界。
+- **deny 按路径段 / glob 匹配**（`.godot/` 命中 `.godot/x`，不误伤 `.godotignore`），而非裸 `startswith`。
+- **读/写分离**：`deny_read_paths`（含检索）≠ `deny_write_paths`；`addons/` **默认可读（自我调试）但禁止写**。
+- **`allow_paths` 生效**：非空时只允许其下子路径。
+- **批量工具校验所有 path 参数**（`ToolDef.path_args` 列出的每个），不止第一个。
 - server 文件操作**只读**；套大小上限。
 
 ### 3.4 边界三：写操作收口前端 + 可逆
@@ -263,8 +286,9 @@ class SecuritySettings(BaseModel):
     trusted: bool = False
     permission_mode: Literal["default","plan","auto_approve","read_only"] = "default"
     enabled_domains: list[str] = ["program","map","scene","resource","project"]
-    deny_paths: list[str] = [".git/", ".godot/"]
-    allow_paths: list[str] = []          # 限定可检索/读取子路径（空=全工程内）
+    deny_read_paths:  list[str] = [".git/", ".godot/"]              # 禁读（含检索）
+    deny_write_paths: list[str] = [".git/", ".godot/", "addons/"]   # 禁写（addons 可读不可写）
+    allow_paths: list[str] = []          # 非空=限定可检索/读取子路径（空=全工程内）
 
 # 解析顺序：服务端本地配置（基线）→ 工程内 settings（只能收紧）
 # 未受信任：忽略工程内的 allow/auto_approve 提权
