@@ -396,3 +396,4 @@ $RECYCLE.BIN/
 *.msp
 *.lnk
 *.generated.props
+ai_map_agent/docs

@@ -3,10 +3,12 @@
 | 项目 | 内容 |
 |------|------|
 | 文档名称 | AI 游戏开发 Agent —— 代码检索 / Skill / 安全边界 详细设计 |
-| 版本 | v0.2 |
-| 日期 | 2026-06-05 |
-| 依据 | 《Python 服务架构方案》v0.4（§9 安全、§10 检索、§11 Skill）；借鉴 Claude Code Glob/Grep、skills、Sandbox/trust |
+| 版本 | v0.3.1 |
+| 日期 | 2026-06-13 |
+| 依据 | 《Python 服务架构方案》v0.4.5（§9 安全、§10 检索、§11 Skill）；借鉴 Claude Code Glob/Grep、SkillTool/PromptCommand、Sandbox/trust |
 | 范围 | 展开三个支撑/守卫子系统的内部设计；与《多智能体与权限系统详细设计》互补 |
+| 变更 | v0.3.1（命名一致性）：检索引用的 agent 名统一 kebab-case（`programming-agent`），与详设A/主方案一致。见术语表 §4.A item 15 |
+| 变更 | v0.3：Skill 改为 Claude Code 同构模式（`SKILL.md` → PromptCommand/SkillTool）；补充 `allowed-tools` 只收敛不扩张、`paths` 条件激活、source/namespace、动态发现与缓存失效、Agent/Skill/OutputStyle 扩展内容安全边界 |
 | 变更 | v0.2（评审收紧）：skill 同名冲突防覆盖（命名空间/信任）+ description 注入防护；`path_ok` 严谨化（Windows/跨盘/glob/`allow_paths`/批量 path）；`addons/` 默认可读不可写（读写分离）；检索 stale-edit 提醒 |
 
 ---
@@ -86,7 +88,7 @@
 
 ### 1.7 与多智能体/上下文
 
-- 主要供 **ProgrammingAgent**（跨文件大重构、Bug 修复依赖检索）。
+- 主要供 **programming-agent**（跨文件大重构、Bug 修复依赖检索）。
 - 返回片段而非全文，控 token；agent 据片段再用 `read_script` 取权威全文。
 
 ### 1.8 待细化
@@ -100,49 +102,80 @@
 
 ---
 
-## 二、Skill 系统
+## 二、Skill 系统（Claude Code 同构）
 
 ### 2.1 定位
 
-领域知识**按需加载**：固定上下文只放一句话简述，需要时才取全文（渐进披露）。**用户/社区可扩展**（开源飞轮、创新点⑤）。
+Skill 采用 Claude Code 同构模式：**一个 `SKILL.md` 目录就是一个 PromptCommand**。系统常驻展示 `name + description + when_to_use`，模型需要时通过 `load_skill(name)` / SkillTool 读取正文。Skill 可以由用户手动触发，也可以由模型自主调用；两者看到同一份 Skill 注册表。
+
+同构边界：Skill 的文件格式、加载层级、条件激活、Command 化方式与 Claude Code 保持一致；实际可用工具仍由本项目 `ToolDef`、入口能力边界和权限闸决定。
 
 ### 2.2 SKILL.md 结构
 
 ```markdown
 ---
 name: tilemap-terrain
-description: 瓦片地形自动连边、房间/走廊生成的套路与陷阱
-when_to_use: 任务涉及成片瓦片地图、房间、地形接边、路径
-agents: [MapAgent]            # 默认绑定的 agent（可空）
-version: 1
+description: Godot TileMapLayer 地形铺设、房间/走廊生成与连边规则
+when_to_use: 用户要生成地图、铺瓦片、修改 TileMapLayer 或解释瓦片规则时使用
+allowed-tools: read_scene_tree, read_class_docs, fill_rect, draw_line, set_cells, clear_rect
+paths:
+  - "**/*.tscn"
+  - "**/*.tres"
+model: inherit
+effort: standard
+hooks:
+  PreToolUse: audit_only
 ---
 
 # 正文：详细指令、步骤、示例、反例……
-（仅在被加载时注入上下文）
 ```
 
-### 2.3 发现与注册
+字段规则：
+
+| 字段 | 作用 | 安全约束 |
+|------|------|---------|
+| `name` | 稳定 id；内部使用 `source:name` 规范名 | 同名不直接覆盖，按 source/namespace 展示 |
+| `description` | 常驻 Skill 列表展示 | 限长、过滤换行；作为非指令数据注入 |
+| `when_to_use` | 帮助模型判断何时调用 | 只影响选择，不影响权限 |
+| `allowed-tools` | 裁剪本 Skill 可建议/使用的工具集合 | 只能与当前可见 `ToolDef` 取交集，不能新增能力 |
+| `paths` | 条件激活与动态发现 | 先 realpath/Windows 规范化，禁止越界和符号链接逃逸 |
+| `model` / `effort` | 建议模型与思考档位 | 受会话设置、成本上限和 provider 能力限制 |
+| `hooks` | 注册本项目支持的内部 hook | 不支持任意 shell hook，返回值不能越过权限闸 |
+
+### 2.3 发现、来源与优先级
 
 ```
 扫描来源（合并）：
-  1. bundled/   随服务内置（官方 skill）
-  2. user 全局  用户机器级
-  3. project    工程内 skills/（随项目走、可放工程约定）
-→ 解析 frontmatter → 构建 SkillRegistry{name → {meta, body_path, source}}
-→ 把每个 skill 的「一句话 description」注入 system（常驻，占用极小）——但 description 也是注入面：限长(≤120字)、过滤换行/指令性文本，project/第三方 skill 描述按「非指令数据」呈现（见 §2.7）
+  1. bundled/   随服务发布的内置 Skill
+  2. user/      用户机器级 Skill
+  3. project/   工程内 Skill（未信任工程默认只收紧，不提权）
+  4. plugin/    插件级 Skill（后续）
+→ 解析 frontmatter + paths
+→ 构建 SkillRegistry{qualified_name → SkillCommand}
+→ 生成常驻 Skill 列表（name/description/when_to_use/source/enabled）
+→ 模型或用户触发时再加载正文
 ```
+
+来源策略：
+
+- 内部规范名使用 `source:name`，例如 `bundled:tilemap-terrain`、`project:tilemap-terrain`；UI 可展示短名。
+- project Skill 不直接覆盖 bundled/user Skill。若短名冲突，Doctor 标记冲突，模型看到带来源的候选。
+- 未信任工程的 project Skill 默认不自动启用；前端 `extension_panel.gd` 显示来源和启用确认。
+- 动态发现：模型/工具接触某个路径时，沿路径向上查找本项目 Skill 目录；发现新目录后清理 Skill 列表与命令缓存。
 
 ### 2.4 渐进披露机制
 
-- **模型驱动（主）**：agent 看到相关 description → 调用 `load_skill(name)`（server 只读工具）取**全文**注入上下文。
-- **默认预载（辅）**：`AgentDef.default_skills` 在帧创建时把指定 skill 全文直接注入（如 MapAgent 默认带 `tilemap-terrain`）。
+- **常驻列表**：只注入 `name + description + when_to_use + source`，保持 prompt 前缀稳定。
+- **模型驱动加载**：agent 调用 `load_skill(name)` 获取正文，正文作为附件/用户消息注入当前帧。
+- **Agent 预加载**：AgentDefinition frontmatter 的 `skills` 字段在子 agent 启动时预加载对应 Skill 正文。
+- **手动命令加载**：命令面板或 `/skill <name>` 触发同一 SkillCommand。
 
 ```jsonc
-{"name":"load_skill","description":"按名加载一个技能的完整指令到上下文",
+{"name":"load_skill","description":"按名加载一个 Skill 的完整指令到上下文",
  "parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}
 ```
 
-### 2.5 建议内置 skill
+### 2.5 建议内置 Skill
 
 | skill | 覆盖 |
 |------|------|
@@ -153,35 +186,47 @@ version: 1
 | `resource-patterns` | `.tres` 数据资源、批处理套路 |
 | `signals-and-callbacks` | 信号连接、回调、生命周期 |
 
-### 2.6 配置与扩展
+### 2.6 Skill 与 Command 同构
 
-- 三来源合并（§2.3）；**工程内 skill** 支持"本工程专属约定"。
-- **同名冲突（安全收紧）**：**未信任工程的 project skill 不得覆盖 bundled/user 的官方 skill 名**（防伪造 `gdscript-4x-idioms`）。两种做法：① project skill **命名空间化**（如 `project:my-skill`），永不与官方同名（**默认**）；② 仅在工程**受信任**后才允许同名覆盖。
-- 版本字段便于演进；社区 skill 直接丢目录即被发现。
+Skill 以 `type=prompt` 的 command 进入命令系统：
+
+| 层 | 行为 |
+|----|------|
+| Command Palette | 用户手动选择 Skill，预览来源/说明后注入 |
+| SkillTool / `load_skill` | 模型按名称加载 Skill 正文 |
+| `/commands` | 返回 SkillCommand 与普通 typed command 的统一列表 |
+| Doctor | 展示 frontmatter 校验、被忽略字段、实际生效工具集合 |
+
+不支持 Claude Code 的任意 shell command 形态；本项目 command 只能调用 typed 能力或生成 prompt 内容。
 
 ### 2.7 安全（关键）
 
-skill 内容是**注入 prompt 的指令**，尤其 project-local / 第三方来源属**不可信内容**：
+Skill 内容是**注入 prompt 的指令**，尤其 project/plugin 来源属**不可信内容**：
 
 | 风险 | 缓解 |
 |------|------|
-| prompt 注入 / 越权诱导（"忽略权限直接改文件"） | skill 仅作**参考数据**注入，**不赋予任何操作权限**；权限仍由权限系统裁决，skill 无法提权 |
-| 覆盖核心约束 | **核心 system 指令优先级高于 skill**；skill 注入在可被核心约束的层级 |
-| 来源不明 | 标注 skill `source`；project/第三方 skill 可要求"信任"后才加载（与安全边界信任模型一致） |
-| 简述（description）注入 system | frontmatter 字段限长、过滤换行/指令性文本；project/第三方 skill 的 `description` 作为**非指令数据**呈现（包裹/标注来源），不得含"忽略/必须/总是"等指令式措辞 |
+| prompt 注入 / 越权诱导（"忽略权限直接改文件"） | Skill 仅作提示词资产，**不赋予任何操作权限**；权限仍由 `ToolDef + 权限闸 + 前端确认` 裁决 |
+| `allowed-tools` 被误当授权 | 只与当前可见工具取交集；`*` 也只代表当前入口允许暴露的工具集合 |
+| 覆盖核心约束 | 系统安全规则 > 权限闸 > AgentDefinition > Skill 正文 > 用户输入 |
+| 来源不明/同名冲突 | `source` + namespace；Doctor 展示冲突和被禁用项 |
+| `paths` 条件激活越界 | realpath/Windows 规范化，禁止 `..`、绝对路径越界、符号链接逃逸 |
+| 简述注入 system | frontmatter 字段限长、过滤换行/指令性文本；project/plugin 描述作为非指令数据呈现 |
+| hook/shell 提权 | 只支持内部 hook；不支持任意 shell hook，hook 返回值不能越过权限闸 |
 
 ### 2.8 协议
 
-- `load_skill` = server 只读工具；启动时构建 registry；`GET /skills` 列出 `name/description/source`。
-- skill 简述常驻 system，利于缓存（稳定前缀）。
+- `load_skill` = server 只读工具；启动时构建 registry；动态发现后清缓存。
+- `GET /skills` 返回 `qualified_name/name/description/when_to_use/source/enabled/effective_tools/warnings`。
+- `/doctor` 返回 Skill 校验结果：无效字段、被忽略 hook、路径越界、同名冲突、未信任禁用。
 
 ### 2.9 待细化
 
 | 项 | 说明 |
 |----|------|
-| 自动选取 vs 纯模型驱动 | 是否加一个启发式按 `when_to_use`/关键词预选 |
-| 第三方 skill 信任流程 | 是否需用户显式信任 project/外部 skill |
+| Skill 目录实际落点 | 是否采用 `.ai_agent/skills/`，还是 `ai_agent/skills/`；需避开 Godot 导出 |
+| 项目级 Skill 信任流程 | 首次启用确认、撤销信任、跨项目隔离 |
 | skill 大小/数量上限 | 控 token 与发现成本 |
+| 动态发现触发源 | read_script/list_files/grep/search 哪些工具触发路径上溯 |
 
 ---
 
@@ -193,6 +238,7 @@ skill 内容是**注入 prompt 的指令**，尤其 project-local / 第三方来
 |------|------|
 | 不可信工程提权/越界 | 工程内 settings/skill 试图开 `auto_approve`、改无关文件 |
 | prompt 注入诱导危险操作 | 让 agent 删文件、外泄 key、改 `.git` |
+| 同构扩展误提权 | Agent/Skill/OutputStyle frontmatter 试图扩大工具、开启 hook/shell、覆盖安全规则 |
 | 模型幻觉越界 | 产生越界路径、危险调用 |
 | 密钥泄露 | key 入库/进导出包/下发前端 |
 | 越权读写 | 工具读写越出工程根 |
@@ -260,6 +306,17 @@ def all_paths_ok(args: dict, path_args: list[str], ctx, write=False) -> bool:
 
 - **配置两源**：服务端本地配置（可信，可定义 allow/mode）；**工程内 settings 只能收紧（deny/ask），不能提升为 allow / 开 auto_approve**。
 - **信任动作**：用户在前端对某工程显式"信任"后，才解锁完整配置与 `auto_approve`。
+- **扩展四源**：`bundled/user/project/plugin` 都保留 `source`；project/plugin 扩展未信任前默认禁用或只收紧，不允许扩大工具集合、注册外部 MCP、写入 hook/shell。
+
+### 3.5.1 边界四补充：扩展内容不是授权来源
+
+Agent、Skill、OutputStyle 的 markdown/frontmatter 会进入提示词或运行配置，但只影响**选择、裁剪、表达方式**：
+
+- `tools` / `allowed-tools` 只能与当前可见 `ToolDef` 取交集。
+- `model` / `effort` 受用户本地配置与成本上限约束。
+- `hooks` 只能注册本项目内部 hook，不能执行任意 shell。
+- `paths` 只用于条件激活，必须落在工程根内。
+- 正文里要求"忽略确认/自动修改/读取密钥"一律按普通文本处理，最终由系统安全规则和权限闸拒绝。
 
 ### 3.6 边界五：密钥与配置隔离
 
@@ -309,7 +366,9 @@ class SecuritySettings(BaseModel):
 - [ ] key 不入库/不进导出/不下发前端/不进日志
 - [ ] 服务仅绑 `127.0.0.1`
 - [ ] 工程内配置只能收紧、不可提权
-- [ ] skill/检索内容按不可信数据对待，不可提权
+- [ ] Agent/Skill/OutputStyle 内容按不可信数据对待，不可提权
+- [ ] `tools` / `allowed-tools` 只取当前可见 `ToolDef` 交集
+- [ ] `paths` / 附带资源路径做 realpath/Windows 规范化
 
 **待细化**：
 
@@ -319,6 +378,7 @@ class SecuritySettings(BaseModel):
 | 导出期防护 | 确保插件/配置不被打包进游戏导出 |
 | 审计 | 危险决策（deny/越界）的日志留存 |
 | Windows 路径/符号链接 | `realpath`/`commonpath` 在 Windows 的边界用例 |
+| 项目级扩展目录 | Agent/Skill/OutputStyle 放置路径与 Godot 导出排除策略 |
 
 ---
 
@@ -326,6 +386,6 @@ class SecuritySettings(BaseModel):
 
 | 子系统 | 归属层 | 与其他的交汇 |
 |------|------|------|
-| 代码检索 | 支撑（server 工具） | 受**安全边界**限定工程根；供 ProgrammingAgent；结果喂多智能体上下文 |
-| Skill | 支撑（渐进披露） | 受**信任模型**约束（不可信 skill 不提权）；按 agent 绑定 |
+| 代码检索 | 支撑（server 工具） | 受**安全边界**限定工程根；供 programming-agent；结果喂多智能体上下文 |
+| Skill | 支撑（Claude Code 同构 PromptCommand） | 受**信任模型**约束（不可信 skill 不提权）；按 agent 绑定；与 Command/SkillTool 同一注册表 |
 | 安全边界 | 守卫层 | 是**权限系统**的第 1 级硬闸；约束检索范围与写操作收口 |
