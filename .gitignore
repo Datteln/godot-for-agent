@@ -397,3 +397,5 @@ $RECYCLE.BIN/
 *.lnk
 *.generated.props
 ai_map_agent/docs
+CLAUDE.md
+.claude

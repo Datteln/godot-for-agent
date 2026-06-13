@@ -1,0 +1,31 @@
+@tool
+extends RefCounted
+
+## 写操作禁止访问的路径前缀：插件自身、Godot 内部数据与版本控制目录。
+const DENY_WRITE_PREFIXES: PackedStringArray = [
+	"res://addons/",
+	"res://.godot/",
+	"res://.git/",
+]
+
+
+## 将任意输入路径归一化为 res:// 路径；绝对路径或空字符串返回 ""。
+static func to_res_path(path: String) -> String:
+	var cleaned := path.strip_edges()
+	if cleaned == "":
+		return ""
+	if cleaned.is_absolute_path():
+		return ""
+	if cleaned.begins_with("res://"):
+		return cleaned
+	return "res://" + cleaned.trim_prefix("/")
+
+
+## 判断给定 res:// 路径是否允许写入（不在 DENY_WRITE_PREFIXES 之内）。
+static func is_write_allowed(res_path: String) -> bool:
+	if res_path == "":
+		return false
+	for prefix in DENY_WRITE_PREFIXES:
+		if res_path.begins_with(prefix):
+			return false
+	return true

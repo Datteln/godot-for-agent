@@ -1,0 +1,2 @@
+"""Project-local memory store."""
+

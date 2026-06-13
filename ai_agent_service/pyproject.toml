@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-agent-service"
+version = "0.1.0"
+description = "Godot 内嵌 AI 游戏开发 Agent —— Python LLM 服务（M0 骨架）"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "openai>=1.14",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+disallow_any_generics = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+no_implicit_optional = true
+pretty = true
+show_column_numbers = true
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]

@@ -1,0 +1,11 @@
+; Engine configuration file.
+; This project exists only to inspect and develop the editor plugin in isolation.
+
+config_version=5
+
+[application]
+config/name="AI Agent Frontend"
+config/features=PackedStringArray("4.4")
+
+[editor_plugins]
+enabled=PackedStringArray("res://addons/ai_agent/plugin.cfg")
