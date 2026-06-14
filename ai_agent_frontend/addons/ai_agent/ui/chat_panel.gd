@@ -58,7 +58,7 @@ const _CODE_KEYWORDS := {
 # 该段落会被当作等宽代码块整体渲染（否则连线在比例字体下无法对齐）。
 const _TREE_LINE_CHARS := ["├", "└", "│", "─", "┌", "┐", "┘", "┬", "┴", "┤", "┼", "╭", "╮", "╯", "╰"]
 
-# 工具名 -> Claude Code 风格的展示名（"⏺ ToolName(args)"）。未列出的工具直接
+# 工具名 -> workflow 展示名。未列出的工具直接
 # 使用原始工具名。
 const _TOOL_DISPLAY_NAMES := {
 	"read_file": "Read",
@@ -125,11 +125,11 @@ const UI_TEXT := {
 		"history_restored": "已恢复上次会话记录：%s 条。",
 		"event_agent_step": "思考中：`%s`（第 %s 轮，可用工具 %s 个）。",
 		"event_agent_tools": "`%s` 请求工具：%s。",
-		"event_delegate": "⏺ **Task**(%s)",
-		"event_tool_start": "⏺ **%s**(%s)",
-		"event_tool_done": "⎿ %s 完成",
-		"event_tool_done_count": "⎿ %s 完成（%d 个结果）",
-		"event_tool_failed": "⎿ %s 出错",
+		"event_delegate": "Task(%s)",
+		"event_tool_start": "%s(%s)",
+		"event_tool_done": "%s 完成",
+		"event_tool_done_count": "%s 完成（%d 个结果）",
+		"event_tool_failed": "%s 出错",
 		"tool_read_lines": "读取了 %s 行",
 		"tool_wrote_lines": "已写入 `%s`（%s 行）",
 		"tool_run_result": "%s（exit=%s）",
@@ -183,11 +183,11 @@ const UI_TEXT := {
 		"history_restored": "Restored previous session history: %s item(s).",
 		"event_agent_step": "Thinking: `%s` (loop %s, %s visible tool(s)).",
 		"event_agent_tools": "`%s` requested tools: %s.",
-		"event_delegate": "⏺ **Task**(%s)",
-		"event_tool_start": "⏺ **%s**(%s)",
-		"event_tool_done": "⎿ %s done",
-		"event_tool_done_count": "⎿ %s done (%d result(s))",
-		"event_tool_failed": "⎿ %s failed",
+		"event_delegate": "Task(%s)",
+		"event_tool_start": "%s(%s)",
+		"event_tool_done": "%s done",
+		"event_tool_done_count": "%s done (%d result(s))",
+		"event_tool_failed": "%s failed",
 		"tool_read_lines": "Read %s lines",
 		"tool_wrote_lines": "Wrote `%s` (%s lines)",
 		"tool_run_result": "%s (exit=%s)",
@@ -242,6 +242,12 @@ var _stream_row: Control
 var _stream_content_rich: RichTextLabel
 var _stream_content_text := ""
 var _stream_started_ms: int = -1
+var _reasoning_key := ""
+var _reasoning_row: Control
+var _reasoning_toggle: Button
+var _reasoning_detail_rich: RichTextLabel
+var _reasoning_text := ""
+var _reasoning_started_ms: int = -1
 var _rendered_assistant_keys := {}
 var _closed_stream_keys := {}
 
@@ -384,6 +390,8 @@ func _on_send() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length()})
 	_interrupted_locally = false
 	_finish_streaming()
+	_mark_reasoning_stream_closed()
+	_finish_reasoning_stream()
 	_input.clear()
 	_append_message("user", text)
 	_append_message("system", _ui("waiting_model"))
@@ -468,7 +476,7 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		else:
 			silent.append(call)
 
-	# 立即展示每个工具调用的 "⏺ ToolName(args)" 标题行，无论是否需要确认，
+	# 立即展示每个工具调用标题行，无论是否需要确认，
 	# 让用户能实时看到模型调用了什么智能体/工具、读取/编辑了什么文件。
 	for call in confirm:
 		if call is Dictionary:
@@ -616,6 +624,7 @@ func _on_error(message: String) -> void:
 	FrontendLogger.error(editor_interface, "ChatPanel", "Agent error.", {"message": message})
 	_append_message("error", message)
 	_finish_streaming()
+	_finish_reasoning_stream()
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	if state_store != null:
@@ -681,6 +690,7 @@ func _on_interrupt() -> void:
 	_interrupted_locally = true
 	_clear_inline_confirmation()
 	_finish_streaming()
+	_finish_reasoning_stream()
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	if _http_client != null:
@@ -790,7 +800,9 @@ func _on_events(events: Array) -> void:
 		var is_compacting := event_type == "compact_boundary" and previous_state != AgentState.IDLE
 		if is_compacting:
 			_set_state(AgentState.COMPACTING)
-		_append_message("system", _describe_event(event))
+		var description := _describe_event(event)
+		if description != "":
+			_append_message("system", description)
 		if is_compacting:
 			_set_state(previous_state)
 
@@ -799,19 +811,14 @@ func _describe_event(event: Dictionary) -> String:
 	var payload: Dictionary = event.get("payload", {})
 	match str(event.get("type", "")):
 		"agent_step":
-			return _ui("event_agent_step") % [
-				str(payload.get("agent", "")),
-				str(payload.get("loop", "")),
-				str(payload.get("visible_tools", 0))
-			]
+			return ""
 		"agent_tool_calls":
-			return _ui("event_agent_tools") % [
-				str(payload.get("agent", "")),
-				", ".join(_string_array(payload.get("tools", [])))
-			]
+			return ""
 		"delegate_start":
 			return _ui("event_delegate") % _format_delegate_args(payload)
 		"server_tool_start":
+			if _is_workflow_tool(str(payload.get("tool", ""))):
+				return ""
 			return _ui("event_tool_start") % [
 				_tool_display_name(str(payload.get("tool", ""))),
 				_format_event_args(payload)
@@ -820,19 +827,22 @@ func _describe_event(event: Dictionary) -> String:
 			var tool_label := _tool_display_name(str(payload.get("tool", "")))
 			if bool(payload.get("is_error", false)):
 				return _ui("event_tool_failed") % tool_label
+			var workflow_entry := _workflow_entry_from_event_result(payload)
+			if workflow_entry != "":
+				return workflow_entry
 			var count = payload.get("result_count")
 			if count != null:
 				return _ui("event_tool_done_count") % [tool_label, int(count)]
 			return _ui("event_tool_done") % tool_label
 		"tool_results_received":
-			return _ui("event_tool_results") % str(payload.get("count", 0))
+			return ""
 		"user_submitted":
 			var with_context := bool(payload.get("has_context", false))
 			return _ui("event_user") % (_ui("event_with_context") if with_context else "")
 		"tool_calls":
-			return _ui("event_tool_calls") % [str(payload.get("count", 0)), str(payload.get("turn_id", ""))]
+			return ""
 		"final":
-			return _ui("event_final") % str(payload.get("text_length", 0))
+			return ""
 		"error":
 			return _ui("event_error") % str(payload.get("text", ""))
 		"reset":
@@ -853,6 +863,71 @@ func _describe_event(event: Dictionary) -> String:
 			]
 		_:
 			return _ui("event_unknown") % [str(event.get("type", "unknown")), JSON.stringify(payload)]
+
+
+func _is_workflow_tool(name: String) -> bool:
+	var display := _tool_display_name(name)
+	return display == "Read" or display == "Grep" or display == "Edit" or display == "Write"
+
+
+func _workflow_entry_from_event_result(payload: Dictionary) -> String:
+	var raw_summary = payload.get("result_summary", {})
+	if not (raw_summary is Dictionary):
+		return ""
+	var summary: Dictionary = raw_summary
+	match str(summary.get("kind", "")):
+		"read":
+			return _format_read_event_entry(summary)
+		"grep":
+			return _format_grep_event_entry(summary)
+		_:
+			return ""
+
+
+func _format_read_event_entry(summary: Dictionary) -> String:
+	var path := str(summary.get("path", "<unknown>"))
+	var line_start := int(summary.get("line_start", 1))
+	var line_end := int(summary.get("line_end", line_start))
+	var header := "Read %s (lines %d-%d)" % [path, line_start, max(line_start, line_end)]
+	var content := str(summary.get("content", ""))
+	if content == "":
+		return header
+	var lang := _code_lang_for_path(path)
+	var fence := "```%s" % lang if lang != "" else "```"
+	var suffix := "\n... truncated ..." if bool(summary.get("truncated", false)) else ""
+	return "%s\n%s\n%s%s\n```" % [header, fence, content, suffix]
+
+
+func _format_grep_event_entry(summary: Dictionary) -> String:
+	var pattern := str(summary.get("pattern", summary.get("query", ""))).replace("\"", "\\\"")
+	var include := str(summary.get("include", "project"))
+	var count := int(summary.get("match_count", 0))
+	var lines: Array[String] = ["%d match%s" % [count, "" if count == 1 else "es"]]
+	var matches: Array = summary.get("matches", []) if summary.get("matches", []) is Array else []
+	for item in matches:
+		if not (item is Dictionary):
+			continue
+		lines.append("%s:%s %s" % [
+			str(item.get("path", "")),
+			str(item.get("line", "")),
+			str(item.get("text", "")).strip_edges()
+		])
+	if bool(summary.get("truncated", false)):
+		lines.append("... truncated ...")
+	return "Grep \"%s\" (in %s)\n%s" % [pattern, include, "\n".join(lines)]
+
+
+func _code_lang_for_path(path: String) -> String:
+	var lower := path.to_lower()
+	if lower.ends_with(".gd"):
+		return "gdscript"
+	if lower.ends_with(".py"):
+		return "python"
+	if lower.ends_with(".json"):
+		return "json"
+	if lower.ends_with(".tscn") or lower.ends_with(".tres") or lower.ends_with(".cfg") or lower.ends_with(".ini"):
+		return "ini"
+	return ""
 
 
 func _string_array(value: Variant) -> Array[String]:
@@ -887,13 +962,13 @@ func _format_delegate_args(payload: Dictionary) -> String:
 	return str(payload.get("tool", "delegate"))
 
 
-## 工具名 -> Claude Code 风格展示名（"⏺ ToolName(args)"）；未在
+## 工具名 -> workflow 展示名；未在
 ## `_TOOL_DISPLAY_NAMES` 中列出的工具直接显示原始工具名。
 func _tool_display_name(name: String) -> String:
 	return str(_TOOL_DISPLAY_NAMES.get(name, name))
 
 
-## 截断过长文本并追加省略号，用于"⏺/⎿"行中的参数与结果摘要。
+## 截断过长文本并追加省略号，用于参数与结果摘要。
 func _truncate_text(text: String, max_len: int) -> String:
 	var stripped := text.strip_edges()
 	if stripped.length() > max_len:
@@ -1127,14 +1202,16 @@ func _set_state(value: int) -> void:
 		})
 
 
-## 推理增量本身不再单独渲染（各 Thought 条目在最终回复中逐条折叠展示），
-## 这里仅用于建立流式消息并记录起始时间，供 `_apply_thought_prefix` 计算耗时。
+## 推理增量渲染为独立 Thought workflow 条目，默认折叠但持续更新详情。
 func _on_reasoning_delta(event: Dictionary) -> void:
 	var payload: Dictionary = event.get("payload", {})
 	var key := _stream_event_key(payload)
-	if _should_ignore_stream_delta(key, ""):
+	if key != "" and _closed_stream_keys.has(key):
 		return
-	_ensure_stream_message(key)
+	var text := str(payload.get("text", ""))
+	_ensure_reasoning_entry(key)
+	_reasoning_text = text
+	_update_reasoning_entry()
 
 
 func _on_text_delta(event: Dictionary) -> void:
@@ -1166,6 +1243,72 @@ func _should_ignore_stream_delta(key: String, text: String) -> bool:
 	return false
 
 
+func _ensure_reasoning_entry(key: String) -> void:
+	if _reasoning_key == key and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
+		return
+	_mark_reasoning_stream_closed()
+	_finish_reasoning_stream()
+	_reasoning_key = key
+	_reasoning_started_ms = Time.get_ticks_msec()
+	if _stream_started_ms < 0:
+		_stream_started_ms = _reasoning_started_ms
+
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_theme_constant_override("separation", 8)
+	row.add_child(_make_workflow_marker("thought"))
+
+	var body := VBoxContainer.new()
+	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	body.add_theme_constant_override("separation", 2)
+	row.add_child(body)
+
+	var toggle := _make_workflow_toggle(_format_reasoning_header(""), "#666666")
+	body.add_child(toggle)
+
+	var detail_rich := _make_log_rich_text("", "#666666")
+	detail_rich.visible = false
+	body.add_child(detail_rich)
+
+	toggle.pressed.connect(func():
+		detail_rich.visible = not detail_rich.visible
+		_scroll_to_bottom()
+	)
+
+	_message_list.add_child(row)
+	_reasoning_row = row
+	_reasoning_toggle = toggle
+	_reasoning_detail_rich = detail_rich
+	_scroll_to_bottom()
+
+
+func _update_reasoning_entry() -> void:
+	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
+		_reasoning_toggle.text = _format_reasoning_header(_reasoning_text)
+	if _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
+		_reasoning_detail_rich.clear()
+		_reasoning_detail_rich.append_text(_markdown_to_bbcode(_reasoning_text))
+	_scroll_to_bottom()
+
+
+func _format_reasoning_header(text: String) -> String:
+	var elapsed := 1
+	if _reasoning_started_ms >= 0:
+		elapsed = max(1, int(round((Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)))
+	var summary := _first_nonempty_line(text)
+	if summary != "":
+		return "Thought for %ds > %s" % [elapsed, _truncate_text(summary, 96)]
+	return "Thought for %ds >" % elapsed
+
+
+func _first_nonempty_line(text: String) -> String:
+	for raw_line in text.split("\n"):
+		var line := str(raw_line).strip_edges()
+		if line != "":
+			return line
+	return ""
+
+
 ## 确保存在一个用于流式展示的消息气泡（仅含正文区域）。`key` 通常为
 ## `frame_id:loop`；与当前流式消息的 key 不同时会丢弃上一条流式消息气泡
 ## （例如委派子帧或"边想边调用工具"轮次的中间输出，不应作为独立消息保留，
@@ -1179,16 +1322,14 @@ func _ensure_stream_message(key: String) -> void:
 
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
-	var panel := _make_message_panel("assistant")
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(panel)
+	row.add_theme_constant_override("separation", 8)
+	row.add_child(_make_workflow_marker("text"))
 
 	var body := VBoxContainer.new()
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	panel.add_child(body)
+	row.add_child(body)
 
-	var content_rich := _make_rich_text("", "#dddddd")
+	var content_rich := _make_log_rich_text("", "#dddddd")
 	body.add_child(content_rich)
 
 	_message_list.add_child(row)
@@ -1206,11 +1347,25 @@ func _finish_streaming() -> void:
 	_stream_started_ms = -1
 
 
+func _finish_reasoning_stream() -> void:
+	_reasoning_key = ""
+	_reasoning_row = null
+	_reasoning_toggle = null
+	_reasoning_detail_rich = null
+	_reasoning_text = ""
+	_reasoning_started_ms = -1
+
+
 ## 丢弃当前流式消息气泡：用于本轮 LLM 输出仅是"边想边调用工具"的中间内容，
 ## 不是最终回复（避免和后续轮次的最终回复重复展示）。
 func _mark_current_stream_closed() -> void:
 	if _stream_key != "":
 		_closed_stream_keys[_stream_key] = true
+
+
+func _mark_reasoning_stream_closed() -> void:
+	if _reasoning_key != "":
+		_closed_stream_keys[_reasoning_key] = true
 
 
 func _discard_stream_message() -> void:
@@ -1259,7 +1414,7 @@ func _append_message(role: String, text: String, color: String = "#dddddd") -> v
 	_scroll_to_bottom()
 
 
-## 生成单个工具调用的 "⏺ ToolName(args)" 标题行，在执行/确认之前展示，
+## 生成单个工具调用标题行，在执行/确认之前展示，
 ## 让用户能实时看到模型正在调用什么智能体/工具、读取或编辑了什么文件。
 func _message_fingerprint(text: String) -> String:
 	return " ".join(text.strip_edges().split())
@@ -1297,7 +1452,7 @@ func _normalize_written_result(text: String) -> String:
 	var end := text.find("`", start)
 	var path := text.substr(start, end - start) if end > start else "<unknown>"
 	var line_count := _extract_first_int_after(text, "(", 0)
-	return "Edit %s\nAdded %d lines" % [path, line_count]
+	return "Edit %s\n+%d -0 lines" % [path, line_count]
 
 
 func _extract_parenthesized_action_arg(text: String) -> String:
@@ -1371,30 +1526,44 @@ func _append_log_entry(entry: String, color: String) -> void:
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_theme_constant_override("separation", 8)
 
-	var marker := Label.new()
-	marker.text = "*"
-	marker.custom_minimum_size = Vector2(18, 0)
-	marker.add_theme_color_override("font_color", Color("#64c987") if kind in ["grep", "read", "edit"] else Color("#555555"))
-	row.add_child(marker)
+	row.add_child(_make_workflow_marker(kind))
 
 	var content := VBoxContainer.new()
 	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	content.add_theme_constant_override("separation", 2)
 	row.add_child(content)
 
-	if kind == "grep":
-		var command_panel := _make_log_command_panel()
-		content.add_child(command_panel)
-		command_panel.add_child(_make_log_rich_text(_first_line(entry), "#111111"))
-		var rest := _rest_lines(entry)
-		if rest != "":
-			content.add_child(_make_log_rich_text(rest, "#777777"))
-	elif kind == "thought":
+	if kind == "thought":
 		_append_thought_entry(content, entry)
+	elif kind == "read":
+		_append_read_entry(content, entry)
+	elif kind == "grep":
+		_append_grep_entry(content, entry)
+	elif kind == "edit":
+		_append_edit_entry(content, entry)
 	else:
 		content.add_child(_make_log_rich_text(entry, color))
 
 	_message_list.add_child(row)
+
+
+func _make_workflow_marker(kind: String) -> Label:
+	var marker := Label.new()
+	marker.text = _workflow_marker_text(kind)
+	marker.custom_minimum_size = Vector2(24, 0)
+	marker.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	marker.add_theme_color_override("font_color", Color("#64c987") if kind in ["read", "grep", "edit"] else Color("#777777"))
+	return marker
+
+
+func _workflow_marker_text(kind: String) -> String:
+	match kind:
+		"thought":
+			return "✻"
+		"read", "grep", "edit":
+			return "⏺"
+		_:
+			return ""
 
 
 func _log_entry_kind(entry: String) -> String:
@@ -1460,10 +1629,13 @@ func _append_thought_entry(content: VBoxContainer, entry: String) -> void:
 	if rest != "":
 		detail_parts.append(rest)
 	var detail := "\n\n".join(detail_parts)
+	var title := header
+	if inline != "":
+		title += " " + _truncate_text(inline, 96)
 
 	if detail == "":
 		var label := Label.new()
-		label.text = header
+		label.text = title
 		label.add_theme_color_override("font_color", Color("#666666"))
 		content.add_child(label)
 		return
@@ -1475,7 +1647,7 @@ func _append_thought_entry(content: VBoxContainer, entry: String) -> void:
 	toggle.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	toggle.add_theme_color_override("font_color", Color("#666666"))
 	toggle.add_theme_color_override("font_hover_color", Color("#999999"))
-	toggle.text = "▸ " + header
+	toggle.text = title
 	content.add_child(toggle)
 
 	var detail_rich := _make_log_rich_text(detail, "#666666")
@@ -1484,25 +1656,89 @@ func _append_thought_entry(content: VBoxContainer, entry: String) -> void:
 
 	toggle.pressed.connect(func():
 		detail_rich.visible = not detail_rich.visible
-		toggle.text = ("▾ " if detail_rich.visible else "▸ ") + header
+		toggle.text = title
 		_scroll_to_bottom()
 	)
 
 
-func _make_log_command_panel() -> PanelContainer:
-	var panel := PanelContainer.new()
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	var style := StyleBoxFlat.new()
-	style.bg_color = Color("#e9e9e9")
-	style.border_color = Color("#d0d0d0")
-	style.set_border_width_all(1)
-	style.set_corner_radius_all(4)
-	style.set_content_margin(SIDE_LEFT, 6)
-	style.set_content_margin(SIDE_RIGHT, 6)
-	style.set_content_margin(SIDE_TOP, 3)
-	style.set_content_margin(SIDE_BOTTOM, 3)
-	panel.add_theme_stylebox_override("panel", style)
-	return panel
+func _append_read_entry(content: VBoxContainer, entry: String) -> void:
+	var header := _first_line(entry)
+	var detail := _rest_lines(entry)
+	if detail == "":
+		content.add_child(_make_log_rich_text(header, "#dddddd"))
+		return
+
+	var toggle := _make_workflow_toggle(header, "#dddddd")
+	content.add_child(toggle)
+
+	var detail_rich := _make_log_rich_text(detail, "#9a9a9a")
+	detail_rich.visible = false
+	content.add_child(detail_rich)
+
+	toggle.pressed.connect(func():
+		detail_rich.visible = not detail_rich.visible
+		_scroll_to_bottom()
+	)
+
+
+func _append_grep_entry(content: VBoxContainer, entry: String) -> void:
+	var rest := _rest_lines(entry)
+	if rest == "":
+		content.add_child(_make_log_rich_text(_first_line(entry), "#dddddd"))
+		return
+	var rest_lines := rest.split("\n")
+	var summary := str(rest_lines[0]).strip_edges()
+	var details: Array[String] = []
+	for index in range(1, rest_lines.size()):
+		details.append(str(rest_lines[index]))
+	var header := _first_line(entry)
+	if summary != "":
+		header += " - " + summary
+	if details.is_empty():
+		content.add_child(_make_log_rich_text(header, "#dddddd"))
+		return
+
+	var toggle := _make_workflow_toggle(header, "#dddddd")
+	content.add_child(toggle)
+
+	var detail_rich := _make_log_rich_text("\n".join(details), "#888888")
+	detail_rich.visible = false
+	content.add_child(detail_rich)
+
+	toggle.pressed.connect(func():
+		detail_rich.visible = not detail_rich.visible
+		_scroll_to_bottom()
+	)
+
+
+func _append_edit_entry(content: VBoxContainer, entry: String) -> void:
+	content.add_child(_make_log_rich_text(_first_line(entry), "#dddddd"))
+	var stats := _format_edit_stats(_rest_lines(entry))
+	if stats != "":
+		content.add_child(_make_log_rich_text(stats, "#88c999"))
+
+
+func _make_workflow_toggle(text: String, color: String) -> Button:
+	var toggle := Button.new()
+	toggle.flat = true
+	toggle.focus_mode = Control.FOCUS_NONE
+	toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	toggle.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	toggle.add_theme_color_override("font_color", Color(color))
+	toggle.add_theme_color_override("font_hover_color", Color("#ffffff"))
+	toggle.text = text
+	return toggle
+
+
+func _format_edit_stats(detail: String) -> String:
+	var stripped := detail.strip_edges()
+	if stripped == "":
+		return ""
+	if stripped.begins_with("+") or stripped.contains(" -"):
+		return stripped
+	var added := _extract_first_int_after(stripped, "Added ", 0)
+	var removed := _extract_first_int_after(stripped, "Removed ", 0)
+	return "+%d -%d lines" % [added, removed]
 
 
 func _make_log_rich_text(text: String, color: String) -> RichTextLabel:
@@ -1514,7 +1750,9 @@ func _make_log_rich_text(text: String, color: String) -> RichTextLabel:
 func _format_tool_call_header(call: Dictionary) -> String:
 	var name := str(call.get("name", "unknown"))
 	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
-	var header := "⏺ **%s**(%s)" % [_tool_display_name(name), _format_tool_call_args(name, input)]
+	var display := _tool_display_name(name)
+	var args := _format_tool_call_args(name, input)
+	var header := display if args == "" else "%s %s" % [display, args]
 	var agent := str(call.get("agent", ""))
 	if agent != "" and agent != "coordinator":
 		header += " · `%s`" % agent
@@ -1529,29 +1767,29 @@ func _format_tool_call_args(name: String, input: Dictionary) -> String:
 	for key in ["path", "target_path", "file_path", "script_path", "resource_path", "scene_path"]:
 		if input.has(key):
 			return str(input.get(key, ""))
-	for key in ["command", "agent", "task", "query", "class_name", "node_path", "name"]:
+	for key in ["pattern", "query", "include", "command", "agent", "task", "class_name", "node_path", "name"]:
 		if input.has(key):
 			return _truncate_text(str(input.get(key, "")), 60)
 	return ""
 
 
-## 生成单个工具调用结果的 "⎿ ..." 摘要行：读取类工具显示行数，写入/编辑类
+## 生成单个工具调用结果摘要行：读取类工具显示行数，写入/编辑类
 ## 工具显示路径与行数，测试/命令类工具显示状态与截断输出，出错/被拒绝的调用
 ## 显示对应说明。
 func _format_tool_result_detail(name: String, input: Dictionary, status: String, result: Dictionary) -> String:
 	var inner: Dictionary = result.get("result", {}) if result.get("result") is Dictionary else {}
 	if status == "rejected":
-		return "⎿ %s" % _ui("tool_rejected")
+		return _ui("tool_rejected")
 	if status == "error":
 		var message := str(inner.get("message", result.get("error_code", _ui("tool_unknown_error"))))
-		return "⎿ %s" % (_ui("tool_error_detail") % message)
+		return _ui("tool_error_detail") % message
 	match name:
 		"read_file", "read_script":
-			return "⎿ %s" % (_ui("tool_read_lines") % _count_lines(str(inner.get("content", ""))))
+			return _ui("tool_read_lines") % _count_lines(str(inner.get("content", "")))
 		"write_file", "propose_script_edit", "apply_text_edit", "propose_tests", "propose_content_file":
 			var after_text := str(input.get("content", input.get("after_text", "")))
 			var path := str(inner.get("path", input.get("path", input.get("target_path", ""))))
-			return "⎿ %s" % (_ui("tool_wrote_lines") % [path, _count_lines(after_text)])
+			return _ui("tool_wrote_lines") % [path, _count_lines(after_text)]
 		"run_tests", "run_headless_self_test":
 			var run_status := str(inner.get("status", "unknown"))
 			var exit_code = inner.get("exit_code")
@@ -1561,38 +1799,34 @@ func _format_tool_result_detail(name: String, input: Dictionary, status: String,
 			var output := str(inner.get("output", "")).strip_edges()
 			if output != "":
 				summary += "\n```\n%s\n```" % _truncate_text(output, 800)
-			return "⎿ %s" % summary
+			return summary
 		"read_debugger_errors":
 			var items: Array = inner.get("items", []) if inner.get("items") is Array else []
-			return "⎿ %s" % (_ui("tool_items_count") % items.size())
+			return _ui("tool_items_count") % items.size()
 		_:
 			if inner.has("path"):
-				return "⎿ %s" % (_ui("tool_done_path") % str(inner.get("path")))
-			return "⎿ %s" % _ui("tool_done")
+				return _ui("tool_done_path") % str(inner.get("path"))
+			return _ui("tool_done")
 
 
-## 在 "⎿" 结果行之后追加一条结果消息；失败/被拒绝的调用使用醒目颜色。
+## 追加一条工具结果消息；失败/被拒绝的调用使用醒目颜色。
 func _format_log_tool_result(name: String, input: Dictionary, result: Dictionary, fallback: String) -> String:
 	var inner: Dictionary = result.get("result", {}) if result.get("result") is Dictionary else {}
 	match name:
 		"read_file", "read_script":
 			var read_path := str(inner.get("path", input.get("path", "<unknown>")))
-			var line_count := _count_lines(str(inner.get("content", "")))
-			return "Read %s (lines 1-%d)" % [read_path, line_count]
+			var content := str(inner.get("content", ""))
+			var line_count := _count_lines(content)
+			var lang := _code_lang_for_path(read_path)
+			var fence := "```%s" % lang if lang != "" else "```"
+			return "Read %s (lines 1-%d)\n%s\n%s\n```" % [read_path, line_count, fence, content]
 		"write_file", "propose_script_edit", "apply_text_edit", "propose_tests", "propose_content_file":
 			var edit_path := str(inner.get("path", input.get("path", input.get("target_path", "<unknown>"))))
 			var after_text := str(input.get("content", input.get("after_text", "")))
 			var before_text := str(input.get("before_text", input.get("before", "")))
 			var added := max(_count_lines(after_text) - _count_lines(before_text), 0)
 			var removed := max(_count_lines(before_text) - _count_lines(after_text), 0)
-			var lines: Array[String] = ["Edit %s" % edit_path]
-			if added > 0:
-				lines.append("Added %d lines" % added)
-			if removed > 0:
-				lines.append("Removed %d lines" % removed)
-			if added == 0 and removed == 0:
-				lines.append("Added %d lines" % _count_lines(after_text))
-			return "\n".join(lines)
+			return "Edit %s\n+%d -%d lines" % [edit_path, added, removed]
 		_:
 			return fallback
 
@@ -1671,6 +1905,7 @@ func _apply_mono_font(rich: RichTextLabel) -> void:
 
 func _clear_messages() -> void:
 	_finish_streaming()
+	_finish_reasoning_stream()
 	_rendered_assistant_keys.clear()
 	_closed_stream_keys.clear()
 	for child in _message_list.get_children():

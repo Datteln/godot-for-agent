@@ -38,6 +38,8 @@ from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY, ToolDef, tools_for
 
 MAX_AGENT_DEPTH = 4
+EVENT_TEXT_PREVIEW_CHARS = 24_000
+EVENT_MATCH_PREVIEW_ITEMS = 20
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +444,24 @@ def _append_delegate_protocol_errors(frame: Frame, calls: list[Any]) -> None:
         )
 
 
+def _append_single_tool_call_protocol_errors(frame: Frame, calls: list[Any]) -> None:
+    """Reject multi-tool assistant turns so the UI can render atomic workflow steps."""
+    logger.warning(
+        "Single-tool protocol violation frame=%s agent=%s tool_calls=%d",
+        frame.id,
+        frame.agent.name,
+        len(calls),
+    )
+    for call in calls:
+        frame.messages.append(
+            _tool_message(
+                call.id,
+                "每轮 assistant 只能调用一个工具；本轮所有工具均未执行，请只选择一个工具后重试",
+                is_error=True,
+            )
+        )
+
+
 def _start_delegate_frame(
     *,
     session: Session,
@@ -625,6 +645,56 @@ def _event_result_count(result: Any, is_error: bool) -> int | None:
     return None
 
 
+def _event_result_summary(tool_name: str, result: Any, is_error: bool) -> dict[str, Any] | None:
+    """Return a bounded, UI-safe summary for workflow event rendering."""
+    if is_error or not isinstance(result, dict):
+        return None
+    if tool_name in {"read_file", "read_script"}:
+        content = result.get("content")
+        if not isinstance(content, str):
+            return None
+        preview = content[:EVENT_TEXT_PREVIEW_CHARS]
+        return {
+            "kind": "read",
+            "path": str(result.get("path", "")),
+            "line_start": 1,
+            "line_end": max(1, len(content.splitlines())),
+            "content": preview,
+            "truncated": bool(result.get("truncated", False)) or len(content) > len(preview),
+        }
+    if tool_name in {"grep_code", "search_codebase", "list_files"}:
+        matches = _event_match_items(result)
+        return {
+            "kind": "grep",
+            "pattern": str(result.get("pattern", result.get("query", ""))),
+            "include": str(result.get("include", result.get("path", "project"))),
+            "match_count": len(matches),
+            "matches": matches[:EVENT_MATCH_PREVIEW_ITEMS],
+            "truncated": bool(result.get("truncated", False)) or len(matches) > EVENT_MATCH_PREVIEW_ITEMS,
+        }
+    return None
+
+
+def _event_match_items(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize search-like result rows for the frontend workflow list."""
+    raw_items = result.get("matches", result.get("results", result.get("files", [])))
+    if not isinstance(raw_items, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            normalized.append(
+                {
+                    "path": str(item.get("path", item.get("file", ""))),
+                    "line": item.get("line", item.get("line_no", "")),
+                    "text": str(item.get("text", item.get("preview", ""))),
+                }
+            )
+        else:
+            normalized.append({"path": str(item), "line": "", "text": ""})
+    return normalized
+
+
 def _emit_orchestration_event(
     event_callback: Callable[[str, dict[str, Any]], None] | None,
     event_type: str,
@@ -736,6 +806,10 @@ async def run_turn(
                 logger.info("Agent run_turn final session=%s loop=%d", session.session_id, loop_index + 1)
                 return result
             continue  # 子帧已结束，继续驱动父帧
+
+        if len(turn.tool_calls) > 1:
+            _append_single_tool_call_protocol_errors(frame, turn.tool_calls)
+            continue
 
         logger.info(
             "Agent requested tools session=%s frame=%s agent=%s names=%s",
@@ -922,6 +996,7 @@ async def run_turn(
                         "args": _event_tool_args(item.args),
                         "is_error": outcome[1],
                         "result_count": _event_result_count(outcome[0], outcome[1]),
+                        "result_summary": _event_result_summary(item.tool.name, outcome[0], outcome[1]),
                     },
                 )
         for item in sequential_calls:
@@ -948,6 +1023,7 @@ async def run_turn(
                     "args": _event_tool_args(item.args),
                     "is_error": results[item.call_id][1],
                     "result_count": _event_result_count(*results[item.call_id]),
+                    "result_summary": _event_result_summary(item.tool.name, *results[item.call_id]),
                 },
             )
 

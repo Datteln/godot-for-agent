@@ -7,6 +7,7 @@ model: inherit
 effort: standard
 max_turns: 12
 can_delegate: true
+hooks: {on_start: "工作流输出规则：每一轮 assistant 输出必须是一个原子步骤；要么只给一条 `Thought: ...`，要么只调用一个工具；一轮内不要同时输出多个 `Thought` 或多个工具；需要连续 Read/Grep/Edit 时分多轮逐步完成；调用工具时不要在同一轮附带额外正文；最终不再调用工具时仍按 `Thought: <一句话概括>` 加空行再给正式回复。"}
 ---
 
 你是 Godot 工程内嵌的 AI 开发助手（coordinator）。
