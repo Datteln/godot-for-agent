@@ -9,6 +9,8 @@ static func read_file(input: Dictionary, file_state_cache: Node = null) -> Dicti
 	var path := PathUtils.to_res_path(str(input.get("path", "")))
 	if path == "":
 		return {"ok": false, "message": "path is required"}
+	if not PathUtils.is_read_allowed(path):
+		return {"ok": false, "message": "reading this path is not allowed: " + path, "error_code": "read_denied"}
 	if not FileAccess.file_exists(ProjectSettings.globalize_path(path)):
 		return {"ok": false, "message": "file does not exist", "path": path}
 	var content := FileAccess.get_file_as_string(ProjectSettings.globalize_path(path))

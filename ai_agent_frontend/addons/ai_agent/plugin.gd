@@ -2,6 +2,7 @@
 extends EditorPlugin
 
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
+const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 const ServiceManager = preload("res://addons/ai_agent/service/service_manager.gd")
 const AgentStateStore = preload("res://addons/ai_agent/state/agent_state_store.gd")
 const UnifiedUndoManager = preload("res://addons/ai_agent/undo/unified_undo_manager.gd")
@@ -15,6 +16,7 @@ var _chat_panel: Control
 
 func _enter_tree() -> void:
 	ConfigMigrations.apply_defaults(get_editor_interface())
+	FrontendLogger.info(get_editor_interface(), "Plugin", "Entering AI Agent plugin.")
 
 	_state_store = AgentStateStore.new()
 	_state_store.name = "AgentStateStore"
@@ -42,6 +44,7 @@ func _enter_tree() -> void:
 
 
 func _exit_tree() -> void:
+	FrontendLogger.info(get_editor_interface(), "Plugin", "Exiting AI Agent plugin.")
 	if _chat_panel != null:
 		remove_control_from_docks(_chat_panel)
 		_chat_panel.queue_free()

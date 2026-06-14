@@ -2,8 +2,20 @@
 extends RefCounted
 
 ## 写操作禁止访问的路径前缀：插件自身、Godot 内部数据与版本控制目录。
+const DENY_READ_PREFIXES: PackedStringArray = [
+	"res://addons/ai_agent/",
+	"res://ai_agent_frontend/",
+	"res://ai_agent_service/",
+	"res://.ai_agent_service/",
+	"res://.godot/",
+	"res://.git/",
+]
+
 const DENY_WRITE_PREFIXES: PackedStringArray = [
 	"res://addons/",
+	"res://ai_agent_frontend/",
+	"res://ai_agent_service/",
+	"res://.ai_agent_service/",
 	"res://.godot/",
 	"res://.git/",
 ]
@@ -26,6 +38,15 @@ static func is_write_allowed(res_path: String) -> bool:
 	if res_path == "":
 		return false
 	for prefix in DENY_WRITE_PREFIXES:
+		if res_path.begins_with(prefix):
+			return false
+	return true
+
+
+static func is_read_allowed(res_path: String) -> bool:
+	if res_path == "":
+		return false
+	for prefix in DENY_READ_PREFIXES:
 		if res_path.begins_with(prefix):
 			return false
 	return true

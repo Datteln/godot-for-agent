@@ -47,7 +47,7 @@ func _scan_project_dir(path: String, out: Array, depth: int) -> void:
 		var name := dir.get_next()
 		if name == "":
 			break
-		if name.begins_with(".") or name == "addons":
+		if name.begins_with(".") or name in ["addons", "ai_agent_frontend", "ai_agent_service"]:
 			continue
 		var full := path.path_join(name)
 		if dir.current_is_dir():

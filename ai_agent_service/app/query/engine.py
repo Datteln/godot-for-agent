@@ -24,6 +24,8 @@ from app.api.schemas import (
     ChatResponse,
     ChatToolCallsResponse,
     FrontToolCallDTO,
+    SessionHistoryItemDTO,
+    SessionHistoryResponse,
     ToolResult,
 )
 from app.config import AppSettings
@@ -133,6 +135,93 @@ def _brief_message(message: dict[str, Any]) -> str:
     return f"{role}: {compact}"
 
 
+def _display_user_content(content: str) -> str:
+    """Remove frontend context metadata from a stored user message."""
+    marker = "\n\n[editor_context]\n"
+    if marker in content:
+        return content.split(marker, 1)[0]
+    return content
+
+
+def _display_tool_content(content: str) -> str:
+    """Pretty-print JSON tool content when possible."""
+    try:
+        parsed = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return content
+    return "```json\n" + json.dumps(parsed, ensure_ascii=False, indent=2) + "\n```"
+
+
+def _history_items_for_frame(frame: Frame, *, include_system_prompt: bool = False) -> list[SessionHistoryItemDTO]:
+    """Convert stored LLM messages into chat-panel friendly history items."""
+    items: list[SessionHistoryItemDTO] = []
+    for index, message in enumerate(frame.messages):
+        role = str(message.get("role", "system"))
+        content = message.get("content", "")
+        text = "" if content is None else str(content)
+
+        if role == "system":
+            if index == 0 and not include_system_prompt:
+                continue
+            if not text.strip():
+                continue
+            items.append(
+                SessionHistoryItemDTO(role="system", text=text, frame_id=frame.id, agent=frame.agent.name)
+            )
+            continue
+
+        if role == "user":
+            text = _display_user_content(text)
+            if text.strip():
+                items.append(
+                    SessionHistoryItemDTO(role="user", text=text, frame_id=frame.id, agent=frame.agent.name)
+                )
+            continue
+
+        if role == "assistant":
+            if text.strip():
+                items.append(
+                    SessionHistoryItemDTO(role="assistant", text=text, frame_id=frame.id, agent=frame.agent.name)
+                )
+            tool_calls = message.get("tool_calls", [])
+            if isinstance(tool_calls, list) and tool_calls:
+                lines = ["Tool calls"]
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function", {})
+                    name = "unknown"
+                    if isinstance(function, dict):
+                        name = str(function.get("name", "unknown"))
+                    lines.append(f"- `{name}`")
+                items.append(
+                    SessionHistoryItemDTO(
+                        role="system",
+                        text="\n".join(lines),
+                        frame_id=frame.id,
+                        agent=frame.agent.name,
+                    )
+                )
+            continue
+
+        if role == "tool":
+            tool_call_id = str(message.get("tool_call_id", ""))
+            heading = f"Tool result `{tool_call_id}`" if tool_call_id else "Tool result"
+            items.append(
+                SessionHistoryItemDTO(
+                    role="system",
+                    text=heading + "\n\n" + _display_tool_content(text),
+                    frame_id=frame.id,
+                    agent=frame.agent.name,
+                )
+            )
+            continue
+
+        if text.strip():
+            items.append(SessionHistoryItemDTO(role="system", text=text, frame_id=frame.id, agent=frame.agent.name))
+    return items
+
+
 def _pending_anchor_index(frame: Frame, pending_ids: set[str]) -> int | None:
     """找到包含 pending tool_call 的 assistant 消息位置。"""
     if not pending_ids:
@@ -186,6 +275,27 @@ class QueryEngine:
     def available_tools(self) -> set[str]:
         """当前工具注册表里的可见工具名集合。"""
         return set(REGISTRY)
+
+    def session_history(self, session_id: str, limit: int = 200) -> SessionHistoryResponse:
+        """Return frontend-renderable history for a persisted session."""
+        session = self._store.get_or_create(session_id, self.available_tools)
+        items: list[SessionHistoryItemDTO] = []
+        for frame in session.agent_stack:
+            items.extend(_history_items_for_frame(frame))
+        if limit > 0 and len(items) > limit:
+            items = items[-limit:]
+        logger.info(
+            "Session history requested session=%s frames=%d items=%d pending=%s",
+            session_id,
+            len(session.agent_stack),
+            len(items),
+            session.pending_turn_id is not None,
+        )
+        return SessionHistoryResponse(
+            session_id=session.session_id,
+            pending_turn_id=session.pending_turn_id,
+            items=items,
+        )
 
     async def submit_user_turn(self, request: ChatRequest) -> ChatResponse:
         """处理一次 `/chat` 请求。
@@ -315,6 +425,7 @@ class QueryEngine:
                 self._output_styles,
                 session.output_style,
             ),
+            model_selector=self._model_for_effort,
         )
         response = _step_to_response(step)
         if isinstance(response, ChatToolCallsResponse):
@@ -351,6 +462,19 @@ class QueryEngine:
             request.permission_mode,
         )
         return self._base_security.model_copy(update={"permission_mode": request.permission_mode})
+
+    def _model_for_effort(self, effort: str) -> str | None:
+        """Return an optional model override for the current effort."""
+        value = {
+            "quick": self._settings.llm_quick_model,
+            "standard": self._settings.llm_standard_model,
+            "deep": self._settings.llm_deep_model,
+            "verify": self._settings.llm_verify_model,
+            "advisor": self._settings.llm_advisor_model,
+        }.get(effort)
+        if value is None or str(value).strip() == "":
+            return None
+        return str(value).strip()
 
     def _append_tool_results(
         self, session: Session, results: list[ToolResult]
@@ -445,6 +569,37 @@ class QueryEngine:
             self._recovery.clear()
         self._emit(session_id, "reset", {})
         logger.info("Session reset through QueryEngine session=%s", session_id)
+
+    async def discard_pending(self, session_id: str) -> ChatResponse:
+        """放弃当前会话待回传的前端工具调用，保留其余会话历史。
+
+        为每个待回应的 `tool_use_id` 写入一条"用户放弃"的占位 `tool` 消息，
+        然后清空 `pending_turn_id`，使会话恢复到可接受新用户消息的状态。
+        """
+        async with self._store.lock_for(session_id):
+            session = self._store.get_or_create(session_id, self.available_tools)
+            if session.pending_turn_id is None:
+                return ChatErrorResponse(text="当前会话没有等待回传的工具调用")
+
+            frames = {frame.id: frame for frame in session.agent_stack}
+            discarded = 0
+            for tool_use_id in sorted(session.pending_tool_call_ids):
+                metadata = session.pending_tool_calls.get(tool_use_id, {})
+                frame = frames.get(str(metadata.get("frame_id", "")))
+                if frame is None:
+                    continue
+                frame.messages.append(
+                    _tool_message(tool_use_id, "用户放弃了该工具调用的结果回传。", is_error=True)
+                )
+                discarded += 1
+
+            session.clear_pending()
+            self._store.save(session)
+            response = ChatFinalResponse(text="已放弃 %d 个待回传的工具调用，可以继续发送新消息。" % discarded)
+            self._record_recovery(session, response)
+            self._emit(session_id, "pending_discarded", {"count": discarded})
+            logger.info("Pending tool calls discarded session=%s count=%d", session_id, discarded)
+            return response
 
     def set_effort(self, session_id: str, effort: str) -> None:
         """Set session effort without starting a model turn."""

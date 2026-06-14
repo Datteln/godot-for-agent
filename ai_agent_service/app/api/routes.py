@@ -24,6 +24,7 @@ from app.api.schemas import (
     RecoveryPointerResponse,
     ResetRequest,
     ResetResponse,
+    SessionHistoryResponse,
     SkillsResponse,
 )
 from app.config import AppSettings
@@ -132,6 +133,11 @@ def create_router(
         query_engine.reset(request.session_id)
         return ResetResponse(ok=True, session_id=request.session_id)
 
+    @router.post("/chat/discard-pending", response_model=ChatResponse)
+    async def discard_pending(request: ResetRequest) -> ChatResponse:
+        logger.info("HTTP /chat/discard-pending session=%s", request.session_id)
+        return await query_engine.discard_pending(request.session_id)
+
     @router.get("/doctor", response_model=DoctorResponse)
     async def doctor() -> DoctorResponse:
         response = run_doctor(
@@ -175,6 +181,11 @@ def create_router(
                 for event in events
             ]
         )
+
+    @router.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)
+    async def session_history(session_id: str, limit: int = 200) -> SessionHistoryResponse:
+        logger.info("HTTP /sessions/%s/history limit=%d", session_id, limit)
+        return query_engine.session_history(session_id, limit=limit)
 
     @router.get("/recovery-pointer", response_model=RecoveryPointerResponse)
     async def recovery_pointer() -> RecoveryPointerResponse:

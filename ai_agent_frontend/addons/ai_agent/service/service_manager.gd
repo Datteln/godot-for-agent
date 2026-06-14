@@ -6,6 +6,7 @@ signal service_stopped
 signal service_failed(message: String)
 
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
+const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 
 const PORT_MIN := 49152
 const PORT_MAX := 65535
@@ -27,17 +28,27 @@ func start() -> void:
 	token = _generate_token()
 
 	var auto_start := bool(ConfigMigrations.get_value(editor_interface, "ai_agent/auto_start_service"))
+	FrontendLogger.info(editor_interface, "Service", "Starting service manager.", {
+		"auto_start": auto_start,
+		"base_url": base_url
+	})
 	if auto_start:
 		base_url = _with_port(base_url, _pick_port())
+		FrontendLogger.debug(editor_interface, "Service", "Auto-start selected port.", {"base_url": base_url})
 		_start_python_service()
 		if _pid <= 0:
 			return
 
+	FrontendLogger.info(editor_interface, "Service", "Service manager ready.", {
+		"base_url": base_url,
+		"pid": _pid
+	})
 	service_started.emit(base_url)
 
 
 func stop() -> void:
 	if _pid > 0:
+		FrontendLogger.info(editor_interface, "Service", "Stopping auto-started service.", {"pid": _pid})
 		OS.kill(_pid)
 	_pid = -1
 	service_stopped.emit()
@@ -48,47 +59,121 @@ func is_running() -> bool:
 
 
 func _start_python_service() -> void:
-	var python := str(ConfigMigrations.get_value(editor_interface, "ai_agent/python_executable"))
-	if python.strip_edges().is_empty():
-		python = _detect_python()
-
 	var module_dir := str(ConfigMigrations.get_value(editor_interface, "ai_agent/service_module_dir"))
 	if module_dir.strip_edges().is_empty():
+		FrontendLogger.error(editor_interface, "Service", "Service module directory is not configured.")
 		service_failed.emit("ai_agent/service_module_dir is empty; start the Python service manually or configure it.")
 		return
+	module_dir = module_dir.strip_edges()
+
+	var python := str(ConfigMigrations.get_value(editor_interface, "ai_agent/python_executable")).strip_edges()
+	if python.is_empty():
+		python = _detect_python(module_dir)
+	elif _looks_like_path(python) and not FileAccess.file_exists(python):
+		var detected_python := _detect_python(module_dir)
+		if _looks_like_path(detected_python) and FileAccess.file_exists(detected_python):
+			python = detected_python
+		else:
+			FrontendLogger.error(editor_interface, "Service", "Configured Python executable does not exist.", {
+				"python": python
+			})
+			service_failed.emit("ai_agent/python_executable does not exist: " + python)
+			return
 
 	var old_project_root := OS.get_environment("AI_AGENT_PROJECT_ROOT")
 	var old_port := OS.get_environment("AI_AGENT_PORT")
 	var old_pythonpath := OS.get_environment("PYTHONPATH")
+	var old_llm_base_url := OS.get_environment("AI_AGENT_LLM_BASE_URL")
+	var old_llm_api_key := OS.get_environment("AI_AGENT_LLM_API_KEY")
+	var old_llm_model := OS.get_environment("AI_AGENT_LLM_MODEL")
+	var old_llm_quick_model := OS.get_environment("AI_AGENT_LLM_QUICK_MODEL")
+	var old_llm_standard_model := OS.get_environment("AI_AGENT_LLM_STANDARD_MODEL")
+	var old_llm_deep_model := OS.get_environment("AI_AGENT_LLM_DEEP_MODEL")
+	var old_llm_verify_model := OS.get_environment("AI_AGENT_LLM_VERIFY_MODEL")
+	var old_llm_advisor_model := OS.get_environment("AI_AGENT_LLM_ADVISOR_MODEL")
+	var old_llm_fallback_model := OS.get_environment("AI_AGENT_LLM_FALLBACK_MODEL")
+	var old_llm_timeout := OS.get_environment("AI_AGENT_LLM_REQUEST_TIMEOUT_S")
 	OS.set_environment("AI_AGENT_PROJECT_ROOT", ProjectSettings.globalize_path("res://"))
 	OS.set_environment("AI_AGENT_PORT", _port_from_url(base_url))
 	OS.set_environment("PYTHONPATH", module_dir + _path_separator() + old_pythonpath)
+	_apply_llm_environment()
 	# token 经 stdin 首行传入（--token-stdin），不放命令行/环境变量——避免出现在系统进程列表。
 	var args := ["-m", "app.main", "--token-stdin"]
+	FrontendLogger.info(editor_interface, "Service", "Launching Python service.", {
+		"python": python,
+		"module_dir": module_dir,
+		"base_url": base_url
+	})
 	var pipe := OS.execute_with_pipe(python, args)
 	OS.set_environment("AI_AGENT_PROJECT_ROOT", old_project_root)
 	OS.set_environment("AI_AGENT_PORT", old_port)
 	OS.set_environment("PYTHONPATH", old_pythonpath)
+	OS.set_environment("AI_AGENT_LLM_BASE_URL", old_llm_base_url)
+	OS.set_environment("AI_AGENT_LLM_API_KEY", old_llm_api_key)
+	OS.set_environment("AI_AGENT_LLM_MODEL", old_llm_model)
+	OS.set_environment("AI_AGENT_LLM_QUICK_MODEL", old_llm_quick_model)
+	OS.set_environment("AI_AGENT_LLM_STANDARD_MODEL", old_llm_standard_model)
+	OS.set_environment("AI_AGENT_LLM_DEEP_MODEL", old_llm_deep_model)
+	OS.set_environment("AI_AGENT_LLM_VERIFY_MODEL", old_llm_verify_model)
+	OS.set_environment("AI_AGENT_LLM_ADVISOR_MODEL", old_llm_advisor_model)
+	OS.set_environment("AI_AGENT_LLM_FALLBACK_MODEL", old_llm_fallback_model)
+	OS.set_environment("AI_AGENT_LLM_REQUEST_TIMEOUT_S", old_llm_timeout)
 
 	if pipe.is_empty() or int(pipe.get("pid", -1)) <= 0:
+		FrontendLogger.error(editor_interface, "Service", "Failed to create Python service process.", {
+			"python": python,
+			"module_dir": module_dir
+		})
 		service_failed.emit("Failed to start Python service with: " + python)
 		return
 
 	_pid = int(pipe["pid"])
+	FrontendLogger.info(editor_interface, "Service", "Python service process created.", {"pid": _pid})
 	var stdio: FileAccess = pipe.get("stdio")
 	if stdio != null:
 		stdio.store_line(token)
 		stdio.flush()
 
 
-func _detect_python() -> String:
+func _detect_python(module_dir: String = "") -> String:
 	if OS.get_name() == "Windows":
+		var candidates: Array[String] = []
+		var project_root := ProjectSettings.globalize_path("res://")
+		candidates.append(project_root.path_join(".venv").path_join("Scripts").path_join("python.exe"))
+		if not module_dir.strip_edges().is_empty():
+			candidates.append(module_dir.get_base_dir().path_join(".venv").path_join("Scripts").path_join("python.exe"))
+			candidates.append(module_dir.path_join(".venv").path_join("Scripts").path_join("python.exe"))
+		for candidate in candidates:
+			if FileAccess.file_exists(candidate):
+				return candidate
 		return "python"
 	return "python3"
 
 
+func _looks_like_path(value: String) -> bool:
+	return value.is_absolute_path() or value.find("/") >= 0 or value.find("\\") >= 0
+
+
 func _path_separator() -> String:
 	return ";" if OS.get_name() == "Windows" else ":"
+
+
+func _apply_llm_environment() -> void:
+	_set_env_from_setting("AI_AGENT_LLM_BASE_URL", "ai_agent/llm_base_url")
+	_set_env_from_setting("AI_AGENT_LLM_API_KEY", "ai_agent/llm_api_key")
+	_set_env_from_setting("AI_AGENT_LLM_MODEL", "ai_agent/llm_model")
+	_set_env_from_setting("AI_AGENT_LLM_QUICK_MODEL", "ai_agent/llm_quick_model")
+	_set_env_from_setting("AI_AGENT_LLM_STANDARD_MODEL", "ai_agent/llm_standard_model")
+	_set_env_from_setting("AI_AGENT_LLM_DEEP_MODEL", "ai_agent/llm_deep_model")
+	_set_env_from_setting("AI_AGENT_LLM_VERIFY_MODEL", "ai_agent/llm_verify_model")
+	_set_env_from_setting("AI_AGENT_LLM_ADVISOR_MODEL", "ai_agent/llm_advisor_model")
+	_set_env_from_setting("AI_AGENT_LLM_FALLBACK_MODEL", "ai_agent/llm_fallback_model")
+	_set_env_from_setting("AI_AGENT_LLM_REQUEST_TIMEOUT_S", "ai_agent/llm_request_timeout_s")
+
+
+func _set_env_from_setting(env_key: String, setting_key: String) -> void:
+	var value := str(ConfigMigrations.get_value(editor_interface, setting_key)).strip_edges()
+	OS.set_environment(env_key, value)
 
 
 func _port_from_url(url: String) -> String:

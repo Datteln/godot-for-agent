@@ -41,6 +41,11 @@ class AppSettings(BaseSettings):
         default="gpt-4o-mini",
         description="默认对话模型名。",
     )
+    llm_quick_model: str | None = Field(default=None, description="quick effort 模型；为空时使用 llm_model。")
+    llm_standard_model: str | None = Field(default=None, description="standard effort 模型；为空时使用 llm_model。")
+    llm_deep_model: str | None = Field(default=None, description="deep effort 模型；为空时使用 llm_model。")
+    llm_verify_model: str | None = Field(default=None, description="verify effort 模型；为空时使用 llm_model。")
+    llm_advisor_model: str | None = Field(default=None, description="advisor effort 模型；为空时使用 llm_model。")
     llm_fallback_model: str | None = Field(
         default=None,
         description="主模型不可用时的降级模型名；为空表示不降级。",

@@ -109,6 +109,25 @@ def _resolve_model(agent: AgentDefinition) -> str | None:
     return agent.model
 
 
+def _resolve_model_for_effort(
+    agent: AgentDefinition,
+    effort: EffortLevel,
+    model_selector: Callable[[EffortLevel], str | None] | None,
+) -> str | None:
+    """Resolve the model for the current frame.
+
+    Agent definitions with an explicit model keep priority. Inherited models can be
+    selected by effort so quick/verify can use cheaper models while deep can use a
+    stronger one.
+    """
+    agent_model = _resolve_model(agent)
+    if agent_model is not None:
+        return agent_model
+    if model_selector is None:
+        return None
+    return model_selector(effort)
+
+
 # effort 档位 -> 采样温度（§6.5）；`verify` 取 0 以追求确定性复核结果。
 EFFORT_TEMPERATURE: dict[EffortLevel, float] = {
     "quick": 0.2,
@@ -573,6 +592,7 @@ async def run_turn(
     max_turns: int,
     session_allow: set[SessionAllowGrant] | None = None,
     agent_prompt_factory: Callable[[AgentDefinition], str] | None = None,
+    model_selector: Callable[[EffortLevel], str | None] | None = None,
 ) -> StepResult:
     """驱动当前会话的活跃帧完成一轮（或多轮）编排循环。
 
@@ -607,11 +627,12 @@ async def run_turn(
                 len(frame.messages),
                 len(visible_tools),
             )
+            effort = _resolve_effort(session, frame)
             turn = await llm.chat(
                 frame.messages,
                 visible_tools,
-                model=_resolve_model(frame.agent),
-                temperature=_resolve_temperature(_resolve_effort(session, frame)),
+                model=_resolve_model_for_effort(frame.agent, effort, model_selector),
+                temperature=_resolve_temperature(effort),
             )
         except LLMError as exc:
             logger.warning("Agent LLM step failed session=%s frame=%s error=%s", session.session_id, frame.id, exc)

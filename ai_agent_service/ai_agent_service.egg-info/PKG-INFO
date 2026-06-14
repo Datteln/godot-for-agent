@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: ai-agent-service
+Version: 0.1.0
+Summary: Godot 内嵌 AI 游戏开发 Agent —— Python LLM 服务（M0 骨架）
+Requires-Python: >=3.10
+Requires-Dist: fastapi>=0.110
+Requires-Dist: uvicorn[standard]>=0.27
+Requires-Dist: pydantic>=2.6
+Requires-Dist: pydantic-settings>=2.2
+Requires-Dist: openai>=1.14

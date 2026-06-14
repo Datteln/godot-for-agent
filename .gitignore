@@ -401,3 +401,6 @@ CLAUDE.md
 .claude/
 .agents/
 .python-version
+ai_map_agent/
+.ai_agent_service/
+**/*.gd.uid

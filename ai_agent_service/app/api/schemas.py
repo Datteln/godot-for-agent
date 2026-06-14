@@ -192,6 +192,24 @@ class ChatEventsResponse(BaseModel):
     events: list[ChatEventDTO]
 
 
+class SessionHistoryItemDTO(BaseModel):
+    """A frontend-renderable session history item."""
+
+    role: Literal["user", "assistant", "system", "error"]
+    text: str
+    frame_id: str | None = None
+    agent: str | None = None
+
+
+class SessionHistoryResponse(BaseModel):
+    """`GET /sessions/{session_id}/history` response."""
+
+    ok: bool = True
+    session_id: str
+    pending_turn_id: str | None = None
+    items: list[SessionHistoryItemDTO] = Field(default_factory=list)
+
+
 class RecoveryPointerDTO(BaseModel):
     """最小恢复指针（§14.3），不包含 token/API key/完整消息。"""
 

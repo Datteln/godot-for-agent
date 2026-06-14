@@ -47,7 +47,16 @@ class SecuritySettings(BaseModel):
     enabled_domains: list[str] = Field(
         default_factory=lambda: ["core", "program", "map", "scene", "resource", "project"]
     )
-    deny_read_paths: list[str] = Field(default_factory=lambda: [".git/", ".godot/"])
+    deny_read_paths: list[str] = Field(
+        default_factory=lambda: [
+            ".git/",
+            ".godot/",
+            ".ai_agent_service/",
+            "addons/ai_agent/",
+            "ai_agent_frontend/",
+            "ai_agent_service/",
+        ]
+    )
     deny_write_paths: list[str] = Field(
         default_factory=lambda: [".git/", ".godot/", "addons/"]
     )
