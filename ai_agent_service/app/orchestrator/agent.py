@@ -609,6 +609,22 @@ def _event_tool_args(args: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _event_result_count(result: Any, is_error: bool) -> int | None:
+    """Best-effort 提取 server 工具结果的条目数，供事件展示行数统计。
+
+    `grep_code`/`list_files`/`search_codebase` 等检索类工具的结果分别以
+    `matches`/`files`/`results` 列表承载命中项；其它工具或出错时返回 None，
+    前端据此回退为不带计数的展示文案。
+    """
+    if is_error or not isinstance(result, dict):
+        return None
+    for key in ("matches", "files", "results"):
+        value = result.get(key)
+        if isinstance(value, list):
+            return len(value)
+    return None
+
+
 def _emit_orchestration_event(
     event_callback: Callable[[str, dict[str, Any]], None] | None,
     event_type: str,
@@ -905,6 +921,7 @@ async def run_turn(
                         "tool": item.tool.name,
                         "args": _event_tool_args(item.args),
                         "is_error": outcome[1],
+                        "result_count": _event_result_count(outcome[0], outcome[1]),
                     },
                 )
         for item in sequential_calls:
@@ -930,6 +947,7 @@ async def run_turn(
                     "tool": item.tool.name,
                     "args": _event_tool_args(item.args),
                     "is_error": results[item.call_id][1],
+                    "result_count": _event_result_count(*results[item.call_id]),
                 },
             )
 

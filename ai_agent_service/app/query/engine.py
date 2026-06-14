@@ -338,7 +338,7 @@ class QueryEngine:
     async def _submit_locked(self, session: Session, request: ChatRequest) -> ChatResponse:
         """在持有会话锁时执行一次请求。"""
         has_user = request.user_message is not None
-        has_results = bool(request.tool_results)
+        has_results = request.tool_results is not None
         if has_user == has_results:
             logger.warning(
                 "Invalid chat request shape session=%s has_user=%s has_results=%s",

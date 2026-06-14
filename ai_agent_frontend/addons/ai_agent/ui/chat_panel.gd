@@ -66,6 +66,9 @@ const _TOOL_DISPLAY_NAMES := {
 	"read_class_docs": "ClassInfo",
 	"read_class_info": "ClassInfo",
 	"get_class_info": "ClassInfo",
+	"grep_code": "Grep",
+	"search_codebase": "Grep",
+	"list_files": "Grep",
 	"write_file": "Write",
 	"propose_script_edit": "Edit",
 	"apply_text_edit": "Edit",
@@ -125,9 +128,8 @@ const UI_TEXT := {
 		"event_delegate": "⏺ **Task**(%s)",
 		"event_tool_start": "⏺ **%s**(%s)",
 		"event_tool_done": "⎿ %s 完成",
+		"event_tool_done_count": "⎿ %s 完成（%d 个结果）",
 		"event_tool_failed": "⎿ %s 出错",
-		"thinking_show": "▸ 显示思考过程",
-		"thinking_hide": "▾ 隐藏思考过程",
 		"tool_read_lines": "读取了 %s 行",
 		"tool_wrote_lines": "已写入 `%s`（%s 行）",
 		"tool_run_result": "%s（exit=%s）",
@@ -184,9 +186,8 @@ const UI_TEXT := {
 		"event_delegate": "⏺ **Task**(%s)",
 		"event_tool_start": "⏺ **%s**(%s)",
 		"event_tool_done": "⎿ %s done",
+		"event_tool_done_count": "⎿ %s done (%d result(s))",
 		"event_tool_failed": "⎿ %s failed",
-		"thinking_show": "▸ Show thinking",
-		"thinking_hide": "▾ Hide thinking",
 		"tool_read_lines": "Read %s lines",
 		"tool_wrote_lines": "Wrote `%s` (%s lines)",
 		"tool_run_result": "%s (exit=%s)",
@@ -238,12 +239,11 @@ var _interrupted_locally := false
 
 var _stream_key := ""
 var _stream_row: Control
-var _stream_reasoning_toggle: Button
-var _stream_reasoning_rich: RichTextLabel
-var _stream_reasoning_text := ""
 var _stream_content_rich: RichTextLabel
 var _stream_content_text := ""
+var _stream_started_ms: int = -1
 var _rendered_assistant_keys := {}
+var _closed_stream_keys := {}
 
 
 func _ready() -> void:
@@ -314,7 +314,7 @@ func _build_ui() -> void:
 
 	_message_list = VBoxContainer.new()
 	_message_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_message_list.add_theme_constant_override("separation", 10)
+	_message_list.add_theme_constant_override("separation", 4)
 	_scroll.add_child(_message_list)
 
 	var bottom := HBoxContainer.new()
@@ -458,6 +458,7 @@ func _handle_tool_calls(response: Dictionary) -> void:
 
 	# 本轮流式输出只是模型在调用工具前的中间想法，不是最终回复，丢弃其气泡避免与
 	# 后续轮次的最终回复重复展示。
+	_mark_current_stream_closed()
 	_discard_stream_message()
 	var silent: Array = []
 	var confirm: Array = []
@@ -494,7 +495,7 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		FrontendLogger.info(editor_interface, "ChatPanel", "Waiting for inline tool confirmation.", {"count": confirm.size()})
 		_pending_calls = confirm.duplicate(true)
 		_pending_silent_results = results.duplicate(true)
-		_show_inline_confirmation(_pending_calls)
+		_show_inline_confirmation(confirm.duplicate(true))
 		_set_state(AgentState.WAITING_CONFIRM)
 	else:
 		_set_state(AgentState.WAITING_LLM)
@@ -512,8 +513,44 @@ func _on_decision(results: Array) -> void:
 	_clear_inline_confirmation()
 	if state_store != null:
 		state_store.set_value("pending_calls", [])
+	if results.is_empty():
+		_on_error("没有生成可回传的工具结果。")
+		return
 	_set_state(AgentState.WAITING_LLM)
 	_http_client.send_tool_results(results)
+
+
+## 若回复以 `Thought: ...` 摘要行开头，拆分出摘要文本与剩余正文；
+## 否则 `summary` 为空字符串，`rest` 为原文。
+func _split_thought_summary(text: String) -> Dictionary:
+	var stripped := text.strip_edges()
+	if not stripped.begins_with("Thought:"):
+		return {"summary": "", "rest": text}
+	var newline := stripped.find("\n")
+	var first_line := stripped if newline == -1 else stripped.substr(0, newline)
+	var rest := "" if newline == -1 else stripped.substr(newline + 1)
+	return {
+		"summary": first_line.substr("Thought:".length()).strip_edges(),
+		"rest": rest.strip_edges()
+	}
+
+
+## 把模型最终回复开头的 `Thought: ...` 摘要行转换为 Claude Code 风格的
+## "Thought for Xs > 摘要" 独立日志行（Xs 为本轮流式输出耗时），与正式回复
+## 正文之间用空行分隔，交由 `_append_log_stream_message` 拆分成独立条目展示。
+func _apply_thought_prefix(text: String) -> String:
+	var parts := _split_thought_summary(text)
+	var summary := str(parts.get("summary", ""))
+	if summary == "":
+		return text
+	var elapsed := 1
+	if _stream_started_ms >= 0:
+		elapsed = max(1, int(round((Time.get_ticks_msec() - _stream_started_ms) / 1000.0)))
+	var thought_line := "Thought for %ds > %s" % [elapsed, summary]
+	var rest := str(parts.get("rest", ""))
+	if rest == "":
+		return thought_line
+	return "%s\n\n%s" % [thought_line, rest]
 
 
 func _handle_final(response: Dictionary) -> void:
@@ -522,16 +559,16 @@ func _handle_final(response: Dictionary) -> void:
 	})
 	var text := str(response.get("text", ""))
 	var assistant_key := _message_fingerprint(text)
-	if _rendered_assistant_keys.has(assistant_key):
-		_discard_stream_message()
-	elif _stream_content_rich != null and is_instance_valid(_stream_content_rich) and _stream_content_text.strip_edges() != "":
-		_stream_content_rich.clear()
-		_stream_content_rich.append_text(_markdown_to_bbcode(text))
+	# 流式过程中展示的气泡内容是未拆分的原始文本，最终回复改为按
+	# Thought/Grep/Read/Edit/text 拆分成独立日志条目展示，因此无论是否重复，
+	# 都要先彻底移除流式气泡（而不是只清空其文字，否则会留下空气泡或残留
+	# 旧内容），避免与下方新追加的条目重复展示。
+	var prefixed := _apply_thought_prefix(text)
+	_mark_current_stream_closed()
+	_discard_stream_message()
+	if not _rendered_assistant_keys.has(assistant_key):
 		_rendered_assistant_keys[assistant_key] = true
-		_scroll_to_bottom()
-	else:
-		_append_message("assistant", text)
-	_finish_streaming()
+		_append_log_stream_message(prefixed, "#dddddd")
 	if undo_manager != null:
 		undo_manager.commit_batch()
 	_set_state(AgentState.IDLE)
@@ -568,7 +605,7 @@ func _handle_session_history(response: Dictionary) -> void:
 		var text := str(item.get("text", ""))
 		if text.strip_edges() == "":
 			continue
-		_append_message(role, text)
+		_append_message(role, _apply_thought_prefix(text) if role == "assistant" else text)
 	if pending_turn_id != null:
 		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
 	if not items.is_empty():
@@ -780,8 +817,13 @@ func _describe_event(event: Dictionary) -> String:
 				_format_event_args(payload)
 			]
 		"server_tool_result":
-			var key := "event_tool_failed" if bool(payload.get("is_error", false)) else "event_tool_done"
-			return _ui(key) % _tool_display_name(str(payload.get("tool", "")))
+			var tool_label := _tool_display_name(str(payload.get("tool", "")))
+			if bool(payload.get("is_error", false)):
+				return _ui("event_tool_failed") % tool_label
+			var count = payload.get("result_count")
+			if count != null:
+				return _ui("event_tool_done_count") % [tool_label, int(count)]
+			return _ui("event_tool_done") % tool_label
 		"tool_results_received":
 			return _ui("event_tool_results") % str(payload.get("count", 0))
 		"user_submitted":
@@ -1085,25 +1127,23 @@ func _set_state(value: int) -> void:
 		})
 
 
+## 推理增量本身不再单独渲染（各 Thought 条目在最终回复中逐条折叠展示），
+## 这里仅用于建立流式消息并记录起始时间，供 `_apply_thought_prefix` 计算耗时。
 func _on_reasoning_delta(event: Dictionary) -> void:
 	var payload: Dictionary = event.get("payload", {})
-	var text := str(payload.get("text", ""))
-	_ensure_stream_message("%s:%s" % [str(payload.get("frame_id", "")), str(payload.get("loop", ""))])
-	_stream_reasoning_text = text
-	if text.strip_edges() == "":
+	var key := _stream_event_key(payload)
+	if _should_ignore_stream_delta(key, ""):
 		return
-	if _stream_reasoning_toggle != null and is_instance_valid(_stream_reasoning_toggle):
-		_stream_reasoning_toggle.visible = true
-	if _stream_reasoning_rich != null and is_instance_valid(_stream_reasoning_rich):
-		_stream_reasoning_rich.clear()
-		_stream_reasoning_rich.append_text(_markdown_to_bbcode(text))
-	_scroll_to_bottom()
+	_ensure_stream_message(key)
 
 
 func _on_text_delta(event: Dictionary) -> void:
 	var payload: Dictionary = event.get("payload", {})
 	var text := str(payload.get("text", ""))
-	_ensure_stream_message("%s:%s" % [str(payload.get("frame_id", "")), str(payload.get("loop", ""))])
+	var key := _stream_event_key(payload)
+	if _should_ignore_stream_delta(key, text):
+		return
+	_ensure_stream_message(key)
 	_stream_content_text = text
 	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		_stream_content_rich.clear()
@@ -1111,15 +1151,31 @@ func _on_text_delta(event: Dictionary) -> void:
 	_scroll_to_bottom()
 
 
-## 确保存在一个用于流式展示的消息气泡，包含可折叠的"思考过程"与正文区域。
-## `key` 通常为 `frame_id:loop`；与当前流式消息的 key 不同时会丢弃上一条流式
-## 消息气泡（例如委派子帧或"边想边调用工具"轮次的中间输出，不应作为独立
-## 消息保留，否则会和后续轮次/父帧的最终回复重复展示）。
+func _stream_event_key(payload: Dictionary) -> String:
+	return "%s:%s" % [str(payload.get("frame_id", "")), str(payload.get("loop", ""))]
+
+
+func _should_ignore_stream_delta(key: String, text: String) -> bool:
+	if key != "" and _closed_stream_keys.has(key):
+		return true
+	var text_key := _message_fingerprint(text)
+	if text_key != "" and _rendered_assistant_keys.has(text_key):
+		if _stream_key == key:
+			_discard_stream_message()
+		return true
+	return false
+
+
+## 确保存在一个用于流式展示的消息气泡（仅含正文区域）。`key` 通常为
+## `frame_id:loop`；与当前流式消息的 key 不同时会丢弃上一条流式消息气泡
+## （例如委派子帧或"边想边调用工具"轮次的中间输出，不应作为独立消息保留，
+## 否则会和后续轮次/父帧的最终回复重复展示）。
 func _ensure_stream_message(key: String) -> void:
 	if _stream_key == key and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		return
 	_discard_stream_message()
 	_stream_key = key
+	_stream_started_ms = Time.get_ticks_msec()
 
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -1132,29 +1188,11 @@ func _ensure_stream_message(key: String) -> void:
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	panel.add_child(body)
 
-	var toggle := Button.new()
-	toggle.text = _ui("thinking_show")
-	toggle.visible = false
-	toggle.focus_mode = Control.FOCUS_NONE
-	body.add_child(toggle)
-
-	var reasoning_rich := _make_rich_text("", "#9a9a9a")
-	reasoning_rich.visible = false
-	body.add_child(reasoning_rich)
-
-	toggle.pressed.connect(func():
-		reasoning_rich.visible = not reasoning_rich.visible
-		toggle.text = _ui("thinking_hide") if reasoning_rich.visible else _ui("thinking_show")
-		_scroll_to_bottom()
-	)
-
 	var content_rich := _make_rich_text("", "#dddddd")
 	body.add_child(content_rich)
 
 	_message_list.add_child(row)
 	_stream_row = row
-	_stream_reasoning_toggle = toggle
-	_stream_reasoning_rich = reasoning_rich
 	_stream_content_rich = content_rich
 	_scroll_to_bottom()
 
@@ -1163,15 +1201,18 @@ func _ensure_stream_message(key: String) -> void:
 func _finish_streaming() -> void:
 	_stream_key = ""
 	_stream_row = null
-	_stream_reasoning_toggle = null
-	_stream_reasoning_rich = null
-	_stream_reasoning_text = ""
 	_stream_content_rich = null
 	_stream_content_text = ""
+	_stream_started_ms = -1
 
 
 ## 丢弃当前流式消息气泡：用于本轮 LLM 输出仅是"边想边调用工具"的中间内容，
 ## 不是最终回复（避免和后续轮次的最终回复重复展示）。
+func _mark_current_stream_closed() -> void:
+	if _stream_key != "":
+		_closed_stream_keys[_stream_key] = true
+
+
 func _discard_stream_message() -> void:
 	if _stream_row != null and is_instance_valid(_stream_row):
 		_stream_row.queue_free()
@@ -1184,9 +1225,13 @@ func _append_message(role: String, text: String, color: String = "#dddddd") -> v
 		if _rendered_assistant_keys.has(assistant_key):
 			FrontendLogger.debug(editor_interface, "ChatPanel", "Skipped duplicate assistant message.", {
 				"chars": text.length()
-			})
+		})
 			return
 		_rendered_assistant_keys[assistant_key] = true
+
+	if role != "user" and role != "error":
+		_append_log_stream_message(text, color)
+		return
 
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -1218,6 +1263,252 @@ func _append_message(role: String, text: String, color: String = "#dddddd") -> v
 ## 让用户能实时看到模型正在调用什么智能体/工具、读取或编辑了什么文件。
 func _message_fingerprint(text: String) -> String:
 	return " ".join(text.strip_edges().split())
+
+
+## Log stream action rows.
+func _append_log_stream_message(text: String, color: String = "#dddddd") -> void:
+	for entry in _split_log_entries(_normalize_action_message(text)):
+		_append_log_entry(str(entry), color)
+	_scroll_to_bottom()
+
+
+func _normalize_action_message(text: String) -> String:
+	var normalized := text.strip_edges()
+	if normalized == "":
+		return text
+	if _is_log_action_start(normalized):
+		return normalized
+	if normalized.contains("Wrote `"):
+		return _normalize_written_result(normalized)
+	if normalized.contains("**Read**"):
+		return "Read %s (lines 1-EOF)" % _extract_parenthesized_action_arg(normalized)
+	if normalized.contains("**Edit**") or normalized.contains("**Write**"):
+		return "Edit %s" % _extract_parenthesized_action_arg(normalized)
+	if normalized.contains("**Grep**") or normalized.contains("**SearchTools**"):
+		return "Grep \"%s\" (in project)" % _extract_parenthesized_action_arg(normalized).replace("\"", "\\\"")
+	return normalized
+
+
+func _normalize_written_result(text: String) -> String:
+	var start := text.find("Wrote `")
+	if start == -1:
+		return text
+	start += "Wrote `".length()
+	var end := text.find("`", start)
+	var path := text.substr(start, end - start) if end > start else "<unknown>"
+	var line_count := _extract_first_int_after(text, "(", 0)
+	return "Edit %s\nAdded %d lines" % [path, line_count]
+
+
+func _extract_parenthesized_action_arg(text: String) -> String:
+	var start := text.find("(")
+	var end := text.rfind(")")
+	if start == -1 or end <= start:
+		return "<unknown>"
+	return text.substr(start + 1, end - start - 1).strip_edges()
+
+
+func _extract_first_int_after(text: String, marker: String, fallback: int) -> int:
+	var start := text.find(marker)
+	if start == -1:
+		return fallback
+	var digits := ""
+	for index in range(start + marker.length(), text.length()):
+		var ch := text.substr(index, 1)
+		if ch >= "0" and ch <= "9":
+			digits += ch
+		elif digits != "":
+			break
+	return int(digits) if digits != "" else fallback
+
+
+## 把文本按 "Grep "/"Read "/"Thought "/"Thought:"/"Edit " 起始行切分为多个
+## 独立条目；两个动作行之间的普通文本（包括多行段落/代码块）合并为一个
+## "text" 条目，避免把一段普通回复拆成逐行的列表项。
+##
+## "Thought" 条目在遇到空行时立即结束（空行本身被丢弃，不计入任一条目），
+## 使 `_apply_thought_prefix` 产出的 "Thought for Xs > 摘要\n\n正文" 拆分为
+## ① 仅含摘要的可折叠 "thought" 条目 与 ② 始终展示的正文 "text" 条目，
+## 不会把真正的回复内容藏进折叠区；连续多个 "Thought" 也各自独立成条目。
+func _split_log_entries(text: String) -> Array[String]:
+	var entries: Array[String] = []
+	var current: Array[String] = []
+	for raw_line in text.split("\n"):
+		var line := str(raw_line)
+		var trimmed := line.strip_edges()
+		if _is_log_action_start(trimmed):
+			_flush_log_entry(entries, current)
+			current.clear()
+			current.append(trimmed)
+		elif trimmed == "" and not current.is_empty() and _is_log_action_start(str(current[0])):
+			_flush_log_entry(entries, current)
+			current.clear()
+		else:
+			current.append(line)
+	_flush_log_entry(entries, current)
+	return entries
+
+
+func _flush_log_entry(entries: Array[String], current: Array[String]) -> void:
+	if current.is_empty():
+		return
+	var block := "\n".join(current).strip_edges()
+	if block != "":
+		entries.append(block)
+
+
+func _is_log_action_start(line: String) -> bool:
+	return line.begins_with("Grep ") \
+		or line.begins_with("Read ") \
+		or line.begins_with("Thought ") \
+		or line.begins_with("Thought:") \
+		or line.begins_with("Edit ")
+
+
+func _append_log_entry(entry: String, color: String) -> void:
+	var kind := _log_entry_kind(entry)
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_theme_constant_override("separation", 8)
+
+	var marker := Label.new()
+	marker.text = "*"
+	marker.custom_minimum_size = Vector2(18, 0)
+	marker.add_theme_color_override("font_color", Color("#64c987") if kind in ["grep", "read", "edit"] else Color("#555555"))
+	row.add_child(marker)
+
+	var content := VBoxContainer.new()
+	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	content.add_theme_constant_override("separation", 2)
+	row.add_child(content)
+
+	if kind == "grep":
+		var command_panel := _make_log_command_panel()
+		content.add_child(command_panel)
+		command_panel.add_child(_make_log_rich_text(_first_line(entry), "#111111"))
+		var rest := _rest_lines(entry)
+		if rest != "":
+			content.add_child(_make_log_rich_text(rest, "#777777"))
+	elif kind == "thought":
+		_append_thought_entry(content, entry)
+	else:
+		content.add_child(_make_log_rich_text(entry, color))
+
+	_message_list.add_child(row)
+
+
+func _log_entry_kind(entry: String) -> String:
+	var first := _first_line(entry)
+	if first.begins_with("Grep "):
+		return "grep"
+	if first.begins_with("Read "):
+		return "read"
+	if first.begins_with("Thought ") or first.begins_with("Thought:"):
+		return "thought"
+	if first.begins_with("Edit "):
+		return "edit"
+	return "text"
+
+
+func _first_line(text: String) -> String:
+	var lines := text.split("\n")
+	return str(lines[0]) if lines.size() > 0 else text
+
+
+func _rest_lines(text: String) -> String:
+	var lines := text.split("\n")
+	if lines.size() <= 1:
+		return ""
+	var rest: Array[String] = []
+	for index in range(1, lines.size()):
+		rest.append(str(lines[index]))
+	return "\n".join(rest)
+
+
+## 拆分 "Thought" 条目首行的标题与内联摘要：
+## - "Thought for Xs > 摘要"  -> {header: "Thought for Xs >", inline: "摘要"}
+## - "Thought: 摘要"          -> {header: "Thought:", inline: "摘要"}
+## - "Thought for Xs >"       -> {header: "Thought for Xs >", inline: ""}
+## - "Thought"（无标记）       -> {header: "Thought >", inline: ""}
+func _split_thought_header(first_line: String) -> Dictionary:
+	var gt := first_line.find(">")
+	if gt != -1:
+		return {
+			"header": first_line.substr(0, gt + 1).strip_edges(),
+			"inline": first_line.substr(gt + 1).strip_edges()
+		}
+	if first_line.begins_with("Thought:"):
+		return {
+			"header": "Thought:",
+			"inline": first_line.substr("Thought:".length()).strip_edges()
+		}
+	return {"header": first_line + " >", "inline": ""}
+
+
+## 渲染一个可折叠的 "Thought" 条目：标题行（如 "Thought for 3s >"）始终
+## 显示，点击可展开/折叠详细思考文本（内联摘要 + 续行）。若没有详细文本，
+## 仅显示标题，不提供折叠交互。
+func _append_thought_entry(content: VBoxContainer, entry: String) -> void:
+	var split := _split_thought_header(_first_line(entry))
+	var header := str(split.get("header", ""))
+	var inline := str(split.get("inline", ""))
+	var rest := _rest_lines(entry)
+
+	var detail_parts: Array[String] = []
+	if inline != "":
+		detail_parts.append(inline)
+	if rest != "":
+		detail_parts.append(rest)
+	var detail := "\n\n".join(detail_parts)
+
+	if detail == "":
+		var label := Label.new()
+		label.text = header
+		label.add_theme_color_override("font_color", Color("#666666"))
+		content.add_child(label)
+		return
+
+	var toggle := Button.new()
+	toggle.flat = true
+	toggle.focus_mode = Control.FOCUS_NONE
+	toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	toggle.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	toggle.add_theme_color_override("font_color", Color("#666666"))
+	toggle.add_theme_color_override("font_hover_color", Color("#999999"))
+	toggle.text = "▸ " + header
+	content.add_child(toggle)
+
+	var detail_rich := _make_log_rich_text(detail, "#666666")
+	detail_rich.visible = false
+	content.add_child(detail_rich)
+
+	toggle.pressed.connect(func():
+		detail_rich.visible = not detail_rich.visible
+		toggle.text = ("▾ " if detail_rich.visible else "▸ ") + header
+		_scroll_to_bottom()
+	)
+
+
+func _make_log_command_panel() -> PanelContainer:
+	var panel := PanelContainer.new()
+	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color("#e9e9e9")
+	style.border_color = Color("#d0d0d0")
+	style.set_border_width_all(1)
+	style.set_corner_radius_all(4)
+	style.set_content_margin(SIDE_LEFT, 6)
+	style.set_content_margin(SIDE_RIGHT, 6)
+	style.set_content_margin(SIDE_TOP, 3)
+	style.set_content_margin(SIDE_BOTTOM, 3)
+	panel.add_theme_stylebox_override("panel", style)
+	return panel
+
+
+func _make_log_rich_text(text: String, color: String) -> RichTextLabel:
+	var rich := _make_rich_text(text, color)
+	rich.add_theme_constant_override("line_separation", 1)
+	return rich
 
 
 func _format_tool_call_header(call: Dictionary) -> String:
@@ -1281,11 +1572,38 @@ func _format_tool_result_detail(name: String, input: Dictionary, status: String,
 
 
 ## 在 "⎿" 结果行之后追加一条结果消息；失败/被拒绝的调用使用醒目颜色。
+func _format_log_tool_result(name: String, input: Dictionary, result: Dictionary, fallback: String) -> String:
+	var inner: Dictionary = result.get("result", {}) if result.get("result") is Dictionary else {}
+	match name:
+		"read_file", "read_script":
+			var read_path := str(inner.get("path", input.get("path", "<unknown>")))
+			var line_count := _count_lines(str(inner.get("content", "")))
+			return "Read %s (lines 1-%d)" % [read_path, line_count]
+		"write_file", "propose_script_edit", "apply_text_edit", "propose_tests", "propose_content_file":
+			var edit_path := str(inner.get("path", input.get("path", input.get("target_path", "<unknown>"))))
+			var after_text := str(input.get("content", input.get("after_text", "")))
+			var before_text := str(input.get("before_text", input.get("before", "")))
+			var added := max(_count_lines(after_text) - _count_lines(before_text), 0)
+			var removed := max(_count_lines(before_text) - _count_lines(after_text), 0)
+			var lines: Array[String] = ["Edit %s" % edit_path]
+			if added > 0:
+				lines.append("Added %d lines" % added)
+			if removed > 0:
+				lines.append("Removed %d lines" % removed)
+			if added == 0 and removed == 0:
+				lines.append("Added %d lines" % _count_lines(after_text))
+			return "\n".join(lines)
+		_:
+			return fallback
+
+
 func _append_tool_result(call: Dictionary, result: Dictionary) -> void:
 	var name := str(call.get("name", "unknown"))
 	var status := str(result.get("status", ""))
 	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
 	var detail := _format_tool_result_detail(name, input, status, result)
+	if status == "applied":
+		detail = _format_log_tool_result(name, input, result, detail)
 	var color := "#e08080" if status == "error" else "#dddddd"
 	_append_message("system", detail, color)
 
@@ -1354,6 +1672,7 @@ func _apply_mono_font(rich: RichTextLabel) -> void:
 func _clear_messages() -> void:
 	_finish_streaming()
 	_rendered_assistant_keys.clear()
+	_closed_stream_keys.clear()
 	for child in _message_list.get_children():
 		child.queue_free()
 
