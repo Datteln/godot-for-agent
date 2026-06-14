@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,8 @@ from app.tools.registry import ToolDef, register
 
 MAX_RESULTS = 200
 MAX_FILE_BYTES = 256 * 1024
+
+logger = logging.getLogger(__name__)
 
 GREP_CODE_SCHEMA: dict[str, Any] = {
     "name": "grep_code",
@@ -64,6 +67,14 @@ async def grep_code_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str,
     root = ctx.security.project_root
     matches: list[dict[str, Any]] = []
     truncated = False
+    scanned_files = 0
+    logger.info(
+        "grep_code start session=%s include=%s max_results=%d pattern_length=%d",
+        ctx.session_id,
+        include,
+        max_results,
+        len(pattern),
+    )
 
     for candidate in sorted(root.glob(include)):
         if not candidate.is_file():
@@ -71,6 +82,7 @@ async def grep_code_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str,
         rel = candidate.relative_to(root).as_posix()
         if not path_ok(rel, ctx.security, write=False):
             continue
+        scanned_files += 1
         data = candidate.read_bytes()
         if len(data) > MAX_FILE_BYTES:
             data = data[:MAX_FILE_BYTES]
@@ -80,6 +92,14 @@ async def grep_code_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str,
                 matches.append({"path": rel, "line": line_no, "text": line})
                 if len(matches) >= max_results:
                     truncated = True
+                    logger.info(
+                        "grep_code success session=%s include=%s scanned_files=%d matches=%d truncated=%s",
+                        ctx.session_id,
+                        include,
+                        scanned_files,
+                        len(matches),
+                        truncated,
+                    )
                     return {
                         "pattern": pattern,
                         "include": include,
@@ -87,6 +107,14 @@ async def grep_code_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str,
                         "truncated": truncated,
                     }
 
+    logger.info(
+        "grep_code success session=%s include=%s scanned_files=%d matches=%d truncated=%s",
+        ctx.session_id,
+        include,
+        scanned_files,
+        len(matches),
+        truncated,
+    )
     return {"pattern": pattern, "include": include, "matches": matches, "truncated": truncated}
 
 

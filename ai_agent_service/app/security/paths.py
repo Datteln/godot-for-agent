@@ -8,12 +8,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
 from app.security.settings import SecuritySettings
+
+logger = logging.getLogger(__name__)
 
 
 def _resolved(path: Path) -> Path:
@@ -64,6 +67,7 @@ def path_ok(target: str, security: SecuritySettings, write: bool = False) -> boo
     """
     target_path = Path(target)
     if target_path.is_absolute():
+        logger.debug("Path rejected reason=absolute target=%s write=%s", target, write)
         return False
 
     root = _resolved(security.project_root)
@@ -71,10 +75,12 @@ def path_ok(target: str, security: SecuritySettings, write: bool = False) -> boo
     try:
         rel = candidate.relative_to(root).as_posix()
     except ValueError:
+        logger.debug("Path rejected reason=outside_root target=%s write=%s", target, write)
         return False  # 越界、绝对路径逃逸或跨盘符
 
     deny = security.deny_write_paths if write else security.deny_read_paths
     if _matches_deny(rel, deny):
+        logger.debug("Path rejected reason=deny_pattern rel=%s write=%s", rel, write)
         return False
 
     if security.allow_paths:
@@ -83,6 +89,7 @@ def path_ok(target: str, security: SecuritySettings, write: bool = False) -> boo
             for a in security.allow_paths
         )
         if not allowed:
+            logger.debug("Path rejected reason=not_in_allow_paths rel=%s write=%s", rel, write)
             return False
 
     return True

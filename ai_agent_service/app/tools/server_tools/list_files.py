@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ from app.tools.registry import ToolDef, register
 
 # 单次返回的最大文件数，避免把超大工程一次性灌入模型上下文。
 MAX_RESULTS = 200
+
+logger = logging.getLogger(__name__)
 
 LIST_FILES_SCHEMA: dict[str, Any] = {
     "name": "list_files",
@@ -59,6 +62,7 @@ async def list_files_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str
     root = ctx.security.project_root
     matches: list[str] = []
     truncated = False
+    logger.info("list_files start session=%s pattern=%s", ctx.session_id, pattern)
     for candidate in sorted(root.glob(pattern)):
         if not candidate.is_file():
             continue
@@ -70,6 +74,13 @@ async def list_files_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str
             break
         matches.append(rel)
 
+    logger.info(
+        "list_files success session=%s pattern=%s count=%d truncated=%s",
+        ctx.session_id,
+        pattern,
+        len(matches),
+        truncated,
+    )
     return {"pattern": pattern, "files": matches, "truncated": truncated}
 
 

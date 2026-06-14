@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,8 @@ from app.config import AppSettings
 from app.security.paths import path_ok
 from app.security.settings import SecuritySettings
 from app.skills.types import SkillDefinition, SkillSource, SkillSummary
+
+logger = logging.getLogger(__name__)
 
 
 def _bundled_skills_dir() -> Path:
@@ -88,11 +91,14 @@ class SkillCatalog:
         skills: dict[str, SkillDefinition] = {}
         for source, root, source_enabled in _source_dirs(self._settings):
             if not root.exists():
+                logger.debug("Skill source skipped missing source=%s root=%s", source, root)
                 continue
             for skill_file in sorted(root.glob("*/SKILL.md")):
                 skill = self._load_file(source, skill_file, source_enabled)
                 skills[skill.qualified_name] = skill
         self._skills = skills
+        warnings = sum(len(skill.warnings) for skill in skills.values())
+        logger.info("Skill catalog refreshed count=%d warnings=%d", len(skills), warnings)
 
     def summaries(self) -> list[SkillSummary]:
         """返回不含正文的 Skill 摘要。"""
@@ -157,7 +163,7 @@ class SkillCatalog:
             if missing:
                 warnings.append(f"allowed-tools 中不可见的工具已忽略：{', '.join(missing)}")
 
-        return SkillDefinition(
+        skill = SkillDefinition(
             qualified_name=f"{source}:{name}",
             name=name,
             source=source,
@@ -171,3 +177,11 @@ class SkillCatalog:
             enabled=enabled,
             warnings=warnings,
         )
+        logger.debug(
+            "Skill loaded qualified_name=%s enabled=%s tools=%d warnings=%d",
+            skill.qualified_name,
+            skill.enabled,
+            len(skill.effective_tools),
+            len(skill.warnings),
+        )
+        return skill

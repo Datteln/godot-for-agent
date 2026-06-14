@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from app.rag.index import CodebaseIndex, validate_glob
@@ -9,6 +10,8 @@ from app.tools.context import ToolContext
 from app.tools.registry import ToolDef, register
 
 MAX_RESULTS = 16
+
+logger = logging.getLogger(__name__)
 
 SEARCH_CODEBASE_SCHEMA: dict[str, Any] = {
     "name": "search_codebase",
@@ -50,7 +53,22 @@ async def search_codebase_handler(args: dict[str, Any], ctx: ToolContext) -> dic
         raise ValueError("max_results 必须是正整数")
     max_results = min(max_results_raw, MAX_RESULTS)
 
-    return CodebaseIndex(ctx.security, ctx.rag_index_path).search(query, include, max_results)
+    logger.info(
+        "search_codebase start session=%s include=%s max_results=%d query_length=%d",
+        ctx.session_id,
+        include,
+        max_results,
+        len(query),
+    )
+    result = CodebaseIndex(ctx.security, ctx.rag_index_path).search(query, include, max_results)
+    logger.info(
+        "search_codebase success session=%s mode=%s results=%d truncated=%s",
+        ctx.session_id,
+        result.get("mode"),
+        len(result.get("results", [])),
+        result.get("truncated"),
+    )
+    return result
 
 
 def register_search_codebase_tool() -> None:

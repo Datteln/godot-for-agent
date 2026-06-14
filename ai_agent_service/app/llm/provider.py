@@ -6,11 +6,14 @@ Responses / Anthropic / Gemini provider 而不改编排层。
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from openai import AsyncOpenAI
 from openai import APIConnectionError, APIStatusError, APITimeoutError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,13 @@ class OpenAICompatibleProvider:
         )
         self._default_model = default_model
         self._fallback_model = fallback_model
+        logger.info(
+            "Initialized OpenAI-compatible provider base_url=%s default_model=%s fallback_model=%s timeout_s=%s",
+            base_url,
+            default_model,
+            fallback_model,
+            timeout_s,
+        )
 
     @property
     def supports_tool_calling(self) -> bool:
@@ -165,9 +175,20 @@ class OpenAICompatibleProvider:
         resolved_model = model or self._default_model
         try:
             return await self._chat_once(messages, tools, resolved_model, temperature)
-        except LLMError:
+        except LLMError as exc:
             if self._fallback_model is None or self._fallback_model == resolved_model:
+                logger.warning(
+                    "LLM chat failed without fallback model=%s status_code=%s",
+                    resolved_model,
+                    exc.status_code,
+                )
                 raise
+            logger.warning(
+                "LLM chat failed; retrying fallback primary_model=%s fallback_model=%s status_code=%s",
+                resolved_model,
+                self._fallback_model,
+                exc.status_code,
+            )
             return await self._chat_once(messages, tools, self._fallback_model, temperature)
 
     async def _chat_once(
@@ -191,6 +212,13 @@ class OpenAICompatibleProvider:
         Raises:
             LLMError: 连接失败、超时或端点返回错误状态码时抛出。
         """
+        logger.info(
+            "LLM chat request model=%s messages=%d tools=%d temperature=%s",
+            model,
+            len(messages),
+            len(tools),
+            temperature,
+        )
         try:
             response = await self._client.chat.completions.create(
                 model=model,
@@ -200,8 +228,10 @@ class OpenAICompatibleProvider:
                 temperature=temperature,
             )
         except (APIConnectionError, APITimeoutError) as exc:
+            logger.warning("LLM connection error model=%s error_type=%s", model, type(exc).__name__)
             raise LLMError(f"无法连接大模型端点：{exc}") from exc
         except APIStatusError as exc:
+            logger.warning("LLM status error model=%s status_code=%s", model, exc.status_code)
             raise LLMError(
                 f"大模型端点返回错误（{exc.status_code}）：{exc.message}",
                 status_code=exc.status_code,
@@ -213,6 +243,13 @@ class OpenAICompatibleProvider:
             ToolCallRequest(id=call.id, name=call.function.name, arguments=call.function.arguments)
             for call in (message.tool_calls or [])
         ]
+        logger.info(
+            "LLM chat response model=%s finish_reason=%s tool_calls=%d content_length=%d",
+            model,
+            choice.finish_reason,
+            len(tool_calls),
+            len(message.content or ""),
+        )
         return AssistantTurn(
             raw_message=message.model_dump(exclude_none=True),
             content=message.content,

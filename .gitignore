@@ -400,3 +400,4 @@ ai_map_agent/docs
 CLAUDE.md
 .claude/
 .agents/
+.python-version

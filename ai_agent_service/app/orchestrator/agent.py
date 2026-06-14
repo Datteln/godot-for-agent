@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from dataclasses import replace
@@ -36,6 +38,8 @@ from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY, ToolDef, tools_for
 
 MAX_AGENT_DEPTH = 4
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -178,9 +182,30 @@ async def _invoke_server_tool(tool: ToolDef, args: dict[str, Any], call_ctx: Too
         `result` 为异常信息字符串，供 `_tool_message(..., is_error=True)` 包装。
     """
     assert tool.handler is not None
+    started = time.perf_counter()
+    logger.info(
+        "Server tool start session=%s tool=%s domain=%s path_args=%s",
+        call_ctx.session_id,
+        tool.name,
+        tool.domain,
+        [name for name in tool.path_args if name in args],
+    )
     try:
-        return await tool.handler(args, call_ctx), False
+        result = await tool.handler(args, call_ctx)
+        logger.info(
+            "Server tool success session=%s tool=%s elapsed_ms=%d",
+            call_ctx.session_id,
+            tool.name,
+            int((time.perf_counter() - started) * 1000),
+        )
+        return result, False
     except Exception as exc:  # 工具实现的非法参数/运行期错误统一回传给模型修正
+        logger.exception(
+            "Server tool failed session=%s tool=%s elapsed_ms=%d",
+            call_ctx.session_id,
+            tool.name,
+            int((time.perf_counter() - started) * 1000),
+        )
         return str(exc), True
 
 
@@ -255,6 +280,12 @@ def _continue_delegate_group(
     assert done.pending_delegate_group_id is not None
     group = session.delegate_groups.get(done.pending_delegate_group_id)
     if group is None:
+        logger.warning(
+            "Delegate group missing session=%s group_id=%s frame=%s",
+            session.session_id,
+            done.pending_delegate_group_id,
+            done.id,
+        )
         return
 
     group.setdefault("results", []).append(
@@ -287,6 +318,14 @@ def _continue_delegate_group(
         )
         if child is not None:
             session.agent_stack.append(child)
+            logger.info(
+                "Delegate group continued session=%s group_id=%s child_frame=%s agent=%s remaining=%d",
+                session.session_id,
+                done.pending_delegate_group_id,
+                child.id,
+                child.agent.name,
+                len(remaining),
+            )
             return
         group["results"].append(
             {
@@ -303,6 +342,12 @@ def _continue_delegate_group(
                 str(group["tool_call_id"]),
                 {"results": group.get("results", [])},
             )
+        )
+        logger.info(
+            "Delegate group completed session=%s group_id=%s results=%d",
+            session.session_id,
+            done.pending_delegate_group_id,
+            len(group.get("results", [])),
         )
     session.delegate_groups.pop(done.pending_delegate_group_id, None)
 
@@ -327,8 +372,16 @@ def _finish_frame(
         继续循环（此时 `session.top_frame()` 已是父帧）。
     """
     if len(session.agent_stack) <= 1:
+        logger.info("Root frame finished session=%s text_length=%d", session.session_id, len(text))
         return FinalResult(text=text)
     done = session.agent_stack.pop()
+    logger.info(
+        "Child frame finished session=%s frame=%s agent=%s text_length=%d",
+        session.session_id,
+        done.id,
+        done.agent.name,
+        len(text),
+    )
     if done.pending_delegate_group_id is not None:
         _continue_delegate_group(session, done, text, prompt_factory)
         return None
@@ -344,14 +397,22 @@ def _load_tool_args(call_id: str, arguments: str) -> tuple[dict[str, Any] | None
     try:
         loaded = json.loads(arguments or "{}")
     except json.JSONDecodeError:
+        logger.warning("Tool arguments JSON parse failed call_id=%s", call_id)
         return None, _tool_message(call_id, "工具入参不是合法 JSON", is_error=True)
     if not isinstance(loaded, dict):
+        logger.warning("Tool arguments are not an object call_id=%s", call_id)
         return None, _tool_message(call_id, "工具入参必须是 JSON object", is_error=True)
     return loaded, None
 
 
 def _append_delegate_protocol_errors(frame: Frame, calls: list[Any]) -> None:
     """当 `delegate` 与其他 tool call 并列时，给本轮所有调用补错误结果。"""
+    logger.warning(
+        "Delegate protocol violation frame=%s agent=%s tool_calls=%d",
+        frame.id,
+        frame.agent.name,
+        len(calls),
+    )
     for call in calls:
         frame.messages.append(
             _tool_message(
@@ -374,15 +435,34 @@ def _start_delegate_frame(
     agent_name = args.get("agent")
     task = args.get("task")
     if not isinstance(agent_name, str) or not agent_name:
+        logger.warning("Delegate rejected: missing agent session=%s frame=%s", session.session_id, frame.id)
         frame.messages.append(_tool_message(call_id, "delegate.agent 不能为空", is_error=True))
         return False
     if not isinstance(task, str) or not task.strip():
+        logger.warning(
+            "Delegate rejected: missing task session=%s frame=%s agent=%s",
+            session.session_id,
+            frame.id,
+            agent_name,
+        )
         frame.messages.append(_tool_message(call_id, "delegate.task 不能为空", is_error=True))
         return False
     if not frame.agent.can_delegate:
+        logger.warning(
+            "Delegate rejected: agent cannot delegate session=%s frame=%s agent=%s",
+            session.session_id,
+            frame.id,
+            frame.agent.name,
+        )
         frame.messages.append(_tool_message(call_id, "当前 agent 不允许委派子 agent", is_error=True))
         return False
     if frame.depth >= MAX_AGENT_DEPTH:
+        logger.warning(
+            "Delegate rejected: max depth session=%s frame=%s depth=%d",
+            session.session_id,
+            frame.id,
+            frame.depth,
+        )
         frame.messages.append(_tool_message(call_id, "已达到最大委派深度，不能继续创建子 agent", is_error=True))
         return False
 
@@ -396,9 +476,19 @@ def _start_delegate_frame(
         prompt_factory=prompt_factory,
     )
     if child is None:
+        logger.warning("Delegate rejected: unknown child agent session=%s agent=%s", session.session_id, agent_name)
         frame.messages.append(_tool_message(call_id, f"未知子 agent：{agent_name}", is_error=True))
         return False
     session.agent_stack.append(child)
+    logger.info(
+        "Delegate frame started session=%s parent_frame=%s child_frame=%s parent_agent=%s child_agent=%s depth=%d",
+        session.session_id,
+        frame.id,
+        child.id,
+        frame.agent.name,
+        child.agent.name,
+        child.depth,
+    )
     return True
 
 
@@ -413,17 +503,31 @@ def _start_delegate_group(
     """启动 `delegate_many` 顺序子任务组。"""
     raw_tasks = args.get("tasks")
     if not isinstance(raw_tasks, list) or not raw_tasks:
+        logger.warning("Delegate_many rejected: missing tasks session=%s frame=%s", session.session_id, frame.id)
         frame.messages.append(_tool_message(call_id, "delegate_many.tasks 不能为空", is_error=True))
         return False
     if not frame.agent.can_delegate:
+        logger.warning(
+            "Delegate_many rejected: agent cannot delegate session=%s frame=%s agent=%s",
+            session.session_id,
+            frame.id,
+            frame.agent.name,
+        )
         frame.messages.append(_tool_message(call_id, "当前 agent 不允许委派子 agent", is_error=True))
         return False
     if frame.depth >= MAX_AGENT_DEPTH:
+        logger.warning(
+            "Delegate_many rejected: max depth session=%s frame=%s depth=%d",
+            session.session_id,
+            frame.id,
+            frame.depth,
+        )
         frame.messages.append(_tool_message(call_id, "已达到最大委派深度，不能继续创建子 agent", is_error=True))
         return False
 
     tasks = [task for task in raw_tasks if isinstance(task, dict)]
     if not tasks:
+        logger.warning("Delegate_many rejected: invalid tasks session=%s frame=%s", session.session_id, frame.id)
         frame.messages.append(_tool_message(call_id, "delegate_many.tasks 格式不合法", is_error=True))
         return False
     first = tasks.pop(0)
@@ -446,9 +550,18 @@ def _start_delegate_group(
     )
     if child is None:
         session.delegate_groups.pop(group_id, None)
+        logger.warning("Delegate_many rejected: invalid first task session=%s frame=%s", session.session_id, frame.id)
         frame.messages.append(_tool_message(call_id, "delegate_many 首个子任务不合法", is_error=True))
         return False
     session.agent_stack.append(child)
+    logger.info(
+        "Delegate_many group started session=%s group_id=%s parent_frame=%s child_frame=%s total_tasks=%d",
+        session.session_id,
+        group_id,
+        frame.id,
+        child.id,
+        len(raw_tasks),
+    )
     return True
 
 
@@ -475,19 +588,33 @@ async def run_turn(
         `ToolCallsResult`（需前端执行/确认）、`FinalResult`（已得到最终回复）
         或 `ErrorResult`（LLM 调用失败/达到轮数上限）。
     """
-    for _ in range(max_turns):
+    logger.info("Agent run_turn start session=%s max_turns=%d", session.session_id, max_turns)
+    for loop_index in range(max_turns):
         frame = session.top_frame()
         if frame is None:
+            logger.error("Agent run_turn failed: empty frame stack session=%s", session.session_id)
             return ErrorResult(text="会话没有活跃的 agent 帧")
 
         try:
+            visible_tools = tools_for(frame.agent.effective_tools, frame.active_deferred_tools)
+            logger.info(
+                "Agent frame step session=%s loop=%d frame=%s agent=%s depth=%d messages=%d tools=%d",
+                session.session_id,
+                loop_index + 1,
+                frame.id,
+                frame.agent.name,
+                frame.depth,
+                len(frame.messages),
+                len(visible_tools),
+            )
             turn = await llm.chat(
                 frame.messages,
-                tools_for(frame.agent.effective_tools, frame.active_deferred_tools),
+                visible_tools,
                 model=_resolve_model(frame.agent),
                 temperature=_resolve_temperature(_resolve_effort(session, frame)),
             )
         except LLMError as exc:
+            logger.warning("Agent LLM step failed session=%s frame=%s error=%s", session.session_id, frame.id, exc)
             return ErrorResult(text=str(exc))
 
         frame.messages.append(turn.raw_message)
@@ -495,8 +622,17 @@ async def run_turn(
         if not turn.tool_calls:
             result = _finish_frame(session, turn.content or "", agent_prompt_factory)
             if result is not None:
+                logger.info("Agent run_turn final session=%s loop=%d", session.session_id, loop_index + 1)
                 return result
             continue  # 子帧已结束，继续驱动父帧
+
+        logger.info(
+            "Agent requested tools session=%s frame=%s agent=%s names=%s",
+            session.session_id,
+            frame.id,
+            frame.agent.name,
+            [call.name for call in turn.tool_calls],
+        )
 
         permission_ctx = PermissionContext(
             security=security,
@@ -516,6 +652,7 @@ async def run_turn(
             call = delegate_calls[0]
             tool = REGISTRY.get(call.name)
             if tool is None:
+                logger.warning("Delegate tool missing from registry session=%s tool=%s", session.session_id, call.name)
                 frame.messages.append(_tool_message(call.id, f"{call.name} 工具未注册", is_error=True))
                 continue
 
@@ -527,6 +664,13 @@ async def run_turn(
 
             decision = check(tool, args, permission_ctx)
             if decision == "deny":
+                logger.warning(
+                    "Delegate denied session=%s frame=%s tool=%s agent=%s",
+                    session.session_id,
+                    frame.id,
+                    tool.name,
+                    frame.agent.name,
+                )
                 frame.messages.append(
                     _tool_message(call.id, "被拒绝：当前 agent/权限模式不允许 delegate", is_error=True)
                 )
@@ -558,6 +702,12 @@ async def run_turn(
         for call in turn.tool_calls:
             tool = REGISTRY.get(call.name)
             if tool is None:
+                logger.warning(
+                    "Unknown tool requested session=%s frame=%s tool=%s",
+                    session.session_id,
+                    frame.id,
+                    call.name,
+                )
                 pending_items.append(
                     _PendingToolMessage(_tool_message(call.id, f"未知工具：{call.name}", is_error=True))
                 )
@@ -570,6 +720,14 @@ async def run_turn(
             assert args is not None
 
             decision = check(tool, args, permission_ctx)
+            logger.info(
+                "Tool permission decision session=%s frame=%s tool=%s side=%s decision=%s",
+                session.session_id,
+                frame.id,
+                tool.name,
+                tool.side,
+                decision,
+            )
             if decision == "deny":
                 pending_items.append(
                     _PendingToolMessage(
@@ -602,12 +760,18 @@ async def run_turn(
 
         results: dict[str, tuple[Any, bool]] = {}
         if concurrent_calls:
+            logger.info(
+                "Running concurrent server tools session=%s count=%d",
+                session.session_id,
+                len(concurrent_calls),
+            )
             outcomes = await asyncio.gather(
                 *(_invoke_server_tool(item.tool, item.args, call_ctx) for item in concurrent_calls)
             )
             for item, outcome in zip(concurrent_calls, outcomes):
                 results[item.call_id] = outcome
         for item in sequential_calls:
+            logger.info("Running sequential server tool session=%s tool=%s", session.session_id, item.tool.name)
             results[item.call_id] = await _invoke_server_tool(item.tool, item.args, call_ctx)
 
         # 第三遍：按 `tool_calls` 原始顺序把结果 append 回 `frame.messages`。
@@ -627,6 +791,12 @@ async def run_turn(
                 }
                 frame.active_deferred_tools.update(activated)
                 result["activated_tools"] = sorted(activated)
+                logger.info(
+                    "Deferred tools activated session=%s frame=%s tools=%s",
+                    session.session_id,
+                    frame.id,
+                    sorted(activated),
+                )
             frame.messages.append(_tool_message(item.call_id, result, is_error=is_error))
 
         if front_calls:
@@ -643,6 +813,14 @@ async def run_turn(
                     for c in front_calls
                 },
             )
+            logger.info(
+                "Front tool calls pending session=%s turn_id=%s count=%d needs_confirm=%d",
+                session.session_id,
+                turn_id,
+                len(front_calls),
+                sum(1 for call in front_calls if call.needs_confirm),
+            )
             return ToolCallsResult(turn_id=turn_id, text=turn.content, calls=front_calls)
 
+    logger.warning("Agent run_turn reached max turns session=%s max_turns=%d", session.session_id, max_turns)
     return ErrorResult(text="已达到本轮最大循环次数，请精简任务或拆分请求后重试")

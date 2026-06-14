@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 
@@ -19,6 +20,8 @@ from pydantic import BaseModel, Field
 
 from app.config import AppSettings
 from app.permissions.types import PermRule
+
+logger = logging.getLogger(__name__)
 
 
 class SecuritySettings(BaseModel):
@@ -62,10 +65,19 @@ def security_settings_from_app(settings: AppSettings) -> SecuritySettings:
     Returns:
         以 `settings.project_root` 为根、采用其权限模式与信任标记的安全边界配置。
     """
-    return SecuritySettings(
+    security = SecuritySettings(
         project_root=settings.project_root.resolve(),
         trusted=settings.trusted_project,
         permission_mode=settings.permission_mode,
         deny_rules=settings.deny_rules,
         allow_rules=settings.allow_rules,
     )
+    logger.info(
+        "Security settings resolved project_root=%s permission_mode=%s trusted=%s deny_rules=%d allow_rules=%d",
+        security.project_root,
+        security.permission_mode,
+        security.trusted,
+        len(security.deny_rules),
+        len(security.allow_rules),
+    )
+    return security

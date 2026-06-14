@@ -49,6 +49,10 @@ class AppSettings(BaseSettings):
         default=60.0,
         description="单次 LLM 请求超时时间（秒）。",
     )
+    log_level: str = Field(
+        default="INFO",
+        description="服务日志等级，可选 DEBUG/INFO/WARNING/ERROR/CRITICAL。",
+    )
 
     project_root: Path = Field(
         default_factory=Path.cwd,

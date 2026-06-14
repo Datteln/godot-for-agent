@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from typing import Any, TextIO
 
@@ -13,6 +14,8 @@ from app.security.settings import SecuritySettings, security_settings_from_app
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY, ToolDef
 from app.tools.server_tools import register_server_tools
+
+logger = logging.getLogger(__name__)
 
 
 def _mcp_tool(tool: ToolDef) -> dict[str, Any]:
@@ -57,6 +60,7 @@ class McpStdioServer:
                 request = json.loads(text)
                 response = await self.handle(request)
             except json.JSONDecodeError as exc:
+                logger.warning("MCP parse error error=%s", exc)
                 response = _error(None, -32700, f"Parse error: {exc}")
             if response is None:
                 continue
@@ -69,9 +73,11 @@ class McpStdioServer:
         request_id = request.get("id")
         method = str(request.get("method", ""))
         params = request.get("params", {})
+        logger.debug("MCP request method=%s has_id=%s", method, request_id is not None)
         if request_id is None and method.startswith("notifications/"):
             return None
         if method == "initialize":
+            logger.info("MCP initialize")
             return _response(
                 request_id,
                 {
@@ -81,14 +87,18 @@ class McpStdioServer:
                 },
             )
         if method == "tools/list":
-            return _response(request_id, {"tools": [_mcp_tool(tool) for tool in self._visible_tools()]})
+            tools = self._visible_tools()
+            logger.info("MCP tools/list count=%d", len(tools))
+            return _response(request_id, {"tools": [_mcp_tool(tool) for tool in tools]})
         if method == "tools/call":
             if not isinstance(params, dict):
+                logger.warning("MCP tools/call rejected: params must be object")
                 return _error(request_id, -32602, "params must be an object")
             result = await self._call_tool(params)
             return _response(request_id, result)
         if method == "ping":
             return _response(request_id, {})
+        logger.warning("MCP unknown method=%s", method)
         return _error(request_id, -32601, f"Unknown method: {method}")
 
     def _visible_tools(self) -> list[ToolDef]:
@@ -103,6 +113,7 @@ class McpStdioServer:
                 continue
             if check(tool, {}, permission_ctx) == "allow":
                 visible.append(tool)
+        logger.debug("MCP visible tools resolved count=%d", len(visible))
         return sorted(visible, key=lambda item: item.name)
 
     async def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -110,17 +121,22 @@ class McpStdioServer:
         name = params.get("name")
         args = params.get("arguments", {})
         if not isinstance(name, str) or not name:
+            logger.warning("MCP tools/call rejected: missing tool name")
             return {"isError": True, "content": _text_content({"error": "tool name is required"})}
         if not isinstance(args, dict):
+            logger.warning("MCP tools/call rejected: arguments not object tool=%s", name)
             return {"isError": True, "content": _text_content({"error": "arguments must be an object"})}
+        logger.info("MCP tools/call tool=%s", name)
         tool = REGISTRY.get(name)
         if tool is None or tool.side != "server" or tool.handler is None:
+            logger.warning("MCP tools/call rejected: unknown server tool=%s", name)
             return {"isError": True, "content": _text_content({"error": f"unknown server tool: {name}"})}
         permission_ctx = PermissionContext(
             security=self._security,
             effective_tools=frozenset(REGISTRY),
         )
         if check(tool, args, permission_ctx) != "allow":
+            logger.warning("MCP tools/call denied tool=%s", name)
             return {"isError": True, "content": _text_content({"error": f"permission denied: {name}"})}
         try:
             result = await tool.handler(
@@ -133,7 +149,9 @@ class McpStdioServer:
                 ),
             )
         except Exception as exc:
+            logger.exception("MCP tools/call failed tool=%s", name)
             return {"isError": True, "content": _text_content({"error": str(exc)})}
+        logger.info("MCP tools/call success tool=%s", name)
         return {"content": _text_content(result)}
 
 
@@ -142,4 +160,9 @@ async def run_mcp_stdio(settings: AppSettings | None = None) -> int:
     resolved_settings = settings or AppSettings()
     register_server_tools()
     security = security_settings_from_app(resolved_settings)
+    logger.info(
+        "Starting MCP stdio server project_root=%s permission_mode=%s",
+        security.project_root,
+        security.permission_mode,
+    )
     return await McpStdioServer(resolved_settings, security).run()

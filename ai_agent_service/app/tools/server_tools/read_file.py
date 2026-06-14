@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from app.security.paths import path_ok
@@ -9,6 +10,8 @@ from app.tools.context import ToolContext
 from app.tools.registry import ToolDef, register
 
 MAX_BYTES = 128 * 1024
+
+logger = logging.getLogger(__name__)
 
 READ_FILE_SCHEMA: dict[str, Any] = {
     "name": "read_file",
@@ -41,10 +44,18 @@ async def read_file_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str,
     max_bytes = min(max_bytes_raw, MAX_BYTES)
 
     full_path = ctx.security.project_root / path
+    logger.info("read_file start session=%s path=%s max_bytes=%d", ctx.session_id, path, max_bytes)
     data = full_path.read_bytes()
     truncated = len(data) > max_bytes
     chunk = data[:max_bytes]
     text = chunk.decode("utf-8", errors="replace")
+    logger.info(
+        "read_file success session=%s path=%s bytes_read=%d truncated=%s",
+        ctx.session_id,
+        path,
+        len(chunk),
+        truncated,
+    )
     return {
         "path": path,
         "content": text,

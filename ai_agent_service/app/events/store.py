@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,11 +41,19 @@ class EventStore:
         events.append(event)
         if len(events) > _MAX_EVENTS_PER_SESSION:
             del events[: len(events) - _MAX_EVENTS_PER_SESSION]
+            logger.debug(
+                "Event store pruned session=%s max_events=%d",
+                session_id,
+                _MAX_EVENTS_PER_SESSION,
+            )
+        logger.debug("Event appended session=%s seq=%d type=%s", session_id, seq, event_type)
         return event
 
     def list_after(self, session_id: str, after: int = 0) -> list[Event]:
         """返回指定 seq 之后的事件。"""
-        return [event for event in self._events.get(session_id, []) if event.seq > after]
+        events = [event for event in self._events.get(session_id, []) if event.seq > after]
+        logger.debug("Events listed session=%s after=%d count=%d", session_id, after, len(events))
+        return events
 
     def last_seq(self, session_id: str) -> int:
         """返回某会话最后事件序号。"""

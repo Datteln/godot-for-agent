@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -24,6 +25,8 @@ from app.security.settings import SecuritySettings
 from app.tools.registry import ToolDef
 
 Decision = Literal["allow", "ask", "deny"]
+
+logger = logging.getLogger(__name__)
 
 # 会话级"总是允许"授权的粒度：tool + domain + path_scope + effect（详设 A §3.6）。
 SessionAllowGrant = tuple[str, str, str | None, str]
@@ -148,15 +151,30 @@ def check(tool: ToolDef, args: dict[str, Any], ctx: PermissionContext) -> Decisi
         预览确认，`allow` 表示可直接执行/静默返回前端执行。
     """
     if not all_paths_ok(args, tool.path_args, ctx.security, write=tool.writes_project):
+        logger.debug("Permission deny tool=%s reason=path_boundary", tool.name)
         return "deny"
     if tool.domain not in ctx.security.enabled_domains:
+        logger.debug("Permission deny tool=%s reason=disabled_domain domain=%s", tool.name, tool.domain)
         return "deny"
     if tool.name not in ctx.effective_tools:
+        logger.debug("Permission deny tool=%s reason=not_effective_tool", tool.name)
         return "deny"
     if match_rules(ctx.deny_rules, tool, args, "deny"):
+        logger.debug("Permission deny tool=%s reason=deny_rule", tool.name)
         return "deny"
     if ctx.security.trusted and match_rules(ctx.allow_rules, tool, args, "allow"):
+        logger.debug("Permission allow tool=%s reason=allow_rule", tool.name)
         return "allow"
     if _session_allow_match(ctx, tool, args):
+        logger.debug("Permission allow tool=%s reason=session_allow", tool.name)
         return "allow"
-    return _MODE_HANDLERS[ctx.security.permission_mode](tool, ctx)
+    decision = _MODE_HANDLERS[ctx.security.permission_mode](tool, ctx)
+    logger.debug(
+        "Permission decision tool=%s mode=%s mutating=%s trusted=%s decision=%s",
+        tool.name,
+        ctx.security.permission_mode,
+        tool.mutating,
+        ctx.security.trusted,
+        decision,
+    )
+    return decision

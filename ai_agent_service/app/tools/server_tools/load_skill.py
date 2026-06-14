@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from app.tools.context import ToolContext
 from app.tools.registry import ToolDef, register
+
+logger = logging.getLogger(__name__)
 
 LOAD_SKILL_SCHEMA: dict[str, Any] = {
     "name": "load_skill",
@@ -34,6 +37,13 @@ async def load_skill_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str
     if not skill.enabled:
         raise ValueError(f"Skill 未启用：{skill.qualified_name}")
 
+    logger.info(
+        "load_skill success session=%s qualified_name=%s source=%s warnings=%d",
+        ctx.session_id,
+        skill.qualified_name,
+        skill.source,
+        len(skill.warnings),
+    )
     return {
         "qualified_name": skill.qualified_name,
         "name": skill.name,

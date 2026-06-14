@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,7 @@ class MemoryStore:
                 items.append(MemoryItem(**entry))
             except TypeError:
                 continue
+        logger.debug("Memory listed path=%s count=%d", self._path, len(items))
         return items
 
     def save(self, text: str, tags: list[str] | None = None, scope: str = "project") -> MemoryItem:
@@ -48,6 +52,7 @@ class MemoryStore:
         items = [entry for entry in data.get("items", []) if isinstance(entry, dict)]
         items.append(asdict(item))
         self._write({"items": items})
+        logger.info("Memory item saved id=%s scope=%s tags=%d", item.id, item.scope, len(item.tags))
         return item
 
     def delete(self, item_id: str) -> bool:
@@ -55,11 +60,14 @@ class MemoryStore:
         items = [entry for entry in data.get("items", []) if isinstance(entry, dict)]
         kept = [entry for entry in items if entry.get("id") != item_id]
         self._write({"items": kept})
-        return len(kept) != len(items)
+        deleted = len(kept) != len(items)
+        logger.info("Memory item delete requested id=%s deleted=%s", item_id, deleted)
+        return deleted
 
     def clear(self) -> int:
         count = len(self.list())
         self._write({"items": []})
+        logger.info("Memory store cleared count=%d", count)
         return count
 
     def _read(self) -> dict[str, Any]:
@@ -67,10 +75,12 @@ class MemoryStore:
             return {"items": []}
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            logger.warning("Memory read failed path=%s error=%s", self._path, exc)
             return {"items": []}
         return data if isinstance(data, dict) else {"items": []}
 
     def _write(self, data: dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.debug("Memory store written path=%s items=%d", self._path, len(data.get("items", [])))

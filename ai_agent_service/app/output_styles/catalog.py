@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 from app.config import AppSettings
 from app.output_styles.types import OutputStyle, OutputStyleSource, OutputStyleSummary
+
+logger = logging.getLogger(__name__)
 
 
 def _bundled_dir() -> Path:
@@ -54,11 +57,14 @@ class OutputStyleCatalog:
         styles: dict[str, OutputStyle] = {}
         for source, root, enabled in _source_dirs(self._settings):
             if not root.exists():
+                logger.debug("OutputStyle source skipped missing source=%s root=%s", source, root)
                 continue
             for path in sorted(root.glob("*.md")):
                 style = self._load_file(source, path, enabled)
                 styles[style.qualified_name] = style
         self._styles = styles
+        warnings = sum(len(style.warnings) for style in styles.values())
+        logger.info("OutputStyle catalog refreshed count=%d warnings=%d", len(styles), warnings)
 
     def get(self, name: str | None) -> OutputStyle | None:
         if not name:
@@ -93,7 +99,7 @@ class OutputStyleCatalog:
             warnings.append("缺少 description")
         if source == "project" and not enabled:
             warnings.append("项目级 OutputStyle 需要 trusted_project=true 后才启用")
-        return OutputStyle(
+        style = OutputStyle(
             qualified_name=f"{source}:{name}",
             name=name,
             source=source,
@@ -103,3 +109,10 @@ class OutputStyleCatalog:
             enabled=enabled,
             warnings=warnings,
         )
+        logger.debug(
+            "OutputStyle loaded qualified_name=%s enabled=%s warnings=%d",
+            style.qualified_name,
+            style.enabled,
+            len(style.warnings),
+        )
+        return style

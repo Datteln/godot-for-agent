@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -38,6 +39,8 @@ from app.events.store import EventStore
 from app.recovery.pointer import RecoveryPointerStore
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
+
+logger = logging.getLogger(__name__)
 
 
 def _response_from_dict(data: dict[str, Any]) -> ChatResponse:
@@ -192,8 +195,20 @@ class QueryEngine:
         """
         async with self._store.lock_for(request.session_id):
             session = self._store.get_or_create(request.session_id, self.available_tools)
+            logger.info(
+                "Chat request accepted session=%s request_id=%s has_user=%s tool_results=%d",
+                request.session_id,
+                request.request_id,
+                request.user_message is not None,
+                len(request.tool_results or []),
+            )
 
             if request.request_id is not None and request.request_id in session.request_id_cache:
+                logger.info(
+                    "Chat idempotency hit session=%s request_id=%s",
+                    request.session_id,
+                    request.request_id,
+                )
                 return _response_from_dict(session.request_id_cache[request.request_id])
 
             response = await self._submit_locked(session, request)
@@ -202,6 +217,12 @@ class QueryEngine:
                 session.request_id_cache[request.request_id] = _response_to_dict(response)
             self._store.save(session)
             self._record_recovery(session, response)
+            logger.info(
+                "Chat request completed session=%s response_type=%s pending=%s",
+                request.session_id,
+                response.type,
+                session.pending_turn_id is not None,
+            )
             return response
 
     async def _submit_locked(self, session: Session, request: ChatRequest) -> ChatResponse:
@@ -209,13 +230,25 @@ class QueryEngine:
         has_user = request.user_message is not None
         has_results = bool(request.tool_results)
         if has_user == has_results:
+            logger.warning(
+                "Invalid chat request shape session=%s has_user=%s has_results=%s",
+                session.session_id,
+                has_user,
+                has_results,
+            )
             return ChatErrorResponse(text="user_message 与 tool_results 必须二选一")
 
         security = self._security_for_request(request)
         if request.effort is not None:
             session.effort = request.effort
+            logger.info("Session effort overridden session=%s effort=%s", session.session_id, request.effort)
         if request.output_style is not None:
             session.output_style = request.output_style
+            logger.info(
+                "Session output style overridden session=%s output_style=%s",
+                session.session_id,
+                request.output_style,
+            )
 
         coordinator = get_agent("coordinator", self.available_tools)
         prompt = build_system_prompt(
@@ -233,17 +266,36 @@ class QueryEngine:
 
         if has_results:
             self._emit(session.session_id, "tool_results_received", {"count": len(request.tool_results or [])})
+            logger.info(
+                "Appending front tool results session=%s count=%d pending_turn=%s",
+                session.session_id,
+                len(request.tool_results or []),
+                session.pending_turn_id,
+            )
             result_error = self._append_tool_results(session, request.tool_results or [])
             if result_error is not None:
+                logger.warning("Front tool result rejected session=%s reason=%s", session.session_id, result_error.text)
                 return result_error
         else:
             if session.pending_turn_id is not None:
+                logger.warning(
+                    "User message rejected because tools are pending session=%s pending_turn=%s",
+                    session.session_id,
+                    session.pending_turn_id,
+                )
                 return ChatErrorResponse(text="当前会话仍有待回传的工具结果，不能开始新的用户消息")
             frame = session.top_frame()
             if frame is None:
+                logger.error("User message rejected because session has no active frame session=%s", session.session_id)
                 return ChatErrorResponse(text="会话没有活跃的 agent 帧")
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
             self._emit(session.session_id, "user_submitted", {"has_context": request.context is not None})
+            logger.info(
+                "User turn appended session=%s has_context=%s language_hint=%s",
+                session.session_id,
+                request.context is not None,
+                request.language_hint,
+            )
 
         step = await run_turn(
             session=session,
@@ -271,16 +323,33 @@ class QueryEngine:
                 "tool_calls",
                 {"turn_id": response.turn_id, "count": len(response.calls)},
             )
+            logger.info(
+                "Chat produced front tool calls session=%s turn_id=%s count=%d",
+                session.session_id,
+                response.turn_id,
+                len(response.calls),
+            )
         elif isinstance(response, ChatFinalResponse):
             self._emit(session.session_id, "final", {"text_length": len(response.text)})
+            logger.info(
+                "Chat produced final response session=%s text_length=%d",
+                session.session_id,
+                len(response.text),
+            )
         else:
             self._emit(session.session_id, "error", {"text": response.text})
+            logger.warning("Chat produced error response session=%s text=%s", session.session_id, response.text)
         return response
 
     def _security_for_request(self, request: ChatRequest) -> SecuritySettings:
         """基于启动安全边界叠加单次请求的权限模式覆盖。"""
         if request.permission_mode is None:
             return self._base_security
+        logger.info(
+            "Permission mode overridden session=%s mode=%s",
+            request.session_id,
+            request.permission_mode,
+        )
         return self._base_security.model_copy(update={"permission_mode": request.permission_mode})
 
     def _append_tool_results(
@@ -288,22 +357,40 @@ class QueryEngine:
     ) -> ChatErrorResponse | None:
         """校验并把前端工具结果追加到对应 agent 帧。"""
         if session.pending_turn_id is None:
+            logger.warning("Tool results rejected: no pending turn session=%s", session.session_id)
             return ChatErrorResponse(text="当前会话没有等待回传的工具调用")
         if not results:
+            logger.warning("Tool results rejected: empty results session=%s", session.session_id)
             return ChatErrorResponse(text="tool_results 不能为空")
 
         ids = {result.tool_use_id for result in results}
         if ids != session.pending_tool_call_ids:
             expected = ", ".join(sorted(session.pending_tool_call_ids))
             actual = ", ".join(sorted(ids))
+            logger.warning(
+                "Tool results rejected: id mismatch session=%s expected=%s actual=%s",
+                session.session_id,
+                expected,
+                actual,
+            )
             return ChatErrorResponse(text=f"tool_results 与 pending 工具调用不匹配：expected={expected}; actual={actual}")
         if any(result.turn_id != session.pending_turn_id for result in results):
+            logger.warning(
+                "Tool results rejected: turn mismatch session=%s pending_turn=%s",
+                session.session_id,
+                session.pending_turn_id,
+            )
             return ChatErrorResponse(text="tool_results.turn_id 与当前 pending_turn_id 不匹配")
 
         frames = {frame.id: frame for frame in session.agent_stack}
         for result in results:
             frame = frames.get(result.frame_id)
             if frame is None:
+                logger.warning(
+                    "Tool results rejected: unknown frame session=%s frame=%s",
+                    session.session_id,
+                    result.frame_id,
+                )
                 return ChatErrorResponse(text=f"未知 frame_id：{result.frame_id}")
             is_error = result.status in {"rejected", "error"}
             metadata = session.pending_tool_calls.get(result.tool_use_id, {})
@@ -319,6 +406,12 @@ class QueryEngine:
                     applied_result = tool.enrich(tool_args, applied_result)
                 if result.grant_session_allow and tool is not None and not tool.executes_process:
                     session.session_allow.add(make_session_allow_grant(tool, tool_args))
+                    logger.info(
+                        "Session allow grant added session=%s tool=%s frame=%s",
+                        session.session_id,
+                        tool.name,
+                        frame.id,
+                    )
                 payload = {
                     "status": result.status,
                     "result": applied_result,
@@ -332,8 +425,17 @@ class QueryEngine:
                     "result": result.result,
                 }
             frame.messages.append(_tool_message(result.tool_use_id, payload, is_error=is_error))
+            logger.info(
+                "Tool result appended session=%s turn_id=%s tool=%s status=%s frame=%s",
+                session.session_id,
+                result.turn_id,
+                tool_name,
+                result.status,
+                frame.id,
+            )
 
         session.clear_pending()
+        logger.info("Tool results completed session=%s count=%d", session.session_id, len(results))
         return None
 
     def reset(self, session_id: str) -> None:
@@ -342,6 +444,7 @@ class QueryEngine:
         if self._recovery is not None:
             self._recovery.clear()
         self._emit(session_id, "reset", {})
+        logger.info("Session reset through QueryEngine session=%s", session_id)
 
     def set_effort(self, session_id: str, effort: str) -> None:
         """Set session effort without starting a model turn."""
@@ -349,6 +452,7 @@ class QueryEngine:
         session.effort = effort
         self._store.save(session)
         self._emit(session_id, "config_changed", {"effort": effort})
+        logger.info("Session effort changed session=%s effort=%s", session_id, effort)
 
     def set_output_style(self, session_id: str, output_style: str) -> None:
         """Set session output style without starting a model turn."""
@@ -356,10 +460,12 @@ class QueryEngine:
         session.output_style = output_style
         self._store.save(session)
         self._emit(session_id, "config_changed", {"output_style": output_style})
+        logger.info("Session output style changed session=%s output_style=%s", session_id, output_style)
 
     def compact(self, session_id: str, keep_recent: int = 12) -> dict[str, Any]:
         """对指定 session 执行本地 micro/full compact，保留 pending 协议完整性。"""
         session = self._store.get_or_create(session_id, self.available_tools)
+        logger.info("Compacting session session=%s keep_recent=%d", session_id, keep_recent)
         compacted_frames = 0
         removed_messages = 0
         keep = max(6, keep_recent)
@@ -399,6 +505,13 @@ class QueryEngine:
                 "pending_preserved": session.pending_turn_id is not None,
             },
         )
+        logger.info(
+            "Compacted session session=%s frames=%d removed_messages=%d pending_preserved=%s",
+            session_id,
+            compacted_frames,
+            removed_messages,
+            session.pending_turn_id is not None,
+        )
         return {
             "session_id": session_id,
             "compacted_frames": compacted_frames,
@@ -411,7 +524,9 @@ class QueryEngine:
         """记录内部事件；未配置事件存储时返回 0。"""
         if self._events is None:
             return 0
-        return self._events.append(session_id, event_type, payload).seq
+        event = self._events.append(session_id, event_type, payload)
+        logger.debug("Event emitted session=%s seq=%d type=%s", session_id, event.seq, event_type)
+        return event.seq
 
     def _record_recovery(self, session: Session, response: ChatResponse) -> None:
         """根据最新响应写入或清理最小恢复指针。"""
@@ -424,5 +539,12 @@ class QueryEngine:
                 pending_turn_id=response.turn_id,
                 last_event_seq=last_seq,
             )
+            logger.info(
+                "Recovery pointer written session=%s turn_id=%s last_seq=%d",
+                session.session_id,
+                response.turn_id,
+                last_seq,
+            )
         elif isinstance(response, ChatFinalResponse):
             self._recovery.clear()
+            logger.debug("Recovery pointer cleared after final session=%s", session.session_id)

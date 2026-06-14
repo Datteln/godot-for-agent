@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY, ToolDef, register
 
 MAX_RESULTS = 12
+
+logger = logging.getLogger(__name__)
 
 SEARCH_TOOLS_SCHEMA: dict[str, Any] = {
     "name": "search_tools",
@@ -70,6 +73,13 @@ async def search_tools_handler(args: dict[str, Any], ctx: ToolContext) -> dict[s
     max_results = min(max_results_raw, MAX_RESULTS)
 
     visible = set(ctx.effective_tools) if ctx.effective_tools else set(REGISTRY)
+    logger.info(
+        "search_tools start session=%s visible=%d max_results=%d query_length=%d",
+        ctx.session_id,
+        len(visible),
+        max_results,
+        len(query),
+    )
     ranked: list[tuple[int, ToolDef]] = []
     for name in visible:
         tool = REGISTRY.get(name)
@@ -97,6 +107,12 @@ async def search_tools_handler(args: dict[str, Any], ctx: ToolContext) -> dict[s
             }
         )
 
+    logger.info(
+        "search_tools success session=%s matches=%d activated=%d",
+        ctx.session_id,
+        len(matches),
+        len(activated),
+    )
     return {
         "query": query,
         "tools": matches,

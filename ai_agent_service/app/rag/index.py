@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import time
@@ -32,6 +33,8 @@ TEXT_SUFFIXES = {
     ".ini",
     ".import",
 }
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,7 @@ class CodebaseIndex:
     def status(self) -> dict[str, Any]:
         """返回当前索引文件状态。"""
         if not self._index_path.exists():
+            logger.debug("RAG index status missing path=%s", self._index_path)
             return {
                 "enabled": True,
                 "mode": "local_tfidf",
@@ -137,6 +141,7 @@ class CodebaseIndex:
         try:
             data = self._load()
         except ValueError as exc:
+            logger.warning("RAG index status invalid path=%s error=%s", self._index_path, exc)
             return {
                 "enabled": True,
                 "mode": "local_tfidf",
@@ -146,7 +151,7 @@ class CodebaseIndex:
                 "index_path": str(self._index_path),
                 "error": str(exc),
             }
-        return {
+        status = {
             "enabled": True,
             "mode": data.get("mode", "local_tfidf"),
             "tool": "search_codebase",
@@ -158,10 +163,18 @@ class CodebaseIndex:
             "chunks": len(data.get("chunks", [])),
             "schema_version": data.get("schema_version"),
         }
+        logger.debug(
+            "RAG index status path=%s files=%s chunks=%s",
+            self._index_path,
+            status.get("files"),
+            status.get("chunks"),
+        )
+        return status
 
     def build(self, include: str = "**/*", max_files: int = 4000) -> dict[str, Any]:
         """扫描工程并重建本地索引。"""
         root = self._security.project_root
+        logger.info("RAG index build start root=%s include=%s max_files=%d", root, include, max_files)
         files = _iter_text_files(root, self._security, include)
         chunks: list[dict[str, Any]] = []
         indexed_files = 0
@@ -200,7 +213,7 @@ class CodebaseIndex:
         }
         self._index_path.parent.mkdir(parents=True, exist_ok=True)
         self._index_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        return {
+        result = {
             "mode": "local_tfidf",
             "index_rebuilt": True,
             "index_path": str(self._index_path),
@@ -208,9 +221,23 @@ class CodebaseIndex:
             "chunks": len(chunks),
             "truncated_files": len(files) > max_files,
         }
+        logger.info(
+            "RAG index build complete path=%s files=%d chunks=%d truncated=%s",
+            self._index_path,
+            indexed_files,
+            len(chunks),
+            result["truncated_files"],
+        )
+        return result
 
     def search(self, query: str, include: str = "**/*", max_results: int = 16) -> dict[str, Any]:
         """基于持久化索引搜索相关片段。"""
+        logger.info(
+            "RAG search start mode=auto include=%s max_results=%d query_length=%d",
+            include,
+            max_results,
+            len(query),
+        )
         query_counts = token_counts(query)
         if not query_counts:
             raise ValueError("query 至少需要包含一个可检索词")
@@ -223,6 +250,12 @@ class CodebaseIndex:
         if not isinstance(chunks, list):
             raise ValueError("索引 chunks 格式不正确")
         results = self._rank_chunks(query_counts, chunks, include, max_results)
+        logger.info(
+            "RAG search complete mode=index path=%s chunks=%d results=%d",
+            self._index_path,
+            len(chunks),
+            len(results),
+        )
         return {
             "query": query,
             "mode": "local_tfidf_index",
@@ -234,6 +267,12 @@ class CodebaseIndex:
 
     def search_live(self, query: str, include: str = "**/*", max_results: int = 16) -> dict[str, Any]:
         """在无索引时即时扫描工程并搜索。"""
+        logger.info(
+            "RAG live search start include=%s max_results=%d query_length=%d",
+            include,
+            max_results,
+            len(query),
+        )
         query_counts = token_counts(query)
         if not query_counts:
             raise ValueError("query 至少需要包含一个可检索词")
@@ -255,6 +294,12 @@ class CodebaseIndex:
                         }
                     )
         results = self._rank_chunks(query_counts, chunks, include, max_results)
+        logger.info(
+            "RAG live search complete scanned_files=%d chunks=%d results=%d",
+            len(files),
+            len(chunks),
+            len(results),
+        )
         return {
             "query": query,
             "mode": "live_tfidf_scan",
@@ -269,8 +314,10 @@ class CodebaseIndex:
         try:
             data = json.loads(self._index_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("RAG index load failed path=%s error=%s", self._index_path, exc)
             raise ValueError(f"无法读取 RAG 索引：{exc}") from exc
         if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+            logger.warning("RAG index schema mismatch path=%s", self._index_path)
             raise ValueError("RAG 索引 schema_version 不匹配，请重建索引")
         return data
 

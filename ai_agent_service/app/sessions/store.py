@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from typing import Any
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, Frame
 from app.permissions.engine import SessionAllowGrant
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -274,6 +277,7 @@ class SessionStore:
         if lock is None:
             lock = asyncio.Lock()
             self._locks[session_id] = lock
+            logger.debug("Session lock created session=%s", session_id)
         return lock
 
     def get_or_create(self, session_id: str, available_tools: set[str]) -> Session:
@@ -289,10 +293,20 @@ class SessionStore:
         """
         existing = self._sessions.get(session_id)
         if existing is not None:
+            logger.debug("Session cache hit session=%s frames=%d", session_id, len(existing.agent_stack))
             return existing
         restored = self._load(session_id, available_tools)
         session = restored if restored is not None else Session(session_id=session_id)
         self._sessions[session_id] = session
+        if restored is None:
+            logger.info("Session created session=%s", session_id)
+        else:
+            logger.info(
+                "Session restored session=%s frames=%d pending=%s",
+                session_id,
+                len(session.agent_stack),
+                session.pending_turn_id is not None,
+            )
         return session
 
     def save(self, session: Session) -> None:
@@ -308,6 +322,14 @@ class SessionStore:
             json.dumps(session_to_dict(session), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        logger.debug(
+            "Session saved session=%s frames=%d pending=%s cache_entries=%d path=%s",
+            session.session_id,
+            len(session.agent_stack),
+            session.pending_turn_id is not None,
+            len(session.request_id_cache),
+            path,
+        )
 
     def reset(self, session_id: str) -> None:
         """清空指定会话（内存与本地持久化文件）。
@@ -319,6 +341,9 @@ class SessionStore:
         path = self._path_for(session_id)
         if path.exists():
             path.unlink()
+            logger.info("Session reset removed persisted file session=%s path=%s", session_id, path)
+        else:
+            logger.info("Session reset session=%s no persisted file", session_id)
 
     def _path_for(self, session_id: str) -> Path:
         """返回某会话对应的本地 JSON 文件路径。
@@ -343,9 +368,13 @@ class SessionStore:
         """
         path = self._path_for(session_id)
         if not path.exists():
+            logger.debug("Session load skipped missing file session=%s path=%s", session_id, path)
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return session_from_dict(data, available_tools)
-        except (OSError, ValueError, KeyError):
+            session = session_from_dict(data, available_tools)
+            logger.debug("Session loaded from disk session=%s path=%s", session_id, path)
+            return session
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning("Session load failed session=%s path=%s error=%s", session_id, path, exc)
             return None

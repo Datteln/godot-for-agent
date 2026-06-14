@@ -9,11 +9,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from app.tools.context import ToolContext
+
+logger = logging.getLogger(__name__)
 
 # server 工具的实现：接收本次调用入参与执行上下文，返回 JSON 可序列化结果。
 ToolHandler = Callable[[dict[str, Any], ToolContext], Awaitable[dict[str, Any]]]
@@ -92,6 +95,14 @@ def register(tool: ToolDef) -> None:
         tool: 待注册的工具定义；`tool.name` 作为注册表键，重复注册会覆盖。
     """
     REGISTRY[tool.name] = tool
+    logger.debug(
+        "Tool registered name=%s side=%s domain=%s mutating=%s deferred=%s",
+        tool.name,
+        tool.side,
+        tool.domain,
+        tool.mutating,
+        tool.deferred,
+    )
 
 
 def tools_for(
@@ -121,6 +132,12 @@ def tools_for(
         if tool.deferred and name not in active:
             continue
         loaded.append(tool)
+    logger.debug(
+        "Resolved tools for prompt requested=%d active_deferred=%d loaded=%d",
+        len(effective_tools),
+        len(active),
+        len(loaded),
+    )
     return [
         {"type": "function", "function": tool.schema}
         for tool in sorted(loaded, key=lambda t: t.name)
