@@ -17,7 +17,9 @@ var _event_http: HTTPRequest
 var _queue: Array[Dictionary] = []
 var _busy := false
 var _interrupted := false
+var _request_generation := 0
 var _last_event_seq := 0
+var _suppress_events := false
 var _event_timer: Timer
 
 
@@ -40,6 +42,8 @@ func _ready() -> void:
 
 
 func send_user_message(text: String, context: Dictionary) -> void:
+	_suppress_events = false
+	_configure_event_timer()
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing user message.", {
 		"chars": text.length(),
 		"has_context": not context.is_empty()
@@ -73,17 +77,27 @@ func send_tool_results(results: Array) -> void:
 
 func reset_session() -> void:
 	current_turn_id = ""
+	_request_generation += 1
+	_interrupted = false
+	_suppress_events = false
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing session reset.", {"session_id": _session_id()})
 	_enqueue("POST", "/reset", {"session_id": _session_id()})
 
 
 func interrupt_current() -> void:
 	FrontendLogger.warn(editor_interface, "HTTP", "Interrupting current request.", {"queue_size": _queue.size()})
+	_request_generation += 1
+	_suppress_events = true
 	_queue.clear()
-	_busy = false
 	if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
 		_interrupted = true
 		_http.cancel_request()
+	else:
+		_busy = false
+	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+		_event_http.cancel_request()
+	if _event_timer != null:
+		_event_timer.stop()
 	current_turn_id = ""
 
 
@@ -161,7 +175,12 @@ func _enqueue(method: String, path: String, payload: Dictionary) -> void:
 		"path": path,
 		"queue_size": _queue.size() + 1
 	})
-	_queue.append({"method": method, "path": path, "payload": payload})
+	_queue.append({
+		"method": method,
+		"path": path,
+		"payload": payload,
+		"generation": _request_generation
+	})
 	_pump()
 
 
@@ -170,6 +189,10 @@ func _pump() -> void:
 		return
 	_busy = true
 	var item: Dictionary = _queue.pop_front()
+	if int(item.get("generation", _request_generation)) != _request_generation:
+		_busy = false
+		_pump()
+		return
 	var method_name := str(item["method"])
 	var method := HTTPClient.METHOD_GET
 	var body := ""
@@ -196,6 +219,13 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 		return
 	var text := body.get_string_from_utf8()
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
+		if _suppress_events:
+			FrontendLogger.info(editor_interface, "HTTP", "Suppressed HTTP failure after interrupt.", {
+				"code": code,
+				"result": result
+			})
+			_pump()
+			return
 		FrontendLogger.error(editor_interface, "HTTP", "HTTP request failed.", {
 			"code": code,
 			"result": result,
@@ -237,6 +267,10 @@ func _on_events_completed(result: int, code: int, _headers: PackedStringArray, b
 		for event in events:
 			if event is Dictionary:
 				_last_event_seq = max(_last_event_seq, int(event.get("seq", _last_event_seq)))
+		if _suppress_events:
+			if not events.is_empty():
+				FrontendLogger.debug(editor_interface, "HTTP", "Suppressed events after interrupt.", {"count": events.size()})
+			return
 		if not events.is_empty():
 			events_received.emit(events)
 

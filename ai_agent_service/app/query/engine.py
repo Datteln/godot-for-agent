@@ -426,6 +426,7 @@ class QueryEngine:
                 session.output_style,
             ),
             model_selector=self._model_for_effort,
+            event_callback=lambda event_type, payload: self._emit(session.session_id, event_type, payload),
         )
         response = _step_to_response(step)
         if isinstance(response, ChatToolCallsResponse):

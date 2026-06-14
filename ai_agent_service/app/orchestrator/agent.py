@@ -584,6 +584,67 @@ def _start_delegate_group(
     return True
 
 
+def _event_tool_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Return a small, UI-safe summary of tool arguments."""
+    result: dict[str, Any] = {}
+    for key in (
+        "path",
+        "target_path",
+        "file_path",
+        "script_path",
+        "resource_path",
+        "scene_path",
+        "command",
+        "kind",
+        "agent",
+        "task",
+        "query",
+    ):
+        if key not in args:
+            continue
+        value = args[key]
+        if isinstance(value, str) and len(value) > 180:
+            value = value[:180] + "..."
+        result[key] = value
+    return result
+
+
+def _emit_orchestration_event(
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    if event_callback is None:
+        return
+    event_callback(event_type, payload)
+
+
+def _delta_callback(
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+    frame_id: str,
+    loop: int,
+) -> Callable[[str, str], None] | None:
+    """构造传给 `LLMProvider.chat` 的流式增量回调，转发为编排事件。
+
+    Args:
+        event_callback: 编排事件回调；为 None 时不产生增量事件。
+        frame_id: 本轮所属的 agent 帧 id，供前端关联增量与对应消息。
+        loop: 本轮在 `run_turn` 中的循环序号（从 1 开始）。
+
+    Returns:
+        转发增量为 `agent_text_delta`/`agent_reasoning_delta` 事件的回调；
+        `event_callback` 为 None 时返回 None。
+    """
+    if event_callback is None:
+        return None
+
+    def _on_delta(kind: str, text: str) -> None:
+        event_type = "agent_reasoning_delta" if kind == "reasoning" else "agent_text_delta"
+        event_callback(event_type, {"frame_id": frame_id, "loop": loop, "text": text})
+
+    return _on_delta
+
+
 async def run_turn(
     session: Session,
     llm: LLMProvider,
@@ -593,6 +654,7 @@ async def run_turn(
     session_allow: set[SessionAllowGrant] | None = None,
     agent_prompt_factory: Callable[[AgentDefinition], str] | None = None,
     model_selector: Callable[[EffortLevel], str | None] | None = None,
+    event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> StepResult:
     """驱动当前会话的活跃帧完成一轮（或多轮）编排循环。
 
@@ -627,12 +689,24 @@ async def run_turn(
                 len(frame.messages),
                 len(visible_tools),
             )
+            _emit_orchestration_event(
+                event_callback,
+                "agent_step",
+                {
+                    "loop": loop_index + 1,
+                    "frame_id": frame.id,
+                    "agent": frame.agent.name,
+                    "depth": frame.depth,
+                    "visible_tools": len(visible_tools),
+                },
+            )
             effort = _resolve_effort(session, frame)
             turn = await llm.chat(
                 frame.messages,
                 visible_tools,
                 model=_resolve_model_for_effort(frame.agent, effort, model_selector),
                 temperature=_resolve_temperature(effort),
+                on_delta=_delta_callback(event_callback, frame.id, loop_index + 1),
             )
         except LLMError as exc:
             logger.warning("Agent LLM step failed session=%s frame=%s error=%s", session.session_id, frame.id, exc)
@@ -653,6 +727,15 @@ async def run_turn(
             frame.id,
             frame.agent.name,
             [call.name for call in turn.tool_calls],
+        )
+        _emit_orchestration_event(
+            event_callback,
+            "agent_tool_calls",
+            {
+                "frame_id": frame.id,
+                "agent": frame.agent.name,
+                "tools": [call.name for call in turn.tool_calls],
+            },
         )
 
         permission_ctx = PermissionContext(
@@ -697,6 +780,16 @@ async def run_turn(
                 )
                 continue
 
+            _emit_orchestration_event(
+                event_callback,
+                "delegate_start",
+                {
+                    "frame_id": frame.id,
+                    "agent": frame.agent.name,
+                    "tool": call.name,
+                    "args": _event_tool_args(args),
+                },
+            )
             if call.name == "delegate_many":
                 _start_delegate_group(
                     session=session,
@@ -786,14 +879,59 @@ async def run_turn(
                 session.session_id,
                 len(concurrent_calls),
             )
+            for item in concurrent_calls:
+                _emit_orchestration_event(
+                    event_callback,
+                    "server_tool_start",
+                    {
+                        "frame_id": frame.id,
+                        "agent": frame.agent.name,
+                        "tool": item.tool.name,
+                        "args": _event_tool_args(item.args),
+                        "concurrent": True,
+                    },
+                )
             outcomes = await asyncio.gather(
                 *(_invoke_server_tool(item.tool, item.args, call_ctx) for item in concurrent_calls)
             )
             for item, outcome in zip(concurrent_calls, outcomes):
                 results[item.call_id] = outcome
+                _emit_orchestration_event(
+                    event_callback,
+                    "server_tool_result",
+                    {
+                        "frame_id": frame.id,
+                        "agent": frame.agent.name,
+                        "tool": item.tool.name,
+                        "args": _event_tool_args(item.args),
+                        "is_error": outcome[1],
+                    },
+                )
         for item in sequential_calls:
             logger.info("Running sequential server tool session=%s tool=%s", session.session_id, item.tool.name)
+            _emit_orchestration_event(
+                event_callback,
+                "server_tool_start",
+                {
+                    "frame_id": frame.id,
+                    "agent": frame.agent.name,
+                    "tool": item.tool.name,
+                    "args": _event_tool_args(item.args),
+                    "concurrent": False,
+                },
+            )
             results[item.call_id] = await _invoke_server_tool(item.tool, item.args, call_ctx)
+            _emit_orchestration_event(
+                event_callback,
+                "server_tool_result",
+                {
+                    "frame_id": frame.id,
+                    "agent": frame.agent.name,
+                    "tool": item.tool.name,
+                    "args": _event_tool_args(item.args),
+                    "is_error": results[item.call_id][1],
+                },
+            )
 
         # 第三遍：按 `tool_calls` 原始顺序把结果 append 回 `frame.messages`。
         for item in pending_items:

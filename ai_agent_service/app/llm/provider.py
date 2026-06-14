@@ -7,6 +7,8 @@ Responses / Anthropic / Gemini provider 而不改编排层。
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -14,6 +16,13 @@ from openai import AsyncOpenAI
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 
 logger = logging.getLogger(__name__)
+
+# 流式增量回调：`(kind, accumulated_text)`，`kind` 为 `"content"`（回复正文）
+# 或 `"reasoning"`（思考过程），`accumulated_text` 为截至当前的完整累积文本。
+DeltaCallback = Callable[[str, str], None]
+
+# 流式增量事件的最小推送间隔（秒），避免逐 token 产生事件淹没事件队列。
+_DELTA_MIN_INTERVAL_S = 0.12
 
 
 @dataclass(frozen=True)
@@ -41,12 +50,15 @@ class AssistantTurn:
         content: assistant 消息的文本内容；纯工具调用时可能为 None。
         tool_calls: 本轮请求的工具调用列表，可能为空。
         finish_reason: 模型返回的结束原因（如 `stop`/`tool_calls`/`length`）。
+        reasoning: 模型的思考过程文本（`enable_thinking` 开启且端点支持时），
+            不写入 `raw_message`，仅供前端展示。
     """
 
     raw_message: dict[str, Any]
     content: str | None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str | None = None
+    reasoning: str | None = None
 
 
 class LLMError(Exception):
@@ -72,6 +84,7 @@ class LLMProvider(Protocol):
         tools: list[dict[str, Any]],
         model: str | None = None,
         temperature: float | None = None,
+        on_delta: DeltaCallback | None = None,
     ) -> AssistantTurn:
         """发起一次对话补全请求。
 
@@ -82,6 +95,8 @@ class LLMProvider(Protocol):
             model: 本次请求使用的模型名；为 None 时使用 provider 的默认模型。
             temperature: 采样温度；为 None 时使用端点默认值（编排层通常按
                 `AgentDefinition.effort` 解析出具体值）。
+            on_delta: 流式增量回调，每次正文/思考过程有新增内容时被调用，
+                参数为 `(kind, accumulated_text)`；为 None 时不推送增量。
 
         Returns:
             模型本轮的回应。
@@ -154,6 +169,7 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]],
         model: str | None = None,
         temperature: float | None = None,
+        on_delta: DeltaCallback | None = None,
     ) -> AssistantTurn:
         """调用 `chat.completions.create` 并转换为 `AssistantTurn`。
 
@@ -165,6 +181,7 @@ class OpenAICompatibleProvider:
             tools: 当前 agent 可见工具的 OpenAI function schema 列表。
             model: 本次请求使用的模型名；为 None 时使用 `default_model`。
             temperature: 采样温度；为 None 时使用端点默认值。
+            on_delta: 流式增量回调，参见 `LLMProvider.chat`。
 
         Returns:
             模型本轮的回应。
@@ -174,7 +191,7 @@ class OpenAICompatibleProvider:
         """
         resolved_model = model or self._default_model
         try:
-            return await self._chat_once(messages, tools, resolved_model, temperature)
+            return await self._chat_once(messages, tools, resolved_model, temperature, on_delta)
         except LLMError as exc:
             if self._fallback_model is None or self._fallback_model == resolved_model:
                 logger.warning(
@@ -189,7 +206,7 @@ class OpenAICompatibleProvider:
                 self._fallback_model,
                 exc.status_code,
             )
-            return await self._chat_once(messages, tools, self._fallback_model, temperature)
+            return await self._chat_once(messages, tools, self._fallback_model, temperature, on_delta)
 
     async def _chat_once(
         self,
@@ -197,14 +214,16 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]],
         model: str,
         temperature: float | None,
+        on_delta: DeltaCallback | None = None,
     ) -> AssistantTurn:
-        """发起一次 `chat.completions.create` 请求并转换为 `AssistantTurn`。
+        """发起一次流式 `chat.completions.create` 请求并转换为 `AssistantTurn`。
 
         Args:
             messages: 当前 agent 帧的完整消息列表。
             tools: 当前 agent 可见工具的 OpenAI function schema 列表。
             model: 本次请求实际使用的模型名（已解析，非 None）。
             temperature: 采样温度；为 None 时使用端点默认值。
+            on_delta: 流式增量回调，参见 `LLMProvider.chat`。
 
         Returns:
             模型本轮的回应。
@@ -220,12 +239,14 @@ class OpenAICompatibleProvider:
             temperature,
         )
         try:
-            response = await self._client.chat.completions.create(
+            stream = await self._client.chat.completions.create(
                 model=model,
                 messages=messages,  # type: ignore[arg-type]
                 tools=tools or None,  # type: ignore[arg-type]
                 tool_choice="auto" if tools else None,
                 temperature=temperature,
+                extra_body={"enable_thinking": True},
+                stream=True,
             )
         except (APIConnectionError, APITimeoutError) as exc:
             logger.warning("LLM connection error model=%s error_type=%s", model, type(exc).__name__)
@@ -237,22 +258,108 @@ class OpenAICompatibleProvider:
                 status_code=exc.status_code,
             ) from exc
 
-        choice = response.choices[0]
-        message = choice.message
+        role = "assistant"
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls_acc: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        last_content_emit = 0.0
+        last_reasoning_emit = 0.0
+
+        try:
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                delta = choice.delta
+                if delta is None:
+                    continue
+                if delta.role:
+                    role = delta.role
+                if delta.content:
+                    content_parts.append(delta.content)
+                    now = time.monotonic()
+                    if on_delta is not None and now - last_content_emit >= _DELTA_MIN_INTERVAL_S:
+                        last_content_emit = now
+                        on_delta("content", "".join(content_parts))
+                reasoning_piece = getattr(delta, "reasoning_content", None)
+                if reasoning_piece:
+                    reasoning_parts.append(reasoning_piece)
+                    now = time.monotonic()
+                    if on_delta is not None and now - last_reasoning_emit >= _DELTA_MIN_INTERVAL_S:
+                        last_reasoning_emit = now
+                        on_delta("reasoning", "".join(reasoning_parts))
+                for tool_call_delta in delta.tool_calls or []:
+                    entry = tool_calls_acc.setdefault(
+                        tool_call_delta.index,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if tool_call_delta.id:
+                        entry["id"] = tool_call_delta.id
+                    if tool_call_delta.type:
+                        entry["type"] = tool_call_delta.type
+                    if tool_call_delta.function:
+                        if tool_call_delta.function.name:
+                            entry["function"]["name"] += tool_call_delta.function.name
+                        if tool_call_delta.function.arguments:
+                            entry["function"]["arguments"] += tool_call_delta.function.arguments
+        except (APIConnectionError, APITimeoutError) as exc:
+            logger.warning("LLM stream connection error model=%s error_type=%s", model, type(exc).__name__)
+            raise LLMError(f"大模型流式响应中断：{exc}") from exc
+        except APIStatusError as exc:
+            logger.warning("LLM stream status error model=%s status_code=%s", model, exc.status_code)
+            raise LLMError(
+                f"大模型端点返回错误（{exc.status_code}）：{exc.message}",
+                status_code=exc.status_code,
+            ) from exc
+
+        content = "".join(content_parts) or None
+        reasoning = "".join(reasoning_parts) or None
+        if on_delta is not None:
+            if content is not None:
+                on_delta("content", content)
+            if reasoning is not None:
+                on_delta("reasoning", reasoning)
+
         tool_calls = [
-            ToolCallRequest(id=call.id, name=call.function.name, arguments=call.function.arguments)
-            for call in (message.tool_calls or [])
+            ToolCallRequest(
+                id=entry["id"],
+                name=entry["function"]["name"],
+                arguments=entry["function"]["arguments"],
+            )
+            for _, entry in sorted(tool_calls_acc.items())
         ]
+
+        raw_message: dict[str, Any] = {"role": role}
+        if content is not None:
+            raw_message["content"] = content
+        if tool_calls_acc:
+            raw_message["tool_calls"] = [
+                {
+                    "id": entry["id"],
+                    "type": entry["type"],
+                    "function": {
+                        "name": entry["function"]["name"],
+                        "arguments": entry["function"]["arguments"],
+                    },
+                }
+                for _, entry in sorted(tool_calls_acc.items())
+            ]
+
         logger.info(
-            "LLM chat response model=%s finish_reason=%s tool_calls=%d content_length=%d",
+            "LLM chat response model=%s finish_reason=%s tool_calls=%d content_length=%d reasoning_length=%d",
             model,
-            choice.finish_reason,
+            finish_reason,
             len(tool_calls),
-            len(message.content or ""),
+            len(content or ""),
+            len(reasoning or ""),
         )
         return AssistantTurn(
-            raw_message=message.model_dump(exclude_none=True),
-            content=message.content,
+            raw_message=raw_message,
+            content=content,
             tool_calls=tool_calls,
-            finish_reason=choice.finish_reason,
+            finish_reason=finish_reason,
+            reasoning=reasoning,
         )
