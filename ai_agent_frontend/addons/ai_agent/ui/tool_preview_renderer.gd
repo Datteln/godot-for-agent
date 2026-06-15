@@ -7,7 +7,7 @@ const MAX_DIFF_LINES_PER_SIDE := 800
 const MAX_DIFF_LINES_SHOWN := 400
 
 
-static func render_call(call: Dictionary) -> Control:
+static func render_call(call: Dictionary, theme_colors: Dictionary = {}) -> Control:
 	var box := VBoxContainer.new()
 	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
@@ -18,7 +18,7 @@ static func render_call(call: Dictionary) -> Control:
 
 	match kind:
 		"diff":
-			box.add_child(_render_diff(call))
+			box.add_child(_render_diff(call, theme_colors))
 		"map":
 			box.add_child(_render_map_op(call))
 		"run":
@@ -47,7 +47,7 @@ static func infer_render_kind(call: Dictionary) -> String:
 			return "json"
 
 
-static func _render_diff(call: Dictionary) -> Control:
+static func _render_diff(call: Dictionary, theme_colors: Dictionary) -> Control:
 	var input: Dictionary = call.get("input", {})
 	var path := PathUtils.to_res_path(str(input.get("path", input.get("target_path", ""))))
 	var after_text := str(input.get("content", input.get("after_text", input.get("after", ""))))
@@ -66,6 +66,8 @@ static func _render_diff(call: Dictionary) -> Control:
 	view.custom_minimum_size = Vector2(640, 260)
 	view.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	view.append_text("[b]%s[/b]\n" % _escape_bbcode(path if path != "" else "(no path)"))
+	var added_color := _color_tag(_theme_color(theme_colors, "success_text", Color(0.12, 0.56, 0.26)))
+	var removed_color := _color_tag(_theme_color(theme_colors, "error_text", Color(0.72, 0.20, 0.20)))
 
 	var diff_lines := _lcs_diff(before_text, after_text)
 	var shown := diff_lines
@@ -76,9 +78,9 @@ static func _render_diff(call: Dictionary) -> Control:
 		var text := str(line)
 		var escaped := _escape_bbcode(text)
 		if text.begins_with("+ "):
-			view.append_text("[color=#88ff88]%s[/color]\n" % escaped)
+			view.append_text("[color=%s]%s[/color]\n" % [added_color, escaped])
 		elif text.begins_with("- "):
-			view.append_text("[color=#ff8888]%s[/color]\n" % escaped)
+			view.append_text("[color=%s]%s[/color]\n" % [removed_color, escaped])
 		else:
 			view.append_text("%s\n" % escaped)
 	if truncated:
@@ -196,3 +198,12 @@ static func _lcs_diff(before: String, after: String) -> Array:
 
 static func _escape_bbcode(text: String) -> String:
 	return text.replace("[", "[lb]").replace("]", "[rb]")
+
+
+static func _theme_color(theme_colors: Dictionary, key: String, fallback: Color) -> Color:
+	var value = theme_colors.get(key, fallback)
+	return value if value is Color else fallback
+
+
+static func _color_tag(color: Color) -> String:
+	return "#" + color.to_html(color.a < 1.0)

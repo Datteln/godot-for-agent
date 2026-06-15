@@ -15,13 +15,6 @@ enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
 const PENDING_TOOL_RESULTS_ERROR := "当前会话仍有待回传的工具结果，不能开始新的用户消息"
 const HIGH_RISK_TOOLS := ["run_tests", "run_headless_self_test", "set_project_setting", "batch_rename"]
 
-# Markdown 渲染：代码块背景色与语法高亮配色（深色主题）。
-const _CODE_BLOCK_BG := "#1e1e1e"
-const _SYNTAX_COMMENT_COLOR := "#6a9955"
-const _SYNTAX_STRING_COLOR := "#ce9178"
-const _SYNTAX_NUMBER_COLOR := "#b5cea8"
-const _SYNTAX_KEYWORD_COLOR := "#569cd6"
-
 # 代码块语言标记别名归一化（如 ```gd``` -> gdscript）。
 const _CODE_LANG_ALIASES := {
 	"gd": "gdscript",
@@ -107,24 +100,18 @@ const UI_TEXT := {
 		"pending_notice": "上一次工具结果还没有回传。你可以丢弃待回传结果继续当前会话，或重置整个会话。",
 		"discard_pending": "丢弃待回传结果",
 		"recovered_pending": "已恢复会话 %s，存在待处理回合 %s。继续发送消息前请先处理或重置。",
-		"recovered_history": "已恢复会话 %s 的事件历史。",
 		"recovery_dismissed": "已忽略恢复信息，会话已重置。",
 		"service_manual": "AI 服务未自动启动。请连接 %s，令牌：%s",
 		"service_failed": "服务启动失败：%s",
 		"service_manual_full": "请手动启动服务。Base URL：%s  Token：%s",
-		"event_tool_results": "已收到工具结果（%s）。",
 		"event_user": "消息已提交%s。",
 		"event_with_context": "，包含项目上下文",
-		"event_tool_calls": "模型请求 %s 个工具调用（回合 %s）。",
-		"event_final": "已收到最终回复（%s 字符）。",
 		"event_error": "错误：%s",
 		"event_reset": "会话已重置。",
 		"event_config": "配置已更新（%s）。",
 		"event_compact": "已压缩会话历史：%s 个 frame，移除 %s 条消息，保留最近 %s 条，保留待处理：%s。",
 		"event_unknown": "事件：%s %s",
 		"history_restored": "已恢复上次会话记录：%s 条。",
-		"event_agent_step": "思考中：`%s`（第 %s 轮，可用工具 %s 个）。",
-		"event_agent_tools": "`%s` 请求工具：%s。",
 		"event_delegate": "Task(%s)",
 		"event_tool_start": "%s(%s)",
 		"event_tool_done": "%s 完成",
@@ -165,24 +152,18 @@ const UI_TEXT := {
 		"pending_notice": "The previous tool results have not been submitted yet. Discard them to continue this session, or reset the whole session.",
 		"discard_pending": "Discard pending results",
 		"recovered_pending": "Recovered session %s with a pending turn %s. Resolve it or reset before sending another message.",
-		"recovered_history": "Recovered session %s event history.",
 		"recovery_dismissed": "Recovery dismissed; session was reset.",
 		"service_manual": "AI service was not auto-started. Connect to %s with token: %s",
 		"service_failed": "Service failed to start: %s",
 		"service_manual_full": "Start the service manually. Base URL: %s  Token: %s",
-		"event_tool_results": "Tool results received (%s).",
 		"event_user": "Message submitted%s.",
 		"event_with_context": " with project context",
-		"event_tool_calls": "Model requested %s tool call(s) (turn %s).",
-		"event_final": "Final response received (%s chars).",
 		"event_error": "Error: %s",
 		"event_reset": "Session was reset.",
 		"event_config": "Configuration changed (%s).",
 		"event_compact": "Compacted conversation history: %s frame(s), %s message(s) removed, %s recent kept, pending preserved: %s.",
 		"event_unknown": "Event: %s %s",
 		"history_restored": "Restored previous session history: %s item(s).",
-		"event_agent_step": "Thinking: `%s` (loop %s, %s visible tool(s)).",
-		"event_agent_tools": "`%s` requested tools: %s.",
 		"event_delegate": "Task(%s)",
 		"event_tool_start": "%s(%s)",
 		"event_tool_done": "%s done",
@@ -240,25 +221,31 @@ var _interrupted_locally := false
 var _stream_key := ""
 var _stream_row: Control
 var _stream_content_rich: RichTextLabel
-var _stream_content_text := ""
 var _stream_started_ms: int = -1
 var _reasoning_key := ""
-var _reasoning_row: Control
 var _reasoning_toggle: Button
 var _reasoning_detail_rich: RichTextLabel
 var _reasoning_text := ""
 var _reasoning_started_ms: int = -1
 var _rendered_assistant_keys := {}
 var _closed_stream_keys := {}
+var _theme_colors: Dictionary = {}
 
 
 func _ready() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Initializing chat panel.")
+	_refresh_theme_colors()
 	_build_ui()
 	_build_children()
 	_connect_signals()
 	_set_state(AgentState.IDLE)
 	_fetch_initial_service_data()
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_THEME_CHANGED:
+		_refresh_theme_colors()
+		_refresh_live_theme_overrides()
 
 
 func _build_ui() -> void:
@@ -377,6 +364,149 @@ func _connect_signals() -> void:
 	if service != null:
 		service.service_started.connect(_on_service_started)
 		service.service_failed.connect(_on_service_failed)
+
+
+func _refresh_theme_colors() -> void:
+	var base := _get_editor_theme_color("base_color", Color(0.14, 0.14, 0.14))
+	var font := _get_editor_theme_color("font_color", Color(0.875, 0.875, 0.875))
+	var accent := _get_editor_theme_color("accent_color", Color(0.34, 0.62, 1.0))
+	var error := _get_editor_theme_color("error_color", Color(0.95, 0.35, 0.35))
+	var success := _get_editor_theme_color("success_color", Color(0.35, 0.82, 0.48))
+	var is_dark := base.get_luminance() < 0.5
+	var contrast := Color(1, 1, 1) if is_dark else Color(0, 0, 0)
+	var surface := base.lerp(contrast, 0.08 if is_dark else 0.04)
+	var surface_alt := base.lerp(contrast, 0.13 if is_dark else 0.07)
+	var code_bg := base.lerp(contrast, 0.16 if is_dark else 0.06)
+	var muted := font.lerp(base, 0.42)
+	var subtle := font.lerp(base, 0.62)
+	var panel_border := surface.lerp(font, 0.22)
+	var user_bg := base.lerp(accent, 0.32 if is_dark else 0.16)
+	var error_bg := base.lerp(error, 0.24 if is_dark else 0.11)
+
+	_theme_colors = {
+		"text": font,
+		"muted_text": muted,
+		"subtle_text": subtle,
+		"hover_text": font.lerp(accent, 0.28),
+		"panel_bg": surface,
+		"panel_border": panel_border,
+		"panel_alt_bg": surface_alt,
+		"panel_alt_border": surface_alt.lerp(font, 0.26),
+		"user_panel_bg": user_bg,
+		"user_panel_border": user_bg.lerp(accent, 0.55),
+		"error_panel_bg": error_bg,
+		"error_panel_border": error_bg.lerp(error, 0.55),
+		"error_text": error,
+		"success_text": success,
+		"accent_text": accent,
+		"marker_text": subtle,
+		"marker_action": accent,
+		"code_bg": code_bg,
+		"syntax_comment": _get_editor_setting_color("text_editor/theme/highlighting/comment_color", Color(0.42, 0.72, 0.36) if is_dark else Color(0.25, 0.48, 0.18)),
+		"syntax_string": _get_editor_setting_color("text_editor/theme/highlighting/string_color", Color(0.81, 0.57, 0.47) if is_dark else Color(0.62, 0.24, 0.12)),
+		"syntax_number": _get_editor_setting_color("text_editor/theme/highlighting/number_color", Color(0.71, 0.81, 0.66) if is_dark else Color(0.48, 0.40, 0.08)),
+		"syntax_keyword": _get_editor_setting_color("text_editor/theme/highlighting/keyword_color", Color(0.34, 0.61, 0.84) if is_dark else Color(0.13, 0.36, 0.77)),
+	}
+
+
+func _refresh_live_theme_overrides() -> void:
+	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+		_stream_content_rich.add_theme_color_override("default_color", _theme_color("text"))
+	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
+		_set_button_text_colors(_reasoning_toggle, _theme_color("muted_text"), _theme_color("hover_text"))
+	if _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
+		_reasoning_detail_rich.add_theme_color_override("default_color", _theme_color("muted_text"))
+
+
+func _get_editor_theme_color(name: String, fallback: Color) -> Color:
+	var editor_theme: Theme = null
+	if editor_interface != null:
+		editor_theme = editor_interface.get_editor_theme()
+	if editor_theme != null and editor_theme.has_color(name, "Editor"):
+		return editor_theme.get_color(name, "Editor")
+	if has_theme_color(name, "Editor"):
+		return get_theme_color(name, "Editor")
+	return fallback
+
+
+func _get_editor_setting_color(path: String, fallback: Color) -> Color:
+	if editor_interface == null:
+		return fallback
+	var settings := editor_interface.get_editor_settings()
+	if settings == null or not settings.has_setting(path):
+		return fallback
+	var value = settings.get_setting(path)
+	return value if value is Color else fallback
+
+
+func _fallback_theme_color(key: String) -> Color:
+	match key:
+		"text":
+			return Color(0.875, 0.875, 0.875)
+		"muted_text", "subtle_text", "marker_text":
+			return Color(0.55, 0.55, 0.55)
+		"hover_text":
+			return Color(1, 1, 1)
+		"accent_text", "marker_action":
+			return Color(0.34, 0.62, 1.0)
+		"success_text":
+			return Color(0.35, 0.82, 0.48)
+		"error_text":
+			return Color(0.95, 0.35, 0.35)
+		"code_bg":
+			return Color(0.12, 0.12, 0.12)
+		"syntax_comment":
+			return Color(0.42, 0.72, 0.36)
+		"syntax_string":
+			return Color(0.81, 0.57, 0.47)
+		"syntax_number":
+			return Color(0.71, 0.81, 0.66)
+		"syntax_keyword":
+			return Color(0.34, 0.61, 0.84)
+		"user_panel_bg":
+			return Color(0.15, 0.22, 0.27)
+		"user_panel_border":
+			return Color(0.27, 0.38, 0.44)
+		"panel_bg":
+			return Color(0.16, 0.16, 0.16)
+		"panel_border":
+			return Color(0.25, 0.25, 0.25)
+		"error_panel_bg":
+			return Color(0.23, 0.14, 0.14)
+		"error_panel_border":
+			return Color(0.50, 0.27, 0.27)
+		"panel_alt_bg":
+			return Color(0.14, 0.14, 0.14)
+		"panel_alt_border":
+			return Color(0.36, 0.36, 0.36)
+		_:
+			return Color(0.16, 0.16, 0.16)
+
+
+func _theme_color(key: String) -> Color:
+	var value = _theme_colors.get(key, _fallback_theme_color(key))
+	return value if value is Color else _fallback_theme_color(key)
+
+
+func _resolve_color(value, fallback_key: String) -> Color:
+	if value is Color:
+		return value
+	if value is String and str(value) != "":
+		return Color(str(value))
+	return _theme_color(fallback_key)
+
+
+func _color_tag(color: Color) -> String:
+	return "#" + color.to_html(color.a < 1.0)
+
+
+func _theme_color_tag(key: String) -> String:
+	return _color_tag(_theme_color(key))
+
+
+func _set_button_text_colors(button: Button, font_color: Color, hover_color: Color) -> void:
+	button.add_theme_color_override("font_color", font_color)
+	button.add_theme_color_override("font_hover_color", hover_color)
 
 
 func _on_send() -> void:
@@ -576,7 +706,7 @@ func _handle_final(response: Dictionary) -> void:
 	_discard_stream_message()
 	if not _rendered_assistant_keys.has(assistant_key):
 		_rendered_assistant_keys[assistant_key] = true
-		_append_log_stream_message(prefixed, "#dddddd")
+		_append_log_stream_message(prefixed)
 	if undo_manager != null:
 		undo_manager.commit_batch()
 	_set_state(AgentState.IDLE)
@@ -638,7 +768,7 @@ func _show_pending_results_notice() -> void:
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
-	var panel := _make_panel("#262626", "#4a4a4a")
+	var panel := _make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(panel)
 
@@ -646,7 +776,7 @@ func _show_pending_results_notice() -> void:
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	panel.add_child(body)
 
-	var label := _make_rich_text(_ui("pending_notice"), "#dddddd")
+	var label := _make_rich_text(_ui("pending_notice"))
 	body.add_child(label)
 
 	var actions := HBoxContainer.new()
@@ -930,14 +1060,6 @@ func _code_lang_for_path(path: String) -> String:
 	return ""
 
 
-func _string_array(value: Variant) -> Array[String]:
-	var result: Array[String] = []
-	if value is Array:
-		for item in value:
-			result.append(str(item))
-	return result
-
-
 func _format_event_args(payload: Dictionary) -> String:
 	var raw_args = payload.get("args", {})
 	var args: Dictionary = raw_args if raw_args is Dictionary else {}
@@ -1045,7 +1167,7 @@ func _show_inline_confirmation(calls: Array) -> void:
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
-	var panel := _make_panel("#242424", "#5c5c5c")
+	var panel := _make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(panel)
 
@@ -1068,7 +1190,7 @@ func _show_inline_confirmation(calls: Array) -> void:
 		checkbox.button_pressed = true
 		_inline_checkboxes.append(checkbox)
 		item.add_child(checkbox)
-		var preview := ToolPreviewRenderer.render_call(call)
+		var preview := ToolPreviewRenderer.render_call(call, _theme_colors)
 		preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		item.add_child(preview)
 		body.add_child(item)
@@ -1221,7 +1343,6 @@ func _on_text_delta(event: Dictionary) -> void:
 	if _should_ignore_stream_delta(key, text):
 		return
 	_ensure_stream_message(key)
-	_stream_content_text = text
 	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		_stream_content_rich.clear()
 		_stream_content_rich.append_text(_markdown_to_bbcode(text))
@@ -1263,20 +1384,10 @@ func _ensure_reasoning_entry(key: String) -> void:
 	body.add_theme_constant_override("separation", 2)
 	row.add_child(body)
 
-	var toggle := _make_workflow_toggle(_format_reasoning_header(""), "#666666")
-	body.add_child(toggle)
-
-	var detail_rich := _make_log_rich_text("", "#666666")
-	detail_rich.visible = false
-	body.add_child(detail_rich)
-
-	toggle.pressed.connect(func():
-		detail_rich.visible = not detail_rich.visible
-		_scroll_to_bottom()
-	)
+	var toggle := _make_workflow_toggle(_format_reasoning_header(""), _theme_color("muted_text"))
+	var detail_rich := _append_collapsible(body, toggle, "")
 
 	_message_list.add_child(row)
-	_reasoning_row = row
 	_reasoning_toggle = toggle
 	_reasoning_detail_rich = detail_rich
 	_scroll_to_bottom()
@@ -1329,7 +1440,7 @@ func _ensure_stream_message(key: String) -> void:
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(body)
 
-	var content_rich := _make_log_rich_text("", "#dddddd")
+	var content_rich := _make_log_rich_text("")
 	body.add_child(content_rich)
 
 	_message_list.add_child(row)
@@ -1343,13 +1454,11 @@ func _finish_streaming() -> void:
 	_stream_key = ""
 	_stream_row = null
 	_stream_content_rich = null
-	_stream_content_text = ""
 	_stream_started_ms = -1
 
 
 func _finish_reasoning_stream() -> void:
 	_reasoning_key = ""
-	_reasoning_row = null
 	_reasoning_toggle = null
 	_reasoning_detail_rich = null
 	_reasoning_text = ""
@@ -1374,7 +1483,7 @@ func _discard_stream_message() -> void:
 	_finish_streaming()
 
 
-func _append_message(role: String, text: String, color: String = "#dddddd") -> void:
+func _append_message(role: String, text: String, color = null) -> void:
 	if role == "assistant":
 		var assistant_key := _message_fingerprint(text)
 		if _rendered_assistant_keys.has(assistant_key):
@@ -1421,7 +1530,7 @@ func _message_fingerprint(text: String) -> String:
 
 
 ## Log stream action rows.
-func _append_log_stream_message(text: String, color: String = "#dddddd") -> void:
+func _append_log_stream_message(text: String, color = null) -> void:
 	for entry in _split_log_entries(_normalize_action_message(text)):
 		_append_log_entry(str(entry), color)
 	_scroll_to_bottom()
@@ -1520,7 +1629,7 @@ func _is_log_action_start(line: String) -> bool:
 		or line.begins_with("Edit ")
 
 
-func _append_log_entry(entry: String, color: String) -> void:
+func _append_log_entry(entry: String, color = null) -> void:
 	var kind := _log_entry_kind(entry)
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -1552,7 +1661,7 @@ func _make_workflow_marker(kind: String) -> Label:
 	marker.text = _workflow_marker_text(kind)
 	marker.custom_minimum_size = Vector2(24, 0)
 	marker.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	marker.add_theme_color_override("font_color", Color("#64c987") if kind in ["read", "grep", "edit"] else Color("#777777"))
+	marker.add_theme_color_override("font_color", _theme_color("marker_action") if kind in ["read", "grep", "edit"] else _theme_color("marker_text"))
 	return marker
 
 
@@ -1617,6 +1726,20 @@ func _split_thought_header(first_line: String) -> Dictionary:
 ## 渲染一个可折叠的 "Thought" 条目：标题行（如 "Thought for 3s >"）始终
 ## 显示，点击可展开/折叠详细思考文本（内联摘要 + 续行）。若没有详细文本，
 ## 仅显示标题，不提供折叠交互。
+func _append_collapsible(content: VBoxContainer, toggle: Button, detail: String) -> RichTextLabel:
+	content.add_child(toggle)
+
+	var detail_rich := _make_log_rich_text(detail, _theme_color("muted_text"))
+	detail_rich.visible = false
+	content.add_child(detail_rich)
+
+	toggle.pressed.connect(func():
+		detail_rich.visible = not detail_rich.visible
+		_scroll_to_bottom()
+	)
+	return detail_rich
+
+
 func _append_thought_entry(content: VBoxContainer, entry: String) -> void:
 	var split := _split_thought_header(_first_line(entry))
 	var header := str(split.get("header", ""))
@@ -1636,55 +1759,27 @@ func _append_thought_entry(content: VBoxContainer, entry: String) -> void:
 	if detail == "":
 		var label := Label.new()
 		label.text = title
-		label.add_theme_color_override("font_color", Color("#666666"))
+		label.add_theme_color_override("font_color", _theme_color("muted_text"))
 		content.add_child(label)
 		return
 
-	var toggle := Button.new()
-	toggle.flat = true
-	toggle.focus_mode = Control.FOCUS_NONE
-	toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
-	toggle.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	toggle.add_theme_color_override("font_color", Color("#666666"))
-	toggle.add_theme_color_override("font_hover_color", Color("#999999"))
-	toggle.text = title
-	content.add_child(toggle)
-
-	var detail_rich := _make_log_rich_text(detail, "#666666")
-	detail_rich.visible = false
-	content.add_child(detail_rich)
-
-	toggle.pressed.connect(func():
-		detail_rich.visible = not detail_rich.visible
-		toggle.text = title
-		_scroll_to_bottom()
-	)
+	_append_collapsible(content, _make_workflow_toggle(title, _theme_color("muted_text")), detail)
 
 
 func _append_read_entry(content: VBoxContainer, entry: String) -> void:
 	var header := _first_line(entry)
 	var detail := _rest_lines(entry)
 	if detail == "":
-		content.add_child(_make_log_rich_text(header, "#dddddd"))
+		content.add_child(_make_log_rich_text(header))
 		return
 
-	var toggle := _make_workflow_toggle(header, "#dddddd")
-	content.add_child(toggle)
-
-	var detail_rich := _make_log_rich_text(detail, "#9a9a9a")
-	detail_rich.visible = false
-	content.add_child(detail_rich)
-
-	toggle.pressed.connect(func():
-		detail_rich.visible = not detail_rich.visible
-		_scroll_to_bottom()
-	)
+	_append_collapsible(content, _make_workflow_toggle(header), detail)
 
 
 func _append_grep_entry(content: VBoxContainer, entry: String) -> void:
 	var rest := _rest_lines(entry)
 	if rest == "":
-		content.add_child(_make_log_rich_text(_first_line(entry), "#dddddd"))
+		content.add_child(_make_log_rich_text(_first_line(entry)))
 		return
 	var rest_lines := rest.split("\n")
 	var summary := str(rest_lines[0]).strip_edges()
@@ -1695,37 +1790,26 @@ func _append_grep_entry(content: VBoxContainer, entry: String) -> void:
 	if summary != "":
 		header += " - " + summary
 	if details.is_empty():
-		content.add_child(_make_log_rich_text(header, "#dddddd"))
+		content.add_child(_make_log_rich_text(header))
 		return
 
-	var toggle := _make_workflow_toggle(header, "#dddddd")
-	content.add_child(toggle)
-
-	var detail_rich := _make_log_rich_text("\n".join(details), "#888888")
-	detail_rich.visible = false
-	content.add_child(detail_rich)
-
-	toggle.pressed.connect(func():
-		detail_rich.visible = not detail_rich.visible
-		_scroll_to_bottom()
-	)
+	_append_collapsible(content, _make_workflow_toggle(header), "\n".join(details))
 
 
 func _append_edit_entry(content: VBoxContainer, entry: String) -> void:
-	content.add_child(_make_log_rich_text(_first_line(entry), "#dddddd"))
+	content.add_child(_make_log_rich_text(_first_line(entry)))
 	var stats := _format_edit_stats(_rest_lines(entry))
 	if stats != "":
-		content.add_child(_make_log_rich_text(stats, "#88c999"))
+		content.add_child(_make_log_rich_text(stats, _theme_color("success_text")))
 
 
-func _make_workflow_toggle(text: String, color: String) -> Button:
+func _make_workflow_toggle(text: String, color = null) -> Button:
 	var toggle := Button.new()
 	toggle.flat = true
 	toggle.focus_mode = Control.FOCUS_NONE
 	toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
 	toggle.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	toggle.add_theme_color_override("font_color", Color(color))
-	toggle.add_theme_color_override("font_hover_color", Color("#ffffff"))
+	_set_button_text_colors(toggle, _resolve_color(color, "text"), _theme_color("hover_text"))
 	toggle.text = text
 	return toggle
 
@@ -1741,7 +1825,7 @@ func _format_edit_stats(detail: String) -> String:
 	return "+%d -%d lines" % [added, removed]
 
 
-func _make_log_rich_text(text: String, color: String) -> RichTextLabel:
+func _make_log_rich_text(text: String, color = null) -> RichTextLabel:
 	var rich := _make_rich_text(text, color)
 	rich.add_theme_constant_override("line_separation", 1)
 	return rich
@@ -1838,27 +1922,27 @@ func _append_tool_result(call: Dictionary, result: Dictionary) -> void:
 	var detail := _format_tool_result_detail(name, input, status, result)
 	if status == "applied":
 		detail = _format_log_tool_result(name, input, result, detail)
-	var color := "#e08080" if status == "error" else "#dddddd"
+	var color := _theme_color("error_text") if status == "error" else _theme_color("text")
 	_append_message("system", detail, color)
 
 
 func _make_message_panel(role: String) -> PanelContainer:
 	match role:
 		"user":
-			return _make_panel("#263744", "#45606f")
+			return _make_panel(_theme_color("user_panel_bg"), _theme_color("user_panel_border"))
 		"assistant":
-			return _make_panel("#202020", "#3d3d3d")
+			return _make_panel(_theme_color("panel_bg"), _theme_color("panel_border"))
 		"error":
-			return _make_panel("#3b2424", "#804444")
+			return _make_panel(_theme_color("error_panel_bg"), _theme_color("error_panel_border"))
 		_:
-			return _make_panel("#252525", "#3f3f3f")
+			return _make_panel(_theme_color("panel_bg"), _theme_color("panel_border"))
 
 
-func _make_panel(bg_color: String, border_color: String) -> PanelContainer:
+func _make_panel(bg_color = null, border_color = null) -> PanelContainer:
 	var panel := PanelContainer.new()
 	var style := StyleBoxFlat.new()
-	style.bg_color = Color(bg_color)
-	style.border_color = Color(border_color)
+	style.bg_color = _resolve_color(bg_color, "panel_bg")
+	style.border_color = _resolve_color(border_color, "panel_border")
 	style.set_border_width_all(1)
 	style.set_corner_radius_all(6)
 	style.set_content_margin(SIDE_LEFT, 10)
@@ -1869,7 +1953,7 @@ func _make_panel(bg_color: String, border_color: String) -> PanelContainer:
 	return panel
 
 
-func _make_rich_text(text: String, color: String) -> RichTextLabel:
+func _make_rich_text(text: String, color = null) -> RichTextLabel:
 	var rich := RichTextLabel.new()
 	rich.bbcode_enabled = true
 	rich.selection_enabled = true
@@ -1878,7 +1962,8 @@ func _make_rich_text(text: String, color: String) -> RichTextLabel:
 	rich.scroll_active = false
 	rich.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	rich.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	rich.add_theme_color_override("default_color", Color(color))
+	rich.add_theme_stylebox_override("normal", StyleBoxEmpty.new())
+	rich.add_theme_color_override("default_color", _resolve_color(color, "text"))
 	_apply_mono_font(rich)
 	rich.append_text(_markdown_to_bbcode(text))
 	return rich
@@ -1951,7 +2036,7 @@ func _markdown_to_bbcode(text: String) -> String:
 			else:
 				in_code = true
 				code_lang = _normalize_code_lang(line.substr(3))
-				result.append("[bgcolor=%s][code]" % _CODE_BLOCK_BG)
+				result.append("[bgcolor=%s][code]" % _theme_color_tag("code_bg"))
 			index += 1
 			continue
 		if in_code:
@@ -1962,7 +2047,7 @@ func _markdown_to_bbcode(text: String) -> String:
 			tree_range_index += 1
 		if tree_range_index < tree_ranges.size() and int(tree_ranges[tree_range_index].x) == index:
 			var tree_range: Vector2i = tree_ranges[tree_range_index]
-			result.append("[bgcolor=%s][code]" % _CODE_BLOCK_BG)
+			result.append("[bgcolor=%s][code]" % _theme_color_tag("code_bg"))
 			for tree_index in range(tree_range.x, tree_range.y):
 				result.append(_escape_bbcode(str(lines[tree_index])))
 			result.append("[/code][/bgcolor]")
@@ -2031,7 +2116,7 @@ func _markdown_line_to_bbcode(line: String) -> String:
 	var escaped := _escape_bbcode(line)
 	var stripped := line.strip_edges()
 	if stripped == "---" or stripped == "***" or stripped == "___":
-		return "[color=#666666]────────────────────────[/color]"
+		return "[color=%s]────────────────────────[/color]" % _theme_color_tag("subtle_text")
 	if line.begins_with("### "):
 		return "[b]" + _escape_bbcode(line.substr(4)) + "[/b]"
 	if line.begins_with("## "):
@@ -2161,7 +2246,7 @@ func _highlight_code_line(line: String, lang: String) -> String:
 			var code_part := line.substr(0, comment_index)
 			var comment_part := line.substr(comment_index)
 			return _highlight_code_segment(code_part, lang) \
-				+ "[color=%s]%s[/color]" % [_SYNTAX_COMMENT_COLOR, _escape_bbcode(comment_part)]
+				+ "[color=%s]%s[/color]" % [_theme_color_tag("syntax_comment"), _escape_bbcode(comment_part)]
 	return _highlight_code_segment(line, lang)
 
 
@@ -2210,7 +2295,7 @@ func _highlight_code_segment(text: String, lang: String) -> String:
 				if next_char == quote:
 					break
 			var literal := text.substr(index, end - index)
-			result += "[color=%s]%s[/color]" % [_SYNTAX_STRING_COLOR, _escape_bbcode(literal)]
+			result += "[color=%s]%s[/color]" % [_theme_color_tag("syntax_string"), _escape_bbcode(literal)]
 			index = end
 			continue
 		if (code >= 65 and code <= 90) or (code >= 97 and code <= 122) or code == 95:
@@ -2226,7 +2311,7 @@ func _highlight_code_segment(text: String, lang: String) -> String:
 				end += 1
 			var word := text.substr(index, end - index)
 			if keywords.has(word):
-				result += "[color=%s]%s[/color]" % [_SYNTAX_KEYWORD_COLOR, _escape_bbcode(word)]
+				result += "[color=%s]%s[/color]" % [_theme_color_tag("syntax_keyword"), _escape_bbcode(word)]
 			else:
 				result += _escape_bbcode(word)
 			index = end
@@ -2239,7 +2324,7 @@ func _highlight_code_segment(text: String, lang: String) -> String:
 					end += 1
 				else:
 					break
-			result += "[color=%s]%s[/color]" % [_SYNTAX_NUMBER_COLOR, _escape_bbcode(text.substr(index, end - index))]
+			result += "[color=%s]%s[/color]" % [_theme_color_tag("syntax_number"), _escape_bbcode(text.substr(index, end - index))]
 			index = end
 			continue
 		result += _escape_bbcode(character)
