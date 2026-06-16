@@ -179,6 +179,7 @@ var _reasoning_detail_rich: RichTextLabel
 var _reasoning_text := ""
 var _reasoning_started_ms: int = -1
 var _rendered_assistant_keys := {}
+var _live_response_keys := {}   # 仅追踪本轮实时响应，避免历史加载的指纹误判为重复
 var _closed_stream_keys := {}
 var _closed_reasoning_keys := {}   # 新增：专门追踪已关闭的 reasoning stream
 var _theme_colors: Dictionary = {}
@@ -524,6 +525,7 @@ func _on_send() -> void:
 	_finish_reasoning_stream()
 	_closed_stream_keys.clear()
 	_closed_reasoning_keys.clear()   # 新增
+	_live_response_keys.clear()
 	_input.clear()
 	_append_message("user", text)
 	_append_message("system", _ui("waiting_model"))
@@ -534,10 +536,14 @@ func _on_send() -> void:
 
 
 func _on_response(response: Dictionary) -> void:
+	FrontendLogger.debug(editor_interface, "ChatPanel", "=== Response received ===", {
+		"keys": str(response.keys()), "type": str(response.get("type", "data"))
+	})
 	if _interrupted_locally and str(response.get("type", "")) in ["tool_calls", "final", "error"]:
 		FrontendLogger.info(editor_interface, "ChatPanel", "Suppressed response after interrupt.", {
 			"type": str(response.get("type", ""))
 		})
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[response] SUPPRESSED due to interrupt")
 		return
 	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling response.", {
 		"type": str(response.get("type", "data")),
@@ -583,21 +589,31 @@ func _on_response(response: Dictionary) -> void:
 
 	match str(response.get("type", "")):
 		"tool_calls":
+			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: tool_calls")
 			_handle_tool_calls(response)
 		"final":
+			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: final")
 			_handle_final(response)
 		"error":
+			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: error", {
+				"text": str(response.get("text", ""))
+			})
 			_on_error(str(response.get("text", "Unknown error")))
 		_:
+			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: unknown", {
+				"type": str(response.get("type", ""))
+			})
 			_append_message("system", JSON.stringify(response, "\t"))
 
 
 func _handle_tool_calls(response: Dictionary) -> void:
 	var calls: Array = response.get("calls", [])
 	FrontendLogger.info(editor_interface, "ChatPanel", "Handling tool calls.", {"count": calls.size()})
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_calls] count", {"count": calls.size()})
 
 	if _state == AgentState.WAITING_CONFIRM:
 		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring tool_calls while a previous batch is still pending confirmation.", {"count": calls.size()})
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_calls] IGNORED - already waiting confirm")
 		return
 
 	_mark_current_stream_closed()
@@ -609,6 +625,16 @@ func _handle_tool_calls(response: Dictionary) -> void:
 			confirm.append(call)
 		else:
 			silent.append(call)
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_calls] split", {
+		"silent": silent.size(), "confirm": confirm.size()
+	})
+	for call in calls:
+		if call is Dictionary:
+			FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_calls] call", {
+				"name": str(call.get("name", "")),
+				"needs_confirm": bool(call.get("needs_confirm", false)),
+				"input": call.get("input", {})
+			})
 
 	for call in confirm:
 		if call is Dictionary:
@@ -671,7 +697,14 @@ func _strip_think_xml(text: String) -> String:
 			break
 		result = result.substr(0, start) + result.substr(end_tag + "</think>".length())
 		start = result.find("<think>")
-	return result.replace("</think>", "")
+	result = result.replace("</think>", "")
+	# 如果移除 <think> 块后文本变空或几乎为空，记录警告
+	if result.strip_edges().is_empty() and text.strip_edges().length() > 10:
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[strip_think_xml] WARNING: text becomes EMPTY after stripping", {
+			"original_length": text.strip_edges().length(),
+			"preview": text.left(100).replace("\n", "\\n")
+		})
+	return result
 
 
 ## 若回复以 `Thought: ...` 摘要行开头，拆分出摘要文本与剩余正文。
@@ -682,6 +715,14 @@ func _split_thought_summary(text: String) -> Dictionary:
 	var newline := stripped.find("\n")
 	var first_line := stripped if newline == -1 else stripped.substr(0, newline)
 	var rest := "" if newline == -1 else stripped.substr(newline + 1)
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[split_thought_summary] Thought found", {
+		"summary_len": first_line.length(), "rest_len": rest.strip_edges().length()
+	})
+	# 如果 Thought 之后没有正文，记录警告
+	if rest.strip_edges().is_empty():
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[split_thought_summary] WARNING: no body text after Thought summary", {
+			"preview": text.left(150).replace("\n", "\\n")
+		})
 	return {
 		"summary": first_line.substr("Thought:".length()).strip_edges(),
 		"rest": rest.strip_edges()
@@ -713,11 +754,23 @@ func _handle_final(response: Dictionary) -> void:
 	var split := _split_thought_summary(text)
 	var rest := str(split.get("rest", ""))
 	var render_text := rest if rest.strip_edges() != "" else text
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[handle_final]", {
+		"text_len": text.length(),
+		"render_text_len": render_text.strip_edges().length(),
+		"assistant_key": assistant_key
+	})
+	if render_text.strip_edges().is_empty():
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[handle_final] WARNING: render_text is EMPTY", {
+			"preview": text.left(200).replace("\n", "\\n")
+		})
 	_mark_current_stream_closed()
 	_mark_reasoning_stream_closed()   # 阻止后续迟到的 reasoning delta
 	_finish_reasoning_stream()         # 置空 toggle，停止 _process 刷新
 
-	if not _rendered_assistant_keys.has(assistant_key):
+	# 用 _live_response_keys（每次 send 清空）判断本轮是否已渲染，避免历史加载的
+	# 指纹污染 _rendered_assistant_keys 导致当前回复被误判为重复而丢弃。
+	if not _live_response_keys.has(assistant_key):
+		_live_response_keys[assistant_key] = true
 		_rendered_assistant_keys[assistant_key] = true
 		if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 			_stream_content_rich.clear()
@@ -731,6 +784,7 @@ func _handle_final(response: Dictionary) -> void:
 			_append_log_stream_message(render_text)
 			_indent_current_text = false
 	else:
+		FrontendLogger.debug(editor_interface, "ChatPanel", "Skipped duplicate final response.", {"key_len": assistant_key.length()})
 		_discard_stream_message()
 	if undo_manager != null:
 		undo_manager.commit_batch()
@@ -745,6 +799,13 @@ func _handle_session_history(response: Dictionary) -> void:
 	if _state != AgentState.IDLE:
 		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored session history while a turn is active.", {
 			"state": _status.text
+		})
+		return
+	# 消息列表已有内容说明当前会话已在进行，忽略此次历史加载（防止服务重启触发
+	# 的意外历史响应覆盖当前对话内容）。
+	if _message_list.get_child_count() > 0:
+		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored session history: messages already present.", {
+			"count": _message_list.get_child_count()
 		})
 		return
 	var items: Array = response.get("items", [])
@@ -897,6 +958,7 @@ func _on_recovery_accepted(pointer: Dictionary) -> void:
 		"pending_turn_id": str(pointer.get("pending_turn_id", ""))
 	})
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", str(pointer.get("session_id", "default")))
+	_clear_messages()   # 清空当前内容，确保历史加载时消息列表为空
 	_http_client.resume_from_pointer(pointer)
 	_http_client.fetch_session_history()
 	if state_store != null:
@@ -954,8 +1016,59 @@ func _on_events(events: Array) -> void:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "Suppressed events after interrupt.", {"count": events.size()})
 		return
 	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling events.", {"count": events.size()})
-	for event in events:
+	FrontendLogger.debug(editor_interface, "ChatPanel", "=== Received events ===", {"count": events.size()})
+	for i in range(events.size()):
+		var event = events[i]
 		if event is Dictionary:
+			var event_type := str(event.get("type", "<unknown>"))
+			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+			var turn_id := str(event.get("turn_id", event.get("payload", {}).get("turn_id", "") if event.get("payload", {}) is Dictionary else ""))
+			FrontendLogger.debug(editor_interface, "ChatPanel", "Event detail", {
+				"index": i, "type": event_type, "turn_id": turn_id, "payload_keys": str(payload.keys())
+			})
+			# 针对特定事件类型打印更多细节
+			match event_type:
+				"agent_text_delta", "agent_reasoning_delta":
+					var text := str(payload.get("text", ""))
+					var preview := text.left(80) + "..." if text.length() > 80 else text
+					FrontendLogger.debug(editor_interface, "ChatPanel", "delta preview", {
+						"preview": preview.replace("\n", "\\n")
+					})
+				"server_tool_start":
+					var tool := str(payload.get("tool", ""))
+					var args = payload.get("args", {})
+					FrontendLogger.debug(editor_interface, "ChatPanel", "server_tool_start detail", {
+						"tool": tool, "args": args if args is Dictionary else {}
+					})
+				"server_tool_result":
+					var tool := str(payload.get("tool", ""))
+					var is_error := bool(payload.get("is_error", false))
+					var result_count = payload.get("result_count")
+					FrontendLogger.debug(editor_interface, "ChatPanel", "server_tool_result detail", {
+						"tool": tool, "is_error": is_error, "result_count": result_count
+					})
+				"user_submitted":
+					var has_context := bool(payload.get("has_context", false))
+					FrontendLogger.debug(editor_interface, "ChatPanel", "user_submitted detail", {
+						"has_context": has_context
+					})
+				"error":
+					var text := str(payload.get("text", ""))
+					FrontendLogger.debug(editor_interface, "ChatPanel", "error detail", {
+						"error_text": text
+					})
+				"compact_boundary":
+					FrontendLogger.debug(editor_interface, "ChatPanel", "compact_boundary detail", {
+						"compacted_frames": payload.get("compacted_frames", 0),
+						"removed_messages": payload.get("removed_messages", 0),
+						"keep_recent": payload.get("keep_recent", 0),
+						"pending_preserved": payload.get("pending_preserved", false)
+					})
+				"config_changed":
+					FrontendLogger.debug(editor_interface, "ChatPanel", "config_changed detail", {
+						"effort": payload.get("effort", "-"),
+						"output_style": payload.get("output_style", "-")
+					})
 			_event_queue.append(event)
 	if not _draining_events:
 		_drain_event_queue()
@@ -971,9 +1084,13 @@ func _drain_event_queue() -> void:
 		_draining_events = false
 		return
 	var event: Dictionary = _event_queue.pop_front()
+	var event_type := str(event.get("type", ""))
+	var remaining := _event_queue.size()
+	FrontendLogger.debug(editor_interface, "ChatPanel", ">> Draining event", {
+		"type": event_type, "queue_remaining": remaining
+	})
 	if state_store != null:
 		state_store.add_event(event)
-	var event_type := str(event.get("type", ""))
 	if event_type == "agent_reasoning_delta":
 		_on_reasoning_delta(event)
 	elif event_type == "agent_text_delta":
@@ -985,7 +1102,12 @@ func _drain_event_queue() -> void:
 			_set_state(AgentState.COMPACTING)
 		var description := EventFormatter.describe_event(event, _ui_table())
 		if description != "":
+			FrontendLogger.debug(editor_interface, "ChatPanel", "-> rendered", {
+				"description": description
+			})
 			_append_message("system", description)
+		else:
+			FrontendLogger.debug(editor_interface, "ChatPanel", "-> (no description, skipped)")
 		if is_compacting:
 			_set_state(previous_state)
 	call_deferred("_drain_event_queue")
@@ -1214,8 +1336,14 @@ func _on_reasoning_delta(event: Dictionary) -> void:
 	var payload: Dictionary = event.get("payload", {})
 	var key := _stream_event_key(payload)
 	if key != "" and _closed_reasoning_keys.has(key):
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta] IGNORED - key already closed", {
+			"key": key
+		})
 		return
 	var text := str(payload.get("text", ""))
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta]", {
+		"key": key, "text_len": text.length(), "preview": text.left(60).replace("\n", "\\n")
+	})
 	_ensure_reasoning_entry(key)
 	_reasoning_text = text
 	_update_reasoning_entry()
@@ -1225,16 +1353,29 @@ func _on_text_delta(event: Dictionary) -> void:
 	var payload: Dictionary = event.get("payload", {})
 	var text := str(payload.get("text", ""))
 	var key := _stream_event_key(payload)
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta]", {
+		"key": key, "text_len": text.length(), "preview": text.left(60).replace("\n", "\\n")
+	})
 	if _should_ignore_stream_delta(key, text):
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta] IGNORED by _should_ignore_stream_delta")
 		return
 	_mark_reasoning_stream_closed()   # 防止迟到的 reasoning delta 再创建条目
 	_finish_reasoning_stream()         # 置空 toggle，停止 _process 中的计时刷新
 	var stripped := _strip_think_xml(text)
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta] after strip_think_xml", {
+		"len": stripped.strip_edges().length(), "empty": stripped.strip_edges().is_empty()
+	})
 	var parts := _split_thought_summary(stripped)
 	var rest := str(parts.get("rest", ""))
 	_stream_display_text = rest if rest.strip_edges() != "" else stripped
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta] final display_text", {
+		"len": _stream_display_text.strip_edges().length(), "empty": _stream_display_text.strip_edges().is_empty()
+	})
 	_stream_text_dirty = true
 	_ensure_stream_message(key, true)
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta] rendered", {
+		"display_text_len": _stream_display_text.length()
+	})
 
 
 func _stream_event_key(payload: Dictionary) -> String:
@@ -1244,8 +1385,9 @@ func _stream_event_key(payload: Dictionary) -> String:
 func _should_ignore_stream_delta(key: String, text: String) -> bool:
 	if key != "" and _closed_stream_keys.has(key):
 		return true
+	# 只检查本轮实时响应的指纹，避免历史加载的 _rendered_assistant_keys 误拦截当前回复。
 	var text_key := _message_fingerprint(text)
-	if text_key != "" and _rendered_assistant_keys.has(text_key):
+	if text_key != "" and _live_response_keys.has(text_key):
 		if _stream_key == key:
 			_discard_stream_message()
 		return true
@@ -1395,6 +1537,10 @@ func _append_tool_result(call: Dictionary, result: Dictionary) -> void:
 	var detail := EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
 	if status == "applied":
 		detail = EventFormatter.format_log_tool_result(name, input, result, detail)
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_result]", {
+		"name": name, "status": status, "detail_len": detail.length(),
+		"detail": detail.left(120).replace("\n", "\\n")
+	})
 	var color := _theme_color("error_text") if status == "error" else _theme_color("text")
 	_append_message("system", detail, color)
 
@@ -1403,6 +1549,7 @@ func _clear_messages() -> void:
 	_finish_streaming()
 	_finish_reasoning_stream()
 	_rendered_assistant_keys.clear()
+	_live_response_keys.clear()
 	_closed_stream_keys.clear()
 	_closed_reasoning_keys.clear()   # 新增
 	for child in _message_list.get_children():
@@ -1419,7 +1566,7 @@ func _on_scroll_value_changed(value: float) -> void:
 
 	var bar := _scroll.get_v_scroll_bar()
 	var scroll_max := bar.max_value - bar.page
-	var is_at_bottom := scroll_max <= 0 or value >= scroll_max - 40
+	var is_at_bottom := scroll_max <= 0 or value >= scroll_max - 80
 
 	if is_at_bottom:
 		_auto_scroll = true

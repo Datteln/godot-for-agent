@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -18,6 +19,41 @@ def normalize_log_level(level: str) -> str:
     """规范化日志等级字符串，非法值回退为 INFO。"""
     normalized = level.strip().upper()
     return normalized if normalized in _VALID_LEVELS else "INFO"
+
+
+class _SafeRotatingFileHandler(RotatingFileHandler):
+    """Windows 兼容的轮转文件处理器。"""
+
+    def doRollover(self) -> None:
+        """尝试标准轮转；失败时将旧文件改为时间戳备份后新建文件。"""
+        try:
+            super().doRollover()
+            return
+        except (PermissionError, OSError):
+            pass
+
+        # 标准轮转失败，回退策略：
+        # 1. 关闭当前写入流（确保缓冲区刷出）
+        if self.stream:
+            try:
+                self.stream.close()
+            except OSError:
+                pass
+            self.stream = None
+
+        # 2. 尝试把当前文件重命名为带时间戳的备份
+        log_path = Path(self.baseFilename)
+        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup_path = log_path.with_name(f"{log_path.stem}_{timestamp}{log_path.suffix}")
+        try:
+            if log_path.exists():
+                log_path.rename(backup_path)
+        except (PermissionError, OSError):
+            # 重命名也失败（文件仍被锁住），保留原文件不动
+            pass
+
+        # 3. 打开新的 service.log 继续写入
+        self.stream = self._open()
 
 
 def configure_logging(level: str, log_dir: Path | None = None) -> None:
@@ -43,10 +79,10 @@ def configure_logging(level: str, log_dir: Path | None = None) -> None:
     console_handler.setFormatter(formatter)
     root.addHandler(console_handler)
 
-    # 文件输出（带轮转）
+    # 文件输出（带 Windows 安全轮转）
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(
+        file_handler = _SafeRotatingFileHandler(
             filename=log_dir / "service.log",
             maxBytes=_MAX_LOG_BYTES,
             backupCount=_BACKUP_COUNT,
