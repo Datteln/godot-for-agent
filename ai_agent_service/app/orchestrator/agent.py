@@ -763,6 +763,32 @@ async def run_turn(
             logger.error("Agent run_turn failed: empty frame stack session=%s", session.session_id)
             return ErrorResult(text="会话没有活跃的 agent 帧")
 
+        if frame.turns_used >= frame.agent.max_turns:
+            if len(session.agent_stack) <= 1:
+                logger.warning(
+                    "Agent run_turn reached root frame max turns session=%s agent=%s max_turns=%d",
+                    session.session_id,
+                    frame.agent.name,
+                    frame.agent.max_turns,
+                )
+                return ErrorResult(text="已达到本轮最大循环次数，请精简任务或拆分请求后重试")
+            logger.warning(
+                "Delegate frame reached its max turns session=%s frame=%s agent=%s max_turns=%d",
+                session.session_id,
+                frame.id,
+                frame.agent.name,
+                frame.agent.max_turns,
+            )
+            _finish_frame(
+                session,
+                f"子 agent「{frame.agent.name}」已达到自身最大循环次数（{frame.agent.max_turns}），"
+                "任务未完成，已强制收尾。以上为已执行步骤记录，请据此判断是否需要重新拆分任务或继续委派。",
+                agent_prompt_factory,
+            )
+            continue
+
+        frame.turns_used += 1
+
         try:
             visible_tools = tools_for(frame.agent.effective_tools, frame.active_deferred_tools)
             logger.info(

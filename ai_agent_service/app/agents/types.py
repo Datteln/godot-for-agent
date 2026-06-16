@@ -105,6 +105,8 @@ class Frame:
         depth: 帧深度，根帧为 0，供 `MAX_DEPTH` 防御性约束使用（M2+）。
         active_deferred_tools: 本帧通过 `search_tools` 激活的 deferred 工具名；
             只在本帧内生效，不提升权限、不跨 agent 继承。
+        turns_used: 本帧已消耗的 LLM 往返轮数，用于按 `agent.max_turns`
+            做按帧的循环预算控制（见 `orchestrator/agent.py::run_turn`）。
     """
 
     id: str
@@ -116,3 +118,4 @@ class Frame:
     status: Literal["running", "suspended", "done"] = "running"
     depth: int = 0
     active_deferred_tools: set[str] = field(default_factory=set)
+    turns_used: int = 0

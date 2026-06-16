@@ -143,18 +143,110 @@ def _display_user_content(content: str) -> str:
     return content
 
 
+_HISTORY_PREVIEW_LIMIT = 2000
+
+# 与 chat_panel.gd 中 `_TOOL_DISPLAY_NAMES`/`_format_log_tool_result` 的分组保持一致，
+# 使会话历史里的工具结果摘要能复用前端既有的 "Read"/"Edit"/"Grep" 工作流分组渲染。
+_HISTORY_READ_TOOLS = frozenset({"read_file", "read_script"})
+_HISTORY_EDIT_TOOLS = frozenset(
+    {
+        "write_file",
+        "propose_script_edit",
+        "apply_text_edit",
+        "propose_tests",
+        "propose_content_file",
+    }
+)
+_HISTORY_GREP_TOOLS = frozenset({"grep_code", "search_codebase", "list_files"})
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    # 按字符数截断超长文本，避免会话历史里堆入过长内容。
+    if len(text) > max_chars:
+        return text[:max_chars] + "\n... (truncated)"
+    return text
+
+
 def _display_tool_content(content: str) -> str:
-    """Pretty-print JSON tool content when possible."""
+    """Pretty-print JSON tool content when possible，并截断过长内容。"""
     try:
         parsed = json.loads(content)
     except (TypeError, json.JSONDecodeError):
-        return content
-    return "```json\n" + json.dumps(parsed, ensure_ascii=False, indent=2) + "\n```"
+        return _truncate_text(content, _HISTORY_PREVIEW_LIMIT)
+    text = json.dumps(parsed, ensure_ascii=False, indent=2)
+    return "```json\n" + _truncate_text(text, _HISTORY_PREVIEW_LIMIT) + "\n```"
+
+
+def _count_lines(text: str) -> int:
+    # 统计文本行数；空字符串视为 0 行。
+    if text == "":
+        return 0
+    return len(text.split("\n"))
+
+
+def _parse_tool_call_arguments(raw_arguments: Any) -> dict[str, Any]:
+    # 解析 `tool_calls[].function.arguments`（JSON 字符串或已是字典）为入参字典。
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if not isinstance(raw_arguments, str):
+        return {}
+    try:
+        parsed = json.loads(raw_arguments or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _format_tool_result_summary(name: str, input_args: dict[str, Any], content: str) -> str:
+    """把一次工具结果压缩为与实时模式一致的简短摘要行。
+
+    与 `chat_panel.gd` 的 `_format_log_tool_result` 保持同构：读取类工具展示
+    `Read <path> (lines 1-N)`，写入/编辑类工具展示 `Edit <path>\\n+N -M lines`，
+    检索类工具展示 `Grep "<pattern>" (in project)`，使前端能复用既有的工作流
+    分组渲染，而不是把完整结果 JSON（如整份文件内容）堆进会话历史。
+
+    Args:
+        name: 工具名（如 `read_file`）；找不到对应 tool_call 时为空字符串。
+        input_args: 对应工具调用的入参字典；找不到时为空字典。
+        content: 工具结果消息的原始 `content`（通常是 JSON 字符串）。
+
+    Returns:
+        适合直接展示在会话历史中的摘要文本。
+    """
+    try:
+        parsed = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        parsed = None
+    inner: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
+
+    error_message = inner.get("error")
+    if isinstance(error_message, str):
+        return f"{name}: {error_message}"
+
+    if name in _HISTORY_READ_TOOLS:
+        path = str(inner.get("path", input_args.get("path", "<unknown>")))
+        line_count = _count_lines(str(inner.get("content", "")))
+        return f"Read {path} (lines 1-{line_count})"
+
+    if name in _HISTORY_EDIT_TOOLS:
+        path = str(inner.get("path", input_args.get("path", input_args.get("target_path", "<unknown>"))))
+        after_text = str(input_args.get("content", input_args.get("after_text", "")))
+        before_text = str(input_args.get("before_text", input_args.get("before", "")))
+        added = max(_count_lines(after_text) - _count_lines(before_text), 0)
+        removed = max(_count_lines(before_text) - _count_lines(after_text), 0)
+        return f"Edit {path}\n+{added} -{removed} lines"
+
+    if name in _HISTORY_GREP_TOOLS:
+        pattern = str(input_args.get("pattern", input_args.get("query", input_args.get("include", ""))))
+        return 'Grep "%s" (in project)' % pattern.replace('"', '\\"')
+
+    return _display_tool_content(content)
 
 
 def _history_items_for_frame(frame: Frame, *, include_system_prompt: bool = False) -> list[SessionHistoryItemDTO]:
     """Convert stored LLM messages into chat-panel friendly history items."""
     items: list[SessionHistoryItemDTO] = []
+    tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
     for index, message in enumerate(frame.messages):
         role = str(message.get("role", "system"))
         content = message.get("content", "")
@@ -191,8 +283,13 @@ def _history_items_for_frame(frame: Frame, *, include_system_prompt: bool = Fals
                         continue
                     function = call.get("function", {})
                     name = "unknown"
+                    arguments: dict[str, Any] = {}
                     if isinstance(function, dict):
                         name = str(function.get("name", "unknown"))
+                        arguments = _parse_tool_call_arguments(function.get("arguments"))
+                    call_id = str(call.get("id", ""))
+                    if call_id:
+                        tool_calls_by_id[call_id] = (name, arguments)
                     lines.append(f"- `{name}`")
                 items.append(
                     SessionHistoryItemDTO(
@@ -206,11 +303,11 @@ def _history_items_for_frame(frame: Frame, *, include_system_prompt: bool = Fals
 
         if role == "tool":
             tool_call_id = str(message.get("tool_call_id", ""))
-            heading = f"Tool result `{tool_call_id}`" if tool_call_id else "Tool result"
+            tool_name, tool_args = tool_calls_by_id.get(tool_call_id, ("", {}))
             items.append(
                 SessionHistoryItemDTO(
                     role="system",
-                    text=heading + "\n\n" + _display_tool_content(text),
+                    text=_format_tool_result_summary(tool_name, tool_args, text),
                     frame_id=frame.id,
                     agent=frame.agent.name,
                 )

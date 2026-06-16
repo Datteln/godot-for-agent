@@ -86,7 +86,7 @@ const UI_TEXT := {
 		"reset": "重置",
 		"input_placeholder": "向 AI Agent 提问...",
 		"idle": "空闲",
-		"waiting_model": "等待模型响应",
+		"waiting_model": "等待模型响应...",
 		"waiting_confirm": "等待工具确认",
 		"executing": "正在执行工具",
 		"compacting": "正在压缩会话历史",
@@ -138,7 +138,7 @@ const UI_TEXT := {
 		"reset": "Reset",
 		"input_placeholder": "Ask the AI agent...",
 		"idle": "Idle",
-		"waiting_model": "Waiting for model",
+		"waiting_model": "Waiting for model...",
 		"waiting_confirm": "Waiting for confirmation",
 		"executing": "Executing tools",
 		"compacting": "Compacting conversation history",
@@ -217,6 +217,7 @@ var _inline_reject_btn: Button
 var _inline_confirm_box: Control
 var _inline_busy := false
 var _interrupted_locally := false
+var _indent_current_text := false   # 仅对普通文本条目（kind="text"）缩进
 
 var _stream_key := ""
 var _stream_row: Control
@@ -230,6 +231,7 @@ var _reasoning_started_ms: int = -1
 var _rendered_assistant_keys := {}
 var _closed_stream_keys := {}
 var _theme_colors: Dictionary = {}
+var _auto_scroll := true
 
 
 func _ready() -> void:
@@ -307,7 +309,7 @@ func _build_ui() -> void:
 
 	_message_list = VBoxContainer.new()
 	_message_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_message_list.add_theme_constant_override("separation", 4)
+	_message_list.add_theme_constant_override("separation", 10)
 	_scroll.add_child(_message_list)
 
 	var bottom := HBoxContainer.new()
@@ -361,6 +363,7 @@ func _connect_signals() -> void:
 	_http_client.error_occurred.connect(_on_error)
 	_recovery_prompt.accepted_recovery.connect(_on_recovery_accepted)
 	_recovery_prompt.rejected_recovery.connect(_on_recovery_rejected)
+	_scroll.get_v_scroll_bar().value_changed.connect(_on_scroll_value_changed)
 	if service != null:
 		service.service_started.connect(_on_service_started)
 		service.service_failed.connect(_on_service_failed)
@@ -504,6 +507,15 @@ func _theme_color_tag(key: String) -> String:
 	return _color_tag(_theme_color(key))
 
 
+## "●" 使用强调色（与 Read/Grep/Edit 一致），"✻" 使用较弱的文字色。
+func _marker_color(marker_text: String) -> Color:
+	return _theme_color("marker_action") if marker_text == "●" else _theme_color("marker_text")
+
+
+func _marker_color_tag(marker_text: String) -> String:
+	return _color_tag(_marker_color(marker_text))
+
+
 func _set_button_text_colors(button: Button, font_color: Color, hover_color: Color) -> void:
 	button.add_theme_color_override("font_color", font_color)
 	button.add_theme_color_override("font_hover_color", hover_color)
@@ -518,6 +530,7 @@ func _on_send() -> void:
 		})
 		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length()})
+	_auto_scroll = true
 	_interrupted_locally = false
 	_finish_streaming()
 	_mark_reasoning_stream_closed()
@@ -558,6 +571,12 @@ func _on_response(response: Dictionary) -> void:
 
 	if response.has("items") and response.has("ok"):
 		_append_message("system", "Memory\n\n```json\n%s\n```" % JSON.stringify(response, "\t"))
+		return
+
+	if response.has("ok") and response.has("session_id") and response.size() == 2:
+		# `/reset` 的确认响应；会话重置事件已通过 SSE 的 "reset" 事件提示用户，
+		# 这里无需再展示原始 JSON。
+		FrontendLogger.debug(editor_interface, "ChatPanel", "Reset acknowledged.", {"session_id": str(response.get("session_id", ""))})
 		return
 
 	if response.has("type") and response.get("type") == "data":
@@ -658,6 +677,21 @@ func _on_decision(results: Array) -> void:
 	_http_client.send_tool_results(results)
 
 
+## 移除文本中的 `<think>…</think>` XML 块及所有残余的 `</think>` 标签。
+## 模型输出中 think 块的内容已由 reasoning delta 事件单独处理，此处只做清理。
+func _strip_think_xml(text: String) -> String:
+	var result := text
+	var start := result.find("<think>")
+	while start != -1:
+		var end_tag := result.find("</think>", start)
+		if end_tag == -1:
+			result = result.substr(0, start)
+			break
+		result = result.substr(0, start) + result.substr(end_tag + "</think>".length())
+		start = result.find("<think>")
+	return result.replace("</think>", "")
+
+
 ## 若回复以 `Thought: ...` 摘要行开头，拆分出摘要文本与剩余正文；
 ## 否则 `summary` 为空字符串，`rest` 为原文。
 func _split_thought_summary(text: String) -> Dictionary:
@@ -701,12 +735,19 @@ func _handle_final(response: Dictionary) -> void:
 	# Thought/Grep/Read/Edit/text 拆分成独立日志条目展示，因此无论是否重复，
 	# 都要先彻底移除流式气泡（而不是只清空其文字，否则会留下空气泡或残留
 	# 旧内容），避免与下方新追加的条目重复展示。
-	var prefixed := _apply_thought_prefix(text)
+	# Thought: 前缀由流式 reasoning 条目负责展示，正文只渲染 body 部分，
+	# 避免最后一个 thought 条目紧跟在正文之前重复出现。
+	var split := _split_thought_summary(text)
+	var rest := str(split.get("rest", ""))
+	var render_text := rest if rest.strip_edges() != "" else text
 	_mark_current_stream_closed()
 	_discard_stream_message()
+
 	if not _rendered_assistant_keys.has(assistant_key):
 		_rendered_assistant_keys[assistant_key] = true
-		_append_log_stream_message(prefixed)
+		_indent_current_text = true          # 开启缩进
+		_append_log_stream_message(render_text)
+		_indent_current_text = false         # 恢复
 	if undo_manager != null:
 		undo_manager.commit_batch()
 	_set_state(AgentState.IDLE)
@@ -740,10 +781,19 @@ func _handle_session_history(response: Dictionary) -> void:
 		if not (item is Dictionary):
 			continue
 		var role := str(item.get("role", "system"))
-		var text := str(item.get("text", ""))
-		if text.strip_edges() == "":
+		var text := _strip_think_xml(str(item.get("text", ""))).strip_edges()
+		if text == "":
 			continue
-		_append_message(role, _apply_thought_prefix(text) if role == "assistant" else text)
+		# "Tool calls\n- tool_name" 对应 agent_tool_calls 事件，实时对话不显示，历史也跳过。
+		if text.begins_with("Tool calls"):
+			continue
+		var processed := _apply_thought_prefix(text) if role == "assistant" else text
+		if role == "assistant":
+			_indent_current_text = true
+			_append_message(role, processed)
+			_indent_current_text = false
+		else:
+			_append_message(role, processed)
 	if pending_turn_id != null:
 		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
 	if not items.is_empty():
@@ -804,6 +854,7 @@ func _discard_pending_results() -> void:
 
 func _on_reset() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Reset requested.", {"state": _status.text})
+	_auto_scroll = true
 	_interrupted_locally = false
 	_clear_inline_confirmation()
 	if undo_manager != null:
@@ -835,6 +886,7 @@ func _on_interrupt() -> void:
 func _on_new_session() -> void:
 	var session_id := "session_%d" % int(Time.get_unix_time_from_system())
 	FrontendLogger.info(editor_interface, "ChatPanel", "New session requested.", {"session_id": session_id})
+	_auto_scroll = true
 	_interrupted_locally = false
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", session_id)
 	_clear_inline_confirmation()
@@ -1018,14 +1070,7 @@ func _format_read_event_entry(summary: Dictionary) -> String:
 	var path := str(summary.get("path", "<unknown>"))
 	var line_start := int(summary.get("line_start", 1))
 	var line_end := int(summary.get("line_end", line_start))
-	var header := "Read %s (lines %d-%d)" % [path, line_start, max(line_start, line_end)]
-	var content := str(summary.get("content", ""))
-	if content == "":
-		return header
-	var lang := _code_lang_for_path(path)
-	var fence := "```%s" % lang if lang != "" else "```"
-	var suffix := "\n... truncated ..." if bool(summary.get("truncated", false)) else ""
-	return "%s\n%s\n%s%s\n```" % [header, fence, content, suffix]
+	return "Read %s (lines %d-%d)" % [path, line_start, max(line_start, line_end)]
 
 
 func _format_grep_event_entry(summary: Dictionary) -> String:
@@ -1037,27 +1082,16 @@ func _format_grep_event_entry(summary: Dictionary) -> String:
 	for item in matches:
 		if not (item is Dictionary):
 			continue
+		var line_val = item.get("line", "")
+		var line_str := str(int(float(str(line_val)))) if line_val != "" else ""
 		lines.append("%s:%s %s" % [
 			str(item.get("path", "")),
-			str(item.get("line", "")),
+			line_str,
 			str(item.get("text", "")).strip_edges()
 		])
 	if bool(summary.get("truncated", false)):
 		lines.append("... truncated ...")
 	return "Grep \"%s\" (in %s)\n%s" % [pattern, include, "\n".join(lines)]
-
-
-func _code_lang_for_path(path: String) -> String:
-	var lower := path.to_lower()
-	if lower.ends_with(".gd"):
-		return "gdscript"
-	if lower.ends_with(".py"):
-		return "python"
-	if lower.ends_with(".json"):
-		return "json"
-	if lower.ends_with(".tscn") or lower.ends_with(".tres") or lower.ends_with(".cfg") or lower.ends_with(".ini"):
-		return "ini"
-	return ""
 
 
 func _format_event_args(payload: Dictionary) -> String:
@@ -1342,10 +1376,10 @@ func _on_text_delta(event: Dictionary) -> void:
 	var key := _stream_event_key(payload)
 	if _should_ignore_stream_delta(key, text):
 		return
-	_ensure_stream_message(key)
+	_ensure_stream_message(key, true)
 	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		_stream_content_rich.clear()
-		_stream_content_rich.append_text(_markdown_to_bbcode(text))
+		_stream_content_rich.append_text(_markdown_to_bbcode(_strip_think_xml(text)))
 	_scroll_to_bottom()
 
 
@@ -1374,20 +1408,14 @@ func _ensure_reasoning_entry(key: String) -> void:
 	if _stream_started_ms < 0:
 		_stream_started_ms = _reasoning_started_ms
 
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_theme_constant_override("separation", 8)
-	row.add_child(_make_workflow_marker("thought"))
-
 	var body := VBoxContainer.new()
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	body.add_theme_constant_override("separation", 2)
-	row.add_child(body)
 
-	var toggle := _make_workflow_toggle(_format_reasoning_header(""), _theme_color("muted_text"))
-	var detail_rich := _append_collapsible(body, toggle, "")
+	var toggle := _make_workflow_toggle(_format_reasoning_header(), _theme_color("muted_text"))
+	var detail_rich := _append_collapsible(body, toggle, "", "✻")
 
-	_message_list.add_child(row)
+	_message_list.add_child(body)
 	_reasoning_toggle = toggle
 	_reasoning_detail_rich = detail_rich
 	_scroll_to_bottom()
@@ -1395,56 +1423,37 @@ func _ensure_reasoning_entry(key: String) -> void:
 
 func _update_reasoning_entry() -> void:
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
-		_reasoning_toggle.text = _format_reasoning_header(_reasoning_text)
+		# `_format_reasoning_header` 不含标记前缀，这里需要重新拼上 "✻  "，
+		# 否则每次流式更新都会用纯文本覆盖掉 `_append_collapsible` 中设置的标记。
+		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
 	if _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
 		_reasoning_detail_rich.clear()
 		_reasoning_detail_rich.append_text(_markdown_to_bbcode(_reasoning_text))
 	_scroll_to_bottom()
 
 
-func _format_reasoning_header(text: String) -> String:
+func _format_reasoning_header() -> String:
 	var elapsed := 1
 	if _reasoning_started_ms >= 0:
 		elapsed = max(1, int(round((Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)))
-	var summary := _first_nonempty_line(text)
-	if summary != "":
-		return "Thought for %ds > %s" % [elapsed, _truncate_text(summary, 96)]
-	return "Thought for %ds >" % elapsed
-
-
-func _first_nonempty_line(text: String) -> String:
-	for raw_line in text.split("\n"):
-		var line := str(raw_line).strip_edges()
-		if line != "":
-			return line
-	return ""
+	return "Thought for %ds" % elapsed
 
 
 ## 确保存在一个用于流式展示的消息气泡（仅含正文区域）。`key` 通常为
 ## `frame_id:loop`；与当前流式消息的 key 不同时会丢弃上一条流式消息气泡
 ## （例如委派子帧或"边想边调用工具"轮次的中间输出，不应作为独立消息保留，
 ## 否则会和后续轮次/父帧的最终回复重复展示）。
-func _ensure_stream_message(key: String) -> void:
+func _ensure_stream_message(key: String, indent := false) -> void:
 	if _stream_key == key and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		return
 	_discard_stream_message()
 	_stream_key = key
 	_stream_started_ms = Time.get_ticks_msec()
 
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_theme_constant_override("separation", 8)
-	row.add_child(_make_workflow_marker("text"))
+	var content_rich := _make_log_rich_text("", null, "", indent)
 
-	var body := VBoxContainer.new()
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(body)
-
-	var content_rich := _make_log_rich_text("")
-	body.add_child(content_rich)
-
-	_message_list.add_child(row)
-	_stream_row = row
+	_message_list.add_child(content_rich)
+	_stream_row = content_rich
 	_stream_content_rich = content_rich
 	_scroll_to_bottom()
 
@@ -1494,7 +1503,7 @@ func _append_message(role: String, text: String, color = null) -> void:
 		_rendered_assistant_keys[assistant_key] = true
 
 	if role != "user" and role != "error":
-		_append_log_stream_message(text, color)
+		_append_log_stream_message(text, color, role != "assistant")
 		return
 
 	var row := HBoxContainer.new()
@@ -1530,9 +1539,9 @@ func _message_fingerprint(text: String) -> String:
 
 
 ## Log stream action rows.
-func _append_log_stream_message(text: String, color = null) -> void:
+func _append_log_stream_message(text: String, color = null, mark_text: bool = false) -> void:
 	for entry in _split_log_entries(_normalize_action_message(text)):
-		_append_log_entry(str(entry), color)
+		_append_log_entry(str(entry), color, mark_text)
 	_scroll_to_bottom()
 
 
@@ -1629,50 +1638,42 @@ func _is_log_action_start(line: String) -> bool:
 		or line.begins_with("Edit ")
 
 
-func _append_log_entry(entry: String, color = null) -> void:
+func _append_log_entry(entry: String, color = null, mark_text: bool = false) -> void:
 	var kind := _log_entry_kind(entry)
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_theme_constant_override("separation", 8)
-
-	row.add_child(_make_workflow_marker(kind))
+	var marker_text := _workflow_marker_text(kind, mark_text)
 
 	var content := VBoxContainer.new()
 	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	content.add_theme_constant_override("separation", 2)
-	row.add_child(content)
+
+	# 只有 kind == "text" 且 _indent_current_text == true 时才缩进
+	var should_indent := (_indent_current_text and kind == "text")
 
 	if kind == "thought":
-		_append_thought_entry(content, entry)
+		_append_thought_entry(content, entry, marker_text)
 	elif kind == "read":
-		_append_read_entry(content, entry)
+		_append_read_entry(content, entry, marker_text)
 	elif kind == "grep":
-		_append_grep_entry(content, entry)
+		_append_grep_entry(content, entry, marker_text)
 	elif kind == "edit":
-		_append_edit_entry(content, entry)
+		_append_edit_entry(content, entry, marker_text)
 	else:
-		content.add_child(_make_log_rich_text(entry, color))
+		content.add_child(_make_log_rich_text(entry, color, marker_text, should_indent))
 
-	_message_list.add_child(row)
-
-
-func _make_workflow_marker(kind: String) -> Label:
-	var marker := Label.new()
-	marker.text = _workflow_marker_text(kind)
-	marker.custom_minimum_size = Vector2(24, 0)
-	marker.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	marker.add_theme_color_override("font_color", _theme_color("marker_action") if kind in ["read", "grep", "edit"] else _theme_color("marker_text"))
-	return marker
+	_message_list.add_child(content)
+	_scroll_to_bottom()
 
 
-func _workflow_marker_text(kind: String) -> String:
+## "text" 类条目默认无标记；`mark_text` 用于非最终正文回复（如系统/工具状态
+## 消息），使其与 Read/Grep/Edit 一致地显示 "●"。
+func _workflow_marker_text(kind: String, mark_text: bool = false) -> String:
 	match kind:
 		"thought":
 			return "✻"
 		"read", "grep", "edit":
-			return "⏺"
+			return "●"
 		_:
-			return ""
+			return "○" if mark_text else ""
 
 
 func _log_entry_kind(entry: String) -> String:
@@ -1723,11 +1724,38 @@ func _split_thought_header(first_line: String) -> Dictionary:
 	return {"header": first_line + " >", "inline": ""}
 
 
-## 渲染一个可折叠的 "Thought" 条目：标题行（如 "Thought for 3s >"）始终
-## 显示，点击可展开/折叠详细思考文本（内联摘要 + 续行）。若没有详细文本，
-## 仅显示标题，不提供折叠交互。
-func _append_collapsible(content: VBoxContainer, toggle: Button, detail: String) -> RichTextLabel:
-	content.add_child(toggle)
+func _set_arrow_pivot(arrow: Label) -> void:
+	if arrow == null:
+		return
+	arrow.pivot_offset = arrow.size / 2
+
+
+## 渲染一个可折叠的条目：标题文本末尾紧跟一个 ">" 箭头，折叠时指向右侧，
+## 展开时旋转 90 度指向下方；点击标题行可展开/折叠详细文本。`marker_text`
+## （"●"/"✻"）会作为标题文本的前缀，与标题共享同一控件，避免单独一列
+## 渲染时和文字行高不一致导致的错位。
+func _append_collapsible(content: VBoxContainer, toggle: Button, detail: String, marker_text: String = "") -> RichTextLabel:
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_theme_constant_override("separation", 4)
+
+	var arrow := Label.new()
+	arrow.text = ">"
+	arrow.custom_minimum_size = Vector2(16, 16)
+	arrow.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
+	arrow.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	arrow.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	# 延迟到下一帧，等尺寸确定
+	call_deferred("_set_arrow_pivot", arrow)
+	arrow.add_theme_color_override("font_color", toggle.get_theme_color("font_color"))
+
+	if marker_text != "":
+		toggle.text = marker_text + "  " + toggle.text
+	# 不让 toggle 占满整行，使 arrow 紧跟在文本末尾，而不是被挤到容器最右侧。
+	toggle.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	row.add_child(toggle)
+	row.add_child(arrow)
+	content.add_child(row)
 
 	var detail_rich := _make_log_rich_text(detail, _theme_color("muted_text"))
 	detail_rich.visible = false
@@ -1735,14 +1763,16 @@ func _append_collapsible(content: VBoxContainer, toggle: Button, detail: String)
 
 	toggle.pressed.connect(func():
 		detail_rich.visible = not detail_rich.visible
-		_scroll_to_bottom()
+		arrow.rotation_degrees = 90.0 if detail_rich.visible else 0.0
 	)
 	return detail_rich
 
 
-func _append_thought_entry(content: VBoxContainer, entry: String) -> void:
+func _append_thought_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
 	var split := _split_thought_header(_first_line(entry))
 	var header := str(split.get("header", ""))
+	if header.ends_with(">"):
+		header = header.substr(0, header.length() - 1).strip_edges()
 	var inline := str(split.get("inline", ""))
 	var rest := _rest_lines(entry)
 
@@ -1752,34 +1782,22 @@ func _append_thought_entry(content: VBoxContainer, entry: String) -> void:
 	if rest != "":
 		detail_parts.append(rest)
 	var detail := "\n\n".join(detail_parts)
-	var title := header
-	if inline != "":
-		title += " " + _truncate_text(inline, 96)
 
 	if detail == "":
-		var label := Label.new()
-		label.text = title
-		label.add_theme_color_override("font_color", _theme_color("muted_text"))
-		content.add_child(label)
+		content.add_child(_make_log_rich_text(header, _theme_color("muted_text"), marker_text))
 		return
 
-	_append_collapsible(content, _make_workflow_toggle(title, _theme_color("muted_text")), detail)
+	_append_collapsible(content, _make_workflow_toggle(header, _theme_color("muted_text")), detail, marker_text)
 
 
-func _append_read_entry(content: VBoxContainer, entry: String) -> void:
-	var header := _first_line(entry)
-	var detail := _rest_lines(entry)
-	if detail == "":
-		content.add_child(_make_log_rich_text(header))
-		return
-
-	_append_collapsible(content, _make_workflow_toggle(header), detail)
+func _append_read_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
+	content.add_child(_make_log_rich_text(_first_line(entry), null, marker_text))
 
 
-func _append_grep_entry(content: VBoxContainer, entry: String) -> void:
+func _append_grep_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
 	var rest := _rest_lines(entry)
 	if rest == "":
-		content.add_child(_make_log_rich_text(_first_line(entry)))
+		content.add_child(_make_log_rich_text(_first_line(entry), null, marker_text))
 		return
 	var rest_lines := rest.split("\n")
 	var summary := str(rest_lines[0]).strip_edges()
@@ -1790,14 +1808,20 @@ func _append_grep_entry(content: VBoxContainer, entry: String) -> void:
 	if summary != "":
 		header += " - " + summary
 	if details.is_empty():
-		content.add_child(_make_log_rich_text(header))
+		# 用 Button（纯文本）渲染，避免 Grep 正则 pattern 中的 "[" 经 _escape_bbcode
+		# 转成 [lb] 后在 RichTextLabel 里无法正确显示的问题；与有 details 时的路径保持一致。
+		var toggle := _make_workflow_toggle(header)
+		if marker_text != "":
+			toggle.text = marker_text + "  " + toggle.text
+		toggle.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		content.add_child(toggle)
 		return
 
-	_append_collapsible(content, _make_workflow_toggle(header), "\n".join(details))
+	_append_collapsible(content, _make_workflow_toggle(header), "\n".join(details), marker_text)
 
 
-func _append_edit_entry(content: VBoxContainer, entry: String) -> void:
-	content.add_child(_make_log_rich_text(_first_line(entry)))
+func _append_edit_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
+	content.add_child(_make_log_rich_text(_first_line(entry), null, marker_text))
 	var stats := _format_edit_stats(_rest_lines(entry))
 	if stats != "":
 		content.add_child(_make_log_rich_text(stats, _theme_color("success_text")))
@@ -1809,6 +1833,11 @@ func _make_workflow_toggle(text: String, color = null) -> Button:
 	toggle.focus_mode = Control.FOCUS_NONE
 	toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
 	toggle.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# 主题按钮默认 stylebox 自带左边距，会让标题文本相对其他用 RichTextLabel
+	# （零边距）渲染的消息行整体右移，导致消息块左边缘对不齐。这里清空各状态
+	# 的 stylebox，使文本起始位置与 _make_log_rich_text 一致。
+	for state in ["normal", "hover", "pressed", "hover_pressed", "focus", "disabled"]:
+		toggle.add_theme_stylebox_override(state, StyleBoxEmpty.new())
 	_set_button_text_colors(toggle, _resolve_color(color, "text"), _theme_color("hover_text"))
 	toggle.text = text
 	return toggle
@@ -1825,9 +1854,13 @@ func _format_edit_stats(detail: String) -> String:
 	return "+%d -%d lines" % [added, removed]
 
 
-func _make_log_rich_text(text: String, color = null) -> RichTextLabel:
-	var rich := _make_rich_text(text, color)
+func _make_log_rich_text(text: String, color = null, marker_text: String = "", indent := false) -> RichTextLabel:
+	var rich := _make_rich_text(text, color, marker_text)
 	rich.add_theme_constant_override("line_separation", 1)
+	if indent:
+		var style := StyleBoxEmpty.new()
+		style.content_margin_left = 48   # 两个 Tab 的像素宽度，可根据需要调整
+		rich.add_theme_stylebox_override("normal", style)
 	return rich
 
 
@@ -1901,9 +1934,7 @@ func _format_log_tool_result(name: String, input: Dictionary, result: Dictionary
 			var read_path := str(inner.get("path", input.get("path", "<unknown>")))
 			var content := str(inner.get("content", ""))
 			var line_count := _count_lines(content)
-			var lang := _code_lang_for_path(read_path)
-			var fence := "```%s" % lang if lang != "" else "```"
-			return "Read %s (lines 1-%d)\n%s\n%s\n```" % [read_path, line_count, fence, content]
+			return "Read %s (lines 1-%d)" % [read_path, line_count]
 		"write_file", "propose_script_edit", "apply_text_edit", "propose_tests", "propose_content_file":
 			var edit_path := str(inner.get("path", input.get("path", input.get("target_path", "<unknown>"))))
 			var after_text := str(input.get("content", input.get("after_text", "")))
@@ -1953,7 +1984,9 @@ func _make_panel(bg_color = null, border_color = null) -> PanelContainer:
 	return panel
 
 
-func _make_rich_text(text: String, color = null) -> RichTextLabel:
+## `marker_text`（"●"/"✻"）会以其专属颜色拼接到首行文本前，与正文共享同一
+## 基线，避免标记作为独立列渲染时与文字行高不一致导致的错位。
+func _make_rich_text(text: String, color = null, marker_text: String = "") -> RichTextLabel:
 	var rich := RichTextLabel.new()
 	rich.bbcode_enabled = true
 	rich.selection_enabled = true
@@ -1965,7 +1998,10 @@ func _make_rich_text(text: String, color = null) -> RichTextLabel:
 	rich.add_theme_stylebox_override("normal", StyleBoxEmpty.new())
 	rich.add_theme_color_override("default_color", _resolve_color(color, "text"))
 	_apply_mono_font(rich)
-	rich.append_text(_markdown_to_bbcode(text))
+	var bbcode := _markdown_to_bbcode(text)
+	if marker_text != "":
+		bbcode = "[color=%s]%s[/color]  %s" % [_marker_color_tag(marker_text), marker_text, bbcode]
+	rich.append_text(bbcode)
 	return rich
 
 
@@ -2001,8 +2037,14 @@ func _scroll_to_bottom() -> void:
 	call_deferred("_scroll_to_bottom_deferred")
 
 
+func _on_scroll_value_changed(value: float) -> void:
+	var bar := _scroll.get_v_scroll_bar()
+	var scroll_max := bar.max_value - bar.page
+	_auto_scroll = scroll_max <= 0 or value >= scroll_max - 40
+
+
 func _scroll_to_bottom_deferred() -> void:
-	if _scroll == null:
+	if _scroll == null or not _auto_scroll:
 		return
 	var bar := _scroll.get_v_scroll_bar()
 	_scroll.scroll_vertical = int(bar.max_value)

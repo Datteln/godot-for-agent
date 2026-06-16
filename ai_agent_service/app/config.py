@@ -119,7 +119,11 @@ class AppSettings(BaseSettings):
         description="项目级 OutputStyle 目录；未信任工程默认不启用项目级样式。",
     )
 
-    max_turns: int = Field(default=12, description="单次用户消息驱动的 agent 循环最大轮数。")
+    max_turns: int = Field(
+        default=36,
+        description="单次用户消息驱动的 agent 循环最大轮数（跨根帧与所有委派子帧的全局兜底上限；"
+        "各帧自身的预算见 AgentDefinition.max_turns）。",
+    )
 
     def resolved_session_store_dir(self) -> Path:
         """返回会话持久化目录的绝对路径，必要时基于 project_root 解析相对路径。
