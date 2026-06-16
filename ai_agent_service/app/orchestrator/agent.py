@@ -757,13 +757,15 @@ async def run_turn(
         或 `ErrorResult`（LLM 调用失败/达到轮数上限）。
     """
     logger.info("Agent run_turn start session=%s max_turns=%d", session.session_id, max_turns)
+    frame_turns: dict[str, int] = {}  # frame_id -> 本次 run_turn 调用内该帧已消耗轮数
     for loop_index in range(max_turns):
         frame = session.top_frame()
         if frame is None:
             logger.error("Agent run_turn failed: empty frame stack session=%s", session.session_id)
             return ErrorResult(text="会话没有活跃的 agent 帧")
 
-        if frame.turns_used >= frame.agent.max_turns:
+        used = frame_turns.get(frame.id, 0)
+        if used >= frame.agent.max_turns:
             if len(session.agent_stack) <= 1:
                 logger.warning(
                     "Agent run_turn reached root frame max turns session=%s agent=%s max_turns=%d",
@@ -787,7 +789,7 @@ async def run_turn(
             )
             continue
 
-        frame.turns_used += 1
+        frame_turns[frame.id] = used + 1
 
         try:
             visible_tools = tools_for(frame.agent.effective_tools, frame.active_deferred_tools)

@@ -5,7 +5,10 @@ const AgentDTO = preload("res://addons/ai_agent/dto/agent_dto.gd")
 const AgentHttpClient = preload("res://addons/ai_agent/service/agent_http_client.gd")
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 const ContextCollector = preload("res://addons/ai_agent/context/context_collector.gd")
+const EventFormatter = preload("res://addons/ai_agent/ui/event_formatter.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
+const LogEntryRenderer = preload("res://addons/ai_agent/ui/log_entry_renderer.gd")
+const MarkdownRenderer = preload("res://addons/ai_agent/ui/markdown_renderer.gd")
 const RecoveryPrompt = preload("res://addons/ai_agent/ui/recovery_prompt.gd")
 const ToolExecutor = preload("res://addons/ai_agent/tools/tool_executor.gd")
 const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_renderer.gd")
@@ -14,65 +17,6 @@ enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
 
 const PENDING_TOOL_RESULTS_ERROR := "当前会话仍有待回传的工具结果，不能开始新的用户消息"
 const HIGH_RISK_TOOLS := ["run_tests", "run_headless_self_test", "set_project_setting", "batch_rename"]
-
-# 代码块语言标记别名归一化（如 ```gd``` -> gdscript）。
-const _CODE_LANG_ALIASES := {
-	"gd": "gdscript",
-	"py": "python",
-	"js": "javascript",
-	"ts": "typescript",
-	"cs": "csharp",
-	"yml": "yaml",
-	"sh": "bash",
-	"shell": "bash",
-}
-
-# 各语言行注释前缀，用于语法高亮时识别注释（不含的语言不做注释着色）。
-const _CODE_LINE_COMMENT := {
-	"gdscript": "#", "python": "#", "bash": "#", "yaml": "#", "toml": "#", "ini": "#", "cfg": "#",
-	"c": "//", "cpp": "//", "csharp": "//", "java": "//",
-	"javascript": "//", "typescript": "//", "go": "//", "rust": "//",
-}
-
-# 各语言关键字高亮列表。
-const _CODE_KEYWORDS := {
-	"gdscript": ["func", "var", "const", "if", "elif", "else", "for", "while", "return", "class",
-		"extends", "class_name", "enum", "match", "pass", "break", "continue", "signal", "static",
-		"await", "preload", "load", "true", "false", "null", "self", "and", "or", "not", "in", "is",
-		"as", "super", "tool"],
-	"python": ["def", "class", "if", "elif", "else", "for", "while", "return", "import", "from",
-		"as", "with", "try", "except", "finally", "raise", "pass", "break", "continue", "lambda",
-		"yield", "async", "await", "global", "nonlocal", "not", "and", "or", "in", "is", "None",
-		"True", "False", "self"],
-	"json": ["true", "false", "null"],
-}
-
-# 目录树/连线图常用的 Unicode 制表符，出现在未加代码围栏的段落中时，
-# 该段落会被当作等宽代码块整体渲染（否则连线在比例字体下无法对齐）。
-const _TREE_LINE_CHARS := ["├", "└", "│", "─", "┌", "┐", "┘", "┬", "┴", "┤", "┼", "╭", "╮", "╯", "╰"]
-
-# 工具名 -> workflow 展示名。未列出的工具直接
-# 使用原始工具名。
-const _TOOL_DISPLAY_NAMES := {
-	"read_file": "Read",
-	"read_script": "Read",
-	"read_class_docs": "ClassInfo",
-	"read_class_info": "ClassInfo",
-	"get_class_info": "ClassInfo",
-	"grep_code": "Grep",
-	"search_codebase": "Grep",
-	"list_files": "Grep",
-	"write_file": "Write",
-	"propose_script_edit": "Edit",
-	"apply_text_edit": "Edit",
-	"propose_tests": "Write",
-	"propose_content_file": "Write",
-	"run_tests": "Bash",
-	"run_headless_self_test": "Bash",
-	"delegate": "Task",
-	"delegate_many": "Task",
-	"search_tools": "SearchTools",
-}
 
 const UI_TEXT := {
 	"zh": {
@@ -190,6 +134,7 @@ var _http_client: Node
 var _collector: Node
 var _tool_executor: Node
 var _recovery_prompt: ConfirmationDialog
+var _log_renderer: LogEntryRenderer
 
 var _scroll: ScrollContainer
 var _message_list: VBoxContainer
@@ -217,7 +162,10 @@ var _inline_reject_btn: Button
 var _inline_confirm_box: Control
 var _inline_busy := false
 var _interrupted_locally := false
-var _indent_current_text := false   # 仅对普通文本条目（kind="text"）缩进
+var _indent_current_text := false
+var _event_queue: Array = []
+var _draining_events := false
+var _force_scroll_once := false
 
 var _stream_key := ""
 var _stream_row: Control
@@ -345,6 +293,10 @@ func _build_children() -> void:
 	_recovery_prompt = RecoveryPrompt.new()
 	add_child(_recovery_prompt)
 
+	_log_renderer = LogEntryRenderer.new()
+	_log_renderer.theme_colors = _theme_colors
+	_log_renderer.editor_interface = editor_interface
+
 
 func _connect_signals() -> void:
 	_send_btn.pressed.connect(_on_send)
@@ -386,7 +338,7 @@ func _refresh_theme_colors() -> void:
 	var user_bg := base.lerp(accent, 0.32 if is_dark else 0.16)
 	var error_bg := base.lerp(error, 0.24 if is_dark else 0.11)
 
-	_theme_colors = {
+	var new_colors := {
 		"text": font,
 		"muted_text": muted,
 		"subtle_text": subtle,
@@ -410,6 +362,9 @@ func _refresh_theme_colors() -> void:
 		"syntax_number": _get_editor_setting_color("text_editor/theme/highlighting/number_color", Color(0.71, 0.81, 0.66) if is_dark else Color(0.48, 0.40, 0.08)),
 		"syntax_keyword": _get_editor_setting_color("text_editor/theme/highlighting/keyword_color", Color(0.34, 0.61, 0.84) if is_dark else Color(0.13, 0.36, 0.77)),
 	}
+	# 原地更新，使 _log_renderer.theme_colors 引用自动同步
+	_theme_colors.clear()
+	_theme_colors.merge(new_colors)
 
 
 func _refresh_live_theme_overrides() -> void:
@@ -507,7 +462,6 @@ func _theme_color_tag(key: String) -> String:
 	return _color_tag(_theme_color(key))
 
 
-## "●" 使用强调色（与 Read/Grep/Edit 一致），"✻" 使用较弱的文字色。
 func _marker_color(marker_text: String) -> Color:
 	return _theme_color("marker_action") if marker_text == "●" else _theme_color("marker_text")
 
@@ -531,6 +485,7 @@ func _on_send() -> void:
 		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length()})
 	_auto_scroll = true
+	_force_scroll_once = true
 	_interrupted_locally = false
 	_finish_streaming()
 	_mark_reasoning_stream_closed()
@@ -574,8 +529,6 @@ func _on_response(response: Dictionary) -> void:
 		return
 
 	if response.has("ok") and response.has("session_id") and response.size() == 2:
-		# `/reset` 的确认响应；会话重置事件已通过 SSE 的 "reset" 事件提示用户，
-		# 这里无需再展示原始 JSON。
 		FrontendLogger.debug(editor_interface, "ChatPanel", "Reset acknowledged.", {"session_id": str(response.get("session_id", ""))})
 		return
 
@@ -613,8 +566,6 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring tool_calls while a previous batch is still pending confirmation.", {"count": calls.size()})
 		return
 
-	# 本轮流式输出只是模型在调用工具前的中间想法，不是最终回复，丢弃其气泡避免与
-	# 后续轮次的最终回复重复展示。
 	_mark_current_stream_closed()
 	_discard_stream_message()
 	var silent: Array = []
@@ -625,11 +576,9 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		else:
 			silent.append(call)
 
-	# 立即展示每个工具调用标题行，无论是否需要确认，
-	# 让用户能实时看到模型调用了什么智能体/工具、读取/编辑了什么文件。
 	for call in confirm:
 		if call is Dictionary:
-			_append_message("system", _format_tool_call_header(call))
+			_append_message("system", EventFormatter.format_tool_call_header(call))
 
 	if state_store != null:
 		state_store.set_value("current_turn_id", _http_client.current_turn_id)
@@ -640,7 +589,7 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		if call is Dictionary:
 			if _interrupted_locally:
 				return
-			_append_message("system", _format_tool_call_header(call))
+			_append_message("system", EventFormatter.format_tool_call_header(call))
 			_set_state(AgentState.EXECUTING)
 			var result: Dictionary = await _tool_executor.execute(call)
 			if _interrupted_locally:
@@ -678,7 +627,6 @@ func _on_decision(results: Array) -> void:
 
 
 ## 移除文本中的 `<think>…</think>` XML 块及所有残余的 `</think>` 标签。
-## 模型输出中 think 块的内容已由 reasoning delta 事件单独处理，此处只做清理。
 func _strip_think_xml(text: String) -> String:
 	var result := text
 	var start := result.find("<think>")
@@ -692,8 +640,7 @@ func _strip_think_xml(text: String) -> String:
 	return result.replace("</think>", "")
 
 
-## 若回复以 `Thought: ...` 摘要行开头，拆分出摘要文本与剩余正文；
-## 否则 `summary` 为空字符串，`rest` 为原文。
+## 若回复以 `Thought: ...` 摘要行开头，拆分出摘要文本与剩余正文。
 func _split_thought_summary(text: String) -> Dictionary:
 	var stripped := text.strip_edges()
 	if not stripped.begins_with("Thought:"):
@@ -707,9 +654,7 @@ func _split_thought_summary(text: String) -> Dictionary:
 	}
 
 
-## 把模型最终回复开头的 `Thought: ...` 摘要行转换为 Claude Code 风格的
-## "Thought for Xs > 摘要" 独立日志行（Xs 为本轮流式输出耗时），与正式回复
-## 正文之间用空行分隔，交由 `_append_log_stream_message` 拆分成独立条目展示。
+## 把模型最终回复开头的 `Thought: ...` 摘要行转换为可折叠 workflow 条目格式。
 func _apply_thought_prefix(text: String) -> String:
 	var parts := _split_thought_summary(text)
 	var summary := str(parts.get("summary", ""))
@@ -731,23 +676,24 @@ func _handle_final(response: Dictionary) -> void:
 	})
 	var text := str(response.get("text", ""))
 	var assistant_key := _message_fingerprint(text)
-	# 流式过程中展示的气泡内容是未拆分的原始文本，最终回复改为按
-	# Thought/Grep/Read/Edit/text 拆分成独立日志条目展示，因此无论是否重复，
-	# 都要先彻底移除流式气泡（而不是只清空其文字，否则会留下空气泡或残留
-	# 旧内容），避免与下方新追加的条目重复展示。
-	# Thought: 前缀由流式 reasoning 条目负责展示，正文只渲染 body 部分，
-	# 避免最后一个 thought 条目紧跟在正文之前重复出现。
 	var split := _split_thought_summary(text)
 	var rest := str(split.get("rest", ""))
 	var render_text := rest if rest.strip_edges() != "" else text
 	_mark_current_stream_closed()
-	_discard_stream_message()
 
 	if not _rendered_assistant_keys.has(assistant_key):
 		_rendered_assistant_keys[assistant_key] = true
-		_indent_current_text = true          # 开启缩进
-		_append_log_stream_message(render_text)
-		_indent_current_text = false         # 恢复
+		if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+			_stream_content_rich.clear()
+			_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(render_text, _theme_colors))
+			_finish_streaming()
+		else:
+			_discard_stream_message()
+			_indent_current_text = true
+			_append_log_stream_message(render_text)
+			_indent_current_text = false
+	else:
+		_discard_stream_message()
 	if undo_manager != null:
 		undo_manager.commit_batch()
 	_set_state(AgentState.IDLE)
@@ -784,7 +730,7 @@ func _handle_session_history(response: Dictionary) -> void:
 		var text := _strip_think_xml(str(item.get("text", ""))).strip_edges()
 		if text == "":
 			continue
-		# "Tool calls\n- tool_name" 对应 agent_tool_calls 事件，实时对话不显示，历史也跳过。
+		# agent_tool_calls 事件对应的历史条目，实时对话不显示，历史也跳过
 		if text.begins_with("Tool calls"):
 			continue
 		var processed := _apply_thought_prefix(text) if role == "assistant" else text
@@ -818,7 +764,7 @@ func _show_pending_results_notice() -> void:
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
-	var panel := _make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
+	var panel := _log_renderer.make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(panel)
 
@@ -826,7 +772,7 @@ func _show_pending_results_notice() -> void:
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	panel.add_child(body)
 
-	var label := _make_rich_text(_ui("pending_notice"))
+	var label := _log_renderer.make_rich_text(_ui("pending_notice"))
 	body.add_child(label)
 
 	var actions := HBoxContainer.new()
@@ -856,6 +802,8 @@ func _on_reset() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Reset requested.", {"state": _status.text})
 	_auto_scroll = true
 	_interrupted_locally = false
+	_event_queue.clear()
+	_draining_events = false
 	_clear_inline_confirmation()
 	if undo_manager != null:
 		undo_manager.abort_batch()
@@ -869,6 +817,8 @@ func _on_reset() -> void:
 func _on_interrupt() -> void:
 	FrontendLogger.warn(editor_interface, "ChatPanel", "Interrupt requested.", {"state": _status.text})
 	_interrupted_locally = true
+	_event_queue.clear()
+	_draining_events = false
 	_clear_inline_confirmation()
 	_finish_streaming()
 	_finish_reasoning_stream()
@@ -967,176 +917,40 @@ func _on_events(events: Array) -> void:
 		return
 	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling events.", {"count": events.size()})
 	for event in events:
-		if not (event is Dictionary):
-			continue
-		if state_store != null:
-			state_store.add_event(event)
-		var event_type := str(event.get("type", ""))
-		if event_type == "agent_reasoning_delta":
-			_on_reasoning_delta(event)
-			continue
-		if event_type == "agent_text_delta":
-			_on_text_delta(event)
-			continue
+		if event is Dictionary:
+			_event_queue.append(event)
+	if not _draining_events:
+		_drain_event_queue()
+
+
+func _drain_event_queue() -> void:
+	if _event_queue.is_empty():
+		_draining_events = false
+		return
+	_draining_events = true
+	if _interrupted_locally:
+		_event_queue.clear()
+		_draining_events = false
+		return
+	var event: Dictionary = _event_queue.pop_front()
+	if state_store != null:
+		state_store.add_event(event)
+	var event_type := str(event.get("type", ""))
+	if event_type == "agent_reasoning_delta":
+		_on_reasoning_delta(event)
+	elif event_type == "agent_text_delta":
+		_on_text_delta(event)
+	else:
 		var previous_state := _state
 		var is_compacting := event_type == "compact_boundary" and previous_state != AgentState.IDLE
 		if is_compacting:
 			_set_state(AgentState.COMPACTING)
-		var description := _describe_event(event)
+		var description := EventFormatter.describe_event(event, _ui_table())
 		if description != "":
 			_append_message("system", description)
 		if is_compacting:
 			_set_state(previous_state)
-
-
-func _describe_event(event: Dictionary) -> String:
-	var payload: Dictionary = event.get("payload", {})
-	match str(event.get("type", "")):
-		"agent_step":
-			return ""
-		"agent_tool_calls":
-			return ""
-		"delegate_start":
-			return _ui("event_delegate") % _format_delegate_args(payload)
-		"server_tool_start":
-			if _is_workflow_tool(str(payload.get("tool", ""))):
-				return ""
-			return _ui("event_tool_start") % [
-				_tool_display_name(str(payload.get("tool", ""))),
-				_format_event_args(payload)
-			]
-		"server_tool_result":
-			var tool_label := _tool_display_name(str(payload.get("tool", "")))
-			if bool(payload.get("is_error", false)):
-				return _ui("event_tool_failed") % tool_label
-			var workflow_entry := _workflow_entry_from_event_result(payload)
-			if workflow_entry != "":
-				return workflow_entry
-			var count = payload.get("result_count")
-			if count != null:
-				return _ui("event_tool_done_count") % [tool_label, int(count)]
-			return _ui("event_tool_done") % tool_label
-		"tool_results_received":
-			return ""
-		"user_submitted":
-			var with_context := bool(payload.get("has_context", false))
-			return _ui("event_user") % (_ui("event_with_context") if with_context else "")
-		"tool_calls":
-			return ""
-		"final":
-			return ""
-		"error":
-			return _ui("event_error") % str(payload.get("text", ""))
-		"reset":
-			return _ui("event_reset")
-		"config_changed":
-			var parts: Array = []
-			if payload.has("effort"):
-				parts.append("effort=%s" % str(payload.get("effort")))
-			if payload.has("output_style"):
-				parts.append("output_style=%s" % str(payload.get("output_style")))
-			return _ui("event_config") % ", ".join(parts)
-		"compact_boundary":
-			return _ui("event_compact") % [
-				str(payload.get("compacted_frames", 0)),
-				str(payload.get("removed_messages", 0)),
-				str(payload.get("keep_recent", 0)),
-				str(payload.get("pending_preserved", false))
-			]
-		_:
-			return _ui("event_unknown") % [str(event.get("type", "unknown")), JSON.stringify(payload)]
-
-
-func _is_workflow_tool(name: String) -> bool:
-	var display := _tool_display_name(name)
-	return display == "Read" or display == "Grep" or display == "Edit" or display == "Write"
-
-
-func _workflow_entry_from_event_result(payload: Dictionary) -> String:
-	var raw_summary = payload.get("result_summary", {})
-	if not (raw_summary is Dictionary):
-		return ""
-	var summary: Dictionary = raw_summary
-	match str(summary.get("kind", "")):
-		"read":
-			return _format_read_event_entry(summary)
-		"grep":
-			return _format_grep_event_entry(summary)
-		_:
-			return ""
-
-
-func _format_read_event_entry(summary: Dictionary) -> String:
-	var path := str(summary.get("path", "<unknown>"))
-	var line_start := int(summary.get("line_start", 1))
-	var line_end := int(summary.get("line_end", line_start))
-	return "Read %s (lines %d-%d)" % [path, line_start, max(line_start, line_end)]
-
-
-func _format_grep_event_entry(summary: Dictionary) -> String:
-	var pattern := str(summary.get("pattern", summary.get("query", ""))).replace("\"", "\\\"")
-	var include := str(summary.get("include", "project"))
-	var count := int(summary.get("match_count", 0))
-	var lines: Array[String] = ["%d match%s" % [count, "" if count == 1 else "es"]]
-	var matches: Array = summary.get("matches", []) if summary.get("matches", []) is Array else []
-	for item in matches:
-		if not (item is Dictionary):
-			continue
-		var line_val = item.get("line", "")
-		var line_str := str(int(float(str(line_val)))) if line_val != "" else ""
-		lines.append("%s:%s %s" % [
-			str(item.get("path", "")),
-			line_str,
-			str(item.get("text", "")).strip_edges()
-		])
-	if bool(summary.get("truncated", false)):
-		lines.append("... truncated ...")
-	return "Grep \"%s\" (in %s)\n%s" % [pattern, include, "\n".join(lines)]
-
-
-func _format_event_args(payload: Dictionary) -> String:
-	var raw_args = payload.get("args", {})
-	var args: Dictionary = raw_args if raw_args is Dictionary else {}
-	var parts: Array[String] = []
-	for key in ["path", "target_path", "file_path", "script_path", "resource_path", "scene_path", "command", "kind", "agent", "task", "query"]:
-		if not args.has(key):
-			continue
-		var value := str(args.get(key, "")).strip_edges()
-		if value.length() > 90:
-			value = value.left(90) + "..."
-		parts.append("%s=`%s`" % [key, value])
-	return ", ".join(parts)
-
-
-## `delegate`/`delegate_many` 事件的参数展示：优先复用 `_format_event_args`
-## 提取到的 `agent`/`task`，`delegate_many` 的 `tasks` 数组不在该提取范围内，
-## 此时回退为展示工具名本身。
-func _format_delegate_args(payload: Dictionary) -> String:
-	var args_text := _format_event_args(payload)
-	if args_text != "":
-		return args_text
-	return str(payload.get("tool", "delegate"))
-
-
-## 工具名 -> workflow 展示名；未在
-## `_TOOL_DISPLAY_NAMES` 中列出的工具直接显示原始工具名。
-func _tool_display_name(name: String) -> String:
-	return str(_TOOL_DISPLAY_NAMES.get(name, name))
-
-
-## 截断过长文本并追加省略号，用于参数与结果摘要。
-func _truncate_text(text: String, max_len: int) -> String:
-	var stripped := text.strip_edges()
-	if stripped.length() > max_len:
-		return stripped.left(max_len) + "..."
-	return stripped
-
-
-## 统计文本行数（空字符串视为 0 行）。
-func _count_lines(text: String) -> int:
-	if text == "":
-		return 0
-	return text.split("\n").size()
+	call_deferred("_drain_event_queue")
 
 
 func _on_extensions() -> void:
@@ -1201,7 +1015,7 @@ func _show_inline_confirmation(calls: Array) -> void:
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
-	var panel := _make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
+	var panel := _log_renderer.make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(panel)
 
@@ -1358,7 +1172,6 @@ func _set_state(value: int) -> void:
 		})
 
 
-## 推理增量渲染为独立 Thought workflow 条目，默认折叠但持续更新详情。
 func _on_reasoning_delta(event: Dictionary) -> void:
 	var payload: Dictionary = event.get("payload", {})
 	var key := _stream_event_key(payload)
@@ -1379,7 +1192,7 @@ func _on_text_delta(event: Dictionary) -> void:
 	_ensure_stream_message(key, true)
 	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		_stream_content_rich.clear()
-		_stream_content_rich.append_text(_markdown_to_bbcode(_strip_think_xml(text)))
+		_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(_strip_think_xml(text), _theme_colors))
 	_scroll_to_bottom()
 
 
@@ -1412,8 +1225,8 @@ func _ensure_reasoning_entry(key: String) -> void:
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	body.add_theme_constant_override("separation", 2)
 
-	var toggle := _make_workflow_toggle(_format_reasoning_header(), _theme_color("muted_text"))
-	var detail_rich := _append_collapsible(body, toggle, "", "✻")
+	var toggle := _log_renderer.make_workflow_toggle(_format_reasoning_header(), _theme_color("muted_text"))
+	var detail_rich := _log_renderer.append_collapsible(body, toggle, "", "✻")
 
 	_message_list.add_child(body)
 	_reasoning_toggle = toggle
@@ -1423,12 +1236,10 @@ func _ensure_reasoning_entry(key: String) -> void:
 
 func _update_reasoning_entry() -> void:
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
-		# `_format_reasoning_header` 不含标记前缀，这里需要重新拼上 "✻  "，
-		# 否则每次流式更新都会用纯文本覆盖掉 `_append_collapsible` 中设置的标记。
 		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
 	if _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
 		_reasoning_detail_rich.clear()
-		_reasoning_detail_rich.append_text(_markdown_to_bbcode(_reasoning_text))
+		_reasoning_detail_rich.append_text(MarkdownRenderer.markdown_to_bbcode(_reasoning_text, _theme_colors))
 	_scroll_to_bottom()
 
 
@@ -1439,10 +1250,6 @@ func _format_reasoning_header() -> String:
 	return "Thought for %ds" % elapsed
 
 
-## 确保存在一个用于流式展示的消息气泡（仅含正文区域）。`key` 通常为
-## `frame_id:loop`；与当前流式消息的 key 不同时会丢弃上一条流式消息气泡
-## （例如委派子帧或"边想边调用工具"轮次的中间输出，不应作为独立消息保留，
-## 否则会和后续轮次/父帧的最终回复重复展示）。
 func _ensure_stream_message(key: String, indent := false) -> void:
 	if _stream_key == key and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		return
@@ -1450,7 +1257,7 @@ func _ensure_stream_message(key: String, indent := false) -> void:
 	_stream_key = key
 	_stream_started_ms = Time.get_ticks_msec()
 
-	var content_rich := _make_log_rich_text("", null, "", indent)
+	var content_rich := _log_renderer.make_log_rich_text("", null, "", indent)
 
 	_message_list.add_child(content_rich)
 	_stream_row = content_rich
@@ -1458,7 +1265,6 @@ func _ensure_stream_message(key: String, indent := false) -> void:
 	_scroll_to_bottom()
 
 
-## 结束当前流式消息：仅清空引用，已渲染的气泡保留在历史记录中。
 func _finish_streaming() -> void:
 	_stream_key = ""
 	_stream_row = null
@@ -1474,8 +1280,6 @@ func _finish_reasoning_stream() -> void:
 	_reasoning_started_ms = -1
 
 
-## 丢弃当前流式消息气泡：用于本轮 LLM 输出仅是"边想边调用工具"的中间内容，
-## 不是最终回复（避免和后续轮次的最终回复重复展示）。
 func _mark_current_stream_closed() -> void:
 	if _stream_key != "":
 		_closed_stream_keys[_stream_key] = true
@@ -1515,7 +1319,7 @@ func _append_message(role: String, text: String, color = null) -> void:
 		spacer.size_flags_stretch_ratio = 0.35
 		row.add_child(spacer)
 
-	var panel := _make_message_panel(role)
+	var panel := _log_renderer.make_message_panel(role)
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	panel.size_flags_stretch_ratio = 0.65 if role == "user" else 1.0
 	panel.custom_minimum_size = Vector2(320, 0) if role == "user" else Vector2(0, 0)
@@ -1525,503 +1329,31 @@ func _append_message(role: String, text: String, color = null) -> void:
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	panel.add_child(body)
 
-	var rich := _make_rich_text(text, color)
+	var rich := _log_renderer.make_rich_text(text, color)
 	body.add_child(rich)
 
 	_message_list.add_child(row)
 	_scroll_to_bottom()
 
 
-## 生成单个工具调用标题行，在执行/确认之前展示，
-## 让用户能实时看到模型正在调用什么智能体/工具、读取或编辑了什么文件。
 func _message_fingerprint(text: String) -> String:
 	return " ".join(text.strip_edges().split())
 
 
-## Log stream action rows.
 func _append_log_stream_message(text: String, color = null, mark_text: bool = false) -> void:
-	for entry in _split_log_entries(_normalize_action_message(text)):
-		_append_log_entry(str(entry), color, mark_text)
+	_log_renderer.append_log_stream_message(_message_list, text, color, mark_text, _indent_current_text)
 	_scroll_to_bottom()
-
-
-func _normalize_action_message(text: String) -> String:
-	var normalized := text.strip_edges()
-	if normalized == "":
-		return text
-	if _is_log_action_start(normalized):
-		return normalized
-	if normalized.contains("Wrote `"):
-		return _normalize_written_result(normalized)
-	if normalized.contains("**Read**"):
-		return "Read %s (lines 1-EOF)" % _extract_parenthesized_action_arg(normalized)
-	if normalized.contains("**Edit**") or normalized.contains("**Write**"):
-		return "Edit %s" % _extract_parenthesized_action_arg(normalized)
-	if normalized.contains("**Grep**") or normalized.contains("**SearchTools**"):
-		return "Grep \"%s\" (in project)" % _extract_parenthesized_action_arg(normalized).replace("\"", "\\\"")
-	return normalized
-
-
-func _normalize_written_result(text: String) -> String:
-	var start := text.find("Wrote `")
-	if start == -1:
-		return text
-	start += "Wrote `".length()
-	var end := text.find("`", start)
-	var path := text.substr(start, end - start) if end > start else "<unknown>"
-	var line_count := _extract_first_int_after(text, "(", 0)
-	return "Edit %s\n+%d -0 lines" % [path, line_count]
-
-
-func _extract_parenthesized_action_arg(text: String) -> String:
-	var start := text.find("(")
-	var end := text.rfind(")")
-	if start == -1 or end <= start:
-		return "<unknown>"
-	return text.substr(start + 1, end - start - 1).strip_edges()
-
-
-func _extract_first_int_after(text: String, marker: String, fallback: int) -> int:
-	var start := text.find(marker)
-	if start == -1:
-		return fallback
-	var digits := ""
-	for index in range(start + marker.length(), text.length()):
-		var ch := text.substr(index, 1)
-		if ch >= "0" and ch <= "9":
-			digits += ch
-		elif digits != "":
-			break
-	return int(digits) if digits != "" else fallback
-
-
-## 把文本按 "Grep "/"Read "/"Thought "/"Thought:"/"Edit " 起始行切分为多个
-## 独立条目；两个动作行之间的普通文本（包括多行段落/代码块）合并为一个
-## "text" 条目，避免把一段普通回复拆成逐行的列表项。
-##
-## "Thought" 条目在遇到空行时立即结束（空行本身被丢弃，不计入任一条目），
-## 使 `_apply_thought_prefix` 产出的 "Thought for Xs > 摘要\n\n正文" 拆分为
-## ① 仅含摘要的可折叠 "thought" 条目 与 ② 始终展示的正文 "text" 条目，
-## 不会把真正的回复内容藏进折叠区；连续多个 "Thought" 也各自独立成条目。
-func _split_log_entries(text: String) -> Array[String]:
-	var entries: Array[String] = []
-	var current: Array[String] = []
-	for raw_line in text.split("\n"):
-		var line := str(raw_line)
-		var trimmed := line.strip_edges()
-		if _is_log_action_start(trimmed):
-			_flush_log_entry(entries, current)
-			current.clear()
-			current.append(trimmed)
-		elif trimmed == "" and not current.is_empty() and _is_log_action_start(str(current[0])):
-			_flush_log_entry(entries, current)
-			current.clear()
-		else:
-			current.append(line)
-	_flush_log_entry(entries, current)
-	return entries
-
-
-func _flush_log_entry(entries: Array[String], current: Array[String]) -> void:
-	if current.is_empty():
-		return
-	var block := "\n".join(current).strip_edges()
-	if block != "":
-		entries.append(block)
-
-
-func _is_log_action_start(line: String) -> bool:
-	return line.begins_with("Grep ") \
-		or line.begins_with("Read ") \
-		or line.begins_with("Thought ") \
-		or line.begins_with("Thought:") \
-		or line.begins_with("Edit ")
-
-
-func _append_log_entry(entry: String, color = null, mark_text: bool = false) -> void:
-	var kind := _log_entry_kind(entry)
-	var marker_text := _workflow_marker_text(kind, mark_text)
-
-	var content := VBoxContainer.new()
-	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	content.add_theme_constant_override("separation", 2)
-
-	# 只有 kind == "text" 且 _indent_current_text == true 时才缩进
-	var should_indent := (_indent_current_text and kind == "text")
-
-	if kind == "thought":
-		_append_thought_entry(content, entry, marker_text)
-	elif kind == "read":
-		_append_read_entry(content, entry, marker_text)
-	elif kind == "grep":
-		_append_grep_entry(content, entry, marker_text)
-	elif kind == "edit":
-		_append_edit_entry(content, entry, marker_text)
-	else:
-		content.add_child(_make_log_rich_text(entry, color, marker_text, should_indent))
-
-	_message_list.add_child(content)
-	_scroll_to_bottom()
-
-
-## "text" 类条目默认无标记；`mark_text` 用于非最终正文回复（如系统/工具状态
-## 消息），使其与 Read/Grep/Edit 一致地显示 "●"。
-func _workflow_marker_text(kind: String, mark_text: bool = false) -> String:
-	match kind:
-		"thought":
-			return "✻"
-		"read", "grep", "edit":
-			return "●"
-		_:
-			return "○" if mark_text else ""
-
-
-func _log_entry_kind(entry: String) -> String:
-	var first := _first_line(entry)
-	if first.begins_with("Grep "):
-		return "grep"
-	if first.begins_with("Read "):
-		return "read"
-	if first.begins_with("Thought ") or first.begins_with("Thought:"):
-		return "thought"
-	if first.begins_with("Edit "):
-		return "edit"
-	return "text"
-
-
-func _first_line(text: String) -> String:
-	var lines := text.split("\n")
-	return str(lines[0]) if lines.size() > 0 else text
-
-
-func _rest_lines(text: String) -> String:
-	var lines := text.split("\n")
-	if lines.size() <= 1:
-		return ""
-	var rest: Array[String] = []
-	for index in range(1, lines.size()):
-		rest.append(str(lines[index]))
-	return "\n".join(rest)
-
-
-## 拆分 "Thought" 条目首行的标题与内联摘要：
-## - "Thought for Xs > 摘要"  -> {header: "Thought for Xs >", inline: "摘要"}
-## - "Thought: 摘要"          -> {header: "Thought:", inline: "摘要"}
-## - "Thought for Xs >"       -> {header: "Thought for Xs >", inline: ""}
-## - "Thought"（无标记）       -> {header: "Thought >", inline: ""}
-func _split_thought_header(first_line: String) -> Dictionary:
-	var gt := first_line.find(">")
-	if gt != -1:
-		return {
-			"header": first_line.substr(0, gt + 1).strip_edges(),
-			"inline": first_line.substr(gt + 1).strip_edges()
-		}
-	if first_line.begins_with("Thought:"):
-		return {
-			"header": "Thought:",
-			"inline": first_line.substr("Thought:".length()).strip_edges()
-		}
-	return {"header": first_line + " >", "inline": ""}
-
-
-func _set_arrow_pivot(arrow: Label) -> void:
-	if arrow == null:
-		return
-	arrow.pivot_offset = arrow.size / 2
-
-
-## 渲染一个可折叠的条目：标题文本末尾紧跟一个 ">" 箭头，折叠时指向右侧，
-## 展开时旋转 90 度指向下方；点击标题行可展开/折叠详细文本。`marker_text`
-## （"●"/"✻"）会作为标题文本的前缀，与标题共享同一控件，避免单独一列
-## 渲染时和文字行高不一致导致的错位。
-func _append_collapsible(content: VBoxContainer, toggle: Button, detail: String, marker_text: String = "") -> RichTextLabel:
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_theme_constant_override("separation", 4)
-
-	var arrow := Label.new()
-	arrow.text = ">"
-	arrow.custom_minimum_size = Vector2(16, 16)
-	arrow.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
-	arrow.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	arrow.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	# 延迟到下一帧，等尺寸确定
-	call_deferred("_set_arrow_pivot", arrow)
-	arrow.add_theme_color_override("font_color", toggle.get_theme_color("font_color"))
-
-	if marker_text != "":
-		toggle.text = marker_text + "  " + toggle.text
-	# 不让 toggle 占满整行，使 arrow 紧跟在文本末尾，而不是被挤到容器最右侧。
-	toggle.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
-	row.add_child(toggle)
-	row.add_child(arrow)
-	content.add_child(row)
-
-	var detail_rich := _make_log_rich_text(detail, _theme_color("muted_text"))
-	detail_rich.visible = false
-	content.add_child(detail_rich)
-
-	toggle.pressed.connect(func():
-		detail_rich.visible = not detail_rich.visible
-		arrow.rotation_degrees = 90.0 if detail_rich.visible else 0.0
-	)
-	return detail_rich
-
-
-func _append_thought_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
-	var split := _split_thought_header(_first_line(entry))
-	var header := str(split.get("header", ""))
-	if header.ends_with(">"):
-		header = header.substr(0, header.length() - 1).strip_edges()
-	var inline := str(split.get("inline", ""))
-	var rest := _rest_lines(entry)
-
-	var detail_parts: Array[String] = []
-	if inline != "":
-		detail_parts.append(inline)
-	if rest != "":
-		detail_parts.append(rest)
-	var detail := "\n\n".join(detail_parts)
-
-	if detail == "":
-		content.add_child(_make_log_rich_text(header, _theme_color("muted_text"), marker_text))
-		return
-
-	_append_collapsible(content, _make_workflow_toggle(header, _theme_color("muted_text")), detail, marker_text)
-
-
-func _append_read_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
-	content.add_child(_make_log_rich_text(_first_line(entry), null, marker_text))
-
-
-func _append_grep_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
-	var rest := _rest_lines(entry)
-	if rest == "":
-		content.add_child(_make_log_rich_text(_first_line(entry), null, marker_text))
-		return
-	var rest_lines := rest.split("\n")
-	var summary := str(rest_lines[0]).strip_edges()
-	var details: Array[String] = []
-	for index in range(1, rest_lines.size()):
-		details.append(str(rest_lines[index]))
-	var header := _first_line(entry)
-	if summary != "":
-		header += " - " + summary
-	if details.is_empty():
-		# 用 Button（纯文本）渲染，避免 Grep 正则 pattern 中的 "[" 经 _escape_bbcode
-		# 转成 [lb] 后在 RichTextLabel 里无法正确显示的问题；与有 details 时的路径保持一致。
-		var toggle := _make_workflow_toggle(header)
-		if marker_text != "":
-			toggle.text = marker_text + "  " + toggle.text
-		toggle.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		content.add_child(toggle)
-		return
-
-	_append_collapsible(content, _make_workflow_toggle(header), "\n".join(details), marker_text)
-
-
-func _append_edit_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
-	content.add_child(_make_log_rich_text(_first_line(entry), null, marker_text))
-	var stats := _format_edit_stats(_rest_lines(entry))
-	if stats != "":
-		content.add_child(_make_log_rich_text(stats, _theme_color("success_text")))
-
-
-func _make_workflow_toggle(text: String, color = null) -> Button:
-	var toggle := Button.new()
-	toggle.flat = true
-	toggle.focus_mode = Control.FOCUS_NONE
-	toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
-	toggle.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	# 主题按钮默认 stylebox 自带左边距，会让标题文本相对其他用 RichTextLabel
-	# （零边距）渲染的消息行整体右移，导致消息块左边缘对不齐。这里清空各状态
-	# 的 stylebox，使文本起始位置与 _make_log_rich_text 一致。
-	for state in ["normal", "hover", "pressed", "hover_pressed", "focus", "disabled"]:
-		toggle.add_theme_stylebox_override(state, StyleBoxEmpty.new())
-	_set_button_text_colors(toggle, _resolve_color(color, "text"), _theme_color("hover_text"))
-	toggle.text = text
-	return toggle
-
-
-func _format_edit_stats(detail: String) -> String:
-	var stripped := detail.strip_edges()
-	if stripped == "":
-		return ""
-	if stripped.begins_with("+") or stripped.contains(" -"):
-		return stripped
-	var added := _extract_first_int_after(stripped, "Added ", 0)
-	var removed := _extract_first_int_after(stripped, "Removed ", 0)
-	return "+%d -%d lines" % [added, removed]
-
-
-func _make_log_rich_text(text: String, color = null, marker_text: String = "", indent := false) -> RichTextLabel:
-	var rich := _make_rich_text(text, color, marker_text)
-	rich.add_theme_constant_override("line_separation", 1)
-	if indent:
-		var style := StyleBoxEmpty.new()
-		style.content_margin_left = 48   # 两个 Tab 的像素宽度，可根据需要调整
-		rich.add_theme_stylebox_override("normal", style)
-	return rich
-
-
-func _format_tool_call_header(call: Dictionary) -> String:
-	var name := str(call.get("name", "unknown"))
-	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
-	var display := _tool_display_name(name)
-	var args := _format_tool_call_args(name, input)
-	var header := display if args == "" else "%s %s" % [display, args]
-	var agent := str(call.get("agent", ""))
-	if agent != "" and agent != "coordinator":
-		header += " · `%s`" % agent
-	return header
-
-
-## 提取单个工具调用 "(...)" 部分的关键参数：路径类参数优先，其次是命令/智能体/
-## 任务/查询等描述性参数；按需截断避免一行过长。
-func _format_tool_call_args(name: String, input: Dictionary) -> String:
-	if name == "run_tests" or name == "run_headless_self_test":
-		return "kind=%s" % str(input.get("kind", "project"))
-	for key in ["path", "target_path", "file_path", "script_path", "resource_path", "scene_path"]:
-		if input.has(key):
-			return str(input.get(key, ""))
-	for key in ["pattern", "query", "include", "command", "agent", "task", "class_name", "node_path", "name"]:
-		if input.has(key):
-			return _truncate_text(str(input.get(key, "")), 60)
-	return ""
-
-
-## 生成单个工具调用结果摘要行：读取类工具显示行数，写入/编辑类
-## 工具显示路径与行数，测试/命令类工具显示状态与截断输出，出错/被拒绝的调用
-## 显示对应说明。
-func _format_tool_result_detail(name: String, input: Dictionary, status: String, result: Dictionary) -> String:
-	var inner: Dictionary = result.get("result", {}) if result.get("result") is Dictionary else {}
-	if status == "rejected":
-		return _ui("tool_rejected")
-	if status == "error":
-		var message := str(inner.get("message", result.get("error_code", _ui("tool_unknown_error"))))
-		return _ui("tool_error_detail") % message
-	match name:
-		"read_file", "read_script":
-			return _ui("tool_read_lines") % _count_lines(str(inner.get("content", "")))
-		"write_file", "propose_script_edit", "apply_text_edit", "propose_tests", "propose_content_file":
-			var after_text := str(input.get("content", input.get("after_text", "")))
-			var path := str(inner.get("path", input.get("path", input.get("target_path", ""))))
-			return _ui("tool_wrote_lines") % [path, _count_lines(after_text)]
-		"run_tests", "run_headless_self_test":
-			var run_status := str(inner.get("status", "unknown"))
-			var exit_code = inner.get("exit_code")
-			var summary := run_status
-			if exit_code != null:
-				summary = _ui("tool_run_result") % [run_status, str(exit_code)]
-			var output := str(inner.get("output", "")).strip_edges()
-			if output != "":
-				summary += "\n```\n%s\n```" % _truncate_text(output, 800)
-			return summary
-		"read_debugger_errors":
-			var items: Array = inner.get("items", []) if inner.get("items") is Array else []
-			return _ui("tool_items_count") % items.size()
-		_:
-			if inner.has("path"):
-				return _ui("tool_done_path") % str(inner.get("path"))
-			return _ui("tool_done")
-
-
-## 追加一条工具结果消息；失败/被拒绝的调用使用醒目颜色。
-func _format_log_tool_result(name: String, input: Dictionary, result: Dictionary, fallback: String) -> String:
-	var inner: Dictionary = result.get("result", {}) if result.get("result") is Dictionary else {}
-	match name:
-		"read_file", "read_script":
-			var read_path := str(inner.get("path", input.get("path", "<unknown>")))
-			var content := str(inner.get("content", ""))
-			var line_count := _count_lines(content)
-			return "Read %s (lines 1-%d)" % [read_path, line_count]
-		"write_file", "propose_script_edit", "apply_text_edit", "propose_tests", "propose_content_file":
-			var edit_path := str(inner.get("path", input.get("path", input.get("target_path", "<unknown>"))))
-			var after_text := str(input.get("content", input.get("after_text", "")))
-			var before_text := str(input.get("before_text", input.get("before", "")))
-			var added := max(_count_lines(after_text) - _count_lines(before_text), 0)
-			var removed := max(_count_lines(before_text) - _count_lines(after_text), 0)
-			return "Edit %s\n+%d -%d lines" % [edit_path, added, removed]
-		_:
-			return fallback
 
 
 func _append_tool_result(call: Dictionary, result: Dictionary) -> void:
 	var name := str(call.get("name", "unknown"))
 	var status := str(result.get("status", ""))
 	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
-	var detail := _format_tool_result_detail(name, input, status, result)
+	var detail := EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
 	if status == "applied":
-		detail = _format_log_tool_result(name, input, result, detail)
+		detail = EventFormatter.format_log_tool_result(name, input, result, detail)
 	var color := _theme_color("error_text") if status == "error" else _theme_color("text")
 	_append_message("system", detail, color)
-
-
-func _make_message_panel(role: String) -> PanelContainer:
-	match role:
-		"user":
-			return _make_panel(_theme_color("user_panel_bg"), _theme_color("user_panel_border"))
-		"assistant":
-			return _make_panel(_theme_color("panel_bg"), _theme_color("panel_border"))
-		"error":
-			return _make_panel(_theme_color("error_panel_bg"), _theme_color("error_panel_border"))
-		_:
-			return _make_panel(_theme_color("panel_bg"), _theme_color("panel_border"))
-
-
-func _make_panel(bg_color = null, border_color = null) -> PanelContainer:
-	var panel := PanelContainer.new()
-	var style := StyleBoxFlat.new()
-	style.bg_color = _resolve_color(bg_color, "panel_bg")
-	style.border_color = _resolve_color(border_color, "panel_border")
-	style.set_border_width_all(1)
-	style.set_corner_radius_all(6)
-	style.set_content_margin(SIDE_LEFT, 10)
-	style.set_content_margin(SIDE_RIGHT, 10)
-	style.set_content_margin(SIDE_TOP, 8)
-	style.set_content_margin(SIDE_BOTTOM, 8)
-	panel.add_theme_stylebox_override("panel", style)
-	return panel
-
-
-## `marker_text`（"●"/"✻"）会以其专属颜色拼接到首行文本前，与正文共享同一
-## 基线，避免标记作为独立列渲染时与文字行高不一致导致的错位。
-func _make_rich_text(text: String, color = null, marker_text: String = "") -> RichTextLabel:
-	var rich := RichTextLabel.new()
-	rich.bbcode_enabled = true
-	rich.selection_enabled = true
-	rich.context_menu_enabled = true
-	rich.fit_content = true
-	rich.scroll_active = false
-	rich.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	rich.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	rich.add_theme_stylebox_override("normal", StyleBoxEmpty.new())
-	rich.add_theme_color_override("default_color", _resolve_color(color, "text"))
-	_apply_mono_font(rich)
-	var bbcode := _markdown_to_bbcode(text)
-	if marker_text != "":
-		bbcode = "[color=%s]%s[/color]  %s" % [_marker_color_tag(marker_text), marker_text, bbcode]
-	rich.append_text(bbcode)
-	return rich
-
-
-## 为 `[code]`（含行内代码与代码块）配置等宽字体，优先复用编辑器自带的源码字体。
-func _apply_mono_font(rich: RichTextLabel) -> void:
-	var mono_font: Font = null
-	var mono_size := 0
-	if editor_interface != null:
-		var editor_theme := editor_interface.get_editor_theme()
-		if editor_theme != null and editor_theme.has_font("source", "EditorFonts"):
-			mono_font = editor_theme.get_font("source", "EditorFonts")
-		if editor_theme != null and editor_theme.has_font_size("source_size", "EditorFonts"):
-			mono_size = editor_theme.get_font_size("source_size", "EditorFonts")
-	if mono_font == null:
-		var sys_font := SystemFont.new()
-		sys_font.font_names = PackedStringArray(["Consolas", "Menlo", "Monaco", "Courier New", "monospace"])
-		mono_font = sys_font
-	rich.add_theme_font_override("mono_font", mono_font)
-	if mono_size > 0:
-		rich.add_theme_font_size_override("mono_font_size", mono_size)
 
 
 func _clear_messages() -> void:
@@ -2044,10 +1376,12 @@ func _on_scroll_value_changed(value: float) -> void:
 
 
 func _scroll_to_bottom_deferred() -> void:
-	if _scroll == null or not _auto_scroll:
+	if _scroll == null:
 		return
-	var bar := _scroll.get_v_scroll_bar()
-	_scroll.scroll_vertical = int(bar.max_value)
+	if not _auto_scroll and not _force_scroll_once:
+		return
+	_force_scroll_once = false
+	_scroll.scroll_vertical = 999999
 
 
 func _ui(key: String) -> String:
@@ -2060,315 +1394,10 @@ func _ui(key: String) -> String:
 	return str(table.get(key, key))
 
 
-func _markdown_to_bbcode(text: String) -> String:
-	var result: Array[String] = []
-	var in_code := false
-	var code_lang := ""
-	var lines := text.split("\n")
-	var tree_ranges := _find_tree_block_ranges(lines)
-	var tree_range_index := 0
-	var index := 0
-	while index < lines.size():
-		var line := str(lines[index])
-		if line.begins_with("```"):
-			if in_code:
-				in_code = false
-				code_lang = ""
-				result.append("[/code][/bgcolor]")
-			else:
-				in_code = true
-				code_lang = _normalize_code_lang(line.substr(3))
-				result.append("[bgcolor=%s][code]" % _theme_color_tag("code_bg"))
-			index += 1
-			continue
-		if in_code:
-			result.append(_highlight_code_line(line, code_lang))
-			index += 1
-			continue
-		while tree_range_index < tree_ranges.size() and int(tree_ranges[tree_range_index].y) <= index:
-			tree_range_index += 1
-		if tree_range_index < tree_ranges.size() and int(tree_ranges[tree_range_index].x) == index:
-			var tree_range: Vector2i = tree_ranges[tree_range_index]
-			result.append("[bgcolor=%s][code]" % _theme_color_tag("code_bg"))
-			for tree_index in range(tree_range.x, tree_range.y):
-				result.append(_escape_bbcode(str(lines[tree_index])))
-			result.append("[/code][/bgcolor]")
-			index = tree_range.y
-			tree_range_index += 1
-			continue
-		if _looks_like_table_start(lines, index):
-			var table_lines: Array[String] = []
-			while index < lines.size() and str(lines[index]).contains("|"):
-				table_lines.append(str(lines[index]))
-				index += 1
-			result.append(_render_markdown_table(table_lines))
-			continue
-		result.append(_markdown_line_to_bbcode(line))
-		index += 1
-	if in_code:
-		result.append("[/code][/bgcolor]")
-	return "\n".join(result)
-
-
-## 将代码块的语言标记归一化（如 ```gd``` -> gdscript），未知/缺省语言返回空串。
-func _normalize_code_lang(raw: String) -> String:
-	var token := raw.strip_edges().split(" ")[0].to_lower()
-	if _CODE_LANG_ALIASES.has(token):
-		return str(_CODE_LANG_ALIASES[token])
-	return token
-
-
-## 渲染 markdown 表格为真实的 `[table]`/`[cell]` BBCode 网格。
-func _render_markdown_table(table_lines: Array[String]) -> String:
-	if table_lines.size() < 2:
-		return _escape_bbcode("\n".join(table_lines))
-	var header_cells := _split_table_row(table_lines[0])
-	if header_cells.is_empty():
-		return _escape_bbcode("\n".join(table_lines))
-	var column_count := header_cells.size()
-	var bbcode := "[table=%d]" % column_count
-	for cell in header_cells:
-		bbcode += "[cell][b]%s[/b][/cell]" % _format_table_cell(str(cell))
-	for row_index in range(2, table_lines.size()):
-		var cells := _split_table_row(table_lines[row_index])
-		for col_index in range(column_count):
-			var cell_text := str(cells[col_index]) if col_index < cells.size() else ""
-			bbcode += "[cell]%s[/cell]" % _format_table_cell(cell_text)
-	bbcode += "[/table]"
-	return bbcode
-
-
-func _format_table_cell(cell: String) -> String:
-	var escaped := _escape_bbcode(cell.strip_edges())
-	escaped = _replace_inline_code(escaped)
-	escaped = _replace_bold(escaped)
-	return escaped
-
-
-func _split_table_row(line: String) -> PackedStringArray:
-	var trimmed := line.strip_edges()
-	if trimmed.begins_with("|"):
-		trimmed = trimmed.substr(1)
-	if trimmed.ends_with("|"):
-		trimmed = trimmed.substr(0, trimmed.length() - 1)
-	return trimmed.split("|")
-
-
-func _markdown_line_to_bbcode(line: String) -> String:
-	var escaped := _escape_bbcode(line)
-	var stripped := line.strip_edges()
-	if stripped == "---" or stripped == "***" or stripped == "___":
-		return "[color=%s]────────────────────────[/color]" % _theme_color_tag("subtle_text")
-	if line.begins_with("### "):
-		return "[b]" + _escape_bbcode(line.substr(4)) + "[/b]"
-	if line.begins_with("## "):
-		return "[font_size=18][b]" + _escape_bbcode(line.substr(3)) + "[/b][/font_size]"
-	if line.begins_with("# "):
-		return "[font_size=20][b]" + _escape_bbcode(line.substr(2)) + "[/b][/font_size]"
-	if line.begins_with("- "):
-		escaped = "• " + _escape_bbcode(line.substr(2))
-	elif _begins_with_ordered_list(line):
-		escaped = _escape_bbcode(line)
-	escaped = _replace_inline_code(escaped)
-	escaped = _replace_bold(escaped)
-	return escaped
-
-
-func _looks_like_table_start(lines: PackedStringArray, index: int) -> bool:
-	if index + 1 >= lines.size():
-		return false
-	var line := str(lines[index])
-	var next := str(lines[index + 1])
-	return line.contains("|") and _is_markdown_table_separator(next)
-
-
-func _is_markdown_table_separator(line: String) -> bool:
-	var stripped := line.strip_edges()
-	if not stripped.contains("|") or not stripped.contains("-"):
-		return false
-	var allowed := "|-: "
-	for index in range(stripped.length()):
-		var character := stripped.substr(index, 1)
-		if not allowed.contains(character):
-			return false
-	return true
-
-
-## 判断一行是否包含目录树/连线图常用的连线字符（Unicode 制表符或其 ASCII 变体）。
-func _looks_like_tree_line(line: String) -> bool:
-	for character in _TREE_LINE_CHARS:
-		if line.contains(character):
-			return true
-	return line.contains("+-- ") or line.contains("|-- ") or line.contains("`-- ")
-
-
-## 预扫描整段 markdown 文本，找出包含连线字符且未被代码围栏包裹的段落
-## （以空行或代码围栏分隔），返回这些段落的 [起始行, 结束行) 区间。
-## 这类段落（如"文件树"）整体会被当作等宽代码块渲染，否则连线在比例
-## 字体下无法对齐。
-func _find_tree_block_ranges(lines: PackedStringArray) -> Array:
-	var ranges: Array = []
-	var in_code := false
-	var paragraph_start := -1
-	var paragraph_has_tree := false
-	for index in range(lines.size()):
-		var line := str(lines[index])
-		if line.begins_with("```"):
-			if paragraph_start >= 0:
-				if paragraph_has_tree:
-					ranges.append(Vector2i(paragraph_start, index))
-				paragraph_start = -1
-				paragraph_has_tree = false
-			in_code = not in_code
-			continue
-		if in_code:
-			continue
-		if line.strip_edges() == "":
-			if paragraph_start >= 0:
-				if paragraph_has_tree:
-					ranges.append(Vector2i(paragraph_start, index))
-				paragraph_start = -1
-				paragraph_has_tree = false
-			continue
-		if paragraph_start < 0:
-			paragraph_start = index
-		if _looks_like_tree_line(line):
-			paragraph_has_tree = true
-	if paragraph_start >= 0 and paragraph_has_tree:
-		ranges.append(Vector2i(paragraph_start, lines.size()))
-	return ranges
-
-
-func _begins_with_ordered_list(line: String) -> bool:
-	var dot_index := line.find(". ")
-	if dot_index <= 0 or dot_index > 4:
-		return false
-	for index in range(dot_index):
-		var code := line.unicode_at(index)
-		if code < 48 or code > 57:
-			return false
-	return true
-
-
-func _replace_inline_code(text: String) -> String:
-	var parts := text.split("`")
-	if parts.size() < 3:
-		return text
-	var result := ""
-	for index in range(parts.size()):
-		result += str(parts[index])
-		if index < parts.size() - 1:
-			result += "[code]" if index % 2 == 0 else "[/code]"
-	return result
-
-
-func _replace_bold(text: String) -> String:
-	var parts := text.split("**")
-	if parts.size() < 3:
-		return text
-	var result := ""
-	for index in range(parts.size()):
-		result += str(parts[index])
-		if index < parts.size() - 1:
-			result += "[b]" if index % 2 == 0 else "[/b]"
-	return result
-
-
-func _escape_bbcode(text: String) -> String:
-	return text.replace("[", "[lb]").replace("]", "[rb]")
-
-
-## 对代码块中的一行做轻量语法高亮：先按语言的行注释前缀分离注释，
-## 再对剩余部分做字符串/数字/关键字着色，其余文本仅做 BBCode 转义。
-func _highlight_code_line(line: String, lang: String) -> String:
-	var comment_prefix: String = _CODE_LINE_COMMENT.get(lang, "")
-	if comment_prefix != "":
-		var comment_index := _find_comment_index(line, comment_prefix)
-		if comment_index >= 0:
-			var code_part := line.substr(0, comment_index)
-			var comment_part := line.substr(comment_index)
-			return _highlight_code_segment(code_part, lang) \
-				+ "[color=%s]%s[/color]" % [_theme_color_tag("syntax_comment"), _escape_bbcode(comment_part)]
-	return _highlight_code_segment(line, lang)
-
-
-## 查找行注释前缀在代码行中的起始位置；若前缀出现在字符串字面量内则忽略，返回 -1。
-func _find_comment_index(line: String, prefix: String) -> int:
-	var in_string := ""
-	var index := 0
-	while index < line.length():
-		var character := line.substr(index, 1)
-		if in_string != "":
-			if character == "\\":
-				index += 2
-				continue
-			if character == in_string:
-				in_string = ""
-			index += 1
-			continue
-		if character == "\"" or character == "'":
-			in_string = character
-			index += 1
-			continue
-		if line.substr(index, prefix.length()) == prefix:
-			return index
-		index += 1
-	return -1
-
-
-## 对一段不含注释的代码文本做字符串/数字/关键字着色，其余字符做 BBCode 转义。
-func _highlight_code_segment(text: String, lang: String) -> String:
-	var keywords: Array = _CODE_KEYWORDS.get(lang, [])
-	var result := ""
-	var index := 0
-	var length := text.length()
-	while index < length:
-		var code := text.unicode_at(index)
-		var character := text.substr(index, 1)
-		if character == "\"" or character == "'":
-			var quote := character
-			var end := index + 1
-			while end < length:
-				var next_char := text.substr(end, 1)
-				if next_char == "\\":
-					end += 2
-					continue
-				end += 1
-				if next_char == quote:
-					break
-			var literal := text.substr(index, end - index)
-			result += "[color=%s]%s[/color]" % [_theme_color_tag("syntax_string"), _escape_bbcode(literal)]
-			index = end
-			continue
-		if (code >= 65 and code <= 90) or (code >= 97 and code <= 122) or code == 95:
-			var end := index
-			while end < length:
-				var next_code := text.unicode_at(end)
-				var is_word := (next_code >= 65 and next_code <= 90) \
-					or (next_code >= 97 and next_code <= 122) \
-					or (next_code >= 48 and next_code <= 57) \
-					or next_code == 95
-				if not is_word:
-					break
-				end += 1
-			var word := text.substr(index, end - index)
-			if keywords.has(word):
-				result += "[color=%s]%s[/color]" % [_theme_color_tag("syntax_keyword"), _escape_bbcode(word)]
-			else:
-				result += _escape_bbcode(word)
-			index = end
-			continue
-		if code >= 48 and code <= 57:
-			var end := index
-			while end < length:
-				var next_char := text.substr(end, 1)
-				if (next_char.unicode_at(0) >= 48 and next_char.unicode_at(0) <= 57) or next_char == ".":
-					end += 1
-				else:
-					break
-			result += "[color=%s]%s[/color]" % [_theme_color_tag("syntax_number"), _escape_bbcode(text.substr(index, end - index))]
-			index = end
-			continue
-		result += _escape_bbcode(character)
-		index += 1
-	return result
+func _ui_table() -> Dictionary:
+	var lang := "zh"
+	if editor_interface != null:
+		lang = str(ConfigMigrations.get_value(editor_interface, "ai_agent/ui_language"))
+	if not UI_TEXT.has(lang):
+		lang = "zh"
+	return UI_TEXT.get(lang, UI_TEXT["zh"])
