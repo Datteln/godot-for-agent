@@ -55,8 +55,13 @@ class AppSettings(BaseSettings):
         description="单次 LLM 请求超时时间（秒）。",
     )
     log_level: str = Field(
-        default="INFO",
+        default="DEBUG",
         description="服务日志等级，可选 DEBUG/INFO/WARNING/ERROR/CRITICAL。",
+    )
+
+    log_dir: Path = Field(
+        default_factory=lambda: Path("logs"),
+        description="日志文件存储目录，相对路径相对于 project_root。",
     )
 
     project_root: Path = Field(
@@ -124,6 +129,16 @@ class AppSettings(BaseSettings):
         description="单次用户消息驱动的 agent 循环最大轮数（跨根帧与所有委派子帧的全局兜底上限；"
         "各帧自身的预算见 AgentDefinition.max_turns）。",
     )
+
+    def resolved_log_dir(self) -> Path:
+        """返回日志文件存储目录的绝对路径。
+
+        Returns:
+            日志目录的绝对路径。
+        """
+        if self.log_dir.is_absolute():
+            return self.log_dir
+        return self.project_root / self.log_dir
 
     def resolved_session_store_dir(self) -> Path:
         """返回会话持久化目录的绝对路径，必要时基于 project_root 解析相对路径。

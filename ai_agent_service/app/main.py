@@ -68,7 +68,7 @@ def _token_from_env() -> str | None:
 def create_app(settings: AppSettings | None = None, token: str | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。"""
     resolved_settings = settings or AppSettings()
-    configure_logging(resolved_settings.log_level)
+    configure_logging(resolved_settings.log_level, log_dir=resolved_settings.resolved_log_dir())
     resolved_token = token if token is not None else _token_from_env()
 
     logger.info(
@@ -149,7 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = AppSettings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, log_dir=settings.resolved_log_dir())
     if args.mcp_stdio:
         logger.info("Starting AI agent service in MCP stdio mode")
         return asyncio.run(run_mcp_stdio(settings))

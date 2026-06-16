@@ -192,6 +192,14 @@ func _ready() -> void:
 	_fetch_initial_service_data()
 
 
+func _process(_delta: float) -> void:
+	if _stream_content_rich != null and is_instance_valid(_stream_content_rich) and _auto_scroll:
+		_scroll.scroll_vertical = 999999
+	# 实时刷新 reasoning header 的计时
+	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
+		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
+
+
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_THEME_CHANGED:
 		_refresh_theme_colors()
@@ -490,6 +498,7 @@ func _on_send() -> void:
 	_finish_streaming()
 	_mark_reasoning_stream_closed()
 	_finish_reasoning_stream()
+	_closed_stream_keys.clear()
 	_input.clear()
 	_append_message("user", text)
 	_append_message("system", _ui("waiting_model"))
@@ -660,10 +669,10 @@ func _apply_thought_prefix(text: String) -> String:
 	var summary := str(parts.get("summary", ""))
 	if summary == "":
 		return text
-	var elapsed := 1
+	var elapsed := 0.0
 	if _stream_started_ms >= 0:
-		elapsed = max(1, int(round((Time.get_ticks_msec() - _stream_started_ms) / 1000.0)))
-	var thought_line := "Thought for %ds > %s" % [elapsed, summary]
+		elapsed = maxf(0.01, (Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)
+	var thought_line := "Thought for %.2fs > %s" % [elapsed, summary]
 	var rest := str(parts.get("rest", ""))
 	if rest == "":
 		return thought_line
@@ -680,6 +689,8 @@ func _handle_final(response: Dictionary) -> void:
 	var rest := str(split.get("rest", ""))
 	var render_text := rest if rest.strip_edges() != "" else text
 	_mark_current_stream_closed()
+	_mark_reasoning_stream_closed()   # 阻止后续迟到的 reasoning delta
+	_finish_reasoning_stream()         # 置空 toggle，停止 _process 刷新
 
 	if not _rendered_assistant_keys.has(assistant_key):
 		_rendered_assistant_keys[assistant_key] = true
@@ -1189,10 +1200,14 @@ func _on_text_delta(event: Dictionary) -> void:
 	var key := _stream_event_key(payload)
 	if _should_ignore_stream_delta(key, text):
 		return
+	var stripped := _strip_think_xml(text)
+	var parts := _split_thought_summary(stripped)
+	var rest := str(parts.get("rest", ""))
+	var display_text := rest if rest.strip_edges() != "" else stripped
 	_ensure_stream_message(key, true)
 	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		_stream_content_rich.clear()
-		_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(_strip_think_xml(text), _theme_colors))
+		_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(display_text, _theme_colors))
 	_scroll_to_bottom()
 
 
@@ -1244,10 +1259,10 @@ func _update_reasoning_entry() -> void:
 
 
 func _format_reasoning_header() -> String:
-	var elapsed := 1
+	var elapsed := 0.0
 	if _reasoning_started_ms >= 0:
-		elapsed = max(1, int(round((Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)))
-	return "Thought for %ds" % elapsed
+		elapsed = maxf(0.01, (Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)
+	return "Thought for %.2fs" % elapsed
 
 
 func _ensure_stream_message(key: String, indent := false) -> void:

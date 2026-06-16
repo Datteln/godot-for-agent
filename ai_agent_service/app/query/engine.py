@@ -430,6 +430,12 @@ class QueryEngine:
                 response.type,
                 session.pending_turn_id is not None,
             )
+            logger.debug(
+                "Chat response details session=%s type=%s response=%s",
+                request.session_id,
+                response.type,
+                json.dumps(_response_to_dict(response), ensure_ascii=False, default=str),
+            )
             return response
 
     async def _submit_locked(self, session: Session, request: ChatRequest) -> ChatResponse:
@@ -775,10 +781,16 @@ class QueryEngine:
 
     def _emit(self, session_id: str, event_type: str, payload: dict[str, Any]) -> int:
         """记录内部事件；未配置事件存储时返回 0。"""
+        logger.debug(
+            "Event emitted session=%s type=%s payload=%s",
+            session_id,
+            event_type,
+            json.dumps(payload, ensure_ascii=False, default=str),
+        )
         if self._events is None:
             return 0
         event = self._events.append(session_id, event_type, payload)
-        logger.debug("Event emitted session=%s seq=%d type=%s", session_id, event.seq, event_type)
+        logger.debug("Event persisted session=%s seq=%d type=%s", session_id, event.seq, event_type)
         return event.seq
 
     def _record_recovery(self, session: Session, response: ChatResponse) -> None:
