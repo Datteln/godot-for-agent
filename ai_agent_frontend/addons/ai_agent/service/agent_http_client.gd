@@ -187,12 +187,12 @@ func _enqueue(method: String, path: String, payload: Dictionary) -> void:
 func _pump() -> void:
 	if _busy or _queue.is_empty():
 		return
-	_busy = true
 	var item: Dictionary = _queue.pop_front()
-	if int(item.get("generation", _request_generation)) != _request_generation:
-		_busy = false
-		_pump()
-		return
+	while int(item.get("generation", _request_generation)) != _request_generation:
+		if _queue.is_empty():
+			return
+		item = _queue.pop_front()
+	_busy = true
 	var method_name := str(item["method"])
 	var method := HTTPClient.METHOD_GET
 	var body := ""

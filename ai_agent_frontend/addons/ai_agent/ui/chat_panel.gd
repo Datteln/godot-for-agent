@@ -171,6 +171,8 @@ var _stream_key := ""
 var _stream_row: Control
 var _stream_content_rich: RichTextLabel
 var _stream_started_ms: int = -1
+var _stream_display_text := ""
+var _stream_text_dirty := false
 var _reasoning_key := ""
 var _reasoning_toggle: Button
 var _reasoning_detail_rich: RichTextLabel
@@ -178,8 +180,10 @@ var _reasoning_text := ""
 var _reasoning_started_ms: int = -1
 var _rendered_assistant_keys := {}
 var _closed_stream_keys := {}
+var _closed_reasoning_keys := {}   # 新增：专门追踪已关闭的 reasoning stream
 var _theme_colors: Dictionary = {}
 var _auto_scroll := true
+var _suppress_scroll_check := false   # 程序滚动时抑制 value_changed 误判
 
 
 func _ready() -> void:
@@ -193,11 +197,31 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
-	if _stream_content_rich != null and is_instance_valid(_stream_content_rich) and _auto_scroll:
-		_scroll.scroll_vertical = 999999
-	# 实时刷新 reasoning header 的计时
+	if _stream_text_dirty and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+		_stream_content_rich.clear()
+		_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(_stream_display_text, _theme_colors))
+		_stream_text_dirty = false
+	if _auto_scroll and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+		_do_scroll_to_bottom()
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
 		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
+
+
+## 程序控制滚动到底部，设置抑制标志防止 value_changed 误判
+func _do_scroll_to_bottom() -> void:
+	_suppress_scroll_check = true
+	_scroll.scroll_vertical = 999999
+	# 布局可能需要 1-2 帧才能稳定，用 call_deferred 链延长抑制窗口
+	call_deferred("_reset_scroll_suppress_deferred")
+
+
+func _reset_scroll_suppress_deferred() -> void:
+	# 再延迟一帧确保布局完全稳定后才解除抑制
+	call_deferred("_reset_scroll_suppress")
+
+
+func _reset_scroll_suppress() -> void:
+	_suppress_scroll_check = false
 
 
 func _notification(what: int) -> void:
@@ -499,6 +523,7 @@ func _on_send() -> void:
 	_mark_reasoning_stream_closed()
 	_finish_reasoning_stream()
 	_closed_stream_keys.clear()
+	_closed_reasoning_keys.clear()   # 新增
 	_input.clear()
 	_append_message("user", text)
 	_append_message("system", _ui("waiting_model"))
@@ -697,6 +722,8 @@ func _handle_final(response: Dictionary) -> void:
 		if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 			_stream_content_rich.clear()
 			_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(render_text, _theme_colors))
+			_force_scroll_once = true
+			_scroll_to_bottom()
 			_finish_streaming()
 		else:
 			_discard_stream_message()
@@ -1186,7 +1213,7 @@ func _set_state(value: int) -> void:
 func _on_reasoning_delta(event: Dictionary) -> void:
 	var payload: Dictionary = event.get("payload", {})
 	var key := _stream_event_key(payload)
-	if key != "" and _closed_stream_keys.has(key):
+	if key != "" and _closed_reasoning_keys.has(key):
 		return
 	var text := str(payload.get("text", ""))
 	_ensure_reasoning_entry(key)
@@ -1200,15 +1227,14 @@ func _on_text_delta(event: Dictionary) -> void:
 	var key := _stream_event_key(payload)
 	if _should_ignore_stream_delta(key, text):
 		return
+	_mark_reasoning_stream_closed()   # 防止迟到的 reasoning delta 再创建条目
+	_finish_reasoning_stream()         # 置空 toggle，停止 _process 中的计时刷新
 	var stripped := _strip_think_xml(text)
 	var parts := _split_thought_summary(stripped)
 	var rest := str(parts.get("rest", ""))
-	var display_text := rest if rest.strip_edges() != "" else stripped
+	_stream_display_text = rest if rest.strip_edges() != "" else stripped
+	_stream_text_dirty = true
 	_ensure_stream_message(key, true)
-	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-		_stream_content_rich.clear()
-		_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(display_text, _theme_colors))
-	_scroll_to_bottom()
 
 
 func _stream_event_key(payload: Dictionary) -> String:
@@ -1285,6 +1311,8 @@ func _finish_streaming() -> void:
 	_stream_row = null
 	_stream_content_rich = null
 	_stream_started_ms = -1
+	_stream_display_text = ""
+	_stream_text_dirty = false
 
 
 func _finish_reasoning_stream() -> void:
@@ -1302,7 +1330,7 @@ func _mark_current_stream_closed() -> void:
 
 func _mark_reasoning_stream_closed() -> void:
 	if _reasoning_key != "":
-		_closed_stream_keys[_reasoning_key] = true
+		_closed_reasoning_keys[_reasoning_key] = true
 
 
 func _discard_stream_message() -> void:
@@ -1376,6 +1404,7 @@ func _clear_messages() -> void:
 	_finish_reasoning_stream()
 	_rendered_assistant_keys.clear()
 	_closed_stream_keys.clear()
+	_closed_reasoning_keys.clear()   # 新增
 	for child in _message_list.get_children():
 		child.queue_free()
 
@@ -1385,9 +1414,22 @@ func _scroll_to_bottom() -> void:
 
 
 func _on_scroll_value_changed(value: float) -> void:
+	if _suppress_scroll_check:
+		return
+
 	var bar := _scroll.get_v_scroll_bar()
 	var scroll_max := bar.max_value - bar.page
-	_auto_scroll = scroll_max <= 0 or value >= scroll_max - 40
+	var is_at_bottom := scroll_max <= 0 or value >= scroll_max - 40
+
+	if is_at_bottom:
+		_auto_scroll = true
+	else:
+		# 关键修复：如果正在流式输出且自动滚动开启，则忽略此次偏移（归因于内容增加）
+		if _auto_scroll and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+			# 保持自动滚动开启，并立即在下一帧强制推到底部
+			call_deferred("_do_scroll_to_bottom")
+			return
+		_auto_scroll = false
 
 
 func _scroll_to_bottom_deferred() -> void:
@@ -1396,7 +1438,7 @@ func _scroll_to_bottom_deferred() -> void:
 	if not _auto_scroll and not _force_scroll_once:
 		return
 	_force_scroll_once = false
-	_scroll.scroll_vertical = 999999
+	_do_scroll_to_bottom()
 
 
 func _ui(key: String) -> String:
