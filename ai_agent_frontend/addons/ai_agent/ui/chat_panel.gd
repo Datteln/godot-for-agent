@@ -648,6 +648,11 @@ func _handle_tool_calls(response: Dictionary) -> void:
 
 	_mark_current_stream_closed()
 	_discard_stream_message()
+	# 模型这一轮已经决定调用工具，说明它的思考已经结束——必须在这里冻结计时器，
+	# 否则 _process() 会一直用 _reasoning_started_ms 刷新这条 "Thought for Xs"，
+	# 直到下一轮 reasoning_delta 到来才会被关闭，期间会一直跟着 Edit/确认框走。
+	_mark_reasoning_stream_closed()
+	_finish_reasoning_stream()
 	var silent: Array = []
 	var confirm: Array = []
 	for call in calls:
@@ -1591,30 +1596,26 @@ func _append_tool_result(call: Dictionary, result: Dictionary, preview: Control 
 
 
 ## 把已渲染好的 diff/参数预览（在工具执行前从确认框搬出，此时文件内容还是
-## before_text）和执行结果合并成一条永久日志条目：标题行 + diff 预览 + 状态行。
+## before_text）和执行结果合并成一条永久工作流条目：● 标记 + 标题行 + 缩进的
+## diff 预览 + 状态行。特意不用卡片面板包起来——要和 Read/Grep 等其它工作流
+## 条目保持同样的"⏺ 标记 + 纯文本行"外观，否则会显得是另一种不同的 UI 元素。
 func _append_tool_result_panel(call: Dictionary, result: Dictionary, preview: Control, diff_stats: Dictionary) -> void:
 	var status := str(result.get("status", ""))
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var content := VBoxContainer.new()
+	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	content.add_theme_constant_override("separation", 2)
 
-	var panel := _log_renderer.make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(panel)
-
-	var body := VBoxContainer.new()
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	body.add_theme_constant_override("separation", 8)
-	panel.add_child(body)
-
-	var header := Label.new()
-	header.text = EventFormatter.format_tool_call_header(call)
-	header.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	body.add_child(header)
+	var marker := _log_renderer.workflow_marker_text("edit")
+	content.add_child(_log_renderer.make_log_rich_text(EventFormatter.format_tool_call_header(call), null, marker))
 
 	var old_parent := preview.get_parent()
 	if old_parent != null:
 		old_parent.remove_child(preview)
-	body.add_child(preview)
+	var indent := MarginContainer.new()
+	indent.add_theme_constant_override("margin_left", 24)
+	indent.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	indent.add_child(preview)
+	content.add_child(indent)
 
 	var name := str(call.get("name", "unknown"))
 	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
@@ -1638,13 +1639,13 @@ func _append_tool_result_panel(call: Dictionary, result: Dictionary, preview: Co
 		_:
 			status_text = status
 	if status_text != "":
-		body.add_child(_log_renderer.make_log_rich_text(status_text, status_color))
+		content.add_child(_log_renderer.make_log_rich_text(status_text, status_color))
 
 	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_result]", {
 		"name": name, "status": status, "status_text": status_text
 	})
 
-	_message_list.add_child(row)
+	_message_list.add_child(content)
 	_scroll_to_bottom()
 
 
