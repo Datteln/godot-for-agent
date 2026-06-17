@@ -16,6 +16,7 @@ from app.api.schemas import (
     CommandResponse,
     DoctorResponse,
     HealthResponse,
+    InterruptResponse,
     MemoryRequest,
     MemoryResponse,
     MemoryItemDTO,
@@ -137,6 +138,11 @@ def create_router(
     async def discard_pending(request: ResetRequest) -> ChatResponse:
         logger.info("HTTP /chat/discard-pending session=%s", request.session_id)
         return await query_engine.discard_pending(request.session_id)
+
+    @router.post("/chat/interrupt", response_model=InterruptResponse)
+    async def interrupt(request: ResetRequest) -> InterruptResponse:
+        logger.info("HTTP /chat/interrupt session=%s", request.session_id)
+        return await query_engine.interrupt(request.session_id)
 
     @router.get("/doctor", response_model=DoctorResponse)
     async def doctor() -> DoctorResponse:

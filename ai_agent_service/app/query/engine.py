@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import replace
@@ -24,6 +25,7 @@ from app.api.schemas import (
     ChatResponse,
     ChatToolCallsResponse,
     FrontToolCallDTO,
+    InterruptResponse,
     SessionHistoryItemDTO,
     SessionHistoryResponse,
     ToolResult,
@@ -367,6 +369,11 @@ class QueryEngine:
         self._output_styles = output_style_catalog
         self._events = event_store
         self._recovery = recovery_store
+        # session_id -> 该会话当前所有"正在处理 /chat 请求"的任务集合（通常只有
+        # 一个，但用户可能在前一个请求仍卡在 per-session 锁等待时就发出下一条
+        # 消息/中断，short-lived 地出现多个；用 set 而不是单个槎位，避免新任务
+        # 覆盖掉真正持有锁、仍在运行的旧任务引用，导致 interrupt() 取消错对象。
+        self._active_tasks: dict[str, set[asyncio.Task]] = {}
 
     @property
     def available_tools(self) -> set[str]:
@@ -399,44 +406,59 @@ class QueryEngine:
 
         `user_message` 发起新用户轮次；`tool_results` 回填上一轮 front 工具结果。
         两者不可同时出现，且会话有 pending 工具结果时拒绝新用户消息。
-        """
-        async with self._store.lock_for(request.session_id):
-            session = self._store.get_or_create(request.session_id, self.available_tools)
-            logger.info(
-                "Chat request accepted session=%s request_id=%s has_user=%s tool_results=%d",
-                request.session_id,
-                request.request_id,
-                request.user_message is not None,
-                len(request.tool_results or []),
-            )
 
-            if request.request_id is not None and request.request_id in session.request_id_cache:
+        本方法把当前 `asyncio.Task` 登记到 `_active_tasks`，使
+        `interrupt()` 能在用户点击"停止"时真正取消仍在运行的 agent 循环
+        （而不是仅让前端断开 HTTP 连接、后端继续跑完整个 turn）。
+        """
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_tasks.setdefault(request.session_id, set()).add(task)
+        try:
+            async with self._store.lock_for(request.session_id):
+                session = self._store.get_or_create(request.session_id, self.available_tools)
                 logger.info(
-                    "Chat idempotency hit session=%s request_id=%s",
+                    "Chat request accepted session=%s request_id=%s has_user=%s tool_results=%d",
                     request.session_id,
                     request.request_id,
+                    request.user_message is not None,
+                    len(request.tool_results or []),
                 )
-                return _response_from_dict(session.request_id_cache[request.request_id])
 
-            response = await self._submit_locked(session, request)
+                if request.request_id is not None and request.request_id in session.request_id_cache:
+                    logger.info(
+                        "Chat idempotency hit session=%s request_id=%s",
+                        request.session_id,
+                        request.request_id,
+                    )
+                    return _response_from_dict(session.request_id_cache[request.request_id])
 
-            if request.request_id is not None:
-                session.request_id_cache[request.request_id] = _response_to_dict(response)
-            self._store.save(session)
-            self._record_recovery(session, response)
-            logger.info(
-                "Chat request completed session=%s response_type=%s pending=%s",
-                request.session_id,
-                response.type,
-                session.pending_turn_id is not None,
-            )
-            logger.debug(
-                "Chat response details session=%s type=%s response=%s",
-                request.session_id,
-                response.type,
-                json.dumps(_response_to_dict(response), ensure_ascii=False, default=str),
-            )
-            return response
+                response = await self._submit_locked(session, request)
+
+                if request.request_id is not None:
+                    session.request_id_cache[request.request_id] = _response_to_dict(response)
+                self._store.save(session)
+                self._record_recovery(session, response)
+                logger.info(
+                    "Chat request completed session=%s response_type=%s pending=%s",
+                    request.session_id,
+                    response.type,
+                    session.pending_turn_id is not None,
+                )
+                logger.debug(
+                    "Chat response details session=%s type=%s response=%s",
+                    request.session_id,
+                    response.type,
+                    json.dumps(_response_to_dict(response), ensure_ascii=False, default=str),
+                )
+                return response
+        finally:
+            if task is not None:
+                tasks = self._active_tasks.get(request.session_id)
+                if tasks is not None:
+                    tasks.discard(task)
+                    if not tasks:
+                        del self._active_tasks[request.session_id]
 
     async def _submit_locked(self, session: Session, request: ChatRequest) -> ChatResponse:
         """在持有会话锁时执行一次请求。"""
@@ -673,6 +695,67 @@ class QueryEngine:
             self._recovery.clear()
         self._emit(session_id, "reset", {})
         logger.info("Session reset through QueryEngine session=%s", session_id)
+
+    async def interrupt(self, session_id: str) -> InterruptResponse:
+        """真正中断该会话仍在运行的 `/chat` 请求，并丢弃其后续输出。
+
+        前端"停止"按钮此前只是断开自己的 HTTP 连接：后端的 `run_turn`
+        循环（自动执行的静默工具，如 grep/read）会继续跑完整轮，并持续把
+        新事件写进 `EventStore`。等用户发出下一条消息时，这些属于已停止
+        旧任务的事件会被一起拉取并误渲染成新对话的内容。这里改为取消
+        该会话当前登记的 `asyncio.Task`，让 `CancelledError` 在下一个
+        await 点（LLM 调用/工具执行）处中断循环，并清理任何尚未回传的
+        pending 工具调用占位，使会话立刻能接受新消息。
+
+        `_active_tasks[session_id]` 是一个集合而不是单个任务：如果用户在
+        前一个请求仍卡在 per-session 锁等待时就又发了一条消息（或快速点了
+        多次"停止"），会话上会短暂同时存在多个 `submit_user_turn` 任务。
+        只取消其中一个（尤其是若取了最新、可能只是在排队等锁的那个）会让
+        真正持锁运行的旧任务永远不会被取消，导致锁一直被占用，包括这次
+        interrupt 自己后面要拿的锁也会卡死。所以这里要把所有未完成的都
+        取消掉。
+        """
+        tasks = {task for task in self._active_tasks.get(session_id, set()) if not task.done()}
+        cancelled = bool(tasks)
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Interrupted task raised after cancel session=%s", session_id)
+
+        discarded = 0
+        async with self._store.lock_for(session_id):
+            session = self._store.get_or_create(session_id, self.available_tools)
+            if session.pending_turn_id is not None:
+                frames = {frame.id: frame for frame in session.agent_stack}
+                for tool_use_id in sorted(session.pending_tool_call_ids):
+                    metadata = session.pending_tool_calls.get(tool_use_id, {})
+                    frame = frames.get(str(metadata.get("frame_id", "")))
+                    if frame is None:
+                        continue
+                    frame.messages.append(
+                        _tool_message(tool_use_id, "用户中断了当前请求，该工具调用结果未回传。", is_error=True)
+                    )
+                    discarded += 1
+                session.clear_pending()
+                self._store.save(session)
+                if self._recovery is not None:
+                    self._recovery.clear()
+
+        self._emit(session_id, "turn_interrupted", {"cancelled": cancelled, "pending_discarded": discarded})
+        last_seq = self._events.last_seq(session_id) if self._events is not None else 0
+        logger.info(
+            "Turn interrupted session=%s cancelled=%s pending_discarded=%d last_seq=%d",
+            session_id,
+            cancelled,
+            discarded,
+            last_seq,
+        )
+        return InterruptResponse(ok=True, cancelled=cancelled, last_event_seq=last_seq)
 
     async def discard_pending(self, session_id: str) -> ChatResponse:
         """放弃当前会话待回传的前端工具调用，保留其余会话历史。

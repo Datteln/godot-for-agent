@@ -69,7 +69,9 @@ const UI_TEXT := {
 		"tool_done_path": "完成：`%s`",
 		"tool_rejected": "已拒绝",
 		"tool_error_detail": "出错：%s",
-		"tool_unknown_error": "未知错误"
+		"tool_unknown_error": "未知错误",
+		"rejected_preview_title": "已拒绝，未应用的内容如下：",
+		"rejected_turn_ended": "已拒绝本次工具调用，会话已结束，可以继续发送新消息。"
 	},
 	"en": {
 		"send": "Send",
@@ -121,7 +123,9 @@ const UI_TEXT := {
 		"tool_done_path": "Done: `%s`",
 		"tool_rejected": "Rejected",
 		"tool_error_detail": "Error: %s",
-		"tool_unknown_error": "Unknown error"
+		"tool_unknown_error": "Unknown error",
+		"rejected_preview_title": "Rejected. The unapplied content was:",
+		"rejected_turn_ended": "Rejected this tool call. The turn has ended; you can send a new message."
 	}
 }
 
@@ -156,6 +160,7 @@ var _last_doctor_report: Dictionary = {}
 var _pending_calls: Array = []
 var _pending_silent_results: Array = []
 var _inline_checkboxes: Array[CheckBox] = []
+var _inline_previews: Array[Control] = []
 var _inline_always_allow: CheckBox
 var _inline_apply_btn: Button
 var _inline_reject_btn: Button
@@ -542,7 +547,7 @@ func _on_send() -> void:
 			"state": _status.text
 		})
 		return
-	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length()})
+	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length(), "text": text})
 	_auto_scroll = true
 	_force_scroll_once = true
 	_interrupted_locally = false
@@ -701,7 +706,16 @@ func _on_decision(results: Array) -> void:
 	if state_store != null:
 		state_store.set_value("pending_calls", [])
 	if results.is_empty():
-		_on_error("没有生成可回传的工具结果。")
+		FrontendLogger.warn(editor_interface, "ChatPanel", "No tool results to submit; ending turn gracefully instead of erroring.", {})
+		if undo_manager != null:
+			undo_manager.abort_batch()
+		if _http_client != null:
+			_http_client.current_turn_id = ""
+			_http_client.discard_pending()
+		if state_store != null:
+			state_store.set_value("current_turn_id", "")
+		_set_state(AgentState.IDLE)
+		_append_message("system", _ui("rejected_turn_ended"))
 		return
 	_set_state(AgentState.WAITING_LLM)
 	_http_client.send_tool_results(results)
@@ -1156,6 +1170,7 @@ func _update_output_styles(styles: Array) -> void:
 func _show_inline_confirmation(calls: Array) -> void:
 	_clear_inline_confirmation()
 	_inline_checkboxes.clear()
+	_inline_previews.clear()
 
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -1186,6 +1201,7 @@ func _show_inline_confirmation(calls: Array) -> void:
 		var preview := ToolPreviewRenderer.render_call(call, _theme_colors)
 		preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		item.add_child(preview)
+		_inline_previews.append(preview)
 		body.add_child(item)
 		body.add_child(HSeparator.new())
 
@@ -1209,7 +1225,12 @@ func _show_inline_confirmation(calls: Array) -> void:
 
 	_inline_confirm_box = row
 	_message_list.add_child(row)
-	_scroll_to_bottom()
+	# 确保确认面板出现时自动滚动到底部，让用户看到需要操作的内容
+	_auto_scroll = true
+	_force_scroll_once = true
+	_do_scroll_to_bottom()
+	# 布局可能需要额外帧才能稳定，用 _process 多帧兜底
+	_post_final_scroll_frames = max(_post_final_scroll_frames, 5)
 
 
 func _on_inline_apply() -> void:
@@ -1243,13 +1264,66 @@ func _on_inline_apply() -> void:
 func _on_inline_reject() -> void:
 	if _inline_busy:
 		return
-	var results := _pending_silent_results.duplicate(true)
-	for call in _pending_calls:
-		if call is Dictionary:
-			var rejected := AgentDTO.rejected_result(call)
-			results.append(rejected)
-			_append_tool_result(call, rejected)
-	_on_decision(results)
+	_set_inline_busy(true)
+	var calls := _pending_calls.duplicate(true)
+	var previews := _inline_previews.duplicate()
+	_render_rejected_previews(calls, previews)
+	_end_turn_after_rejection()
+
+
+## 拒绝时把已经渲染好的工具预览（diff/参数等）从临时确认框搬到永久消息区，
+## 这样用户拒绝后仍能看到模型原本想做的更改内容，而不是只剩一句"已拒绝"。
+func _render_rejected_previews(calls: Array, previews: Array) -> void:
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	var panel := _log_renderer.make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
+	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(panel)
+
+	var body := VBoxContainer.new()
+	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	body.add_theme_constant_override("separation", 8)
+	panel.add_child(body)
+
+	var title := Label.new()
+	title.text = _ui("rejected_preview_title")
+	body.add_child(title)
+
+	for index in range(calls.size()):
+		var call = calls[index]
+		if not (call is Dictionary):
+			continue
+		var header := Label.new()
+		header.text = EventFormatter.format_tool_call_header(call)
+		header.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		body.add_child(header)
+		var preview: Control = previews[index] if index < previews.size() else null
+		if preview != null and is_instance_valid(preview):
+			var old_parent := preview.get_parent()
+			if old_parent != null:
+				old_parent.remove_child(preview)
+			body.add_child(preview)
+		body.add_child(HSeparator.new())
+
+	_message_list.add_child(row)
+	_scroll_to_bottom()
+
+
+## 拒绝后不再把结果回传给模型继续本轮对话：直接通知后端丢弃这一轮待处理的
+## 工具调用并把前端状态收回 IDLE，相当于在前端"结束"这次会话回合。
+func _end_turn_after_rejection() -> void:
+	_clear_inline_confirmation()
+	if undo_manager != null:
+		undo_manager.abort_batch()
+	if _http_client != null:
+		_http_client.current_turn_id = ""
+		_http_client.discard_pending()
+	if state_store != null:
+		state_store.set_value("current_turn_id", "")
+		state_store.set_value("pending_calls", [])
+	_set_state(AgentState.IDLE)
+	_append_message("system", _ui("rejected_turn_ended"))
 
 
 func _clear_inline_confirmation() -> void:
@@ -1257,6 +1331,7 @@ func _clear_inline_confirmation() -> void:
 		_inline_confirm_box.queue_free()
 	_inline_confirm_box = null
 	_inline_checkboxes.clear()
+	_inline_previews.clear()
 	_pending_calls.clear()
 	_pending_silent_results.clear()
 	_inline_busy = false

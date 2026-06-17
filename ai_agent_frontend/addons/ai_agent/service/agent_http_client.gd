@@ -16,7 +16,7 @@ var _http: HTTPRequest
 var _event_http: HTTPRequest
 var _queue: Array[Dictionary] = []
 var _busy := false
-var _interrupted := false
+var _inflight_generation := -1
 var _request_generation := 0
 var _last_event_seq := 0
 var _suppress_events := false
@@ -78,7 +78,6 @@ func send_tool_results(results: Array) -> void:
 func reset_session() -> void:
 	current_turn_id = ""
 	_request_generation += 1
-	_interrupted = false
 	_suppress_events = false
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing session reset.", {"session_id": _session_id()})
 	_enqueue("POST", "/reset", {"session_id": _session_id()})
@@ -90,15 +89,21 @@ func interrupt_current() -> void:
 	_suppress_events = true
 	_queue.clear()
 	if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		_interrupted = true
 		_http.cancel_request()
-	else:
-		_busy = false
+	# `cancel_request()` 不保证触发 `request_completed`（曾导致 `_busy` 卡死为
+	# true，后续所有请求——包括下面要发的 `/chat/interrupt` 和用户的下一条
+	# 消息——永远排在队列里发不出去）。这里不再等待那个信号，直接复位，
+	# 迟到的信号会被 `_on_request_completed` 的生成号检查丢弃。
+	_busy = false
 	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
 		_event_http.cancel_request()
 	if _event_timer != null:
 		_event_timer.stop()
 	current_turn_id = ""
+	# 仅断开本地连接还不够：后端的 agent 循环（自动执行的静默工具）会继续跑完
+	# 整轮并持续写入新事件，等下一条用户消息发出后这些旧事件会被一起拉取、
+	# 误渲染成新对话内容。这里显式通知后端取消该会话仍在运行的请求。
+	_enqueue("POST", "/chat/interrupt", {"session_id": _session_id()})
 
 
 func discard_pending() -> void:
@@ -193,6 +198,7 @@ func _pump() -> void:
 			return
 		item = _queue.pop_front()
 	_busy = true
+	_inflight_generation = int(item.get("generation", _request_generation))
 	var method_name := str(item["method"])
 	var method := HTTPClient.METHOD_GET
 	var body := ""
@@ -211,12 +217,20 @@ func _pump() -> void:
 
 
 func _on_request_completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
-	_busy = false
-	if _interrupted:
-		_interrupted = false
-		FrontendLogger.info(editor_interface, "HTTP", "Interrupted request completion ignored.")
-		_pump()
+	# `HTTPRequest.cancel_request()` 并不保证一定会触发 `request_completed`
+	# （取决于内部连接处于哪个阶段），所以 `interrupt_current()` 在调用
+	# cancel 后会立即把 `_busy` 复位、不等待这个信号。这里用生成号识别
+	# "迟到的、属于已取消请求的" 完成回调：如果它不属于当前生成，说明
+	# `_busy` 早已被别的（更新的）请求重新占用，绝不能再碰它，否则会把
+	# 正在进行中的新请求状态错误地复位掉。
+	var completed_generation := _inflight_generation
+	if completed_generation != _request_generation:
+		FrontendLogger.info(editor_interface, "HTTP", "Ignoring stale request completion.", {
+			"completed_generation": completed_generation,
+			"current_generation": _request_generation
+		})
 		return
+	_busy = false
 	var text := body.get_string_from_utf8()
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
 		if _suppress_events:
@@ -248,6 +262,16 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			"type": str(response.get("type", "data")),
 			"keys": response.keys()
 		})
+		if response.has("cancelled") and response.has("last_event_seq"):
+			# `/chat/interrupt` 的确认：跳过中断前后后端可能残留写入的旧事件，
+			# 不把这条纯内部 ack 转发给 ChatPanel。
+			_last_event_seq = max(_last_event_seq, int(response.get("last_event_seq", 0)))
+			FrontendLogger.info(editor_interface, "HTTP", "Interrupt acknowledged by backend.", {
+				"cancelled": response.get("cancelled", false),
+				"last_event_seq": _last_event_seq
+			})
+			_pump()
+			return
 		if response.get("type", "") == "tool_calls":
 			current_turn_id = str(response.get("turn_id", ""))
 		response_received.emit(response)

@@ -127,6 +127,16 @@ class ResetRequest(BaseModel):
     session_id: str
 
 
+class InterruptResponse(BaseModel):
+    """`POST /chat/interrupt` 响应：是否真正取消了正在执行的请求，以及
+    该会话此刻的最新事件序号，供前端跳过中断前后产生的过期事件。
+    """
+
+    ok: bool = True
+    cancelled: bool
+    last_event_seq: int
+
+
 class ResetResponse(BaseModel):
     """`POST /reset` 响应：确认会话已清空。"""
 
