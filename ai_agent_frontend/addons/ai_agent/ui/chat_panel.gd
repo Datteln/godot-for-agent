@@ -185,6 +185,8 @@ var _closed_reasoning_keys := {}   # 新增：专门追踪已关闭的 reasoning
 var _theme_colors: Dictionary = {}
 var _auto_scroll := true
 var _suppress_scroll_check := false   # 程序滚动时抑制 value_changed 误判
+var _post_final_scroll_frames := 0   # final 响应后持续滚动到底部的剩余帧数
+var _empty_final_ignored_ms: int = -1   # 空 final 被忽略的时间戳，超时后强制结束 turn
 
 
 func _ready() -> void:
@@ -204,8 +206,32 @@ func _process(_delta: float) -> void:
 		_stream_text_dirty = false
 	if _auto_scroll and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		_do_scroll_to_bottom()
+	# final 响应后连续多帧强制滚动到底部，等待 fit_content RichTextLabel 完成布局
+	if _post_final_scroll_frames > 0:
+		_post_final_scroll_frames -= 1
+		_do_scroll_to_bottom()
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
 		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
+	# 空 final 超时兜底：收到空 final 后 60 秒内没有真正的 final 到来，强制结束 turn
+	if _empty_final_ignored_ms >= 0 and _state != AgentState.IDLE:
+		var elapsed_ms := Time.get_ticks_msec() - _empty_final_ignored_ms
+		if elapsed_ms > 60000:
+			FrontendLogger.warn(editor_interface, "ChatPanel", "[handle_final] TIMEOUT: no real final after 60s, forcing IDLE", {
+				"elapsed_ms": str(elapsed_ms)
+			})
+			_empty_final_ignored_ms = -1
+			_mark_current_stream_closed()
+			_mark_reasoning_stream_closed()
+			_finish_reasoning_stream()
+			_finish_streaming()
+			_append_message("system", "⚠ 服务端未返回最终回复，已自动结束。")
+			if undo_manager != null:
+				undo_manager.commit_batch()
+			_set_state(AgentState.IDLE)
+			_http_client.current_turn_id = ""
+			if state_store != null:
+				state_store.set_value("current_turn_id", "")
+				state_store.set_value("pending_calls", [])
 
 
 ## 程序控制滚动到底部，设置抑制标志防止 value_changed 误判
@@ -526,7 +552,12 @@ func _on_send() -> void:
 	_closed_stream_keys.clear()
 	_closed_reasoning_keys.clear()   # 新增
 	_live_response_keys.clear()
+	_empty_final_ignored_ms = -1   # 重置空 final 超时计时器
 	_input.clear()
+	# 在用户消息之前追加两条空白消息：强制撑开 ScrollContainer 使滚动到底部，
+	# 同时作为上一轮回复与当前用户消息之间的视觉间距
+	_append_message("system", " ")
+	_append_message("system", " ")
 	_append_message("user", text)
 	_append_message("system", _ui("waiting_model"))
 	_set_state(AgentState.WAITING_LLM)
@@ -536,18 +567,15 @@ func _on_send() -> void:
 
 
 func _on_response(response: Dictionary) -> void:
-	FrontendLogger.debug(editor_interface, "ChatPanel", "=== Response received ===", {
-		"keys": str(response.keys()), "type": str(response.get("type", "data"))
-	})
-	if _interrupted_locally and str(response.get("type", "")) in ["tool_calls", "final", "error"]:
+	var resp_type := str(response.get("type", "data"))
+	if _interrupted_locally and resp_type in ["tool_calls", "final", "error"]:
 		FrontendLogger.info(editor_interface, "ChatPanel", "Suppressed response after interrupt.", {
-			"type": str(response.get("type", ""))
+			"type": resp_type
 		})
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[response] SUPPRESSED due to interrupt")
 		return
 	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling response.", {
-		"type": str(response.get("type", "data")),
-		"keys": response.keys()
+		"type": resp_type,
+		"response": response
 	})
 	if response.has("python_version"):
 		_last_doctor_report = response
@@ -608,12 +636,8 @@ func _on_response(response: Dictionary) -> void:
 
 func _handle_tool_calls(response: Dictionary) -> void:
 	var calls: Array = response.get("calls", [])
-	FrontendLogger.info(editor_interface, "ChatPanel", "Handling tool calls.", {"count": calls.size()})
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_calls] count", {"count": calls.size()})
-
 	if _state == AgentState.WAITING_CONFIRM:
 		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring tool_calls while a previous batch is still pending confirmation.", {"count": calls.size()})
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_calls] IGNORED - already waiting confirm")
 		return
 
 	_mark_current_stream_closed()
@@ -625,16 +649,13 @@ func _handle_tool_calls(response: Dictionary) -> void:
 			confirm.append(call)
 		else:
 			silent.append(call)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_calls] split", {
-		"silent": silent.size(), "confirm": confirm.size()
-	})
+	var call_names: Array = []
 	for call in calls:
 		if call is Dictionary:
-			FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_calls] call", {
-				"name": str(call.get("name", "")),
-				"needs_confirm": bool(call.get("needs_confirm", false)),
-				"input": call.get("input", {})
-			})
+			call_names.append(str(call.get("name", "")))
+	FrontendLogger.info(editor_interface, "ChatPanel", "Handling tool calls.", {
+		"count": calls.size(), "silent": silent.size(), "confirm": confirm.size(), "names": call_names
+	})
 
 	for call in confirm:
 		if call is Dictionary:
@@ -756,13 +777,21 @@ func _handle_final(response: Dictionary) -> void:
 	var render_text := rest if rest.strip_edges() != "" else text
 	FrontendLogger.debug(editor_interface, "ChatPanel", "[handle_final]", {
 		"text_len": text.length(),
-		"render_text_len": render_text.strip_edges().length(),
-		"assistant_key": assistant_key
+		"render_text_len": render_text.strip_edges().length()
 	})
 	if render_text.strip_edges().is_empty():
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[handle_final] WARNING: render_text is EMPTY", {
-			"preview": text.left(200).replace("\n", "\\n")
+		# 空的 final 只是 agent 中间轮次的心跳/占位，不代表真正回复结束。
+		# 跳过所有关闭和状态切换，继续等下一个非空 final。
+		if _empty_final_ignored_ms < 0:
+			_empty_final_ignored_ms = Time.get_ticks_msec()
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[handle_final] EMPTY final ignored, still waiting", {
+			"preview": text.left(200).replace("\n", "\\n"),
+			"since_ms": _empty_final_ignored_ms
 		})
+		return
+	# 收到非空 final，重置空 final 计时器
+	_empty_final_ignored_ms = -1
+	render_text = render_text + "\n\n"
 	_mark_current_stream_closed()
 	_mark_reasoning_stream_closed()   # 阻止后续迟到的 reasoning delta
 	_finish_reasoning_stream()         # 置空 toggle，停止 _process 刷新
@@ -775,14 +804,18 @@ func _handle_final(response: Dictionary) -> void:
 		if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 			_stream_content_rich.clear()
 			_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(render_text, _theme_colors))
-			_force_scroll_once = true
-			_scroll_to_bottom()
 			_finish_streaming()
 		else:
 			_discard_stream_message()
 			_indent_current_text = true
 			_append_log_stream_message(render_text)
 			_indent_current_text = false
+		# 无论走流式还是非流式路径，都在 _process 中连续多帧强制滚动到底部，
+		# 等待 fit_content RichTextLabel 完成复杂 Markdown（表格、代码块）的布局计算
+		_auto_scroll = true
+		_force_scroll_once = true
+		_do_scroll_to_bottom()
+		_post_final_scroll_frames = 10
 	else:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "Skipped duplicate final response.", {"key_len": assistant_key.length()})
 		_discard_stream_message()
@@ -1016,59 +1049,13 @@ func _on_events(events: Array) -> void:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "Suppressed events after interrupt.", {"count": events.size()})
 		return
 	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling events.", {"count": events.size()})
-	FrontendLogger.debug(editor_interface, "ChatPanel", "=== Received events ===", {"count": events.size()})
-	for i in range(events.size()):
-		var event = events[i]
+	for event in events:
 		if event is Dictionary:
 			var event_type := str(event.get("type", "<unknown>"))
 			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-			var turn_id := str(event.get("turn_id", event.get("payload", {}).get("turn_id", "") if event.get("payload", {}) is Dictionary else ""))
-			FrontendLogger.debug(editor_interface, "ChatPanel", "Event detail", {
-				"index": i, "type": event_type, "turn_id": turn_id, "payload_keys": str(payload.keys())
+			FrontendLogger.debug(editor_interface, "ChatPanel", "Event", {
+				"type": event_type, "payload": payload
 			})
-			# 针对特定事件类型打印更多细节
-			match event_type:
-				"agent_text_delta", "agent_reasoning_delta":
-					var text := str(payload.get("text", ""))
-					var preview := text.left(80) + "..." if text.length() > 80 else text
-					FrontendLogger.debug(editor_interface, "ChatPanel", "delta preview", {
-						"preview": preview.replace("\n", "\\n")
-					})
-				"server_tool_start":
-					var tool := str(payload.get("tool", ""))
-					var args = payload.get("args", {})
-					FrontendLogger.debug(editor_interface, "ChatPanel", "server_tool_start detail", {
-						"tool": tool, "args": args if args is Dictionary else {}
-					})
-				"server_tool_result":
-					var tool := str(payload.get("tool", ""))
-					var is_error := bool(payload.get("is_error", false))
-					var result_count = payload.get("result_count")
-					FrontendLogger.debug(editor_interface, "ChatPanel", "server_tool_result detail", {
-						"tool": tool, "is_error": is_error, "result_count": result_count
-					})
-				"user_submitted":
-					var has_context := bool(payload.get("has_context", false))
-					FrontendLogger.debug(editor_interface, "ChatPanel", "user_submitted detail", {
-						"has_context": has_context
-					})
-				"error":
-					var text := str(payload.get("text", ""))
-					FrontendLogger.debug(editor_interface, "ChatPanel", "error detail", {
-						"error_text": text
-					})
-				"compact_boundary":
-					FrontendLogger.debug(editor_interface, "ChatPanel", "compact_boundary detail", {
-						"compacted_frames": payload.get("compacted_frames", 0),
-						"removed_messages": payload.get("removed_messages", 0),
-						"keep_recent": payload.get("keep_recent", 0),
-						"pending_preserved": payload.get("pending_preserved", false)
-					})
-				"config_changed":
-					FrontendLogger.debug(editor_interface, "ChatPanel", "config_changed detail", {
-						"effort": payload.get("effort", "-"),
-						"output_style": payload.get("output_style", "-")
-					})
 			_event_queue.append(event)
 	if not _draining_events:
 		_drain_event_queue()
@@ -1085,16 +1072,16 @@ func _drain_event_queue() -> void:
 		return
 	var event: Dictionary = _event_queue.pop_front()
 	var event_type := str(event.get("type", ""))
-	var remaining := _event_queue.size()
-	FrontendLogger.debug(editor_interface, "ChatPanel", ">> Draining event", {
-		"type": event_type, "queue_remaining": remaining
-	})
 	if state_store != null:
 		state_store.add_event(event)
 	if event_type == "agent_reasoning_delta":
 		_on_reasoning_delta(event)
 	elif event_type == "agent_text_delta":
 		_on_text_delta(event)
+	elif event_type == "final":
+		# SSE event 路径的 final 也需要路由到 _handle_final
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (via event stream)", {})
+		_handle_final(event.get("payload", event))
 	else:
 		var previous_state := _state
 		var is_compacting := event_type == "compact_boundary" and previous_state != AgentState.IDLE
@@ -1103,11 +1090,9 @@ func _drain_event_queue() -> void:
 		var description := EventFormatter.describe_event(event, _ui_table())
 		if description != "":
 			FrontendLogger.debug(editor_interface, "ChatPanel", "-> rendered", {
-				"description": description
+				"type": event_type, "description": description
 			})
 			_append_message("system", description)
-		else:
-			FrontendLogger.debug(editor_interface, "ChatPanel", "-> (no description, skipped)")
 		if is_compacting:
 			_set_state(previous_state)
 	call_deferred("_drain_event_queue")
@@ -1353,28 +1338,19 @@ func _on_text_delta(event: Dictionary) -> void:
 	var payload: Dictionary = event.get("payload", {})
 	var text := str(payload.get("text", ""))
 	var key := _stream_event_key(payload)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta]", {
-		"key": key, "text_len": text.length(), "preview": text.left(60).replace("\n", "\\n")
-	})
 	if _should_ignore_stream_delta(key, text):
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta] IGNORED by _should_ignore_stream_delta")
 		return
 	_mark_reasoning_stream_closed()   # 防止迟到的 reasoning delta 再创建条目
 	_finish_reasoning_stream()         # 置空 toggle，停止 _process 中的计时刷新
 	var stripped := _strip_think_xml(text)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta] after strip_think_xml", {
-		"len": stripped.strip_edges().length(), "empty": stripped.strip_edges().is_empty()
-	})
 	var parts := _split_thought_summary(stripped)
 	var rest := str(parts.get("rest", ""))
 	_stream_display_text = rest if rest.strip_edges() != "" else stripped
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta] final display_text", {
-		"len": _stream_display_text.strip_edges().length(), "empty": _stream_display_text.strip_edges().is_empty()
-	})
 	_stream_text_dirty = true
 	_ensure_stream_message(key, true)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta] rendered", {
-		"display_text_len": _stream_display_text.length()
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta]", {
+		"key": key, "text_len": text.length(), "display_len": _stream_display_text.length(),
+		"preview": text.left(40).replace("\n", "\\n")
 	})
 
 
@@ -1571,10 +1547,13 @@ func _on_scroll_value_changed(value: float) -> void:
 	if is_at_bottom:
 		_auto_scroll = true
 	else:
-		# 关键修复：如果正在流式输出且自动滚动开启，则忽略此次偏移（归因于内容增加）
+		# 如果自动滚动已开启且正在流式输出，此次偏移是内容增长引起的，
+		# 不要关闭自动滚动，直接同步把滚动条推到底（避免 call_deferred 链
+		# 追不上内容增长导致末尾消息无法滚到底部）。
 		if _auto_scroll and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-			# 保持自动滚动开启，并立即在下一帧强制推到底部
-			call_deferred("_do_scroll_to_bottom")
+			_suppress_scroll_check = true
+			_scroll.scroll_vertical = 999999
+			call_deferred("_reset_scroll_suppress_deferred")
 			return
 		_auto_scroll = false
 
