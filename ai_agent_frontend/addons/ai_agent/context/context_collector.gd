@@ -80,9 +80,19 @@ func _collect_debugger_errors(diagnostics: Array) -> Array:
 	return result
 
 
+## 节点路径相对于"被编辑场景的根节点"而非 `node.get_path()` 的 SceneTree 绝对路径。
+## 在编辑器里运行时，被编辑场景挂在编辑器自身视口树很深的位置下，
+## `node.get_path()` 会把整条 `/root/@EditorNode@.../@SubViewport@.../` 编辑器内部
+## 路径都吐出来——这份 context 在每条消息里都会发给模型，绝对路径又长又会随编辑器
+## 布局变化，白白占用 token 还可能让模型误以为这是场景里的真实层级。
+func _relative_path(root: Node, node: Node) -> String:
+	return str(root.get_path_to(node))
+
+
 func _collect_selection() -> Dictionary:
 	if editor_interface == null:
 		return {}
+	var root := editor_interface.get_edited_scene_root()
 	var selection := editor_interface.get_selection()
 	var nodes := selection.get_selected_nodes()
 	var result: Array = []
@@ -90,7 +100,7 @@ func _collect_selection() -> Dictionary:
 		if node is Node:
 			result.append({
 				"name": node.name,
-				"path": str(node.get_path()),
+				"path": _relative_path(root, node) if root != null else str(node.get_path()),
 				"type": node.get_class(),
 				"script": _script_path(node)
 			})
@@ -103,18 +113,18 @@ func _collect_scene_tree() -> Dictionary:
 	var root := editor_interface.get_edited_scene_root()
 	if root == null:
 		return {}
-	return _node_to_dict(root, 0, 4)
+	return _node_to_dict(root, root, 0, 4)
 
 
-func _node_to_dict(node: Node, depth: int, max_depth: int) -> Dictionary:
+func _node_to_dict(root: Node, node: Node, depth: int, max_depth: int) -> Dictionary:
 	var children: Array = []
 	if depth < max_depth:
 		for child in node.get_children():
 			if child is Node:
-				children.append(_node_to_dict(child, depth + 1, max_depth))
+				children.append(_node_to_dict(root, child, depth + 1, max_depth))
 	return {
 		"name": node.name,
-		"path": str(node.get_path()),
+		"path": _relative_path(root, node),
 		"type": node.get_class(),
 		"script": _script_path(node),
 		"children": children

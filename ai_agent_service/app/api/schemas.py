@@ -61,6 +61,36 @@ class ToolResult(BaseModel):
     grant_session_allow: bool = False
 
 
+class VerifyIssue(BaseModel):
+    """代码编辑后自动校验发现的一个问题（内部模型，不出现在 HTTP 协议里）。
+
+    Attributes:
+        severity: 严重程度。
+        file_path: 问题所在文件（相对工程根目录）。
+        line: 行号；无法定位时为 None。
+        message: 问题描述。
+    """
+
+    severity: Literal["error", "warning", "info"]
+    file_path: str
+    line: int | None = None
+    message: str
+
+
+class VerifyResultDTO(BaseModel):
+    """一次校验（Phase 1 语法快检或 Phase 2 语义校验）的结构化结果（内部模型）。
+
+    Attributes:
+        passed: 是否通过校验。
+        issues: 发现的问题列表；通过时为空。
+        summary: 一句话总结，供事件 payload 与 system 消息展示。
+    """
+
+    passed: bool
+    issues: list[VerifyIssue] = Field(default_factory=list)
+    summary: str
+
+
 class ChatRequest(BaseModel):
     """`POST /chat` 请求体（§14）。
 

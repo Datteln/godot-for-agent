@@ -14,12 +14,18 @@ func get_state(path: String) -> Dictionary:
 	return _states.get(path, {})
 
 
+## 只比较内容哈希，不比较 mtime：哈希相同就意味着字节内容完全没变，写入不会
+## 覆盖任何人的修改，这种情况下没有"过期"可言。之前还要求 mtime 也相同，结果是
+## 即使内容字节不差，只要文件系统/索引/同步进程之类的东西把 mtime 碰了一下
+## （常见于 OneDrive/云同步、杀毒软件扫描、Windows 搜索索引），就会被误判为
+## "磁盘上已改动"——曾经出现过 read_file 刚拿到的新鲜快照，几秒内紧接着的
+## write 检查就被这条 mtime 比较判成 stale，而内容其实根本没变。
 func is_stale(path: String) -> bool:
 	if not _states.has(path):
 		return false
 	var old_state: Dictionary = _states[path]
 	var current := _make_state(path, bool(old_state.get("known_full_read", false)))
-	return old_state.get("hash", "") != current.get("hash", "") or old_state.get("mtime_ns", 0) != current.get("mtime_ns", 0)
+	return old_state.get("hash", "") != current.get("hash", "")
 
 
 func _make_state(path: String, known_full_read: bool) -> Dictionary:

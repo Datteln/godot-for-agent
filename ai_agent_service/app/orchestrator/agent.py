@@ -291,14 +291,85 @@ def _delegate_child_frame(
     )
 
 
+def _plan_step_started(
+    session: Session,
+    child: Frame,
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> None:
+    """若当前会话有活跃 `create_plan` 计划，记录新子帧对应的步骤并发出 `plan_step_started`。
+
+    Args:
+        session: 当前会话。
+        child: 刚创建并压栈的子 agent 帧。
+        event_callback: 编排事件回调；为 None 时不产生事件。
+    """
+    plan = session.pending_plan
+    if plan is None:
+        return
+    steps = plan.get("steps", [])
+    idx = int(plan.get("next_step_index", 0))
+    if idx >= len(steps):
+        return
+    plan.setdefault("frame_steps", {})[child.id] = idx
+    plan["next_step_index"] = idx + 1
+    step = steps[idx]
+    _emit_orchestration_event(
+        event_callback,
+        "plan_step_started",
+        {
+            "step_index": idx + 1,
+            "total_steps": len(steps),
+            "agent": step.get("agent", ""),
+            "title": step.get("title", ""),
+        },
+    )
+
+
+def _plan_step_completed(
+    session: Session,
+    done: Frame,
+    text: str,
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> None:
+    """若已完成的子帧对应某个计划步骤，发出 `plan_step_completed`。
+
+    Args:
+        session: 当前会话。
+        done: 刚结束并弹栈的子 agent 帧。
+        text: 该子帧本轮产出的最终文本，用作步骤结果摘要。
+        event_callback: 编排事件回调；为 None 时不产生事件。
+    """
+    plan = session.pending_plan
+    if plan is None:
+        return
+    frame_steps: dict[str, int] = plan.get("frame_steps", {})
+    idx = frame_steps.pop(done.id, None)
+    if idx is None:
+        return
+    summary = " ".join(text.split())
+    if len(summary) > 240:
+        summary = summary[:240] + "..."
+    _emit_orchestration_event(
+        event_callback,
+        "plan_step_completed",
+        {
+            "step_index": idx + 1,
+            "total_steps": len(plan.get("steps", [])),
+            "summary": summary,
+        },
+    )
+
+
 def _continue_delegate_group(
     session: Session,
     done: Frame,
     text: str,
     prompt_factory: Callable[[AgentDefinition], str] | None,
+    event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> None:
     """记录一个 `delegate_many` 子任务结果，并按需启动下一个子任务。"""
     assert done.pending_delegate_group_id is not None
+    _plan_step_completed(session, done, text, event_callback)
     group = session.delegate_groups.get(done.pending_delegate_group_id)
     if group is None:
         logger.warning(
@@ -339,6 +410,7 @@ def _continue_delegate_group(
         )
         if child is not None:
             session.agent_stack.append(child)
+            _plan_step_started(session, child, event_callback)
             logger.info(
                 "Delegate group continued session=%s group_id=%s child_frame=%s agent=%s remaining=%d",
                 session.session_id,
@@ -377,6 +449,7 @@ def _finish_frame(
     session: Session,
     text: str,
     prompt_factory: Callable[[AgentDefinition], str] | None = None,
+    event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> FinalResult | None:
     """处理当前帧产出最终文本（无 `tool_calls`）的情况（§13.1）。
 
@@ -387,6 +460,8 @@ def _finish_frame(
     Args:
         session: 当前会话。
         text: 当前帧本轮产出的最终文本。
+        prompt_factory: 子 agent 系统提示词构造函数。
+        event_callback: 编排事件回调，供 `create_plan` 步骤进度事件使用。
 
     Returns:
         根帧结束时返回 `FinalResult`；子帧结束时返回 None，调用方应
@@ -394,6 +469,8 @@ def _finish_frame(
     """
     if len(session.agent_stack) <= 1:
         logger.info("Root frame finished session=%s text_length=%d", session.session_id, len(text))
+        if session.pending_plan is not None:
+            session.pending_plan = None
         return FinalResult(text=text)
     done = session.agent_stack.pop()
     logger.info(
@@ -404,11 +481,12 @@ def _finish_frame(
         len(text),
     )
     if done.pending_delegate_group_id is not None:
-        _continue_delegate_group(session, done, text, prompt_factory)
+        _continue_delegate_group(session, done, text, prompt_factory, event_callback)
         return None
     parent = session.top_frame()
     assert parent is not None
     if done.pending_delegate_call_id is not None:
+        _plan_step_completed(session, done, text, event_callback)
         parent.messages.append(_tool_message(done.pending_delegate_call_id, {"summary": text}))
     return None
 
@@ -462,6 +540,159 @@ def _append_single_tool_call_protocol_errors(frame: Frame, calls: list[Any]) -> 
         )
 
 
+def _append_create_plan_protocol_errors(frame: Frame, calls: list[Any]) -> None:
+    """当 `create_plan` 与其他 tool call 并列时，给本轮所有调用补错误结果。"""
+    logger.warning(
+        "Create_plan protocol violation frame=%s agent=%s tool_calls=%d",
+        frame.id,
+        frame.agent.name,
+        len(calls),
+    )
+    for call in calls:
+        frame.messages.append(
+            _tool_message(
+                call.id,
+                "`create_plan` 必须是本轮唯一的 tool call；本轮所有工具均未执行，请重试",
+                is_error=True,
+            )
+        )
+
+
+_PLAN_COMPLEXITY_LEVELS = {"low", "medium", "high"}
+
+
+def _normalize_plan_steps(raw_steps: Any) -> list[dict[str, Any]] | str:
+    """校验并规范化 `create_plan.steps` 入参。
+
+    Args:
+        raw_steps: `create_plan` 工具调用入参里的 `steps` 原始值。
+
+    Returns:
+        校验通过时返回规范化后的步骤字典列表；校验失败时返回中文错误提示字符串。
+    """
+    if not isinstance(raw_steps, list) or not raw_steps:
+        return "create_plan.steps 不能为空"
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_steps:
+        if not isinstance(raw, dict):
+            return "create_plan.steps 的每一项必须是 object"
+        title = raw.get("title")
+        agent_name = raw.get("agent")
+        task = raw.get("task")
+        if not isinstance(title, str) or not title.strip():
+            return "create_plan.steps[].title 不能为空"
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            return "create_plan.steps[].agent 不能为空"
+        if not isinstance(task, str) or not task.strip():
+            return "create_plan.steps[].task 不能为空"
+        try:
+            get_agent(agent_name, set(REGISTRY))
+        except KeyError:
+            return f"未知子 agent：{agent_name}"
+        depends_on = raw.get("depends_on")
+        if depends_on is not None and not (
+            isinstance(depends_on, list) and all(isinstance(value, int) for value in depends_on)
+        ):
+            return "create_plan.steps[].depends_on 必须是整数数组"
+        complexity = raw.get("estimated_complexity")
+        if complexity is not None and complexity not in _PLAN_COMPLEXITY_LEVELS:
+            return "create_plan.steps[].estimated_complexity 取值必须是 low/medium/high"
+        normalized.append(
+            {
+                "title": title.strip(),
+                "agent": agent_name.strip(),
+                "task": task.strip(),
+                "depends_on": depends_on or [],
+                "estimated_complexity": complexity,
+            }
+        )
+    return normalized
+
+
+def _handle_create_plan(
+    *,
+    session: Session,
+    frame: Frame,
+    call_id: str,
+    args: dict[str, Any],
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> None:
+    """处理 `create_plan` 工具调用：校验入参、记录计划、发出通知事件并回填工具结果。
+
+    `create_plan` 不挂起轮次：校验通过后立即把 `steps` 转换为 `delegate_many.tasks`
+    形状，作为成功结果回填本次调用，引导 LLM 在下一轮自行调用 `delegate_many`
+    开始执行（§2.4.2）。
+
+    Args:
+        session: 当前会话。
+        frame: 发起 `create_plan` 调用的帧（必须是允许委派的 agent）。
+        call_id: 本次 `create_plan` 调用的 tool_call id。
+        args: 已解析的入参（`summary`/`steps`）。
+        event_callback: 编排事件回调，用于发出 `plan_created`。
+    """
+    if not frame.agent.can_delegate:
+        logger.warning(
+            "Create_plan rejected: agent cannot delegate session=%s frame=%s agent=%s",
+            session.session_id,
+            frame.id,
+            frame.agent.name,
+        )
+        frame.messages.append(_tool_message(call_id, "当前 agent 不允许委派子 agent，不能创建计划", is_error=True))
+        return
+
+    summary = args.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        frame.messages.append(_tool_message(call_id, "create_plan.summary 不能为空", is_error=True))
+        return
+
+    steps = _normalize_plan_steps(args.get("steps"))
+    if isinstance(steps, str):
+        frame.messages.append(_tool_message(call_id, steps, is_error=True))
+        return
+
+    session.pending_plan = {
+        "summary": summary.strip(),
+        "steps": steps,
+        "next_step_index": 0,
+        "frame_steps": {},
+    }
+    logger.info(
+        "Plan created session=%s frame=%s steps=%d",
+        session.session_id,
+        frame.id,
+        len(steps),
+    )
+    _emit_orchestration_event(
+        event_callback,
+        "plan_created",
+        {
+            "summary": session.pending_plan["summary"],
+            "steps": [
+                {
+                    "index": index + 1,
+                    "title": step["title"],
+                    "agent": step["agent"],
+                    "task": step["task"],
+                    "depends_on": step["depends_on"],
+                    "estimated_complexity": step["estimated_complexity"],
+                }
+                for index, step in enumerate(steps)
+            ],
+        },
+    )
+    tasks = [{"agent": step["agent"], "task": step["task"]} for step in steps]
+    frame.messages.append(
+        _tool_message(
+            call_id,
+            {
+                "ok": True,
+                "tasks": tasks,
+                "note": "计划已记录并通知用户。请立即调用 delegate_many，把上面的 tasks 原样作为参数传入以开始执行。",
+            },
+        )
+    )
+
+
 def _start_delegate_frame(
     *,
     session: Session,
@@ -469,6 +700,7 @@ def _start_delegate_frame(
     call_id: str,
     args: dict[str, Any],
     prompt_factory: Callable[[AgentDefinition], str] | None,
+    event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> bool:
     """创建子 agent 帧并压栈，成功时返回 True。"""
     agent_name = args.get("agent")
@@ -519,6 +751,7 @@ def _start_delegate_frame(
         frame.messages.append(_tool_message(call_id, f"未知子 agent：{agent_name}", is_error=True))
         return False
     session.agent_stack.append(child)
+    _plan_step_started(session, child, event_callback)
     logger.info(
         "Delegate frame started session=%s parent_frame=%s child_frame=%s parent_agent=%s child_agent=%s depth=%d",
         session.session_id,
@@ -538,6 +771,7 @@ def _start_delegate_group(
     call_id: str,
     args: dict[str, Any],
     prompt_factory: Callable[[AgentDefinition], str] | None,
+    event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> bool:
     """启动 `delegate_many` 顺序子任务组。"""
     raw_tasks = args.get("tasks")
@@ -593,6 +827,7 @@ def _start_delegate_group(
         frame.messages.append(_tool_message(call_id, "delegate_many 首个子任务不合法", is_error=True))
         return False
     session.agent_stack.append(child)
+    _plan_step_started(session, child, event_callback)
     logger.info(
         "Delegate_many group started session=%s group_id=%s parent_frame=%s child_frame=%s total_tasks=%d",
         session.session_id,
@@ -822,6 +1057,7 @@ async def run_turn(
                 f"子 agent「{frame.agent.name}」已达到自身最大循环次数（{frame.agent.max_turns}），"
                 "任务未完成，已强制收尾。以上为已执行步骤记录，请据此判断是否需要重新拆分任务或继续委派。",
                 agent_prompt_factory,
+                event_callback,
             )
             continue
 
@@ -866,7 +1102,7 @@ async def run_turn(
         frame.messages.append(turn.raw_message)
 
         if not turn.tool_calls:
-            result = _finish_frame(session, turn.content or "", agent_prompt_factory)
+            result = _finish_frame(session, turn.content or "", agent_prompt_factory, event_callback)
             if result is not None:
                 logger.info("Agent run_turn final session=%s loop=%d", session.session_id, loop_index + 1)
                 return result
@@ -952,6 +1188,7 @@ async def run_turn(
                     call_id=call.id,
                     args=args,
                     prompt_factory=agent_prompt_factory,
+                    event_callback=event_callback,
                 )
             else:
                 _start_delegate_frame(
@@ -960,7 +1197,49 @@ async def run_turn(
                     call_id=call.id,
                     args=args,
                     prompt_factory=agent_prompt_factory,
+                    event_callback=event_callback,
                 )
+            continue
+
+        plan_calls = [call for call in turn.tool_calls if call.name == "create_plan"]
+        if plan_calls:
+            if len(turn.tool_calls) != 1:
+                _append_create_plan_protocol_errors(frame, turn.tool_calls)
+                continue
+
+            call = plan_calls[0]
+            tool = REGISTRY.get(call.name)
+            if tool is None:
+                logger.warning("Create_plan tool missing from registry session=%s", session.session_id)
+                frame.messages.append(_tool_message(call.id, "create_plan 工具未注册", is_error=True))
+                continue
+
+            args, parse_error = _load_tool_args(call.id, call.arguments)
+            if parse_error is not None:
+                frame.messages.append(parse_error)
+                continue
+            assert args is not None
+
+            decision = check(tool, args, permission_ctx)
+            if decision == "deny":
+                logger.warning(
+                    "Create_plan denied session=%s frame=%s agent=%s",
+                    session.session_id,
+                    frame.id,
+                    frame.agent.name,
+                )
+                frame.messages.append(
+                    _tool_message(call.id, "被拒绝：当前 agent/权限模式不允许 create_plan", is_error=True)
+                )
+                continue
+
+            _handle_create_plan(
+                session=session,
+                frame=frame,
+                call_id=call.id,
+                args=args,
+                event_callback=event_callback,
+            )
             continue
 
         front_calls: list[FrontToolCall] = []

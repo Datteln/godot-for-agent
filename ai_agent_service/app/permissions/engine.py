@@ -28,8 +28,11 @@ Decision = Literal["allow", "ask", "deny"]
 
 logger = logging.getLogger(__name__)
 
-# 会话级"总是允许"授权的粒度：tool + domain + path_scope + effect（详设 A §3.6）。
-SessionAllowGrant = tuple[str, str, str | None, str]
+# 会话级"总是允许"授权的粒度：tool + domain + effect（详设 A §3.6）。
+# 不含具体路径——按文件路径精确授权时，用户勾选一次"自动允许相似低风险更改"
+# 后，换一个文件名又得再问一遍，体验上等同于这个授权从没生效过；同一个工具
+# 名称本身已经是足够安全的授权粒度（不同工具各自独立授权，互不放宽）。
+SessionAllowGrant = tuple[str, str, str]
 
 
 @dataclass
@@ -43,7 +46,7 @@ class PermissionContext:
         deny_rules: 显式 deny 规则（始终生效，不受信任状态影响）。
         allow_rules: 显式 allow 规则（仅受信任工程生效）。
         session_allow: 本会话内"总是允许"的授权集合，元素为
-            `(tool, domain, path_scope, effect)`。
+            `(tool, domain, effect)`。
     """
 
     security: SecuritySettings
@@ -72,40 +75,30 @@ def _effect_of(tool: ToolDef) -> str:
     return "read_project"
 
 
-def _path_scope_of(tool: ToolDef, args: dict[str, Any]) -> str | None:
-    """提取本次调用涉及的路径范围，用于会话授权的粒度匹配。
-
-    Args:
-        tool: 工具定义。
-        args: 本次调用的入参。
-
-    Returns:
-        若工具声明了 `path_args` 且入参提供了第一个路径值，返回该值；
-        否则返回 None（表示该工具不区分路径范围）。
-    """
-    for name in tool.path_args:
-        if name in args:
-            return str(args[name])
-    return None
-
-
-def _session_allow_match(ctx: PermissionContext, tool: ToolDef, args: dict[str, Any]) -> bool:
+def _session_allow_match(ctx: PermissionContext, tool: ToolDef) -> bool:
     """判断本次调用是否命中会话级"总是允许"授权。
 
     Args:
         ctx: 当前权限上下文。
         tool: 工具定义。
-        args: 本次调用的入参。
 
     Returns:
         命中则返回 True。
     """
-    return make_session_allow_grant(tool, args) in ctx.session_allow
+    return make_session_allow_grant(tool) in ctx.session_allow
 
 
-def make_session_allow_grant(tool: ToolDef, args: dict[str, Any]) -> SessionAllowGrant:
-    """Build the canonical session-allow grant tuple for a tool call."""
-    return (tool.name, tool.domain, _path_scope_of(tool, args), _effect_of(tool))
+def make_session_allow_grant(tool: ToolDef) -> SessionAllowGrant:
+    """构造该工具对应的会话级"总是允许"授权键。
+
+    Args:
+        tool: 工具定义。
+
+    Returns:
+        `(tool.name, tool.domain, effect)` 三元组；不含具体路径，因此对
+        同一工具的任意一次调用授权后，本会话内该工具的后续调用都会命中。
+    """
+    return (tool.name, tool.domain, _effect_of(tool))
 
 
 def _default_mode(tool: ToolDef, ctx: PermissionContext) -> Decision:
@@ -165,7 +158,7 @@ def check(tool: ToolDef, args: dict[str, Any], ctx: PermissionContext) -> Decisi
     if ctx.security.trusted and match_rules(ctx.allow_rules, tool, args, "allow"):
         logger.debug("Permission allow tool=%s reason=allow_rule", tool.name)
         return "allow"
-    if _session_allow_match(ctx, tool, args):
+    if _session_allow_match(ctx, tool):
         logger.debug("Permission allow tool=%s reason=session_allow", tool.name)
         return "allow"
     decision = _MODE_HANDLERS[ctx.security.permission_mode](tool, ctx)

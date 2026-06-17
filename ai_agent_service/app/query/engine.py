@@ -29,10 +29,11 @@ from app.api.schemas import (
     SessionHistoryItemDTO,
     SessionHistoryResponse,
     ToolResult,
+    VerifyResultDTO,
 )
 from app.config import AppSettings
-from app.llm.provider import LLMProvider
-from app.orchestrator.agent import ErrorResult, FinalResult, StepResult, ToolCallsResult, run_turn
+from app.llm.provider import LLMError, LLMProvider
+from app.orchestrator.agent import EFFORT_TEMPERATURE, ErrorResult, FinalResult, StepResult, ToolCallsResult, run_turn
 from app.output_styles.catalog import OutputStyleCatalog
 from app.permissions.engine import make_session_allow_grant
 from app.prompt.builder import build_system_prompt
@@ -43,6 +44,8 @@ from app.events.store import EventStore
 from app.recovery.pointer import RecoveryPointerStore
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
+from app.tools.server_tools.read_file import read_file_handler
+from app.verify.syntax_check import run_syntax_check
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,52 @@ def _tool_message(tool_call_id: str, result: Any, *, is_error: bool = False) -> 
     body: Any = {"error": result} if is_error else result
     content = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+
+_VERIFY_SYSTEM_PROMPT = (
+    "你是代码改动校验员。这份文件已经通过 Phase 1 语法检查，请不要再判断语法正确性，"
+    "只关注语义/逻辑层面：\n"
+    "1) 是否有未定义的变量、函数、类引用；\n"
+    "2) 编辑意图（tool_name/tool_input_path 所表达的修改目标）是否完整实现；\n"
+    "3) 是否引入了明显的逻辑错误；\n"
+    "4) 信号连接是否完整（GDScript 场景相关改动）；\n"
+    "5) 依赖关系是否正确（import/preload 引用）。\n"
+    "只返回 JSON，不要任何额外文字、不要 markdown 代码块标记，格式为："
+    '{"passed": bool, "issues": [{"severity": "error"|"warning"|"info", '
+    '"file_path": str, "line": int|null, "message": str}], "summary": str}'
+)
+
+
+def _parse_verify_response(text: str) -> VerifyResultDTO:
+    """把 Phase 2 LLM 校验返回的文本解析为 `VerifyResultDTO`。
+
+    解析失败（非 JSON/字段不合法）时保守返回 `passed=True`，避免校验自身的
+    解析问题阻塞用户的正常工作流；失败原因记录在 `summary` 与日志中。
+
+    Args:
+        text: LLM 返回的原始文本。
+
+    Returns:
+        解析得到的 `VerifyResultDTO`，或解析失败时的保守兜底结果。
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+    try:
+        data = json.loads(cleaned)
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("Verify response is not valid JSON: %s", cleaned[:200])
+        return VerifyResultDTO(passed=True, issues=[], summary="校验响应解析失败，已跳过")
+    if not isinstance(data, dict):
+        return VerifyResultDTO(passed=True, issues=[], summary="校验响应格式不合法，已跳过")
+    try:
+        return VerifyResultDTO.model_validate(data)
+    except Exception as exc:  # pydantic ValidationError 及其他兜底
+        logger.warning("Verify response failed validation: %s", exc)
+        return VerifyResultDTO(passed=True, issues=[], summary="校验响应字段不合法，已跳过")
 
 
 def _build_user_content(request: ChatRequest) -> str:
@@ -507,10 +556,12 @@ class QueryEngine:
                 len(request.tool_results or []),
                 session.pending_turn_id,
             )
-            result_error = self._append_tool_results(session, request.tool_results or [])
+            result_error, verify_candidates = self._append_tool_results(session, request.tool_results or [])
             if result_error is not None:
                 logger.warning("Front tool result rejected session=%s reason=%s", session.session_id, result_error.text)
                 return result_error
+            if verify_candidates:
+                await self._run_verify(session, security, verify_candidates)
         else:
             if session.pending_turn_id is not None:
                 logger.warning(
@@ -604,14 +655,21 @@ class QueryEngine:
 
     def _append_tool_results(
         self, session: Session, results: list[ToolResult]
-    ) -> ChatErrorResponse | None:
-        """校验并把前端工具结果追加到对应 agent 帧。"""
+    ) -> tuple[ChatErrorResponse | None, list[dict[str, Any]]]:
+        """校验并把前端工具结果追加到对应 agent 帧。
+
+        Returns:
+            `(error, verify_candidates)`：`error` 非 None 时本次回传被拒绝，
+            `verify_candidates` 此时必为空列表；否则 `verify_candidates` 收集
+            本次落地、且命中 `verify_trigger_tools` 的编辑类工具调用，供调用方
+            驱动 Verify 两阶段校验（§3.3）。
+        """
         if session.pending_turn_id is None:
             logger.warning("Tool results rejected: no pending turn session=%s", session.session_id)
-            return ChatErrorResponse(text="当前会话没有等待回传的工具调用")
+            return ChatErrorResponse(text="当前会话没有等待回传的工具调用"), []
         if not results:
             logger.warning("Tool results rejected: empty results session=%s", session.session_id)
-            return ChatErrorResponse(text="tool_results 不能为空")
+            return ChatErrorResponse(text="tool_results 不能为空"), []
 
         ids = {result.tool_use_id for result in results}
         if ids != session.pending_tool_call_ids:
@@ -623,16 +681,20 @@ class QueryEngine:
                 expected,
                 actual,
             )
-            return ChatErrorResponse(text=f"tool_results 与 pending 工具调用不匹配：expected={expected}; actual={actual}")
+            return (
+                ChatErrorResponse(text=f"tool_results 与 pending 工具调用不匹配：expected={expected}; actual={actual}"),
+                [],
+            )
         if any(result.turn_id != session.pending_turn_id for result in results):
             logger.warning(
                 "Tool results rejected: turn mismatch session=%s pending_turn=%s",
                 session.session_id,
                 session.pending_turn_id,
             )
-            return ChatErrorResponse(text="tool_results.turn_id 与当前 pending_turn_id 不匹配")
+            return ChatErrorResponse(text="tool_results.turn_id 与当前 pending_turn_id 不匹配"), []
 
         frames = {frame.id: frame for frame in session.agent_stack}
+        verify_candidates: list[dict[str, Any]] = []
         for result in results:
             frame = frames.get(result.frame_id)
             if frame is None:
@@ -641,7 +703,7 @@ class QueryEngine:
                     session.session_id,
                     result.frame_id,
                 )
-                return ChatErrorResponse(text=f"未知 frame_id：{result.frame_id}")
+                return ChatErrorResponse(text=f"未知 frame_id：{result.frame_id}"), []
             is_error = result.status in {"rejected", "error"}
             metadata = session.pending_tool_calls.get(result.tool_use_id, {})
             tool_name = str(metadata.get("name", ""))
@@ -655,7 +717,7 @@ class QueryEngine:
                 if tool is not None and tool.enrich is not None and isinstance(applied_result, dict):
                     applied_result = tool.enrich(tool_args, applied_result)
                 if result.grant_session_allow and tool is not None and not tool.executes_process:
-                    session.session_allow.add(make_session_allow_grant(tool, tool_args))
+                    session.session_allow.add(make_session_allow_grant(tool))
                     logger.info(
                         "Session allow grant added session=%s tool=%s frame=%s",
                         session.session_id,
@@ -668,6 +730,18 @@ class QueryEngine:
                     "artifact_refs": result.artifact_refs,
                     "grant_session_allow": result.grant_session_allow,
                 }
+                if self._settings.verify_after_edit and tool_name in self._settings.verify_trigger_tools:
+                    path = tool_args.get("path") or tool_args.get("target_path")
+                    if isinstance(path, str) and path:
+                        verify_candidates.append(
+                            {
+                                "tool_use_id": result.tool_use_id,
+                                "frame_id": frame.id,
+                                "tool_name": tool_name,
+                                "path": path,
+                                "input": tool_args,
+                            }
+                        )
             else:
                 payload = {
                     "status": result.status,
@@ -686,7 +760,194 @@ class QueryEngine:
 
         session.clear_pending()
         logger.info("Tool results completed session=%s count=%d", session.session_id, len(results))
-        return None
+        return None, verify_candidates
+
+    async def _run_verify(
+        self,
+        session: Session,
+        security: SecuritySettings,
+        candidates: list[dict[str, Any]],
+    ) -> None:
+        """对本轮所有命中校验条件的编辑结果依次跑 Verify 两阶段校验（§3.4）。
+
+        Args:
+            session: 当前会话。
+            security: 当前请求的安全边界配置，决定文件读取/语法检查的工程根目录。
+            candidates: `_append_tool_results()` 收集的待校验候选列表。
+        """
+        for candidate in candidates:
+            await self._verify_one(session, security, candidate)
+
+    async def _verify_one(
+        self,
+        session: Session,
+        security: SecuritySettings,
+        candidate: dict[str, Any],
+    ) -> None:
+        """对单个编辑结果跑 Phase 1 语法快检 + Phase 2 语义校验，并把结论写回对应帧。"""
+        settings = self._settings
+        tool_use_id = str(candidate["tool_use_id"])
+        frame_id = str(candidate["frame_id"])
+        tool_name = str(candidate["tool_name"])
+        path = str(candidate["path"])
+        frame = next((f for f in session.agent_stack if f.id == frame_id), None)
+        if frame is None:
+            logger.warning("Verify skipped: frame missing session=%s frame=%s", session.session_id, frame_id)
+            return
+
+        retries = session.verify_retry_count.get(path, 0)
+        if retries >= settings.verify_max_retries:
+            logger.info(
+                "Verify skipped: max retries reached session=%s path=%s retries=%d",
+                session.session_id,
+                path,
+                retries,
+            )
+            return
+
+        if settings.verify_syntax_enabled:
+            self._emit(
+                session.session_id,
+                "verify_started",
+                {"tool_use_id": tool_use_id, "file_path": path, "phase": "syntax"},
+            )
+            outcome = await run_syntax_check(
+                path=path,
+                project_root=security.project_root,
+                godot_path=settings.verify_godot_path,
+                timeout_s=settings.verify_syntax_timeout,
+            )
+            if outcome is not None:
+                passed, issues = outcome
+                if not passed:
+                    summary = issues[0].message if issues else "语法检查失败"
+                    self._emit(
+                        session.session_id,
+                        "verify_completed",
+                        {
+                            "tool_use_id": tool_use_id,
+                            "file_path": path,
+                            "passed": False,
+                            "issues_count": len(issues),
+                            "summary": summary,
+                            "phase": "syntax",
+                        },
+                    )
+                    frame.messages.append(
+                        {
+                            "role": "system",
+                            "content": json.dumps(
+                                {
+                                    "verify": {
+                                        "phase": "syntax",
+                                        "passed": False,
+                                        "issues": [issue.model_dump() for issue in issues],
+                                        "summary": summary,
+                                        "file_path": path,
+                                    }
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    )
+                    session.verify_retry_count[path] = retries + 1
+                    logger.info(
+                        "Verify syntax failed session=%s path=%s issues=%d retries=%d",
+                        session.session_id,
+                        path,
+                        len(issues),
+                        session.verify_retry_count[path],
+                    )
+                    return
+
+        self._emit(
+            session.session_id,
+            "verify_started",
+            {"tool_use_id": tool_use_id, "file_path": path, "phase": "semantic"},
+        )
+        result = await self._run_semantic_verify(security, tool_name, candidate.get("input", {}), path)
+        self._emit(
+            session.session_id,
+            "verify_completed",
+            {
+                "tool_use_id": tool_use_id,
+                "file_path": path,
+                "passed": result.passed,
+                "issues_count": len(result.issues),
+                "summary": result.summary,
+                "phase": "semantic",
+            },
+        )
+        frame.messages.append(
+            {
+                "role": "system",
+                "content": json.dumps(
+                    {
+                        "verify": {
+                            "phase": "semantic",
+                            "passed": result.passed,
+                            "issues": [issue.model_dump() for issue in result.issues],
+                            "summary": result.summary,
+                            "file_path": path,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+        session.verify_retry_count[path] = 0 if result.passed else retries + 1
+        logger.info(
+            "Verify semantic finished session=%s path=%s passed=%s issues=%d",
+            session.session_id,
+            path,
+            result.passed,
+            len(result.issues),
+        )
+
+    async def _run_semantic_verify(
+        self,
+        security: SecuritySettings,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        path: str,
+    ) -> VerifyResultDTO:
+        """调用 LLM 对改动后的文件内容做语义/逻辑层面的校验（Phase 2，§3.5）。
+
+        语法正确性已由 Phase 1 保证，这里只关注：未定义引用、编辑意图是否
+        完整实现、明显的逻辑错误、信号连接、import/preload 依赖关系。
+        """
+        try:
+            file_payload = await read_file_handler(
+                {"path": path},
+                ToolContext(security=security, session_id="verify"),
+            )
+        except (OSError, ValueError) as exc:
+            logger.warning("Verify semantic skipped: cannot read file path=%s error=%s", path, exc)
+            return VerifyResultDTO(passed=True, issues=[], summary=f"无法读取文件以校验：{exc}")
+
+        file_content = str(file_payload.get("content", ""))
+        user_payload = {
+            "tool_name": tool_name,
+            "tool_input_path": tool_input.get("path", path),
+            "file_path": path,
+            "file_content": file_content,
+        }
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": _VERIFY_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ]
+        try:
+            turn = await self._llm.chat(
+                messages,
+                [],
+                model=self._model_for_effort(self._settings.verify_effort),
+                temperature=EFFORT_TEMPERATURE.get(self._settings.verify_effort, 0.0),
+            )
+        except LLMError as exc:
+            logger.warning("Verify semantic LLM call failed path=%s error=%s", path, exc)
+            return VerifyResultDTO(passed=True, issues=[], summary="校验调用失败，已跳过")
+
+        return _parse_verify_response(turn.content or "")
 
     def reset(self, session_id: str) -> None:
         """清空指定会话。"""
@@ -730,6 +991,8 @@ class QueryEngine:
         discarded = 0
         async with self._store.lock_for(session_id):
             session = self._store.get_or_create(session_id, self.available_tools)
+            had_pending_plan = session.pending_plan is not None
+            session.pending_plan = None
             if session.pending_turn_id is not None:
                 frames = {frame.id: frame for frame in session.agent_stack}
                 for tool_use_id in sorted(session.pending_tool_call_ids):
@@ -745,6 +1008,8 @@ class QueryEngine:
                 self._store.save(session)
                 if self._recovery is not None:
                     self._recovery.clear()
+            elif had_pending_plan:
+                self._store.save(session)
 
         self._emit(session_id, "turn_interrupted", {"cancelled": cancelled, "pending_discarded": discarded})
         last_seq = self._events.last_seq(session_id) if self._events is not None else 0

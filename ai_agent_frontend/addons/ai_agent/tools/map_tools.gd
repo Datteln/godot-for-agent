@@ -7,9 +7,11 @@ const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 static func describe_selection(editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available"}
+	var root := editor_interface.get_edited_scene_root()
 	for node in editor_interface.get_selection().get_selected_nodes():
 		if node != null and node.get_class() == "TileMapLayer":
-			return {"ok": true, "path": str(node.get_path()), "type": "TileMapLayer"}
+			var path := str(root.get_path_to(node)) if root != null else str(node.get_path())
+			return {"ok": true, "path": path, "type": "TileMapLayer"}
 	return {"ok": false, "message": "Select a TileMapLayer first"}
 
 

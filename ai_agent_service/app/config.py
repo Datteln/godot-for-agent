@@ -130,6 +130,41 @@ class AppSettings(BaseSettings):
         "各帧自身的预算见 AgentDefinition.max_turns）。",
     )
 
+    verify_after_edit: bool = Field(
+        default=True,
+        description="编辑类 front 工具成功落地后是否自动触发校验；为 False 时完全跳过 Verify 功能。",
+    )
+    verify_trigger_tools: list[str] = Field(
+        default_factory=lambda: [
+            "propose_script_edit",
+            "write_file",
+            "apply_text_edit",
+            "propose_tests",
+            "propose_content_file",
+        ],
+        description="触发自动校验的工具名集合，可通过环境变量覆盖（JSON 数组）。",
+    )
+    verify_syntax_enabled: bool = Field(
+        default=True,
+        description="是否启用 Phase 1 语法快检（bash/CLI）；为 False 时直接进入 Phase 2 语义校验。",
+    )
+    verify_syntax_timeout: int = Field(
+        default=10,
+        description="Phase 1 语法快检命令的超时秒数，超时视为该阶段跳过。",
+    )
+    verify_godot_path: str = Field(
+        default="godot",
+        description="Godot 可执行文件路径，用于 GDScript 语法检查（--headless --check-only）。",
+    )
+    verify_effort: str = Field(
+        default="verify",
+        description="Phase 2 语义校验使用的 effort 档位，决定模型与采样温度。",
+    )
+    verify_max_retries: int = Field(
+        default=2,
+        description="单次编辑（按文件路径计）允许的最大校验-修复重试次数，超过后跳过后续校验。",
+    )
+
     def resolved_log_dir(self) -> Path:
         """返回日志文件存储目录的绝对路径。
 

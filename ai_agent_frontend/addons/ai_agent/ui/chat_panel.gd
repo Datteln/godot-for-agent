@@ -17,6 +17,15 @@ enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
 
 const PENDING_TOOL_RESULTS_ERROR := "当前会话仍有待回传的工具结果，不能开始新的用户消息"
 const HIGH_RISK_TOOLS := ["run_tests", "run_headless_self_test", "set_project_setting", "batch_rename"]
+## Plan/Verify 的展示性事件：通常没有活跃 LLM 文本流陪同到达，需要强制滚动一次，
+## 否则容易在 ScrollContainer 重新计算高度期间被误判为"用户已上滑"而停止跟随。
+const _MILESTONE_EVENT_TYPES := {
+	"plan_created": true,
+	"plan_step_started": true,
+	"plan_step_completed": true,
+	"verify_started": true,
+	"verify_completed": true,
+}
 
 const UI_TEXT := {
 	"zh": {
@@ -192,6 +201,7 @@ var _theme_colors: Dictionary = {}
 var _auto_scroll := true
 var _suppress_scroll_check := false   # 程序滚动时抑制 value_changed 误判
 var _post_final_scroll_frames := 0   # final 响应后持续滚动到底部的剩余帧数
+var _post_delta_scroll_frames := 0   # 文本流刷新后持续滚动到底部的剩余帧数（避免每帧都强制滚动）
 var _empty_final_ignored_ms: int = -1   # 空 final 被忽略的时间戳，超时后强制结束 turn
 
 
@@ -210,7 +220,13 @@ func _process(_delta: float) -> void:
 		_stream_content_rich.clear()
 		_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(_stream_display_text, _theme_colors))
 		_stream_text_dirty = false
-	if _auto_scroll and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+		if _auto_scroll:
+			# 内容刚刷新，给 fit_content RichTextLabel 几帧时间稳定布局后再滚动，而不是
+			# 像之前那样不管有没有新内容都每帧滚动一次——长会话里 _message_list 子节点
+			# 一多，每帧都强制重算 ScrollContainer 高度是明显的卡顿来源（§界面卡顿）。
+			_post_delta_scroll_frames = 2
+	if _post_delta_scroll_frames > 0 and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+		_post_delta_scroll_frames -= 1
 		_do_scroll_to_bottom()
 	# final 响应后连续多帧强制滚动到底部，等待 fit_content RichTextLabel 完成布局
 	if _post_final_scroll_frames > 0:
@@ -647,7 +663,7 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		return
 
 	_mark_current_stream_closed()
-	_discard_stream_message()
+	_finalize_stream_as_persistent()
 	# 模型这一轮已经决定调用工具，说明它的思考已经结束——必须在这里冻结计时器，
 	# 否则 _process() 会一直用 _reasoning_started_ms 刷新这条 "Thought for Xs"，
 	# 直到下一轮 reasoning_delta 到来才会被关闭，期间会一直跟着 Edit/确认框走。
@@ -1124,6 +1140,8 @@ func _drain_event_queue() -> void:
 			FrontendLogger.debug(editor_interface, "ChatPanel", "-> rendered", {
 				"type": event_type, "description": description
 			})
+			if _MILESTONE_EVENT_TYPES.has(event_type):
+				_force_scroll_once = true
 			_append_message("system", description)
 		if is_compacting:
 			_set_state(previous_state)
@@ -1265,8 +1283,12 @@ func _on_inline_apply() -> void:
 		if not (call is Dictionary):
 			continue
 		var should_apply := index < _inline_checkboxes.size() and _inline_checkboxes[index].button_pressed
-		var preview: Control = _inline_previews[index] if index < _inline_previews.size() else null
-		var stats: Dictionary = _inline_diff_stats[index] if index < _inline_diff_stats.size() else {}
+		# 只对 workflow 工具（Edit/Write）合并成带 diff 的单条目；其它工具（如
+		# set_node_property/add_node）走旧的"宣告 + 结果"两条文本消息——它们的
+		# 宣告消息在上面没有被跳过，混进新面板只会再造一次重复条目。
+		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
+		var preview: Control = (_inline_previews[index] if index < _inline_previews.size() else null) if is_workflow else null
+		var stats: Dictionary = (_inline_diff_stats[index] if index < _inline_diff_stats.size() else {}) if is_workflow else {}
 		if should_apply:
 			if _interrupted_locally:
 				return
@@ -1300,8 +1322,9 @@ func _on_inline_reject() -> void:
 			continue
 		var rejected := AgentDTO.rejected_result(call)
 		results.append(rejected)
-		var preview: Control = _inline_previews[index] if index < _inline_previews.size() else null
-		var stats: Dictionary = _inline_diff_stats[index] if index < _inline_diff_stats.size() else {}
+		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
+		var preview: Control = (_inline_previews[index] if index < _inline_previews.size() else null) if is_workflow else null
+		var stats: Dictionary = (_inline_diff_stats[index] if index < _inline_diff_stats.size() else {}) if is_workflow else {}
 		_append_tool_result(call, rejected, preview, stats)
 	_set_inline_busy(false)
 	_on_decision(results)
@@ -1408,6 +1431,13 @@ func _on_text_delta(event: Dictionary) -> void:
 		return
 	_mark_reasoning_stream_closed()   # 防止迟到的 reasoning delta 再创建条目
 	_finish_reasoning_stream()         # 置空 toggle，停止 _process 中的计时刷新
+	if key != _stream_key:
+		# 流式 key 变了（典型场景：coordinator 在服务端 delegate 给子 agent，
+		# frame_id 从 f1 变成 f2，前端从未收到 tool_calls，_handle_tool_calls()
+		# 不会被调用）。这里必须先把"旧 key"已经显示在屏幕上的文本保留为
+		# 工作流条目，再开始新 key 的流式行——否则下面整段会直接覆盖
+		# _stream_display_text，旧内容就在用户眼前消失得无影无踪。
+		_finalize_stream_as_persistent()
 	var stripped := _strip_think_xml(text)
 	var parts := _split_thought_summary(stripped)
 	var rest := str(parts.get("rest", ""))
@@ -1520,6 +1550,21 @@ func _mark_reasoning_stream_closed() -> void:
 func _discard_stream_message() -> void:
 	if _stream_row != null and is_instance_valid(_stream_row):
 		_stream_row.queue_free()
+	_finish_streaming()
+
+
+## 把 LLM 在决定调用工具之前已经输出的流式文本，从临时流式行转成持久的
+## 工作流条目（带 `●`/`○` 前缀），而不是像 `_discard_stream_message()` 一样
+## 直接丢弃——这样用户能看到模型在工具调用之间的说明/思考文字。
+func _finalize_stream_as_persistent() -> void:
+	var text := _stream_display_text
+	if _stream_row != null and is_instance_valid(_stream_row):
+		_stream_row.queue_free()
+	if text.strip_edges() != "":
+		_indent_current_text = true
+		_append_log_stream_message(text, null, true)
+		_indent_current_text = false
+		_rendered_assistant_keys[_message_fingerprint(text)] = true
 	_finish_streaming()
 
 

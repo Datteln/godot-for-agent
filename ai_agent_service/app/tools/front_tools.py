@@ -88,6 +88,66 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="create_plan",
+            domain="core",
+            side="server",
+            is_read_only=True,
+            is_concurrency_safe=False,
+            render_kind="json",
+            schema={
+                "name": "create_plan",
+                "description": (
+                    "Produce a structured execution plan for a complex multi-step task and notify the "
+                    "user via the event stream. Must be the only tool call in the assistant turn. "
+                    "After this returns successfully, immediately call delegate_many with the returned "
+                    "tasks to start executing the plan."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "summary": {
+                            "type": "string",
+                            "description": "One-sentence overview of the plan.",
+                        },
+                        "steps": {
+                            "type": "array",
+                            "description": "Ordered list of plan steps.",
+                            "items": _object_schema(
+                                {
+                                    "title": {"type": "string", "description": "Short step title."},
+                                    "agent": {
+                                        "type": "string",
+                                        "description": "Specialist agent name for this step, e.g. programming-agent.",
+                                    },
+                                    "task": {
+                                        "type": "string",
+                                        "description": (
+                                            "Specific task description delegated to the agent; should "
+                                            "include concrete file paths and key operations since it is "
+                                            "shown directly to the user."
+                                        ),
+                                    },
+                                    "depends_on": {
+                                        "type": "array",
+                                        "items": {"type": "integer"},
+                                        "description": "Optional 1-based indices of steps this step depends on.",
+                                    },
+                                    "estimated_complexity": {
+                                        "type": "string",
+                                        "enum": ["low", "medium", "high"],
+                                        "description": "Optional estimated complexity for this step.",
+                                    },
+                                },
+                                ["title", "agent", "task"],
+                            ),
+                        },
+                    },
+                    ["summary", "steps"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="read_class_docs",
             domain="program",
             side="front",

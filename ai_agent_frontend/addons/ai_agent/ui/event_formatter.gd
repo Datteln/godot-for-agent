@@ -104,6 +104,33 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 				str(payload.get("keep_recent", 0)),
 				str(payload.get("pending_preserved", false))
 			]
+		"plan_created":
+			return format_plan_created_event(payload)
+		"plan_step_started":
+			return ui_text.get("event_plan_step_started", "Executing step %d/%d: %s (%s)...") % [
+				int(payload.get("step_index", 0)),
+				int(payload.get("total_steps", 0)),
+				str(payload.get("title", "")),
+				str(payload.get("agent", ""))
+			]
+		"plan_step_completed":
+			return ui_text.get("event_plan_step_completed", "[Done] Step %d/%d completed: %s") % [
+				int(payload.get("step_index", 0)),
+				int(payload.get("total_steps", 0)),
+				str(payload.get("summary", ""))
+			]
+		"verify_started":
+			return ui_text.get("event_verify_started", "Verifying %s (%s)...") % [
+				str(payload.get("file_path", "")),
+				str(payload.get("phase", ""))
+			]
+		"verify_completed":
+			if bool(payload.get("passed", false)):
+				return ui_text.get("event_verify_passed", "[Passed] Verify passed: %s") % str(payload.get("summary", ""))
+			return ui_text.get("event_verify_failed", "[Issue] Verify found %d issue(s): %s") % [
+				int(payload.get("issues_count", 0)),
+				str(payload.get("summary", ""))
+			]
 		_:
 			return ui_text.get("event_unknown", "Event: %s %s") % [str(event.get("type", "unknown")), JSON.stringify(payload)]
 
@@ -148,6 +175,24 @@ static func format_grep_event_entry(summary: Dictionary) -> String:
 	if bool(summary.get("truncated", false)):
 		lines.append("... truncated ...")
 	return "Grep \"%s\" (in %s)\n%s" % [pattern, include, "\n".join(lines)]
+
+
+static func format_plan_created_event(payload: Dictionary) -> String:
+	var summary := str(payload.get("summary", ""))
+	var steps: Array = payload.get("steps", []) if payload.get("steps", []) is Array else []
+	var lines: Array[String] = ["Plan", "  Summary: %s" % summary, ""]
+	for step in steps:
+		if not (step is Dictionary):
+			continue
+		lines.append("  %d. %s (%s)" % [
+			int(step.get("index", 0)),
+			str(step.get("title", "")),
+			str(step.get("agent", ""))
+		])
+		var task := str(step.get("task", ""))
+		if task != "":
+			lines.append("     %s" % task)
+	return "\n".join(lines)
 
 
 static func _format_event_args(payload: Dictionary) -> String:

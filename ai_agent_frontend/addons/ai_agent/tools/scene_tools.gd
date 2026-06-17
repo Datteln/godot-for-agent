@@ -2,13 +2,21 @@
 extends RefCounted
 
 
+## 节点路径相对于"被编辑场景的根节点"而非 `node.get_path()` 的 SceneTree 绝对路径。
+## 在编辑器里运行时，被编辑场景是挂在编辑器自身视口树很深的位置下的，
+## `node.get_path()` 会把整条 `/root/@EditorNode@.../@SubViewport@.../` 编辑器内部
+## 路径都吐出来——又长又会随编辑器布局变化，不适合展示给用户，也不该塞进模型上下文。
+static func _relative_path(root: Node, node: Node) -> String:
+	return str(root.get_path_to(node))
+
+
 static func read_scene_tree(editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {}
 	var root := editor_interface.get_edited_scene_root()
 	if root == null:
 		return {}
-	return _node_to_dict(root, 0, 6)
+	return _node_to_dict(root, root, 0, 6)
 
 
 static func read_runtime_state(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
@@ -25,12 +33,12 @@ static func read_runtime_state(input: Dictionary, editor_interface: EditorInterf
 		return result
 	var root := editor_interface.get_edited_scene_root()
 	if root != null:
-		result["edited_scene"] = _node_to_dict(root, 0, max_depth)
+		result["edited_scene"] = _node_to_dict(root, root, 0, max_depth)
 	for node in editor_interface.get_selection().get_selected_nodes():
 		if node is Node:
 			result["selected_nodes"].append({
 				"name": node.name,
-				"path": str(node.get_path()),
+				"path": _relative_path(root, node) if root != null else str(node.get_path()),
 				"type": node.get_class(),
 				"visible": node.visible if node is CanvasItem else null,
 				"process_mode": int(node.process_mode)
@@ -60,7 +68,7 @@ static func add_node(input: Dictionary, editor_interface: EditorInterface, undo_
 	node.owner = root
 	if undo_manager != null:
 		undo_manager.record_node_added(parent, node, root)
-	return {"ok": true, "path": str(node.get_path()), "type": type_name}
+	return {"ok": true, "path": _relative_path(root, node), "type": type_name}
 
 
 static func set_node_property(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
@@ -79,7 +87,7 @@ static func set_node_property(input: Dictionary, editor_interface: EditorInterfa
 		undo_manager.record_node_property(node, property, before, after)
 	else:
 		node.set(property, after)
-	return {"ok": true, "path": str(node.get_path()), "property": property}
+	return {"ok": true, "path": _relative_path(root, node), "property": property}
 
 
 static func delete_node(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
@@ -131,7 +139,7 @@ static func reparent_node(input: Dictionary, editor_interface: EditorInterface, 
 		old_parent.remove_child(node)
 		new_parent.add_child(node)
 		node.owner = root
-	return {"ok": true, "path": str(node.get_path())}
+	return {"ok": true, "path": _relative_path(root, node)}
 
 
 static func rename_node(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
@@ -154,18 +162,18 @@ static func rename_node(input: Dictionary, editor_interface: EditorInterface, un
 		undo_manager.record_node_renamed(node, before_name, new_name)
 	else:
 		node.name = new_name
-	return {"ok": true, "path": str(node.get_path()), "before_name": before_name, "after_name": new_name}
+	return {"ok": true, "path": _relative_path(root, node), "before_name": before_name, "after_name": new_name}
 
 
-static func _node_to_dict(node: Node, depth: int, max_depth: int) -> Dictionary:
+static func _node_to_dict(root: Node, node: Node, depth: int, max_depth: int) -> Dictionary:
 	var children: Array = []
 	if depth < max_depth:
 		for child in node.get_children():
 			if child is Node:
-				children.append(_node_to_dict(child, depth + 1, max_depth))
+				children.append(_node_to_dict(root, child, depth + 1, max_depth))
 	return {
 		"name": node.name,
-		"path": str(node.get_path()),
+		"path": _relative_path(root, node),
 		"type": node.get_class(),
 		"children": children
 	}

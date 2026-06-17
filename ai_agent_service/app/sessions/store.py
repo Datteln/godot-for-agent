@@ -42,6 +42,10 @@ class Session:
         effort: 当前会话 effort 档位。
         output_style: 当前会话 OutputStyle id。
         delegate_groups: `delegate_many` 的挂起组状态；仅保存 JSON 原生值。
+        pending_plan: 当前正在执行的 `create_plan` 计划状态（概述、步骤、进度指针），
+            不存在活跃计划时为 None。
+        verify_retry_count: 文件路径 → 该文件已触发的"校验失败-修复"重试次数，
+            用于防止 Verify 与 LLM 修复之间死循环。
     """
 
     session_id: str
@@ -56,6 +60,8 @@ class Session:
     effort: str = "standard"
     output_style: str = "default"
     delegate_groups: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_plan: dict[str, Any] | None = None
+    verify_retry_count: dict[str, int] = field(default_factory=dict)
 
     def top_frame(self) -> Frame | None:
         """返回当前活跃帧（栈顶），栈为空时返回 None。
@@ -200,6 +206,8 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "effort": session.effort,
         "output_style": session.output_style,
         "delegate_groups": session.delegate_groups,
+        "pending_plan": session.pending_plan,
+        "verify_retry_count": session.verify_retry_count,
     }
 
 
@@ -223,13 +231,15 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         request_id_cache=data.get("request_id_cache", {}),
         pending_tool_calls=data.get("pending_tool_calls", {}),
         session_allow={
-            (str(item[0]), str(item[1]), item[2] if item[2] is None else str(item[2]), str(item[3]))
+            (str(item[0]), str(item[1]), str(item[2]))
             for item in data.get("session_allow", [])
-            if isinstance(item, list) and len(item) == 4
+            if isinstance(item, list) and len(item) == 3
         },
         effort=str(data.get("effort", "standard")),
         output_style=str(data.get("output_style", "default")),
         delegate_groups=data.get("delegate_groups", {}),
+        pending_plan=data.get("pending_plan"),
+        verify_retry_count=data.get("verify_retry_count", {}),
     )
 
 
