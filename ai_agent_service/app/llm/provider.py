@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 # 或 `"reasoning"`（思考过程），`accumulated_text` 为截至当前的完整累积文本。
 DeltaCallback = Callable[[str, str], None]
 
+# 降级回调：`(primary_model, fallback_model)`，主模型请求失败、即将用
+# `fallback_model` 重试时触发一次，供编排层把这次模型切换暴露为事件，
+# 避免前端/日志里出现风格突变却查不到原因。
+FallbackCallback = Callable[[str, str], None]
+
 # 流式增量事件的最小推送间隔（秒），避免逐 token 产生事件淹没事件队列。
 _DELTA_MIN_INTERVAL_S = 0.12
 
@@ -52,6 +57,8 @@ class AssistantTurn:
         finish_reason: 模型返回的结束原因（如 `stop`/`tool_calls`/`length`）。
         reasoning: 模型的思考过程文本（`enable_thinking` 开启且端点支持时），
             不写入 `raw_message`，仅供前端展示。
+        model: 本次实际应答的模型名（主模型失败降级后为 `fallback_model`），
+            供编排层/事件区分"这轮回复来自哪个模型"。
     """
 
     raw_message: dict[str, Any]
@@ -59,6 +66,7 @@ class AssistantTurn:
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str | None = None
     reasoning: str | None = None
+    model: str = ""
 
 
 class LLMError(Exception):
@@ -85,6 +93,7 @@ class LLMProvider(Protocol):
         model: str | None = None,
         temperature: float | None = None,
         on_delta: DeltaCallback | None = None,
+        on_fallback: FallbackCallback | None = None,
     ) -> AssistantTurn:
         """发起一次对话补全请求。
 
@@ -97,6 +106,8 @@ class LLMProvider(Protocol):
                 `AgentDefinition.effort` 解析出具体值）。
             on_delta: 流式增量回调，每次正文/思考过程有新增内容时被调用，
                 参数为 `(kind, accumulated_text)`；为 None 时不推送增量。
+            on_fallback: 降级回调，主模型失败、即将用 `fallback_model`
+                重试前触发一次；为 None 时不通知。
 
         Returns:
             模型本轮的回应。
@@ -170,6 +181,7 @@ class OpenAICompatibleProvider:
         model: str | None = None,
         temperature: float | None = None,
         on_delta: DeltaCallback | None = None,
+        on_fallback: FallbackCallback | None = None,
     ) -> AssistantTurn:
         """调用 `chat.completions.create` 并转换为 `AssistantTurn`。
 
@@ -182,6 +194,8 @@ class OpenAICompatibleProvider:
             model: 本次请求使用的模型名；为 None 时使用 `default_model`。
             temperature: 采样温度；为 None 时使用端点默认值。
             on_delta: 流式增量回调，参见 `LLMProvider.chat`。
+            on_fallback: 降级回调，参见 `LLMProvider.chat`；在实际发起
+                降级请求前调用一次，便于编排层把这次模型切换暴露为事件。
 
         Returns:
             模型本轮的回应。
@@ -206,6 +220,8 @@ class OpenAICompatibleProvider:
                 self._fallback_model,
                 exc.status_code,
             )
+            if on_fallback is not None:
+                on_fallback(resolved_model, self._fallback_model)
             return await self._chat_once(messages, tools, self._fallback_model, temperature, on_delta)
 
     async def _chat_once(
@@ -362,4 +378,5 @@ class OpenAICompatibleProvider:
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             reasoning=reasoning,
+            model=model,
         )

@@ -11,6 +11,15 @@ from app.output_styles.catalog import OutputStyleCatalog
 from app.skills.catalog import SkillCatalog
 
 
+_TOOL_REJECTION_POLICY = (
+    "工具调用被拒绝时的处理：当某个前端工具结果 `status` 为 `rejected`"
+    "（用户在预览里拒绝了你提议的编辑/操作）时，绝不能就此终止对话或返回"
+    "空响应——必须立即给出一条友好、建设性的正式回复，主动提出可行的替代"
+    "路径，例如：手动修改步骤说明、改为只读分析/解释、或提议风险更低的"
+    "降级方案；让交互流程继续顺畅，而不是卡住或晾着用户。"
+)
+
+
 def build_system_prompt(
     agent: AgentDefinition,
     skill_catalog: SkillCatalog | None = None,
@@ -18,7 +27,7 @@ def build_system_prompt(
     output_style_id: str | None = None,
 ) -> str:
     """构造当前 agent 帧的 system prompt。"""
-    parts = [agent.prompt.strip()]
+    parts = [agent.prompt.strip(), _TOOL_REJECTION_POLICY]
 
     if agent.hooks is not None:
         on_start = agent.hooks.get("on_start")

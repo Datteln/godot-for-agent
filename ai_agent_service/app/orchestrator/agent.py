@@ -731,6 +731,42 @@ def _delta_callback(
     return _on_delta
 
 
+def _fallback_callback(
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+    frame_id: str,
+    loop: int,
+) -> Callable[[str, str], None] | None:
+    """构造传给 `LLMProvider.chat` 的降级回调，转发为 `agent_model_fallback` 事件。
+
+    主模型请求失败、provider 即将用 `fallback_model` 重试时触发一次，
+    让前端/日志能看到"这轮回复换了模型"，而不是看到推理风格突变却不知道原因。
+
+    Args:
+        event_callback: 编排事件回调；为 None 时不产生降级事件。
+        frame_id: 本轮所属的 agent 帧 id。
+        loop: 本轮在 `run_turn` 中的循环序号（从 1 开始）。
+
+    Returns:
+        转发降级信息为 `agent_model_fallback` 事件的回调；`event_callback`
+        为 None 时返回 None。
+    """
+    if event_callback is None:
+        return None
+
+    def _on_fallback(primary_model: str, fallback_model: str) -> None:
+        event_callback(
+            "agent_model_fallback",
+            {
+                "frame_id": frame_id,
+                "loop": loop,
+                "primary_model": primary_model,
+                "fallback_model": fallback_model,
+            },
+        )
+
+    return _on_fallback
+
+
 async def run_turn(
     session: Session,
     llm: LLMProvider,
@@ -821,6 +857,7 @@ async def run_turn(
                 model=_resolve_model_for_effort(frame.agent, effort, model_selector),
                 temperature=_resolve_temperature(effort),
                 on_delta=_delta_callback(event_callback, frame.id, loop_index + 1),
+                on_fallback=_fallback_callback(event_callback, frame.id, loop_index + 1),
             )
         except LLMError as exc:
             logger.warning("Agent LLM step failed session=%s frame=%s error=%s", session.session_id, frame.id, exc)

@@ -88,6 +88,30 @@ static func _render_diff(call: Dictionary, theme_colors: Dictionary) -> Control:
 	return view
 
 
+## 计算 diff 新增/删除行数，与 `_render_diff` 用同一份 before/after 文本来源，
+## 保证统计数字与实际展示的 diff 内容一致（旧实现是单独按 after_text 行数估算，
+## 在 before_text 缺失时会把整份文件算成"全部新增"）。必须在工具执行前调用——
+## 执行后磁盘上的文件已经变成 after_text，再读就读不到真正的 before 了。
+static func diff_stats(call: Dictionary) -> Dictionary:
+	var input: Dictionary = call.get("input", {})
+	var path := PathUtils.to_res_path(str(input.get("path", input.get("target_path", ""))))
+	var after_text := str(input.get("content", input.get("after_text", input.get("after", ""))))
+	var before_text := str(input.get("before_text", input.get("before", "")))
+	if before_text == "" and path != "":
+		var absolute := ProjectSettings.globalize_path(path)
+		if FileAccess.file_exists(absolute):
+			before_text = FileAccess.get_file_as_string(absolute)
+	var added := 0
+	var removed := 0
+	for line in _lcs_diff(before_text, after_text):
+		var text := str(line)
+		if text.begins_with("+ "):
+			added += 1
+		elif text.begins_with("- "):
+			removed += 1
+	return {"added": added, "removed": removed}
+
+
 static func _render_map_op(call: Dictionary) -> Control:
 	var input: Dictionary = call.get("input", {})
 	var lines: Array[String] = []

@@ -57,6 +57,7 @@ const UI_TEXT := {
 		"event_unknown": "事件：%s %s",
 		"history_restored": "已恢复上次会话记录：%s 条。",
 		"event_delegate": "Task(%s)",
+		"event_model_fallback": "主模型不可用，已切换到备用模型：%s -> %s",
 		"event_tool_start": "%s(%s)",
 		"event_tool_done": "%s 完成",
 		"event_tool_done_count": "%s 完成（%d 个结果）",
@@ -70,7 +71,6 @@ const UI_TEXT := {
 		"tool_rejected": "已拒绝",
 		"tool_error_detail": "出错：%s",
 		"tool_unknown_error": "未知错误",
-		"rejected_preview_title": "已拒绝，未应用的内容如下：",
 		"rejected_turn_ended": "已拒绝本次工具调用，会话已结束，可以继续发送新消息。"
 	},
 	"en": {
@@ -111,6 +111,7 @@ const UI_TEXT := {
 		"event_unknown": "Event: %s %s",
 		"history_restored": "Restored previous session history: %s item(s).",
 		"event_delegate": "Task(%s)",
+		"event_model_fallback": "Primary model unavailable, switched to fallback model: %s -> %s",
 		"event_tool_start": "%s(%s)",
 		"event_tool_done": "%s done",
 		"event_tool_done_count": "%s done (%d result(s))",
@@ -124,7 +125,6 @@ const UI_TEXT := {
 		"tool_rejected": "Rejected",
 		"tool_error_detail": "Error: %s",
 		"tool_unknown_error": "Unknown error",
-		"rejected_preview_title": "Rejected. The unapplied content was:",
 		"rejected_turn_ended": "Rejected this tool call. The turn has ended; you can send a new message."
 	}
 }
@@ -161,6 +161,7 @@ var _pending_calls: Array = []
 var _pending_silent_results: Array = []
 var _inline_checkboxes: Array[CheckBox] = []
 var _inline_previews: Array[Control] = []
+var _inline_diff_stats: Array[Dictionary] = []
 var _inline_always_allow: CheckBox
 var _inline_apply_btn: Button
 var _inline_reject_btn: Button
@@ -662,8 +663,11 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		"count": calls.size(), "silent": silent.size(), "confirm": confirm.size(), "names": call_names
 	})
 
+	# workflow 工具（Edit/Write）的"宣告"消息直接跳过：确认框本身（confirm 分支）
+	# 或下面紧接着渲染的 diff 预览（silent 分支）已经表达了同样的信息，等结果出来
+	# 后只追加一条合并了 diff 的永久条目，避免一次编辑显示成两个工作流条目。
 	for call in confirm:
-		if call is Dictionary:
+		if call is Dictionary and not EventFormatter.is_workflow_tool(str(call.get("name", ""))):
 			_append_message("system", EventFormatter.format_tool_call_header(call))
 
 	if state_store != null:
@@ -675,13 +679,22 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		if call is Dictionary:
 			if _interrupted_locally:
 				return
-			_append_message("system", EventFormatter.format_tool_call_header(call))
+			var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
+			var preview: Control = null
+			var stats := {}
+			if is_workflow:
+				# 必须在执行前渲染：之后文件已经被改写成 after_text，就读不到
+				# 真正的 before 内容了。
+				preview = ToolPreviewRenderer.render_call(call, _theme_colors)
+				stats = ToolPreviewRenderer.diff_stats(call)
+			else:
+				_append_message("system", EventFormatter.format_tool_call_header(call))
 			_set_state(AgentState.EXECUTING)
 			var result: Dictionary = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
 			results.append(result)
-			_append_tool_result(call, result)
+			_append_tool_result(call, result, preview, stats)
 
 	if not confirm.is_empty():
 		FrontendLogger.info(editor_interface, "ChatPanel", "Waiting for inline tool confirmation.", {"count": confirm.size()})
@@ -1168,9 +1181,10 @@ func _update_output_styles(styles: Array) -> void:
 
 
 func _show_inline_confirmation(calls: Array) -> void:
-	_clear_inline_confirmation()
+	_clear_inline_confirmation_ui()
 	_inline_checkboxes.clear()
 	_inline_previews.clear()
+	_inline_diff_stats.clear()
 
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -1202,6 +1216,9 @@ func _show_inline_confirmation(calls: Array) -> void:
 		preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		item.add_child(preview)
 		_inline_previews.append(preview)
+		# 此时文件还未被改动，是计算 diff 行数统计的唯一正确时机——执行后文件
+		# 内容已变成 after_text，"before" 就读不到了。
+		_inline_diff_stats.append(ToolPreviewRenderer.diff_stats(call))
 		body.add_child(item)
 		body.add_child(HSeparator.new())
 
@@ -1243,6 +1260,8 @@ func _on_inline_apply() -> void:
 		if not (call is Dictionary):
 			continue
 		var should_apply := index < _inline_checkboxes.size() and _inline_checkboxes[index].button_pressed
+		var preview: Control = _inline_previews[index] if index < _inline_previews.size() else null
+		var stats: Dictionary = _inline_diff_stats[index] if index < _inline_diff_stats.size() else {}
 		if should_apply:
 			if _interrupted_locally:
 				return
@@ -1252,11 +1271,11 @@ func _on_inline_apply() -> void:
 				return
 			result["grant_session_allow"] = _inline_always_allow != null and _inline_always_allow.button_pressed
 			results.append(result)
-			_append_tool_result(call, result)
+			_append_tool_result(call, result, preview, stats)
 		else:
 			var rejected := AgentDTO.rejected_result(call)
 			results.append(rejected)
-			_append_tool_result(call, rejected)
+			_append_tool_result(call, rejected, preview, stats)
 	_set_inline_busy(false)
 	_on_decision(results)
 
@@ -1266,75 +1285,42 @@ func _on_inline_reject() -> void:
 		return
 	_set_inline_busy(true)
 	var calls := _pending_calls.duplicate(true)
-	var previews := _inline_previews.duplicate()
-	_render_rejected_previews(calls, previews)
-	_end_turn_after_rejection()
-
-
-## 拒绝时把已经渲染好的工具预览（diff/参数等）从临时确认框搬到永久消息区，
-## 这样用户拒绝后仍能看到模型原本想做的更改内容，而不是只剩一句"已拒绝"。
-func _render_rejected_previews(calls: Array, previews: Array) -> void:
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
-	var panel := _log_renderer.make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(panel)
-
-	var body := VBoxContainer.new()
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	body.add_theme_constant_override("separation", 8)
-	panel.add_child(body)
-
-	var title := Label.new()
-	title.text = _ui("rejected_preview_title")
-	body.add_child(title)
-
+	# 拒绝不等于挂断：把 rejected 结果回传给模型，让它读到"用户拒绝了这个
+	# 编辑"之后继续给出建设性回复（如手动修改步骤、改成只读分析或降级
+	# 方案），而不是前端单方面结束本轮、晾着用户。
+	var results := _pending_silent_results.duplicate(true)
 	for index in range(calls.size()):
 		var call = calls[index]
 		if not (call is Dictionary):
 			continue
-		var header := Label.new()
-		header.text = EventFormatter.format_tool_call_header(call)
-		header.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		body.add_child(header)
-		var preview: Control = previews[index] if index < previews.size() else null
-		if preview != null and is_instance_valid(preview):
-			var old_parent := preview.get_parent()
-			if old_parent != null:
-				old_parent.remove_child(preview)
-			body.add_child(preview)
-		body.add_child(HSeparator.new())
-
-	_message_list.add_child(row)
-	_scroll_to_bottom()
+		var rejected := AgentDTO.rejected_result(call)
+		results.append(rejected)
+		var preview: Control = _inline_previews[index] if index < _inline_previews.size() else null
+		var stats: Dictionary = _inline_diff_stats[index] if index < _inline_diff_stats.size() else {}
+		_append_tool_result(call, rejected, preview, stats)
+	_set_inline_busy(false)
+	_on_decision(results)
 
 
-## 拒绝后不再把结果回传给模型继续本轮对话：直接通知后端丢弃这一轮待处理的
-## 工具调用并把前端状态收回 IDLE，相当于在前端"结束"这次会话回合。
-func _end_turn_after_rejection() -> void:
-	_clear_inline_confirmation()
-	if undo_manager != null:
-		undo_manager.abort_batch()
-	if _http_client != null:
-		_http_client.current_turn_id = ""
-		_http_client.discard_pending()
-	if state_store != null:
-		state_store.set_value("current_turn_id", "")
-		state_store.set_value("pending_calls", [])
-	_set_state(AgentState.IDLE)
-	_append_message("system", _ui("rejected_turn_ended"))
-
-
-func _clear_inline_confirmation() -> void:
+## 仅拆除确认框的 UI（旧的 checkbox/diff 预览/按钮），不触碰 `_pending_calls` /
+## `_pending_silent_results`。`_show_inline_confirmation` 在构建新一轮确认框
+## 前调用它来清掉上一轮遗留的控件——如果改用下面这个会清空 pending 数据的
+## 完整版本，就会把调用者刚刚（在它之前一行）写入的 `_pending_calls` 清空，
+## 导致确认框显示正常，但用户点"应用"/"拒绝"时已经没有数据可回传。
+func _clear_inline_confirmation_ui() -> void:
 	if _inline_confirm_box != null and is_instance_valid(_inline_confirm_box):
 		_inline_confirm_box.queue_free()
 	_inline_confirm_box = null
 	_inline_checkboxes.clear()
 	_inline_previews.clear()
+	_inline_diff_stats.clear()
+	_inline_busy = false
+
+
+func _clear_inline_confirmation() -> void:
+	_clear_inline_confirmation_ui()
 	_pending_calls.clear()
 	_pending_silent_results.clear()
-	_inline_busy = false
 
 
 func _set_inline_busy(value: bool) -> void:
@@ -1581,10 +1567,18 @@ func _append_log_stream_message(text: String, color = null, mark_text: bool = fa
 	_scroll_to_bottom()
 
 
-func _append_tool_result(call: Dictionary, result: Dictionary) -> void:
+## `preview`/`diff_stats` 仅在调用方已经为这个 call 渲染过 diff 预览时传入
+## （即 workflow 类工具：Edit/Write）。传入时渲染一条带彩色 diff 的永久面板，
+## 取代"宣告 + 结果"两条消息——避免同一次编辑在工作流列表里显示成两个条目。
+func _append_tool_result(call: Dictionary, result: Dictionary, preview: Control = null, diff_stats: Dictionary = {}) -> void:
 	var name := str(call.get("name", "unknown"))
 	var status := str(result.get("status", ""))
 	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
+
+	if preview != null and is_instance_valid(preview):
+		_append_tool_result_panel(call, result, preview, diff_stats)
+		return
+
 	var detail := EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
 	if status == "applied":
 		detail = EventFormatter.format_log_tool_result(name, input, result, detail)
@@ -1594,6 +1588,64 @@ func _append_tool_result(call: Dictionary, result: Dictionary) -> void:
 	})
 	var color := _theme_color("error_text") if status == "error" else _theme_color("text")
 	_append_message("system", detail, color)
+
+
+## 把已渲染好的 diff/参数预览（在工具执行前从确认框搬出，此时文件内容还是
+## before_text）和执行结果合并成一条永久日志条目：标题行 + diff 预览 + 状态行。
+func _append_tool_result_panel(call: Dictionary, result: Dictionary, preview: Control, diff_stats: Dictionary) -> void:
+	var status := str(result.get("status", ""))
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	var panel := _log_renderer.make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
+	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(panel)
+
+	var body := VBoxContainer.new()
+	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	body.add_theme_constant_override("separation", 8)
+	panel.add_child(body)
+
+	var header := Label.new()
+	header.text = EventFormatter.format_tool_call_header(call)
+	header.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	body.add_child(header)
+
+	var old_parent := preview.get_parent()
+	if old_parent != null:
+		old_parent.remove_child(preview)
+	body.add_child(preview)
+
+	var name := str(call.get("name", "unknown"))
+	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
+	var is_diff_kind := ToolPreviewRenderer.infer_render_kind(call) == "diff"
+
+	var status_text := ""
+	var status_color := _theme_color("text")
+	match status:
+		"applied":
+			if is_diff_kind:
+				status_text = "+%d -%d lines" % [int(diff_stats.get("added", 0)), int(diff_stats.get("removed", 0))]
+			else:
+				status_text = EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
+			status_color = _theme_color("success_text")
+		"rejected":
+			status_text = _ui("tool_rejected")
+			status_color = _theme_color("muted_text")
+		"error":
+			status_text = EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
+			status_color = _theme_color("error_text")
+		_:
+			status_text = status
+	if status_text != "":
+		body.add_child(_log_renderer.make_log_rich_text(status_text, status_color))
+
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_result]", {
+		"name": name, "status": status, "status_text": status_text
+	})
+
+	_message_list.add_child(row)
+	_scroll_to_bottom()
 
 
 func _clear_messages() -> void:
@@ -1622,9 +1674,7 @@ func _on_scroll_value_changed(value: float) -> void:
 	if is_at_bottom:
 		_auto_scroll = true
 	else:
-		# 如果自动滚动已开启且正在流式输出，此次偏移是内容增长引起的，
-		# 不要关闭自动滚动，直接同步把滚动条推到底（避免 call_deferred 链
-		# 追不上内容增长导致末尾消息无法滚到底部）。
+		# 如果自动滚动已开启且正在流式输出，此次偏移是内容增长引起的，不要关闭自动滚动，直接同步把滚动条推到底（避免 call_deferred 链追不上内容增长导致末尾消息无法滚到底部）。
 		if _auto_scroll and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 			_suppress_scroll_check = true
 			_scroll.scroll_vertical = 999999

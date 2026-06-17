@@ -59,6 +59,11 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 			return ""
 		"delegate_start":
 			return ui_text.get("event_delegate", "Task(%s)") % _format_delegate_args(payload)
+		"agent_model_fallback":
+			return ui_text.get("event_model_fallback", "Model fallback: %s -> %s") % [
+				str(payload.get("primary_model", "")),
+				str(payload.get("fallback_model", ""))
+			]
 		"server_tool_start":
 			if is_workflow_tool(str(payload.get("tool", ""))):
 				return ""
