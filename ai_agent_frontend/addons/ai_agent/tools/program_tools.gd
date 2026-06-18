@@ -4,6 +4,8 @@ extends RefCounted
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 
+const MAX_STALE_CONTENT_CHARS := 40000
+
 
 static func read_file(input: Dictionary, file_state_cache: Node = null) -> Dictionary:
 	var path := PathUtils.to_res_path(str(input.get("path", "")))
@@ -37,6 +39,8 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 		var current_content := ""
 		if FileAccess.file_exists(ProjectSettings.globalize_path(path)):
 			current_content = FileAccess.get_file_as_string(ProjectSettings.globalize_path(path))
+			if current_content.length() > MAX_STALE_CONTENT_CHARS:
+				current_content = current_content.left(MAX_STALE_CONTENT_CHARS) + "\n\n... (content truncated)"
 		file_state_cache.snapshot(path, true)
 		return {
 			"ok": false,

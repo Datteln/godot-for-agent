@@ -55,7 +55,10 @@ func show(
 		preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		item.add_child(preview)
 		_previews.append(preview)
-		_diff_stats.append(ToolPreviewRenderer.diff_stats(call))
+		if ToolPreviewRenderer.infer_render_kind(call) == "diff":
+			_diff_stats.append(ToolPreviewRenderer.diff_stats(call))
+		else:
+			_diff_stats.append({})
 		body.add_child(item)
 		body.add_child(HSeparator.new())
 

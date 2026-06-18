@@ -17,6 +17,7 @@ const REDACTED_KEYS := {
 	"llm_api_key": true,
 	"token": true
 }
+const MAX_DATA_CHARS := 4000
 
 
 static func debug(editor_interface: EditorInterface, component: String, message: String, data: Dictionary = {}) -> void:
@@ -71,7 +72,10 @@ static func _format_line(level: String, component: String, message: String, data
 	var timestamp := Time.get_datetime_string_from_system(false, true)
 	var suffix := ""
 	if not data.is_empty():
-		suffix = " " + JSON.stringify(data)
+		var data_text := JSON.stringify(data)
+		if data_text.length() > MAX_DATA_CHARS:
+			data_text = data_text.left(MAX_DATA_CHARS) + "...(truncated)"
+		suffix = " " + data_text
 	return "[%s] [%s] [AI Agent:%s] %s%s" % [timestamp, level.to_upper(), component, message, suffix]
 
 

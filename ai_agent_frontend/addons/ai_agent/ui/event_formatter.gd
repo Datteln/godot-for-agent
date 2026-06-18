@@ -60,7 +60,7 @@ static func _title_with_body(title: String, body: String) -> String:
 
 
 static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
-	var payload: Dictionary = event.get("payload", {})
+	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 	match str(event.get("type", "")):
 		"agent_step", "agent_tool_calls", "tool_calls", "final", "tool_results_received":
 			return ""
@@ -142,7 +142,10 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 				str(payload.get("summary", ""))
 			)
 		_:
-			return ui_text.get("event_unknown", "Event: %s %s") % [str(event.get("type", "unknown")), JSON.stringify(payload)]
+			var key_names: Array[String] = []
+			for key in payload.keys():
+				key_names.append(str(key))
+			return ui_text.get("event_unknown", "Event: %s %s") % [str(event.get("type", "unknown")), "keys=" + ",".join(key_names)]
 
 
 static func workflow_entry_from_event_result(payload: Dictionary) -> String:

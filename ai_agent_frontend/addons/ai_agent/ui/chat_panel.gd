@@ -19,6 +19,14 @@ const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_rende
 enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
 
 const PENDING_TOOL_RESULTS_ERROR := "当前会话仍有待回传的工具结果，不能开始新的用户消息"
+const STREAM_RENDER_INTERVAL_MS := 120
+const REASONING_RENDER_INTERVAL_MS := 250
+const EVENT_DRAIN_BATCH_SIZE := 24
+const EVENT_DRAIN_TIME_BUDGET_MS := 6
+const MAX_MESSAGE_LIST_CHILDREN := 240
+const MAX_LIVE_RENDER_CHARS := 60000
+const MAX_MESSAGE_RENDER_CHARS := 90000
+const MAX_REASONING_RENDER_CHARS := 30000
 ## Plan/Verify 的展示性事件：通常没有活跃 LLM 文本流陪同到达，需要强制滚动一次，
 ## 否则容易在 ScrollContainer 重新计算高度期间被误判为"用户已上滑"而停止跟随。
 const _MILESTONE_EVENT_TYPES := {
@@ -72,11 +80,14 @@ var _stream_content_rich: RichTextLabel
 var _stream_started_ms: int = -1
 var _stream_display_text := ""
 var _stream_text_dirty := false
+var _stream_last_render_ms := 0
 var _reasoning_key := ""
 var _reasoning_toggle: Button
 var _reasoning_detail_rich: RichTextLabel
 var _reasoning_text := ""
 var _reasoning_started_ms: int = -1
+var _reasoning_text_dirty := false
+var _reasoning_last_render_ms := 0
 var _rendered_assistant_keys := {}
 var _live_response_keys := {}   # 仅追踪本轮实时响应，避免历史加载的指纹误判为重复
 var _closed_stream_keys := {}
@@ -101,14 +112,9 @@ func _ready() -> void:
 
 func _process(_delta: float) -> void:
 	if _stream_text_dirty and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-		_stream_content_rich.clear()
-		_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(_stream_display_text, _theme_colors))
-		_stream_text_dirty = false
-		if _auto_scroll:
-			# 内容刚刷新，给 fit_content RichTextLabel 几帧时间稳定布局后再滚动，而不是
-			# 像之前那样不管有没有新内容都每帧滚动一次——长会话里 _message_list 子节点
-			# 一多，每帧都强制重算 ScrollContainer 高度是明显的卡顿来源（§界面卡顿）。
-			_post_delta_scroll_frames = 2
+		var now_ms := Time.get_ticks_msec()
+		if _stream_last_render_ms == 0 or now_ms - _stream_last_render_ms >= STREAM_RENDER_INTERVAL_MS:
+			_render_stream_content()
 	if _post_delta_scroll_frames > 0 and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		_post_delta_scroll_frames -= 1
 		_do_scroll_to_bottom()
@@ -118,6 +124,10 @@ func _process(_delta: float) -> void:
 		_do_scroll_to_bottom()
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
 		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
+	if _reasoning_text_dirty and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
+		var reasoning_now_ms := Time.get_ticks_msec()
+		if _reasoning_last_render_ms == 0 or reasoning_now_ms - _reasoning_last_render_ms >= REASONING_RENDER_INTERVAL_MS:
+			_render_reasoning_entry()
 	# 空 final 超时兜底：收到空 final 后 60 秒内没有真正的 final 到来，强制结束 turn
 	if _empty_final_ignored_ms >= 0 and _state != AgentState.IDLE:
 		var elapsed_ms := Time.get_ticks_msec() - _empty_final_ignored_ms
@@ -138,6 +148,42 @@ func _process(_delta: float) -> void:
 			if state_store != null:
 				state_store.set_value("current_turn_id", "")
 				state_store.set_value("pending_calls", [])
+
+
+func _render_stream_content() -> void:
+	if _stream_content_rich == null or not is_instance_valid(_stream_content_rich):
+		return
+	_stream_content_rich.clear()
+	_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(
+		_limit_render_text(_stream_display_text, MAX_LIVE_RENDER_CHARS),
+		_theme_colors
+	))
+	_stream_text_dirty = false
+	_stream_last_render_ms = Time.get_ticks_msec()
+	if _auto_scroll:
+		# 内容刚刷新，给 fit_content RichTextLabel 几帧时间稳定布局后再滚动，而不是
+		# 像之前那样不管有没有新内容都每帧滚动一次——长会话里 _message_list 子节点
+		# 一多，每帧都强制重算 ScrollContainer 高度是明显的卡顿来源（§界面卡顿）。
+		_post_delta_scroll_frames = 2
+
+
+func _render_reasoning_entry() -> void:
+	if _reasoning_detail_rich == null or not is_instance_valid(_reasoning_detail_rich):
+		return
+	_reasoning_detail_rich.clear()
+	_reasoning_detail_rich.append_text(MarkdownRenderer.markdown_to_bbcode(
+		_limit_render_text(_reasoning_text, MAX_REASONING_RENDER_CHARS),
+		_theme_colors
+	))
+	_reasoning_text_dirty = false
+	_reasoning_last_render_ms = Time.get_ticks_msec()
+	_scroll_to_bottom()
+
+
+func _limit_render_text(text: String, max_chars: int) -> String:
+	if max_chars <= 0 or text.length() <= max_chars:
+		return text
+	return text.left(max_chars) + "\n\n... (display truncated)"
 
 
 ## 程序控制滚动到底部，设置抑制标志防止 value_changed 误判
@@ -344,7 +390,8 @@ func _on_response(response: Dictionary) -> void:
 		return
 	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling response.", {
 		"type": resp_type,
-		"response": response
+		"keys": response.keys(),
+		"text_len": str(response.get("text", "")).length()
 	})
 	if response.has("python_version"):
 		_last_doctor_report = response
@@ -598,7 +645,10 @@ func _handle_final(response: Dictionary) -> void:
 		_rendered_assistant_keys[assistant_key] = true
 		if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 			_stream_content_rich.clear()
-			_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(render_text, _theme_colors))
+			_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(
+				_limit_render_text(render_text, MAX_MESSAGE_RENDER_CHARS),
+				_theme_colors
+			))
 			_finish_streaming()
 		else:
 			_discard_stream_message()
@@ -959,17 +1009,64 @@ func _on_events(events: Array) -> void:
 	if _interrupted_locally:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "Suppressed events after interrupt.", {"count": events.size()})
 		return
-	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling events.", {"count": events.size()})
-	for event in events:
+	var coalesced := _coalesce_events(events)
+	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling events.", {
+		"count": events.size(),
+		"coalesced_count": coalesced.size()
+	})
+	if state_store != null and state_store.has_method("add_events"):
+		state_store.add_events(coalesced)
+	for event in coalesced:
 		if event is Dictionary:
 			var event_type := str(event.get("type", "<unknown>"))
 			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 			FrontendLogger.debug(editor_interface, "ChatPanel", "Event", {
-				"type": event_type, "payload": payload
+				"type": event_type,
+				"seq": int(event.get("seq", 0)),
+				"payload_keys": payload.keys(),
+				"text_len": str(payload.get("text", "")).length()
 			})
 			_event_queue.append(event)
 	if not _draining_events:
 		_drain_event_queue()
+
+
+func _coalesce_events(events: Array) -> Array:
+	var result: Array = []
+	var latest_delta := {}
+	var ordered_delta_keys: Array[String] = []
+	for raw_event in events:
+		if not (raw_event is Dictionary):
+			continue
+		var event: Dictionary = raw_event
+		var event_type := str(event.get("type", ""))
+		if event_type == "agent_reasoning_delta" or event_type == "agent_text_delta":
+			_remember_delta_event(event, latest_delta, ordered_delta_keys)
+			continue
+		_flush_delta_events(result, latest_delta, ordered_delta_keys)
+		result.append(event)
+	_flush_delta_events(result, latest_delta, ordered_delta_keys)
+	return result
+
+
+func _remember_delta_event(event: Dictionary, latest_delta: Dictionary, ordered_delta_keys: Array[String]) -> void:
+	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+	var key := "%s:%s:%s" % [
+		str(event.get("type", "")),
+		str(payload.get("frame_id", "")),
+		str(payload.get("loop", ""))
+	]
+	if not latest_delta.has(key):
+		ordered_delta_keys.append(key)
+	latest_delta[key] = event
+
+
+func _flush_delta_events(result: Array, latest_delta: Dictionary, ordered_delta_keys: Array[String]) -> void:
+	for key in ordered_delta_keys:
+		if latest_delta.has(key):
+			result.append(latest_delta[key])
+	latest_delta.clear()
+	ordered_delta_keys.clear()
 
 
 func _drain_event_queue() -> void:
@@ -981,10 +1078,23 @@ func _drain_event_queue() -> void:
 		_event_queue.clear()
 		_draining_events = false
 		return
-	var event: Dictionary = _event_queue.pop_front()
+	var started_ms := Time.get_ticks_msec()
+	var processed := 0
+	while not _event_queue.is_empty() and processed < EVENT_DRAIN_BATCH_SIZE:
+		var event = _event_queue.pop_front()
+		if event is Dictionary:
+			_handle_event(event)
+		processed += 1
+		if Time.get_ticks_msec() - started_ms >= EVENT_DRAIN_TIME_BUDGET_MS:
+			break
+	if _event_queue.is_empty():
+		_draining_events = false
+	else:
+		call_deferred("_drain_event_queue")
+
+
+func _handle_event(event: Dictionary) -> void:
 	var event_type := str(event.get("type", ""))
-	if state_store != null:
-		state_store.add_event(event)
 	if event_type == "agent_reasoning_delta":
 		_on_reasoning_delta(event)
 	elif event_type == "agent_text_delta":
@@ -1002,14 +1112,14 @@ func _drain_event_queue() -> void:
 		var description := EventFormatter.describe_event(event, _ui_table())
 		if description != "":
 			FrontendLogger.debug(editor_interface, "ChatPanel", "-> rendered", {
-				"type": event_type, "description": description
+				"type": event_type,
+				"description_len": description.length()
 			})
 			if _MILESTONE_EVENT_TYPES.has(event_type):
 				_force_scroll_once = true
 			_append_message("system", description)
 		if is_compacting:
 			_set_state(previous_state)
-	call_deferred("_drain_event_queue")
 
 
 func _on_extensions() -> void:
@@ -1069,6 +1179,7 @@ func _update_output_styles(styles: Array) -> void:
 
 func _show_inline_confirmation(calls: Array) -> void:
 	_inline_confirm.show(_message_list, calls, _ui_table(), _theme_colors, _on_inline_apply, _on_inline_reject)
+	_trim_message_list()
 	# 确保确认面板出现时自动滚动到底部，让用户看到需要操作的内容
 	_auto_scroll = true
 	_force_scroll_once = true
@@ -1262,10 +1373,7 @@ func _ensure_reasoning_entry(key: String) -> void:
 func _update_reasoning_entry() -> void:
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
 		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
-	if _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
-		_reasoning_detail_rich.clear()
-		_reasoning_detail_rich.append_text(MarkdownRenderer.markdown_to_bbcode(_reasoning_text, _theme_colors))
-	_scroll_to_bottom()
+	_reasoning_text_dirty = true
 
 
 func _format_reasoning_header() -> String:
@@ -1297,14 +1405,19 @@ func _finish_streaming() -> void:
 	_stream_started_ms = -1
 	_stream_display_text = ""
 	_stream_text_dirty = false
+	_stream_last_render_ms = 0
 
 
 func _finish_reasoning_stream() -> void:
+	if _reasoning_text_dirty and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
+		_render_reasoning_entry()
 	_reasoning_key = ""
 	_reasoning_toggle = null
 	_reasoning_detail_rich = null
 	_reasoning_text = ""
 	_reasoning_started_ms = -1
+	_reasoning_text_dirty = false
+	_reasoning_last_render_ms = 0
 
 
 func _mark_current_stream_closed() -> void:
@@ -1371,7 +1484,7 @@ func _append_message(role: String, text: String, color = null) -> void:
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	panel.add_child(body)
 
-	var rich := _log_renderer.make_rich_text(text, color)
+	var rich := _log_renderer.make_rich_text(_limit_render_text(text, MAX_MESSAGE_RENDER_CHARS), color)
 	body.add_child(rich)
 
 	_message_list.add_child(row)
@@ -1383,7 +1496,13 @@ func _message_fingerprint(text: String) -> String:
 
 
 func _append_log_stream_message(text: String, color = null, mark_text: bool = false) -> void:
-	_log_renderer.append_log_stream_message(_message_list, text, color, mark_text, _indent_current_text)
+	_log_renderer.append_log_stream_message(
+		_message_list,
+		_limit_render_text(text, MAX_MESSAGE_RENDER_CHARS),
+		color,
+		mark_text,
+		_indent_current_text
+	)
 	_scroll_to_bottom()
 
 
@@ -1476,7 +1595,17 @@ func _clear_messages() -> void:
 
 
 func _scroll_to_bottom() -> void:
+	_trim_message_list()
 	call_deferred("_scroll_to_bottom_deferred")
+
+
+func _trim_message_list() -> void:
+	if _message_list == null:
+		return
+	while _message_list.get_child_count() > MAX_MESSAGE_LIST_CHILDREN:
+		var child := _message_list.get_child(0)
+		_message_list.remove_child(child)
+		child.queue_free()
 
 
 func _on_scroll_value_changed(value: float) -> void:

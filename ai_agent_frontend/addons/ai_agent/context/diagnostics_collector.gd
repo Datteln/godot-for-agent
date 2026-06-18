@@ -2,7 +2,8 @@
 extends RefCounted
 
 const MAX_ITEMS := 60
-const MAX_LOG_CHARS := 80000
+const MAX_LOG_CHARS := 20000
+const MAX_LOG_LINES := 200
 
 
 static func collect(editor_interface: EditorInterface) -> Array:
@@ -63,7 +64,7 @@ static func _collect_log_file(path: String) -> Array:
 	if text.length() > MAX_LOG_CHARS:
 		text = text.substr(text.length() - MAX_LOG_CHARS)
 	var lines := text.split("\n")
-	var start = max(0, lines.size() - 500)
+	var start = max(0, lines.size() - MAX_LOG_LINES)
 	for index in range(start, lines.size()):
 		var line := str(lines[index]).strip_edges()
 		var lower := line.to_lower()

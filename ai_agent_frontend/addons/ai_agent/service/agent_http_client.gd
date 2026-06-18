@@ -40,7 +40,7 @@ func _ready() -> void:
 	_event_timer.one_shot = false
 	add_child(_event_timer)
 	_event_timer.timeout.connect(poll_events)
-	_configure_event_timer()
+	_event_timer.stop()
 
 
 func send_user_message(text: String, context: Dictionary) -> void:
@@ -186,6 +186,7 @@ func resume_from_pointer(pointer: Dictionary) -> void:
 	_last_event_seq = max(_last_event_seq, int(pointer.get("last_event_seq", 0)))
 	var pending_turn_id = pointer.get("pending_turn_id")
 	current_turn_id = str(pending_turn_id) if pending_turn_id != null else ""
+	_configure_event_timer()
 
 
 func poll_events() -> void:

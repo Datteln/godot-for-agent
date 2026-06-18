@@ -33,9 +33,22 @@ func merge(values: Dictionary) -> void:
 
 
 func add_event(event: Dictionary) -> void:
-	_log.append(event)
+	add_events([event])
+
+
+func add_events(new_events: Array) -> void:
+	var last_seq := int(state.get("last_event_seq", 0))
+	var changed_events := false
+	for event in new_events:
+		if not (event is Dictionary):
+			continue
+		_log.append(event)
+		last_seq = max(last_seq, int(event.get("seq", 0)))
+		changed_events = true
+	if not changed_events:
+		return
 	state["event_log"] = _log.events.duplicate(true)
-	state["last_event_seq"] = max(int(state.get("last_event_seq", 0)), int(event.get("seq", 0)))
+	state["last_event_seq"] = last_seq
 	changed.emit(state.duplicate(true))
 
 

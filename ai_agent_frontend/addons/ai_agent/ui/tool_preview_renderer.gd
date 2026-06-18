@@ -3,8 +3,8 @@ extends RefCounted
 
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 
-const MAX_DIFF_LINES_PER_SIDE := 800
-const MAX_DIFF_LINES_SHOWN := 400
+const MAX_DIFF_LINES_PER_SIDE := 260
+const MAX_DIFF_LINES_SHOWN := 240
 
 
 static func render_call(call: Dictionary, theme_colors: Dictionary = {}) -> Control:
@@ -177,12 +177,7 @@ static func _lcs_diff(before: String, after: String) -> Array:
 	var m := b.size()
 
 	if n > MAX_DIFF_LINES_PER_SIDE or m > MAX_DIFF_LINES_PER_SIDE:
-		var fallback: Array = []
-		for line in a:
-			fallback.append("- " + line)
-		for line in b:
-			fallback.append("+ " + line)
-		return fallback
+		return _bounded_fallback_diff(a, b)
 
 	var lcs: Array = []
 	for i in range(n + 1):
@@ -218,6 +213,22 @@ static func _lcs_diff(before: String, after: String) -> Array:
 		out.append("+ " + b[j])
 		j += 1
 	return out
+
+
+static func _bounded_fallback_diff(before_lines: PackedStringArray, after_lines: PackedStringArray) -> Array:
+	var fallback: Array = []
+	var per_side := maxi(1, int(MAX_DIFF_LINES_SHOWN / 2))
+	var before_count = mini(before_lines.size(), per_side)
+	var after_count = mini(after_lines.size(), per_side)
+	for index in range(before_count):
+		fallback.append("- " + str(before_lines[index]))
+	if before_lines.size() > before_count:
+		fallback.append("- ... (%d more line(s))" % (before_lines.size() - before_count))
+	for index in range(after_count):
+		fallback.append("+ " + str(after_lines[index]))
+	if after_lines.size() > after_count:
+		fallback.append("+ ... (%d more line(s))" % (after_lines.size() - after_count))
+	return fallback
 
 
 static func _escape_bbcode(text: String) -> String:
