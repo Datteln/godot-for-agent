@@ -17,9 +17,9 @@ from app.api.schemas import (
     DoctorResponse,
     HealthResponse,
     InterruptResponse,
+    MemoryItemDTO,
     MemoryRequest,
     MemoryResponse,
-    MemoryItemDTO,
     OutputStylesResponse,
     RecoveryPointerDTO,
     RecoveryPointerResponse,
@@ -315,10 +315,14 @@ def create_router(
         if request.action == "list":
             return await memory_list()
         if request.action == "save":
-            if request.text is None:
+            if request.text is None or not request.text.strip():
                 logger.warning("Memory save rejected: missing text")
-                return MemoryResponse(ok=False, text="save 需要 text")
-            item = memory_store.save(request.text, tags=request.tags, scope=request.scope)
+                return MemoryResponse(ok=False, text="save 需要非空 text")
+            try:
+                item = memory_store.save(request.text, tags=request.tags, scope=request.scope)
+            except ValueError as exc:
+                logger.warning("Memory save rejected: %s", exc)
+                return MemoryResponse(ok=False, text=str(exc))
             logger.info("Memory saved id=%s scope=%s tags=%d", item.id, item.scope, len(item.tags))
             return MemoryResponse(
                 text="memory saved",

@@ -159,20 +159,107 @@ static func _split_args(args_text: String) -> PackedStringArray:
 
 
 static func _run_process_with_timeout(executable: String, args: PackedStringArray, timeout_ms: int) -> Dictionary:
-	var pid := OS.create_process(executable, args, false)
+	var launch := _build_runner_launch(executable, args)
+	if launch.is_empty():
+		return {"ok": false, "status": "failed_to_prepare", "pid": -1, "exit_code": null}
+	var launch_args: PackedStringArray = launch.get("args", PackedStringArray())
+	var pid := OS.create_process(str(launch.get("executable", "")), launch_args, false)
 	if pid <= 0:
+		_cleanup_runner_files(launch)
 		return {"ok": false, "status": "failed_to_start", "pid": pid, "exit_code": null}
 	var tree := Engine.get_main_loop() as SceneTree
 	var start_ms := Time.get_ticks_msec()
 	while OS.is_process_running(pid):
 		if Time.get_ticks_msec() - start_ms > timeout_ms:
 			OS.kill(pid)
+			_cleanup_runner_files(launch)
 			return {"ok": false, "status": "timed_out", "pid": pid, "exit_code": null}
 		if tree != null:
 			await tree.create_timer(0.1).timeout
 		else:
 			OS.delay_msec(100)
-	return {"ok": true, "status": "completed", "pid": pid, "exit_code": null}
+	var exit_code = _read_runner_exit_code(str(launch.get("exit_path", "")))
+	_cleanup_runner_files(launch)
+	if exit_code == null:
+		return {"ok": false, "status": "exit_code_missing", "pid": pid, "exit_code": null}
+	var code := int(exit_code)
+	return {"ok": code == 0, "status": "completed" if code == 0 else "failed", "pid": pid, "exit_code": code}
+
+
+static func _build_runner_launch(executable: String, args: PackedStringArray) -> Dictionary:
+	var token := "%d_%d" % [Time.get_ticks_usec(), randi()]
+	var script_path := "user://ai_agent_runner_%s%s" % [token, ".ps1" if OS.get_name() == "Windows" else ".sh"]
+	var exit_path := "user://ai_agent_runner_%s.exit" % token
+	var script_abs := ProjectSettings.globalize_path(script_path)
+	var exit_abs := ProjectSettings.globalize_path(exit_path)
+	var script := ""
+	var launch_executable := ""
+	var launch_args := PackedStringArray()
+	if OS.get_name() == "Windows":
+		script = "$exe = '%s'\n$argList = @(%s)\n& $exe @argList\n$code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }\nSet-Content -LiteralPath '%s' -Value $code -Encoding ASCII\n" % [
+			_powershell_quote(executable),
+			_powershell_array(args),
+			_powershell_quote(exit_abs)
+		]
+		launch_executable = "powershell.exe"
+		launch_args = PackedStringArray(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_abs])
+	else:
+		script = "#!/bin/sh\n%s %s\ncode=$?\nprintf '%%s' \"$code\" > %s\n" % [
+			_shell_quote(executable),
+			_shell_args(args),
+			_shell_quote(exit_abs)
+		]
+		launch_executable = "/bin/sh"
+		launch_args = PackedStringArray([script_abs])
+	var file := FileAccess.open(script_abs, FileAccess.WRITE)
+	if file == null:
+		return {}
+	file.store_string(script)
+	file.close()
+	return {
+		"executable": launch_executable,
+		"args": launch_args,
+		"script_path": script_abs,
+		"exit_path": exit_abs
+	}
+
+
+static func _powershell_quote(value: String) -> String:
+	return value.replace("'", "''")
+
+
+static func _powershell_array(args: PackedStringArray) -> String:
+	var parts: Array[String] = []
+	for arg in args:
+		parts.append("'%s'" % _powershell_quote(str(arg)))
+	return ", ".join(parts)
+
+
+static func _shell_quote(value: String) -> String:
+	return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+static func _shell_args(args: PackedStringArray) -> String:
+	var parts: Array[String] = []
+	for arg in args:
+		parts.append(_shell_quote(str(arg)))
+	return " ".join(parts)
+
+
+static func _read_runner_exit_code(exit_path: String) -> Variant:
+	if exit_path == "" or not FileAccess.file_exists(exit_path):
+		return null
+	var text := FileAccess.get_file_as_string(exit_path).strip_edges()
+	if not text.is_valid_int():
+		return null
+	return int(text)
+
+
+static func _cleanup_runner_files(launch: Dictionary) -> void:
+	for key in ["script_path", "exit_path"]:
+		var path := str(launch.get(key, ""))
+		if path != "" and FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
 
 
 static func _read_optional_log(path: String) -> String:

@@ -35,7 +35,7 @@ def _rule_matches(rule: PermRule, tool: ToolDef, args: dict[str, Any]) -> bool:
 
     path_glob = rule.match.get("path_glob")
     if path_glob is not None:
-        candidates = [args[name] for name in tool.path_args if name in args]
+        candidates = [args[name] for name in tool.all_path_args if name in args]
         if not any(fnmatch(str(value), path_glob) for value in candidates):
             return False
 

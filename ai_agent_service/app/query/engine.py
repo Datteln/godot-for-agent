@@ -17,31 +17,58 @@ from dataclasses import replace
 from typing import Any
 
 from app.agents.bundled import get_agent
-from app.agents.types import AgentDefinition, Frame
+from app.agents.types import Frame
 from app.api.schemas import (
     ChatErrorResponse,
     ChatFinalResponse,
     ChatRequest,
     ChatResponse,
     ChatToolCallsResponse,
+    DelegateResultDTO,
+    DelegateResultHistoryBlock,
+    DelegateResultsHistoryBlock,
+    ErrorHistoryBlock,
     FrontToolCallDTO,
+    GrepMatchDTO,
     InterruptResponse,
+    LogEditHistoryBlock,
+    LogGrepHistoryBlock,
+    LogReadHistoryBlock,
+    LogTextHistoryBlock,
+    PlanCreatedHistoryBlock,
+    PlanStepDTO,
+    SessionHistoryBlock,
     SessionHistoryItemDTO,
     SessionHistoryResponse,
+    StepCompletedHistoryBlock,
+    StepStartedHistoryBlock,
+    SystemTextHistoryBlock,
+    ThoughtHistoryBlock,
     ToolResult,
+    UserHistoryBlock,
+    VerifyFailedHistoryBlock,
+    VerifyPassedHistoryBlock,
     VerifyResultDTO,
+    VerifyStartedHistoryBlock,
 )
 from app.config import AppSettings
+from app.events.store import Event, EventStore
 from app.llm.provider import LLMError, LLMProvider
-from app.orchestrator.agent import EFFORT_TEMPERATURE, ErrorResult, FinalResult, StepResult, ToolCallsResult, run_turn
+from app.orchestrator.agent import (
+    EFFORT_TEMPERATURE,
+    ErrorResult,
+    FinalResult,
+    StepResult,
+    ToolCallsResult,
+    run_turn,
+)
 from app.output_styles.catalog import OutputStyleCatalog
 from app.permissions.engine import make_session_allow_grant
 from app.prompt.builder import build_system_prompt
+from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import SecuritySettings, security_settings_from_app
 from app.sessions.store import Session, SessionStore
 from app.skills.catalog import SkillCatalog
-from app.events.store import Event, EventStore
-from app.recovery.pointer import RecoveryPointerStore
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
 from app.tools.server_tools.read_file import read_file_handler
@@ -209,6 +236,19 @@ _HISTORY_EDIT_TOOLS = frozenset(
     }
 )
 _HISTORY_GREP_TOOLS = frozenset({"grep_code", "search_codebase", "list_files"})
+_PERSISTED_HISTORY_EVENT_TYPES = frozenset(
+    {
+        "agent_reasoning_delta",
+        "agent_text_delta",
+        "plan_created",
+        "plan_step_started",
+        "plan_step_completed",
+        "verify_started",
+        "verify_completed",
+        "delegate_start",
+        "server_tool_result",
+    }
+)
 
 
 def _looks_like_create_plan_result(content: dict[str, Any]) -> bool:
@@ -302,7 +342,7 @@ def _count_lines(text: str) -> int:
     # 统计文本行数；空字符串视为 0 行。
     if text == "":
         return 0
-    return len(text.split("\n"))
+    return len(text.splitlines())
 
 
 def _parse_tool_call_arguments(raw_arguments: Any) -> dict[str, Any]:
@@ -368,7 +408,8 @@ def _format_tool_result_summary(name: str, input_args: dict[str, Any], content: 
 
     if name in _HISTORY_GREP_TOOLS:
         pattern = str(input_args.get("pattern", input_args.get("query", input_args.get("include", ""))))
-        return 'Grep "%s" (in project)' % pattern.replace('"', '\\"')
+        escaped_pattern = pattern.replace('"', '\\"')
+        return f'Grep "{escaped_pattern}" (in project)'
 
     return _display_tool_content(content)
 
@@ -600,6 +641,577 @@ def _history_items_for_events(events: list[Event], seen: set[str]) -> list[Sessi
     return items
 
 
+def _json_object(raw: str) -> dict[str, Any]:
+    """Parse a JSON object, returning an empty object for non-object content."""
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _history_origin(frame: Frame) -> dict[str, str]:
+    return {"frame_id": frame.id, "agent": frame.agent.name}
+
+
+def _assistant_history_blocks(
+    frame: Frame,
+    text: str,
+    *,
+    has_tool_calls: bool,
+    include_thought_summary: bool = True,
+) -> list[SessionHistoryBlock]:
+    """Split a stored assistant message without treating its final body as reasoning."""
+    stripped = text.strip()
+    if not stripped:
+        return []
+    origin = _history_origin(frame)
+    if not stripped.startswith("Thought:"):
+        return [
+            LogTextHistoryBlock(
+                text=stripped,
+                marker=has_tool_calls,
+                indent=not has_tool_calls,
+                **origin,
+            )
+        ]
+
+    first_line, separator, remainder = stripped.partition("\n")
+    summary = first_line.removeprefix("Thought:").strip()
+    blocks: list[SessionHistoryBlock] = (
+        [ThoughtHistoryBlock(**origin)] if include_thought_summary else []
+    )
+    if summary and include_thought_summary:
+        blocks.append(LogTextHistoryBlock(text=summary, marker=True, **origin))
+    final_text = remainder.strip() if separator else ""
+    if final_text:
+        blocks.append(LogTextHistoryBlock(text=final_text, indent=True, **origin))
+    return blocks
+
+
+def _grep_matches(inner: dict[str, Any]) -> list[GrepMatchDTO]:
+    raw_results: Any = inner.get("results", inner.get("matches", inner.get("items", [])))
+    if not isinstance(raw_results, list):
+        return []
+    matches: list[GrepMatchDTO] = []
+    for raw in raw_results:
+        if isinstance(raw, dict):
+            raw_line = raw.get("line", raw.get("line_no"))
+            line: int | None
+            try:
+                line = int(raw_line) if raw_line not in (None, "") else None
+            except (TypeError, ValueError):
+                line = None
+            matches.append(
+                GrepMatchDTO(
+                    path=str(raw.get("path", raw.get("file", ""))),
+                    line=line,
+                    text=str(raw.get("text", raw.get("preview", ""))),
+                )
+            )
+        else:
+            matches.append(GrepMatchDTO(path=str(raw)))
+    return matches
+
+
+def _tool_history_blocks(
+    frame: Frame,
+    name: str,
+    input_args: dict[str, Any],
+    content: str,
+) -> list[SessionHistoryBlock]:
+    inner = _json_object(content)
+    origin = _history_origin(frame)
+    error_message = inner.get("error")
+    if isinstance(error_message, str):
+        return [ErrorHistoryBlock(text=f"{name}: {error_message}", **origin)]
+
+    if name == "create_plan" or _looks_like_create_plan_result(inner):
+        raw_steps = input_args.get("steps", inner.get("tasks", []))
+        steps = raw_steps if isinstance(raw_steps, list) else []
+        return [
+            PlanCreatedHistoryBlock(
+                summary=str(input_args.get("summary", "")).strip(),
+                steps=[
+                    PlanStepDTO(
+                        index=index,
+                        title=str(step.get("title", "")),
+                        agent=str(step.get("agent", "")),
+                        task=str(step.get("task", "")),
+                    )
+                    for index, step in enumerate(steps, start=1)
+                    if isinstance(step, dict)
+                ],
+                **origin,
+            )
+        ]
+
+    if name == "delegate_many" or _looks_like_delegate_group_result(inner):
+        raw_results = inner.get("results", [])
+        results = raw_results if isinstance(raw_results, list) else []
+        return [
+            DelegateResultsHistoryBlock(
+                results=[
+                    DelegateResultDTO(
+                        agent=str(result.get("agent", "")),
+                        summary=str(result.get("summary", "")),
+                    )
+                    for result in results
+                    if isinstance(result, dict)
+                ],
+                **origin,
+            )
+        ]
+
+    if name == "delegate" or _looks_like_delegate_result(inner):
+        return [
+            DelegateResultHistoryBlock(
+                agent=str(inner.get("agent", "")),
+                summary=str(inner.get("summary", "")),
+                frame_id=frame.id,
+            )
+        ]
+
+    if name in _HISTORY_READ_TOOLS:
+        path = str(inner.get("path", input_args.get("path", "<unknown>")))
+        line_count = max(_count_lines(str(inner.get("content", ""))), 1)
+        return [LogReadHistoryBlock(path=path, line_end=line_count, **origin)]
+
+    if name in _HISTORY_EDIT_TOOLS:
+        path = str(inner.get("path", input_args.get("path", input_args.get("target_path", "<unknown>"))))
+        after_text = str(input_args.get("content", input_args.get("after_text", "")))
+        before_text = str(input_args.get("before_text", input_args.get("before", "")))
+        return [
+            LogEditHistoryBlock(
+                path=path,
+                added=max(_count_lines(after_text) - _count_lines(before_text), 0),
+                removed=max(_count_lines(before_text) - _count_lines(after_text), 0),
+                **origin,
+            )
+        ]
+
+    if name in _HISTORY_GREP_TOOLS:
+        matches = _grep_matches(inner)
+        pattern = str(input_args.get("pattern", input_args.get("query", input_args.get("include", ""))))
+        include = str(input_args.get("include", input_args.get("path", "project"))) or "project"
+        raw_count = inner.get("match_count", inner.get("count", len(matches)))
+        try:
+            match_count = int(raw_count)
+        except (TypeError, ValueError):
+            match_count = len(matches)
+        return [
+            LogGrepHistoryBlock(
+                pattern=pattern,
+                include=include,
+                match_count=match_count,
+                results=matches,
+                truncated=bool(inner.get("truncated", False)),
+                **origin,
+            )
+        ]
+
+    summary = _format_tool_result_summary(name, input_args, content).strip()
+    return [LogTextHistoryBlock(text=summary, marker=True, **origin)] if summary else []
+
+
+def _system_history_blocks(frame: Frame, text: str) -> list[SessionHistoryBlock]:
+    inner = _json_object(text)
+    verify = inner.get("verify")
+    if not isinstance(verify, dict):
+        return []
+    origin = _history_origin(frame)
+    file_path = str(verify.get("file_path", ""))
+    summary = str(verify.get("summary", ""))
+    if bool(verify.get("passed", False)):
+        return [VerifyPassedHistoryBlock(file_path=file_path, summary=summary, **origin)]
+    issues = verify.get("issues", [])
+    issues_count = len(issues) if isinstance(issues, list) else 0
+    return [
+        VerifyFailedHistoryBlock(
+            file_path=file_path,
+            issues_count=issues_count,
+            summary=summary,
+            **origin,
+        )
+    ]
+
+
+def _message_history_blocks(
+    frame: Frame,
+    message: dict[str, Any],
+    tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]],
+    *,
+    is_initial_system: bool,
+    include_thought_summary: bool = True,
+) -> list[SessionHistoryBlock]:
+    role = str(message.get("role", "system"))
+    raw_content = message.get("content", "")
+    text = "" if raw_content is None else str(raw_content)
+    origin = _history_origin(frame)
+    if role == "user":
+        displayed = _display_user_content(text).strip()
+        return [UserHistoryBlock(text=displayed, **origin)] if displayed else []
+    if role == "assistant":
+        calls = message.get("tool_calls", [])
+        if isinstance(calls, list):
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function", {})
+                if not isinstance(function, dict):
+                    continue
+                call_id = str(call.get("id", ""))
+                if call_id:
+                    tool_calls_by_id[call_id] = (
+                        str(function.get("name", "unknown")),
+                        _parse_tool_call_arguments(function.get("arguments")),
+                    )
+        return _assistant_history_blocks(
+            frame,
+            text,
+            has_tool_calls=bool(calls),
+            include_thought_summary=include_thought_summary,
+        )
+    if role == "tool":
+        call_id = str(message.get("tool_call_id", ""))
+        name, input_args = tool_calls_by_id.get(call_id, ("", {}))
+        return _tool_history_blocks(frame, name, input_args, text)
+    if role == "system":
+        if is_initial_system or not text.strip():
+            return []
+        return _system_history_blocks(frame, text)
+    return [SystemTextHistoryBlock(text=text, **origin)] if text.strip() else []
+
+
+def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
+    payload = event.payload
+    frame_id = str(payload.get("frame_id", "")) or None
+    agent = str(payload.get("agent", "")) or None
+    origin = {"frame_id": frame_id, "agent": agent}
+    if event.type == "agent_reasoning_delta":
+        detail = str(payload.get("text", "")).strip()
+        if not detail:
+            return []
+        elapsed_ms = payload.get("elapsed_ms")
+        header = "Thought"
+        if isinstance(elapsed_ms, int | float) and elapsed_ms > 0:
+            header = f"Thought for {elapsed_ms / 1000:.2f}s"
+        return [ThoughtHistoryBlock(header=header, detail=detail, **origin)]
+    if event.type == "agent_text_delta":
+        text = str(payload.get("text", "")).strip()
+        if text.startswith("Thought:"):
+            _, _, remainder = text.partition("\n")
+            text = remainder.strip()
+            return [LogTextHistoryBlock(text=text, indent=True, **origin)] if text else []
+        return [LogTextHistoryBlock(text=text, marker=True, **origin)] if text else []
+    if event.type == "plan_created":
+        raw_steps = payload.get("steps", [])
+        steps = raw_steps if isinstance(raw_steps, list) else []
+        return [
+            PlanCreatedHistoryBlock(
+                summary=str(payload.get("summary", "")),
+                steps=[
+                    PlanStepDTO(
+                        index=int(step.get("index", index)),
+                        title=str(step.get("title", "")),
+                        agent=str(step.get("agent", "")),
+                        task=str(step.get("task", "")),
+                    )
+                    for index, step in enumerate(steps, start=1)
+                    if isinstance(step, dict)
+                ],
+                **origin,
+            )
+        ]
+    if event.type == "plan_step_started":
+        return [
+            StepStartedHistoryBlock(
+                index=int(payload.get("step_index", 0)),
+                total=int(payload.get("total_steps", 0)),
+                title=str(payload.get("title", "")),
+                **origin,
+            )
+        ]
+    if event.type == "plan_step_completed":
+        return [
+            StepCompletedHistoryBlock(
+                index=int(payload.get("step_index", 0)),
+                total=int(payload.get("total_steps", 0)),
+                summary=str(payload.get("summary", "")),
+                **origin,
+            )
+        ]
+    if event.type == "verify_started":
+        return [
+            VerifyStartedHistoryBlock(
+                file_path=str(payload.get("file_path", "")),
+                phase=str(payload.get("phase", "")),
+                **origin,
+            )
+        ]
+    if event.type == "verify_completed":
+        if bool(payload.get("passed", False)):
+            return [
+                VerifyPassedHistoryBlock(
+                    file_path=str(payload.get("file_path", "")),
+                    summary=str(payload.get("summary", "")),
+                    **origin,
+                )
+            ]
+        return [
+            VerifyFailedHistoryBlock(
+                file_path=str(payload.get("file_path", "")),
+                issues_count=int(payload.get("issues_count", 0)),
+                summary=str(payload.get("summary", "")),
+                **origin,
+            )
+        ]
+    if event.type == "delegate_start":
+        args = payload.get("args", {})
+        task = str(args.get("task", "")) if isinstance(args, dict) else ""
+        delegated_agent = str(args.get("agent", "")) if isinstance(args, dict) else ""
+        label = f"Task({delegated_agent})" if delegated_agent else "Task"
+        if task:
+            label += f"\n{task}"
+        return [LogTextHistoryBlock(text=label, marker=True, **origin)]
+    if event.type == "server_tool_result":
+        summary = payload.get("result_summary")
+        if not isinstance(summary, dict):
+            if bool(payload.get("is_error", False)):
+                tool = str(payload.get("tool", "tool"))
+                return [ErrorHistoryBlock(text=f"{tool} failed", **origin)]
+            return []
+        kind = str(summary.get("kind", ""))
+        if kind == "read":
+            return [
+                LogReadHistoryBlock(
+                    path=str(summary.get("path", "")),
+                    line_start=int(summary.get("line_start", 1)),
+                    line_end=int(summary.get("line_end", 1)),
+                    **origin,
+                )
+            ]
+        if kind == "grep":
+            raw_matches = summary.get("matches", [])
+            matches = raw_matches if isinstance(raw_matches, list) else []
+            return [
+                LogGrepHistoryBlock(
+                    pattern=str(summary.get("pattern", "")),
+                    include=str(summary.get("include", "project")),
+                    match_count=int(summary.get("match_count", len(matches))),
+                    results=[
+                        GrepMatchDTO(
+                            path=str(match.get("path", "")),
+                            line=(
+                                int(match["line"])
+                                if match.get("line") not in (None, "")
+                                else None
+                            ),
+                            text=str(match.get("text", "")),
+                        )
+                        for match in matches
+                        if isinstance(match, dict)
+                    ],
+                    truncated=bool(summary.get("truncated", False)),
+                    **origin,
+                )
+            ]
+    return []
+
+
+def _block_fingerprint(block: SessionHistoryBlock) -> str:
+    data = block.model_dump(exclude={"frame_id", "agent"})
+    return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+
+def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[SessionHistoryBlock]:
+    """Interleave frame messages with events anchored to their upcoming message index."""
+    assistant_indexes = [
+        index for index, message in enumerate(frame.messages) if str(message.get("role", "")) == "assistant"
+    ]
+    anchored: dict[int, list[SessionHistoryBlock]] = {}
+    trailing: list[SessionHistoryBlock] = []
+    legacy_stream_anchor = 0
+    legacy_stream_key: tuple[str, str] | None = None
+    stream_groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    normalized_events: list[tuple[Event, int, int]] = []
+    for event in events:
+        if event.type not in {"agent_reasoning_delta", "agent_text_delta"}:
+            normalized_events.append((event, event.seq, 2))
+            continue
+        group_key = (
+            str(event.payload.get("frame_id", "")),
+            str(event.payload.get("loop", "")),
+            str(event.payload.get("timeline_frame_id", "")),
+            str(
+                event.payload.get(
+                    "timeline_message_index",
+                    event.payload.get("message_index", ""),
+                )
+            ),
+        )
+        group = stream_groups.setdefault(
+            group_key,
+            {"reasoning": [], "text": []},
+        )
+        group_events = group[
+            "reasoning" if event.type == "agent_reasoning_delta" else "text"
+        ]
+        assert isinstance(group_events, list)
+        group_events.append(event)
+
+    for group in stream_groups.values():
+        reasoning_events = group["reasoning"]
+        text_events = group["text"]
+        assert isinstance(reasoning_events, list)
+        assert isinstance(text_events, list)
+        text = max(text_events, key=lambda event: event.seq) if text_events else None
+        if text is not None:
+            reasoning_before_text = [
+                event for event in reasoning_events if event.seq < text.seq
+            ]
+            reasoning = (
+                max(reasoning_before_text, key=lambda event: event.seq)
+                if reasoning_before_text
+                else None
+            )
+        else:
+            reasoning = (
+                max(reasoning_events, key=lambda event: event.seq)
+                if reasoning_events
+                else None
+            )
+        selected = [event for event in (reasoning, text) if event is not None]
+        first_seq = min((event.seq for event in selected), default=2**31 - 1)
+        if reasoning is not None:
+            normalized_events.append((reasoning, first_seq, 0))
+        if text is not None:
+            normalized_events.append((text, first_seq, 1))
+
+    def event_message_index(event: Event) -> int:
+        raw_index = event.payload.get(
+            "timeline_message_index",
+            event.payload.get("message_index"),
+        )
+        try:
+            return int(raw_index)
+        except (TypeError, ValueError):
+            return 2**31 - 1
+
+    ordered_events = sorted(
+        normalized_events,
+        key=lambda item: (
+            event_message_index(item[0]),
+            item[1],
+            item[2],
+        ),
+    )
+    for event, _, _ in ordered_events:
+        blocks = _event_history_blocks(event)
+        if not blocks:
+            continue
+        raw_index = event.payload.get(
+            "timeline_message_index",
+            event.payload.get("message_index"),
+        )
+        message_index: int | None = None
+        if isinstance(raw_index, int):
+            message_index = raw_index
+        elif event.type in {"agent_reasoning_delta", "agent_text_delta"} and assistant_indexes:
+            key = (str(event.payload.get("loop", "")), str(event.payload.get("frame_id", "")))
+            if legacy_stream_key is not None and key != legacy_stream_key:
+                legacy_stream_anchor += 1
+            legacy_stream_key = key
+            message_index = assistant_indexes[min(legacy_stream_anchor, len(assistant_indexes) - 1)]
+        if message_index is None:
+            trailing.extend(blocks)
+        else:
+            anchored.setdefault(message_index, []).extend(blocks)
+
+    result: list[SessionHistoryBlock] = []
+    seen: set[str] = set()
+
+    def append_unique(block: SessionHistoryBlock) -> None:
+        fingerprint = _block_fingerprint(block)
+        if fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        result.append(block)
+
+    tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
+    for index, message in enumerate(frame.messages):
+        event_blocks = anchored.get(index, [])
+        has_reasoning_event = any(isinstance(block, ThoughtHistoryBlock) for block in event_blocks)
+        for block in event_blocks:
+            append_unique(block)
+        message_blocks = _message_history_blocks(
+            frame,
+            message,
+            tool_calls_by_id,
+            is_initial_system=index == 0,
+            include_thought_summary=not has_reasoning_event,
+        )
+        for block in message_blocks:
+            if has_reasoning_event and isinstance(block, ThoughtHistoryBlock) and not block.detail:
+                continue
+            append_unique(block)
+    for message_index in sorted(index for index in anchored if index >= len(frame.messages)):
+        for block in anchored[message_index]:
+            append_unique(block)
+    for block in trailing:
+        append_unique(block)
+    return result
+
+
+def _structured_session_history(session_frames: list[Frame], events: list[Event]) -> list[SessionHistoryBlock]:
+    blocks: list[SessionHistoryBlock] = []
+    claimed_event_ids: set[int] = set()
+    for frame in session_frames:
+        frame_events = [
+            event
+            for event in events
+            if str(
+                event.payload.get(
+                    "timeline_frame_id",
+                    event.payload.get("frame_id", ""),
+                )
+            )
+            == frame.id
+        ]
+        claimed_event_ids.update(id(event) for event in frame_events)
+        blocks.extend(_structured_history_for_frame(frame, frame_events))
+    for event in events:
+        if id(event) in claimed_event_ids:
+            continue
+        blocks.extend(_event_history_blocks(event))
+    return blocks
+
+
+def _persisted_history_events(session: Session) -> list[Event]:
+    """Convert the session-owned replay timeline back to typed internal events."""
+    events: list[Event] = []
+    for record in session.history_events:
+        payload = record.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        try:
+            seq = int(record.get("seq", 0))
+        except (TypeError, ValueError):
+            continue
+        event_type = str(record.get("type", ""))
+        if seq <= 0 or not event_type:
+            continue
+        events.append(
+            Event(
+                seq=seq,
+                session_id=session.session_id,
+                type=event_type,
+                payload=payload,
+            )
+        )
+    return events
+
+
 def _pending_anchor_index(frame: Frame, pending_ids: set[str]) -> int | None:
     """找到包含 pending tool_call 的 assistant 消息位置。"""
     if not pending_ids:
@@ -662,25 +1274,33 @@ class QueryEngine:
     def session_history(self, session_id: str, limit: int = 200) -> SessionHistoryResponse:
         """Return frontend-renderable history for a persisted session."""
         session = self._store.get_or_create(session_id, self.available_tools)
+        events = _persisted_history_events(session)
+        if not events and self._events is not None:
+            events = self._events.list_after(session_id, 0)
+        blocks = _structured_session_history(session.agent_stack, events)
         items: list[SessionHistoryItemDTO] = []
         for frame in session.agent_stack:
             items.extend(_history_items_for_frame(frame))
         seen = {_history_text_fingerprint(item.text) for item in items}
-        if self._events is not None:
-            items.extend(_history_items_for_events(self._events.list_after(session_id, 0), seen))
+        if events:
+            items.extend(_history_items_for_events(events, seen))
         if limit > 0 and len(items) > limit:
             items = items[-limit:]
+        if limit > 0 and len(blocks) > limit:
+            blocks = blocks[-limit:]
         logger.info(
-            "Session history requested session=%s frames=%d items=%d pending=%s",
+            "Session history requested session=%s frames=%d items=%d blocks=%d pending=%s",
             session_id,
             len(session.agent_stack),
             len(items),
+            len(blocks),
             session.pending_turn_id is not None,
         )
         return SessionHistoryResponse(
             session_id=session.session_id,
             pending_turn_id=session.pending_turn_id,
             items=items,
+            blocks=blocks,
         )
 
     async def submit_user_turn(self, request: ChatRequest) -> ChatResponse:
@@ -1042,7 +1662,13 @@ class QueryEngine:
             self._emit(
                 session.session_id,
                 "verify_started",
-                {"tool_use_id": tool_use_id, "file_path": path, "phase": "syntax"},
+                {
+                    "tool_use_id": tool_use_id,
+                    "file_path": path,
+                    "phase": "syntax",
+                    "frame_id": frame.id,
+                    "message_index": len(frame.messages),
+                },
             )
             outcome = await run_syntax_check(
                 path=path,
@@ -1064,6 +1690,8 @@ class QueryEngine:
                             "issues_count": len(issues),
                             "summary": summary,
                             "phase": "syntax",
+                            "frame_id": frame.id,
+                            "message_index": len(frame.messages),
                         },
                     )
                     frame.messages.append(
@@ -1096,7 +1724,13 @@ class QueryEngine:
         self._emit(
             session.session_id,
             "verify_started",
-            {"tool_use_id": tool_use_id, "file_path": path, "phase": "semantic"},
+            {
+                "tool_use_id": tool_use_id,
+                "file_path": path,
+                "phase": "semantic",
+                "frame_id": frame.id,
+                "message_index": len(frame.messages),
+            },
         )
         result = await self._run_semantic_verify(security, tool_name, candidate.get("input", {}), path)
         self._emit(
@@ -1109,6 +1743,8 @@ class QueryEngine:
                 "issues_count": len(result.issues),
                 "summary": result.summary,
                 "phase": "semantic",
+                "frame_id": frame.id,
+                "message_index": len(frame.messages),
             },
         )
         frame.messages.append(
@@ -1280,7 +1916,7 @@ class QueryEngine:
 
             session.clear_pending()
             self._store.save(session)
-            response = ChatFinalResponse(text="已放弃 %d 个待回传的工具调用，可以继续发送新消息。" % discarded)
+            response = ChatFinalResponse(text=f"已放弃 {discarded} 个待回传的工具调用，可以继续发送新消息。")
             self._record_recovery(session, response)
             self._emit(session_id, "pending_discarded", {"count": discarded})
             logger.info("Pending tool calls discarded session=%s count=%d", session_id, discarded)
@@ -1368,6 +2004,9 @@ class QueryEngine:
             event_type,
             json.dumps(payload, ensure_ascii=False, default=str),
         )
+        if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
+            session = self._store.get_or_create(session_id, self.available_tools)
+            session.record_history_event(event_type, payload)
         if self._events is None:
             return 0
         event = self._events.append(session_id, event_type, payload)

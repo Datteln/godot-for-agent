@@ -369,6 +369,16 @@ func append_history_thought_entry(message_list: VBoxContainer, header: String, d
 	message_list.add_child(content)
 
 
+## 结构化历史文本专用。与通用文本路径不同，marker=true 明确表示行动条目，
+## 因此使用与 Read/Edit 相同的蓝色实心标记，不再退化成灰色状态圆圈。
+func append_history_text_entry(message_list: VBoxContainer, text: String, marker: bool, indent: bool) -> void:
+	var content := VBoxContainer.new()
+	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	content.add_theme_constant_override("separation", 2)
+	content.add_child(make_log_rich_text(text, null, "●" if marker else "", indent))
+	message_list.add_child(content)
+
+
 func append_thought_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
 	var split := split_thought_header(first_line(entry))
 	var header := str(split.get("header", ""))

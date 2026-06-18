@@ -370,7 +370,7 @@ func _on_send() -> void:
 			"state": _status.text
 		})
 		return
-	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length(), "text": text})
+	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length()})
 	_auto_scroll = true
 	_force_scroll_once = true
 	_interrupted_locally = false
@@ -704,6 +704,7 @@ func _handle_session_history(response: Dictionary) -> void:
 		})
 		return
 	var items: Array = response.get("items", [])
+	var blocks: Array = response.get("blocks", [])
 	var session_id := str(response.get("session_id", ""))
 	# 响应 session_id 与当前不符说明是切换会话后迟到的过期响应，直接丢弃。
 	if session_id != "" and session_id != _current_session_id():
@@ -714,7 +715,8 @@ func _handle_session_history(response: Dictionary) -> void:
 		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Restoring session history.", {
 		"session_id": session_id,
-		"count": items.size()
+		"count": blocks.size() if response.has("blocks") else items.size(),
+		"structured": response.has("blocks")
 	})
 	_clear_messages()
 	if state_store != null:
@@ -726,6 +728,28 @@ func _handle_session_history(response: Dictionary) -> void:
 			state_store.set_value("current_turn_id", _http_client.current_turn_id)
 	var saved_auto_scroll := _auto_scroll
 	_auto_scroll = false
+	if response.has("blocks"):
+		for block in blocks:
+			if block is Dictionary:
+				_render_history_block(block)
+	else:
+		_render_legacy_history_items(items)
+	if pending_turn_id != null:
+		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
+		_show_pending_results_notice()
+		_set_state(AgentState.WAITING_CONFIRM)
+	# 旧服务没有 blocks 时保留恢复提示；结构化响应本身已经完整表达内容，
+	# 不再向历史时间线注入一条并不存在的系统消息。
+	if not response.has("blocks") and not items.is_empty():
+		_append_message("system", _ui("history_restored") % str(items.size()))
+	elif blocks.is_empty() and items.is_empty() and _message_list.get_child_count() == 0:
+		_append_message("system", _ui("switch_session_empty"))
+	_auto_scroll = saved_auto_scroll
+	_force_scroll_once = true
+	_scroll_to_bottom()
+
+
+func _render_legacy_history_items(items: Array) -> void:
 	for item in items:
 		if not (item is Dictionary):
 			continue
@@ -749,17 +773,145 @@ func _handle_session_history(response: Dictionary) -> void:
 			_indent_current_text = false
 		else:
 			_append_message(role, processed)
-	if pending_turn_id != null:
-		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
-		_show_pending_results_notice()
-		_set_state(AgentState.WAITING_CONFIRM)
-	if not items.is_empty():
-		_append_message("system", _ui("history_restored") % str(items.size()))
-	elif items.is_empty() and _message_list.get_child_count() == 0:
-		_append_message("system", _ui("switch_session_empty"))
-	_auto_scroll = saved_auto_scroll
-	_force_scroll_once = true
-	_scroll_to_bottom()
+
+
+func _render_history_block(block: Dictionary) -> void:
+	var block_type := str(block.get("type", ""))
+	match block_type:
+		"user":
+			_append_message("user", str(block.get("text", "")))
+		"error":
+			_append_message("error", str(block.get("text", "")))
+		"log_text":
+			_log_renderer.append_history_text_entry(
+				_message_list,
+				str(block.get("text", "")),
+				bool(block.get("marker", false)),
+				bool(block.get("indent", false))
+			)
+		"log_read":
+			_append_log_stream_message(
+				"Read %s (lines %d-%d)" % [
+					str(block.get("path", "<unknown>")),
+					int(block.get("line_start", 1)),
+					int(block.get("line_end", 1))
+				]
+			)
+		"log_grep":
+			_render_history_grep_block(block)
+		"log_edit":
+			_append_log_stream_message(
+				"Edit %s\n+%d -%d lines" % [
+					str(block.get("path", "<unknown>")),
+					int(block.get("added", 0)),
+					int(block.get("removed", 0))
+				]
+			)
+		"thought":
+			_log_renderer.append_history_thought_entry(
+				_message_list,
+				str(block.get("header", "Thought")),
+				str(block.get("detail", ""))
+			)
+		"plan_created":
+			_render_history_plan_created(block)
+		"step_started":
+			_append_log_stream_message(
+				"Step %d/%d started:\n%s%s" % [
+					int(block.get("index", 0)), int(block.get("total", 0)),
+					str(block.get("title", "")), _history_agent_suffix(block)
+				], null, true
+			)
+		"step_completed":
+			_append_log_stream_message(
+				"Step %d/%d completed:\n%s" % [
+					int(block.get("index", 0)), int(block.get("total", 0)),
+					str(block.get("summary", ""))
+				], null, true
+			)
+		"verify_started":
+			_append_log_stream_message(
+				"Verify started:\n%s (%s)" % [
+					str(block.get("file_path", "")), str(block.get("phase", ""))
+				], null, true
+			)
+		"verify_passed":
+			_append_log_stream_message(
+				"Verify passed:\n%s" % str(block.get("summary", "")), null, true
+			)
+		"verify_failed":
+			_append_log_stream_message(
+				"Verify found %d issue(s):\n%s" % [
+					int(block.get("issues_count", 0)), str(block.get("summary", ""))
+				], null, true
+			)
+		"delegate_results":
+			_render_history_delegate_results(block)
+		"delegate_result":
+			_append_log_stream_message(
+				"Delegate result: %s\n%s" % [
+					str(block.get("agent", "")), str(block.get("summary", ""))
+				], null, true
+			)
+		"system_text":
+			_append_message("system", str(block.get("text", "")))
+
+
+func _history_agent_suffix(block: Dictionary) -> String:
+	var agent := str(block.get("agent", "")).strip_edges()
+	return " (%s)" % agent if agent != "" else ""
+
+
+func _render_history_grep_block(block: Dictionary) -> void:
+	var lines: Array[String] = []
+	lines.append("Grep \"%s\" (in %s)" % [
+		str(block.get("pattern", "")).replace("\"", "\\\""),
+		str(block.get("include", "project"))
+	])
+	lines.append("%d match(es)" % int(block.get("match_count", 0)))
+	var results: Array = block.get("results", [])
+	for result in results:
+		if not (result is Dictionary):
+			continue
+		var location := str(result.get("path", ""))
+		var line = result.get("line")
+		if line != null:
+			location += ":%d" % int(line)
+		lines.append("%s %s" % [location, str(result.get("text", ""))])
+	if bool(block.get("truncated", false)):
+		lines.append("... (truncated)")
+	_append_log_stream_message("\n".join(lines))
+
+
+func _render_history_plan_created(block: Dictionary) -> void:
+	var lines: Array[String] = ["Plan created:"]
+	var summary := str(block.get("summary", "")).strip_edges()
+	if summary != "":
+		lines.append(summary)
+	var steps: Array = block.get("steps", [])
+	for step in steps:
+		if not (step is Dictionary):
+			continue
+		var label := str(step.get("title", "")).strip_edges()
+		if label == "":
+			label = str(step.get("task", "")).strip_edges()
+		var agent := str(step.get("agent", "")).strip_edges()
+		var suffix := " (%s)" % agent if agent != "" else ""
+		lines.append("%d. %s%s" % [int(step.get("index", 0)), label, suffix])
+	_append_log_stream_message("\n".join(lines), null, true)
+
+
+func _render_history_delegate_results(block: Dictionary) -> void:
+	var lines: Array[String] = ["Delegate results:"]
+	var results: Array = block.get("results", [])
+	for index in range(results.size()):
+		var result = results[index]
+		if not (result is Dictionary):
+			continue
+		lines.append("")
+		lines.append("**%d. %s**" % [index + 1, str(result.get("agent", "delegate"))])
+		lines.append(str(result.get("summary", "")))
+	_append_log_stream_message("\n".join(lines), null, true)
 
 
 func _normalize_history_text(role: String, text: String) -> String:
@@ -1772,6 +1924,7 @@ func _switch_to_session(session_id: String) -> void:
 		"from": previous_session_id,
 		"to": session_id
 	})
+	_save_session_to_history(previous_session_id)
 	_auto_scroll = true
 	_post_final_scroll_frames = 0
 	_post_delta_scroll_frames = 0
@@ -1790,6 +1943,7 @@ func _switch_to_session(session_id: String) -> void:
 	_clear_messages()
 	_set_state(AgentState.IDLE)
 	_http_client.fetch_session_history()
+	_save_session_to_history(session_id)
 
 
 func _current_session_id() -> String:

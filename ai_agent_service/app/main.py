@@ -19,13 +19,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from app.api.routes import create_router
 from app.config import AppSettings
-from app.logging_config import configure_logging
+from app.events.store import EventStore
 from app.llm.provider import OpenAICompatibleProvider
-from app.memory.store import MemoryStore
+from app.logging_config import configure_logging
 from app.mcp.server import run_mcp_stdio
+from app.memory.store import MemoryStore
 from app.output_styles.catalog import OutputStyleCatalog
 from app.query.engine import QueryEngine
-from app.events.store import EventStore
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import security_settings_from_app
 from app.sessions.store import SessionStore

@@ -20,6 +20,9 @@ from app.permissions.engine import SessionAllowGrant
 
 logger = logging.getLogger(__name__)
 
+_MAX_HISTORY_EVENTS = 500
+_COALESCED_HISTORY_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta"}
+
 
 @dataclass
 class Session:
@@ -62,6 +65,8 @@ class Session:
     delegate_groups: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_plan: dict[str, Any] | None = None
     verify_retry_count: dict[str, int] = field(default_factory=dict)
+    history_event_counter: int = 0
+    history_events: list[dict[str, Any]] = field(default_factory=list)
 
     def top_frame(self) -> Frame | None:
         """返回当前活跃帧（栈顶），栈为空时返回 None。
@@ -134,6 +139,37 @@ class Session:
         self.pending_tool_call_ids = set()
         self.pending_tool_calls = {}
 
+    def record_history_event(self, event_type: str, payload: dict[str, Any]) -> int:
+        """Record a bounded, coalesced event timeline used for history replay."""
+        self.history_event_counter += 1
+        record = {
+            "seq": self.history_event_counter,
+            "type": event_type,
+            "payload": dict(payload),
+        }
+        if event_type in _COALESCED_HISTORY_EVENT_TYPES and self.history_events:
+            previous = self.history_events[-1]
+            previous_payload = previous.get("payload", {})
+            if not isinstance(previous_payload, dict):
+                previous_payload = {}
+            previous_key = (
+                str(previous.get("type", "")),
+                str(previous_payload.get("frame_id", "")),
+                str(previous_payload.get("loop", "")),
+            )
+            current_key = (
+                event_type,
+                str(payload.get("frame_id", "")),
+                str(payload.get("loop", "")),
+            )
+            if previous_key == current_key:
+                self.history_events[-1] = record
+                return self.history_event_counter
+        self.history_events.append(record)
+        if len(self.history_events) > _MAX_HISTORY_EVENTS:
+            del self.history_events[: len(self.history_events) - _MAX_HISTORY_EVENTS]
+        return self.history_event_counter
+
 
 def _frame_to_dict(frame: Frame) -> dict[str, Any]:
     """把 `Frame` 序列化为可写入 JSON 的字典。
@@ -155,6 +191,8 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
         "status": frame.status,
         "depth": frame.depth,
         "active_deferred_tools": sorted(frame.active_deferred_tools),
+        "history_anchor_frame_id": frame.history_anchor_frame_id,
+        "history_anchor_message_index": frame.history_anchor_message_index,
     }
 
 
@@ -181,6 +219,8 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
         status=status,
         depth=data.get("depth", 0),
         active_deferred_tools=set(data.get("active_deferred_tools", [])),
+        history_anchor_frame_id=data.get("history_anchor_frame_id"),
+        history_anchor_message_index=data.get("history_anchor_message_index"),
     )
 
 
@@ -208,6 +248,8 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "delegate_groups": session.delegate_groups,
         "pending_plan": session.pending_plan,
         "verify_retry_count": session.verify_retry_count,
+        "history_event_counter": session.history_event_counter,
+        "history_events": session.history_events,
     }
 
 
@@ -221,6 +263,23 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
     Returns:
         恢复后的 `Session`。
     """
+    raw_history_events = data.get("history_events", [])
+    history_events = (
+        [event for event in raw_history_events if isinstance(event, dict)]
+        if isinstance(raw_history_events, list)
+        else []
+    )
+    restored_event_counter = 0
+    for event in history_events:
+        try:
+            restored_event_counter = max(restored_event_counter, int(event.get("seq", 0)))
+        except (TypeError, ValueError):
+            continue
+    try:
+        stored_event_counter = int(data.get("history_event_counter", 0))
+    except (TypeError, ValueError):
+        stored_event_counter = 0
+    history_event_counter = max(stored_event_counter, restored_event_counter)
     return Session(
         session_id=data["session_id"],
         agent_stack=[_frame_from_dict(f, available_tools) for f in data.get("agent_stack", [])],
@@ -240,6 +299,8 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         delegate_groups=data.get("delegate_groups", {}),
         pending_plan=data.get("pending_plan"),
         verify_retry_count=data.get("verify_retry_count", {}),
+        history_event_counter=history_event_counter,
+        history_events=history_events,
     )
 
 

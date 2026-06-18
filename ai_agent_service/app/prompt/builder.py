@@ -10,7 +10,6 @@ from app.agents.types import AgentDefinition
 from app.output_styles.catalog import OutputStyleCatalog
 from app.skills.catalog import SkillCatalog
 
-
 _TOOL_REJECTION_POLICY = (
     "工具调用被拒绝时的处理：当某个前端工具结果 `status` 为 `rejected`"
     "（用户在预览里拒绝了你提议的编辑/操作）时，绝不能就此终止对话或返回"

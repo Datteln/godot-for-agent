@@ -58,7 +58,14 @@ class SecuritySettings(BaseModel):
         ]
     )
     deny_write_paths: list[str] = Field(
-        default_factory=lambda: [".git/", ".godot/", "addons/"]
+        default_factory=lambda: [
+            ".git/",
+            ".godot/",
+            ".ai_agent_service/",
+            "addons/",
+            "ai_agent_frontend/",
+            "ai_agent_service/",
+        ]
     )
     allow_paths: list[str] = Field(default_factory=list)
     deny_rules: list[PermRule] = Field(default_factory=list)

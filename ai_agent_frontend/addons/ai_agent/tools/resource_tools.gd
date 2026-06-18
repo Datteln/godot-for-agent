@@ -31,6 +31,8 @@ static func read_image_metadata(input: Dictionary) -> Dictionary:
 	var path := PathUtils.to_res_path(str(input.get("path", "")))
 	if path == "":
 		return {"ok": false, "message": "path must be relative or res://"}
+	if not PathUtils.is_read_allowed(path):
+		return {"ok": false, "message": "reading this path is not allowed: " + path, "error_code": "read_denied"}
 	var image := Image.new()
 	var err := image.load(path)
 	if err != OK:
@@ -64,6 +66,8 @@ static func create_sprite_frames_from_sheet(input: Dictionary, undo_manager: Nod
 	var frame_height := max(1, int(input.get("frame_height", 0)))
 	if sheet_path == "" or output_path == "":
 		return {"ok": false, "message": "sheet_path and output_path are required"}
+	if not PathUtils.is_read_allowed(sheet_path):
+		return {"ok": false, "message": "reading this path is not allowed: " + sheet_path, "error_code": "read_denied"}
 	if not PathUtils.is_write_allowed(output_path):
 		return {"ok": false, "message": "writing to this path is not allowed: " + output_path, "error_code": "write_denied"}
 	var texture = load(sheet_path)

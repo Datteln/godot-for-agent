@@ -116,3 +116,5 @@ class Frame:
     status: Literal["running", "suspended", "done"] = "running"
     depth: int = 0
     active_deferred_tools: set[str] = field(default_factory=set)
+    history_anchor_frame_id: str | None = None
+    history_anchor_message_index: int | None = None

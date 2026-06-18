@@ -48,6 +48,9 @@ class ToolDef:
         search_hint: `deferred=True` 时的检索关键词/摘要。
         render_kind: 前端预览渲染类型（`diff`/`list`/`run`/`log`/`map` 等）。
         path_args: 入参中表示路径的字段名，供 `path_ok`/`all_paths_ok` 校验。
+            为兼容旧定义，该字段会按 `writes_project` 推断为读或写路径。
+        read_path_args: 需要按读权限校验的路径参数名。
+        write_path_args: 需要按写权限校验的路径参数名。
         schema: OpenAI function calling 的 `function` schema。
         handler: `side="server"` 时的实现；`side="front"` 时为 None。
         enrich: `side="front"` 时对前端结果的服务端增强（如合并文档 prose）。
@@ -70,6 +73,8 @@ class ToolDef:
     search_hint: str | None = None
     render_kind: str | None = None
     path_args: list[str] = field(default_factory=list)
+    read_path_args: list[str] = field(default_factory=list)
+    write_path_args: list[str] = field(default_factory=list)
     schema: dict[str, Any] = field(default_factory=dict)
     handler: ToolHandler | None = None
     enrich: ToolEnricher | None = None
@@ -83,6 +88,15 @@ class ToolDef:
             `writes_project` 或 `executes_process` 任一为真则返回 True。
         """
         return self.writes_project or self.executes_process
+
+    @property
+    def all_path_args(self) -> list[str]:
+        """All declared path-like argument names, preserving declaration order."""
+        result: list[str] = []
+        for name in (*self.path_args, *self.read_path_args, *self.write_path_args):
+            if name not in result:
+                result.append(name)
+        return result
 
 
 REGISTRY: dict[str, ToolDef] = {}

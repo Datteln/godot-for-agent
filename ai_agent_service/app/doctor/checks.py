@@ -12,9 +12,9 @@ import sys
 from app.api.schemas import DoctorResponse
 from app.config import AppSettings
 from app.llm.provider import LLMProvider
-from app.memory.store import MemoryStore
 from app.lsp.status import lsp_status
 from app.mcp.status import mcp_status
+from app.memory.store import MemoryStore
 from app.output_styles.catalog import OutputStyleCatalog
 from app.rag.status import rag_status
 from app.security.settings import SecuritySettings

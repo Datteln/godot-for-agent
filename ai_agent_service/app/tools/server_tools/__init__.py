@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import logging
 
+from app.tools.registry import REGISTRY
 from app.tools.server_tools.grep_code import register_grep_code_tool
 from app.tools.server_tools.list_files import register_list_files_tool
 from app.tools.server_tools.load_skill import register_load_skill_tool
 from app.tools.server_tools.read_file import register_read_file_tool
 from app.tools.server_tools.search_codebase import register_search_codebase_tool
 from app.tools.server_tools.search_tools import register_search_tools_tool
-from app.tools.registry import REGISTRY
 
 logger = logging.getLogger(__name__)
 

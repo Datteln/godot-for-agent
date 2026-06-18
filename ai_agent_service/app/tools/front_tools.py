@@ -470,6 +470,7 @@ def register_front_tools() -> None:
             writes_project=True,
             needs_preview=True,
             render_kind="map",
+            read_path_args=["image_path"],
             schema={
                 "name": "paint_from_image_grid",
                 "description": (
@@ -564,6 +565,7 @@ def register_front_tools() -> None:
             needs_preview=True,
             render_kind="list",
             path_args=["output_path"],
+            read_path_args=["sheet_path"],
             schema={
                 "name": "create_sprite_frames_from_sheet",
                 "description": "Create a SpriteFrames resource from a sprite sheet after confirmation.",

@@ -143,7 +143,14 @@ def check(tool: ToolDef, args: dict[str, Any], ctx: PermissionContext) -> Decisi
         三态决策之一；`deny` 表示不执行，`ask` 表示 front 改动型工具需前端
         预览确认，`allow` 表示可直接执行/静默返回前端执行。
     """
-    if not all_paths_ok(args, tool.path_args, ctx.security, write=tool.writes_project):
+    legacy_read_path_args = [] if tool.writes_project else tool.path_args
+    legacy_write_path_args = tool.path_args if tool.writes_project else []
+    read_path_args = [*legacy_read_path_args, *tool.read_path_args]
+    write_path_args = [*legacy_write_path_args, *tool.write_path_args]
+    if not all_paths_ok(args, read_path_args, ctx.security, write=False):
+        logger.debug("Permission deny tool=%s reason=read_path_boundary", tool.name)
+        return "deny"
+    if not all_paths_ok(args, write_path_args, ctx.security, write=True):
         logger.debug("Permission deny tool=%s reason=path_boundary", tool.name)
         return "deny"
     if tool.domain not in ctx.security.enabled_domains:

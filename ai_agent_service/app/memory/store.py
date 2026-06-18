@@ -12,6 +12,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+MAX_MEMORY_TEXT_CHARS = 8000
+MAX_MEMORY_TAGS = 16
+MAX_MEMORY_TAG_CHARS = 64
+
 
 @dataclass(frozen=True)
 class MemoryItem:
@@ -47,7 +51,14 @@ class MemoryStore:
         stripped = text.strip()
         if not stripped:
             raise ValueError("memory text cannot be empty")
-        item = MemoryItem(id=str(uuid.uuid4()), text=stripped, tags=tags or [], scope=scope)
+        if len(stripped) > MAX_MEMORY_TEXT_CHARS:
+            raise ValueError(f"memory text cannot exceed {MAX_MEMORY_TEXT_CHARS} characters")
+        normalized_tags = [
+            tag.strip()[:MAX_MEMORY_TAG_CHARS]
+            for tag in (tags or [])
+            if tag.strip()
+        ][:MAX_MEMORY_TAGS]
+        item = MemoryItem(id=str(uuid.uuid4()), text=stripped, tags=normalized_tags, scope=scope)
         data = self._read()
         items = [entry for entry in data.get("items", []) if isinstance(entry, dict)]
         items.append(asdict(item))

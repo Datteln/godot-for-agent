@@ -23,15 +23,13 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
 
 from app.agents.bundled import get_agent
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
 from app.llm.provider import LLMError, LLMProvider
-from app.permissions.engine import PermissionContext, check
-from app.permissions.engine import SessionAllowGrant
+from app.permissions.engine import PermissionContext, SessionAllowGrant, check
 from app.security.settings import SecuritySettings
 from app.sessions.store import Session
 from app.tools.context import ToolContext
@@ -209,7 +207,7 @@ async def _invoke_server_tool(tool: ToolDef, args: dict[str, Any], call_ctx: Too
         call_ctx.session_id,
         tool.name,
         tool.domain,
-        [name for name in tool.path_args if name in args],
+        [name for name in tool.all_path_args if name in args],
     )
     try:
         result = await tool.handler(args, call_ctx)
@@ -277,6 +275,8 @@ def _delegate_child_frame(
         return None
     prompt = prompt_factory(child_agent) if prompt_factory is not None else child_agent.prompt
     child_agent = replace(child_agent, prompt=prompt)
+    parent = _find_frame(session, parent_id)
+    history_anchor_message_index = len(parent.messages) if parent is not None else None
     return Frame(
         id=session.new_frame_id(),
         agent=child_agent,
@@ -288,6 +288,8 @@ def _delegate_child_frame(
         pending_delegate_call_id=call_id,
         pending_delegate_group_id=group_id,
         depth=depth,
+        history_anchor_frame_id=parent_id,
+        history_anchor_message_index=history_anchor_message_index,
     )
 
 
@@ -317,6 +319,9 @@ def _plan_step_started(
         event_callback,
         "plan_step_started",
         {
+            "frame_id": child.id,
+            "message_index": len(child.messages),
+            **_history_timeline_payload(child),
             "step_index": idx + 1,
             "total_steps": len(steps),
             "agent": step.get("agent", ""),
@@ -353,6 +358,9 @@ def _plan_step_completed(
         event_callback,
         "plan_step_completed",
         {
+            "frame_id": done.id,
+            "message_index": len(done.messages),
+            **_history_timeline_payload(done),
             "step_index": idx + 1,
             "total_steps": len(plan.get("steps", [])),
             "summary": summary,
@@ -666,6 +674,10 @@ def _handle_create_plan(
         event_callback,
         "plan_created",
         {
+            "frame_id": frame.id,
+            "agent": frame.agent.name,
+            "message_index": len(frame.messages),
+            **_history_timeline_payload(frame),
             "summary": session.pending_plan["summary"],
             "steps": [
                 {
@@ -940,10 +952,25 @@ def _emit_orchestration_event(
     event_callback(event_type, payload)
 
 
+def _history_timeline_payload(frame: Frame) -> dict[str, Any]:
+    """Return the persisted timeline anchor for root and delegated frames."""
+    return {
+        "timeline_frame_id": frame.history_anchor_frame_id or frame.id,
+        "timeline_message_index": (
+            frame.history_anchor_message_index
+            if frame.history_anchor_message_index is not None
+            else len(frame.messages)
+        ),
+    }
+
+
 def _delta_callback(
     event_callback: Callable[[str, dict[str, Any]], None] | None,
     frame_id: str,
     loop: int,
+    message_index: int,
+    timeline_frame_id: str,
+    timeline_message_index: int,
 ) -> Callable[[str, str], None] | None:
     """构造传给 `LLMProvider.chat` 的流式增量回调，转发为编排事件。
 
@@ -951,6 +978,7 @@ def _delta_callback(
         event_callback: 编排事件回调；为 None 时不产生增量事件。
         frame_id: 本轮所属的 agent 帧 id，供前端关联增量与对应消息。
         loop: 本轮在 `run_turn` 中的循环序号（从 1 开始）。
+        message_index: 本次 LLM 响应即将写入 `frame.messages` 的位置，供历史交织。
 
     Returns:
         转发增量为 `agent_text_delta`/`agent_reasoning_delta` 事件的回调；
@@ -959,9 +987,21 @@ def _delta_callback(
     if event_callback is None:
         return None
 
+    reasoning_started_at = time.monotonic()
+
     def _on_delta(kind: str, text: str) -> None:
         event_type = "agent_reasoning_delta" if kind == "reasoning" else "agent_text_delta"
-        event_callback(event_type, {"frame_id": frame_id, "loop": loop, "text": text})
+        payload: dict[str, Any] = {
+            "frame_id": frame_id,
+            "loop": loop,
+            "message_index": message_index,
+            "timeline_frame_id": timeline_frame_id,
+            "timeline_message_index": timeline_message_index,
+            "text": text,
+        }
+        if kind == "reasoning":
+            payload["elapsed_ms"] = max(int((time.monotonic() - reasoning_started_at) * 1000), 1)
+        event_callback(event_type, payload)
 
     return _on_delta
 
@@ -1092,7 +1132,18 @@ async def run_turn(
                 visible_tools,
                 model=_resolve_model_for_effort(frame.agent, effort, model_selector),
                 temperature=_resolve_temperature(effort),
-                on_delta=_delta_callback(event_callback, frame.id, loop_index + 1),
+                on_delta=_delta_callback(
+                    event_callback,
+                    frame.id,
+                    loop_index + 1,
+                    len(frame.messages),
+                    frame.history_anchor_frame_id or frame.id,
+                    (
+                        frame.history_anchor_message_index
+                        if frame.history_anchor_message_index is not None
+                        else len(frame.messages)
+                    ),
+                ),
                 on_fallback=_fallback_callback(event_callback, frame.id, loop_index + 1),
             )
         except LLMError as exc:
@@ -1107,10 +1158,6 @@ async def run_turn(
                 logger.info("Agent run_turn final session=%s loop=%d", session.session_id, loop_index + 1)
                 return result
             continue  # 子帧已结束，继续驱动父帧
-
-        if len(turn.tool_calls) > 1:
-            _append_single_tool_call_protocol_errors(frame, turn.tool_calls)
-            continue
 
         logger.info(
             "Agent requested tools session=%s frame=%s agent=%s names=%s",
@@ -1179,6 +1226,7 @@ async def run_turn(
                     "agent": frame.agent.name,
                     "tool": call.name,
                     "args": _event_tool_args(args),
+                    **_history_timeline_payload(frame),
                 },
             )
             if call.name == "delegate_many":
@@ -1323,6 +1371,7 @@ async def run_turn(
                         "tool": item.tool.name,
                         "args": _event_tool_args(item.args),
                         "concurrent": True,
+                        **_history_timeline_payload(frame),
                     },
                 )
             outcomes = await asyncio.gather(
@@ -1341,6 +1390,7 @@ async def run_turn(
                         "is_error": outcome[1],
                         "result_count": _event_result_count(outcome[0], outcome[1]),
                         "result_summary": _event_result_summary(item.tool.name, outcome[0], outcome[1]),
+                        **_history_timeline_payload(frame),
                     },
                 )
         for item in sequential_calls:
@@ -1354,6 +1404,7 @@ async def run_turn(
                     "tool": item.tool.name,
                     "args": _event_tool_args(item.args),
                     "concurrent": False,
+                    **_history_timeline_payload(frame),
                 },
             )
             results[item.call_id] = await _invoke_server_tool(item.tool, item.args, call_ctx)
@@ -1368,6 +1419,7 @@ async def run_turn(
                     "is_error": results[item.call_id][1],
                     "result_count": _event_result_count(*results[item.call_id]),
                     "result_summary": _event_result_summary(item.tool.name, *results[item.call_id]),
+                    **_history_timeline_payload(frame),
                 },
             )
 

@@ -241,6 +241,152 @@ class SessionHistoryItemDTO(BaseModel):
     agent: str | None = None
 
 
+class HistoryBlockBase(BaseModel):
+    """Structured, frontend-renderable session history block."""
+
+    frame_id: str | None = None
+    agent: str | None = None
+
+
+class UserHistoryBlock(HistoryBlockBase):
+    type: Literal["user"] = "user"
+    text: str
+
+
+class ErrorHistoryBlock(HistoryBlockBase):
+    type: Literal["error"] = "error"
+    text: str
+
+
+class LogTextHistoryBlock(HistoryBlockBase):
+    type: Literal["log_text"] = "log_text"
+    text: str
+    marker: bool = False
+    indent: bool = False
+
+
+class LogReadHistoryBlock(HistoryBlockBase):
+    type: Literal["log_read"] = "log_read"
+    path: str
+    line_start: int = 1
+    line_end: int = 1
+
+
+class GrepMatchDTO(BaseModel):
+    path: str
+    line: int | None = None
+    text: str = ""
+
+
+class LogGrepHistoryBlock(HistoryBlockBase):
+    type: Literal["log_grep"] = "log_grep"
+    pattern: str
+    include: str = "project"
+    match_count: int = 0
+    results: list[GrepMatchDTO] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class LogEditHistoryBlock(HistoryBlockBase):
+    type: Literal["log_edit"] = "log_edit"
+    path: str
+    added: int = 0
+    removed: int = 0
+
+
+class ThoughtHistoryBlock(HistoryBlockBase):
+    type: Literal["thought"] = "thought"
+    header: str = "Thought"
+    detail: str = ""
+
+
+class PlanStepDTO(BaseModel):
+    index: int
+    title: str = ""
+    agent: str = ""
+    task: str = ""
+
+
+class PlanCreatedHistoryBlock(HistoryBlockBase):
+    type: Literal["plan_created"] = "plan_created"
+    summary: str = ""
+    steps: list[PlanStepDTO] = Field(default_factory=list)
+
+
+class StepStartedHistoryBlock(HistoryBlockBase):
+    type: Literal["step_started"] = "step_started"
+    index: int
+    total: int
+    title: str = ""
+
+
+class StepCompletedHistoryBlock(HistoryBlockBase):
+    type: Literal["step_completed"] = "step_completed"
+    index: int
+    total: int
+    summary: str = ""
+
+
+class VerifyStartedHistoryBlock(HistoryBlockBase):
+    type: Literal["verify_started"] = "verify_started"
+    file_path: str
+    phase: str = ""
+
+
+class VerifyPassedHistoryBlock(HistoryBlockBase):
+    type: Literal["verify_passed"] = "verify_passed"
+    file_path: str
+    summary: str = ""
+
+
+class VerifyFailedHistoryBlock(HistoryBlockBase):
+    type: Literal["verify_failed"] = "verify_failed"
+    file_path: str
+    issues_count: int = 0
+    summary: str = ""
+
+
+class DelegateResultDTO(BaseModel):
+    agent: str = ""
+    summary: str = ""
+
+
+class DelegateResultsHistoryBlock(HistoryBlockBase):
+    type: Literal["delegate_results"] = "delegate_results"
+    results: list[DelegateResultDTO] = Field(default_factory=list)
+
+
+class DelegateResultHistoryBlock(HistoryBlockBase):
+    type: Literal["delegate_result"] = "delegate_result"
+    summary: str = ""
+
+
+class SystemTextHistoryBlock(HistoryBlockBase):
+    type: Literal["system_text"] = "system_text"
+    text: str
+
+
+SessionHistoryBlock = Annotated[
+    UserHistoryBlock
+    | ErrorHistoryBlock
+    | LogTextHistoryBlock
+    | LogReadHistoryBlock
+    | LogGrepHistoryBlock
+    | LogEditHistoryBlock
+    | ThoughtHistoryBlock
+    | PlanCreatedHistoryBlock
+    | StepStartedHistoryBlock
+    | StepCompletedHistoryBlock
+    | VerifyStartedHistoryBlock
+    | VerifyPassedHistoryBlock
+    | VerifyFailedHistoryBlock
+    | DelegateResultsHistoryBlock
+    | DelegateResultHistoryBlock
+    | SystemTextHistoryBlock,
+    Field(discriminator="type"),
+]
+
+
 class SessionHistoryResponse(BaseModel):
     """`GET /sessions/{session_id}/history` response."""
 
@@ -248,6 +394,7 @@ class SessionHistoryResponse(BaseModel):
     session_id: str
     pending_turn_id: str | None = None
     items: list[SessionHistoryItemDTO] = Field(default_factory=list)
+    blocks: list[SessionHistoryBlock] = Field(default_factory=list)
 
 
 class RecoveryPointerDTO(BaseModel):
