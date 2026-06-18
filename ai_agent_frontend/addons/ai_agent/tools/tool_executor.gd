@@ -83,7 +83,16 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			"",
 			_result_artifacts(result)
 		)
-	return AgentDTO.error_result(tool_call, str(result.get("message", "Tool failed")), "front_tool_failed")
+	# 把工具函数返回的完整 result 字典原样带回去（而不是只取 message 拼一个新字典），
+	# 这样像 write_file 的 file_stale 场景里附带的 current_content/path 等字段才能
+	# 传到 LLM 那一侧，不用再让它额外猜一次该不该重新 read_file。
+	return AgentDTO.tool_result(
+		str(tool_call.get("id", "")),
+		str(tool_call.get("frame_id", "")),
+		"error",
+		result,
+		str(result.get("error_code", "front_tool_failed"))
+	)
 
 
 func _result_artifacts(result: Dictionary) -> Array:

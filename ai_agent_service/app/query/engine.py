@@ -40,7 +40,7 @@ from app.prompt.builder import build_system_prompt
 from app.security.settings import SecuritySettings, security_settings_from_app
 from app.sessions.store import Session, SessionStore
 from app.skills.catalog import SkillCatalog
-from app.events.store import EventStore
+from app.events.store import Event, EventStore
 from app.recovery.pointer import RecoveryPointerStore
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
@@ -211,6 +211,76 @@ _HISTORY_EDIT_TOOLS = frozenset(
 _HISTORY_GREP_TOOLS = frozenset({"grep_code", "search_codebase", "list_files"})
 
 
+def _looks_like_create_plan_result(content: dict[str, Any]) -> bool:
+    """判断工具结果是否是 `create_plan` 的内部回填载荷。"""
+    tasks = content.get("tasks")
+    note = str(content.get("note", ""))
+    return bool(content.get("ok", False)) and isinstance(tasks, list) and "delegate_many" in note
+
+
+def _format_create_plan_history_summary(input_args: dict[str, Any], content: dict[str, Any]) -> str:
+    """把 `create_plan` 历史结果压缩成用户可读的计划摘要。"""
+    summary = str(input_args.get("summary", "")).strip()
+    raw_steps = input_args.get("steps")
+    if not isinstance(raw_steps, list):
+        raw_steps = content.get("tasks", [])
+    steps = [step for step in raw_steps if isinstance(step, dict)]
+
+    title = f"Plan created: {summary}" if summary else "Plan created"
+    lines = [title]
+    for index, step in enumerate(steps[:8], start=1):
+        step_title = str(step.get("title", "")).strip()
+        task = str(step.get("task", "")).strip()
+        agent = str(step.get("agent", "")).strip()
+        label = step_title or task or "Untitled step"
+        suffix = f" ({agent})" if agent else ""
+        lines.append(f"{index}. {label}{suffix}")
+    if len(steps) > 8:
+        lines.append(f"... {len(steps) - 8} more step(s)")
+    return "\n".join(lines)
+
+
+def _looks_like_delegate_group_result(content: dict[str, Any]) -> bool:
+    """判断工具结果是否是 `delegate_many` 的子任务汇总载荷。"""
+    results = content.get("results")
+    if not isinstance(results, list) or not results:
+        return False
+    return all(isinstance(item, dict) and "summary" in item for item in results)
+
+
+def _format_delegate_group_history_summary(content: dict[str, Any]) -> str:
+    """把 `delegate_many` 子任务结果转换成可渲染 Markdown 的历史块。"""
+    results = content.get("results")
+    if not isinstance(results, list):
+        return "Delegate results:"
+
+    lines = ["Delegate results:"]
+    for index, item in enumerate(results[:8], start=1):
+        if not isinstance(item, dict):
+            continue
+        agent = str(item.get("agent", "")).strip()
+        summary = str(item.get("summary", "")).strip()
+        heading = f"**{index}. {agent or 'delegate'}**"
+        lines.extend(["", heading, _truncate_text(summary or "No summary", 1600)])
+    if len(results) > 8:
+        lines.append("")
+        lines.append(f"... {len(results) - 8} more result(s)")
+    return "\n".join(lines)
+
+
+def _looks_like_delegate_result(content: dict[str, Any]) -> bool:
+    """判断工具结果是否是单个 `delegate` 子任务摘要。"""
+    return "summary" in content and set(content.keys()).issubset({"summary", "agent", "frame_id", "error"})
+
+
+def _format_delegate_history_summary(content: dict[str, Any]) -> str:
+    """把单个 `delegate` 子任务结果转换成可渲染 Markdown 的历史块。"""
+    agent = str(content.get("agent", "")).strip()
+    summary = str(content.get("summary", "")).strip()
+    title = f"Delegate result: {agent}" if agent else "Delegate result:"
+    return f"{title}\n{_truncate_text(summary or 'No summary', 2000)}"
+
+
 def _truncate_text(text: str, max_chars: int) -> str:
     # 按字符数截断超长文本，避免会话历史里堆入过长内容。
     if len(text) > max_chars:
@@ -273,6 +343,15 @@ def _format_tool_result_summary(name: str, input_args: dict[str, Any], content: 
     error_message = inner.get("error")
     if isinstance(error_message, str):
         return f"{name}: {error_message}"
+
+    if name == "create_plan" or _looks_like_create_plan_result(inner):
+        return _format_create_plan_history_summary(input_args, inner)
+
+    if name == "delegate_many" or _looks_like_delegate_group_result(inner):
+        return _format_delegate_group_history_summary(inner)
+
+    if name == "delegate" or _looks_like_delegate_result(inner):
+        return _format_delegate_history_summary(inner)
 
     if name in _HISTORY_READ_TOOLS:
         path = str(inner.get("path", input_args.get("path", "<unknown>")))
@@ -370,6 +449,157 @@ def _history_items_for_frame(frame: Frame, *, include_system_prompt: bool = Fals
     return items
 
 
+def _history_text_fingerprint(text: str) -> str:
+    """生成用于历史条目去重的稳定文本指纹。"""
+    return " ".join(text.split())
+
+
+def _append_history_item_if_new(
+    items: list[SessionHistoryItemDTO],
+    seen: set[str],
+    item: SessionHistoryItemDTO | None,
+) -> None:
+    """将非空且未重复的历史条目追加到目标列表。"""
+    if item is None:
+        return
+    fingerprint = _history_text_fingerprint(item.text)
+    if not fingerprint or fingerprint in seen:
+        return
+    seen.add(fingerprint)
+    items.append(item)
+
+
+def _history_title_with_body(title: str, body: str) -> str:
+    """组合 workflow 历史条目的标题行与 Markdown 正文。"""
+    stripped = body.strip()
+    if not stripped:
+        return title
+    return f"{title}\n{stripped}"
+
+
+def _format_plan_created_history_event(payload: dict[str, Any]) -> str:
+    """把 `plan_created` 事件转换成前端可渲染的 Markdown 历史文本。"""
+    summary = str(payload.get("summary", "")).strip()
+    steps = payload.get("steps", [])
+    body_lines: list[str] = []
+    if summary:
+        body_lines.append(summary)
+    if isinstance(steps, list) and steps:
+        if body_lines:
+            body_lines.append("")
+        for raw_step in steps:
+            if not isinstance(raw_step, dict):
+                continue
+            index = int(raw_step.get("index", 0))
+            title = str(raw_step.get("title", "")).strip()
+            agent = str(raw_step.get("agent", "")).strip()
+            task = str(raw_step.get("task", "")).strip()
+            label = title or task or "Untitled step"
+            suffix = f" ({agent})" if agent else ""
+            body_lines.append(f"{index}. {label}{suffix}")
+            if task and task != title:
+                body_lines.append(f"   - {task}")
+    return _history_title_with_body("Plan created:", "\n".join(body_lines))
+
+
+def _format_plan_step_started_history_event(payload: dict[str, Any]) -> str:
+    """把 `plan_step_started` 事件转换成前端可渲染的历史文本。"""
+    index = int(payload.get("step_index", 0))
+    total = int(payload.get("total_steps", 0))
+    title = str(payload.get("title", "")).strip()
+    agent = str(payload.get("agent", "")).strip()
+    suffix = f" ({agent})" if agent else ""
+    return _history_title_with_body(f"Step {index}/{total} started:", f"{title}{suffix}".strip())
+
+
+def _format_plan_step_completed_history_event(payload: dict[str, Any]) -> str:
+    """把 `plan_step_completed` 事件转换成前端可渲染的历史文本。"""
+    index = int(payload.get("step_index", 0))
+    total = int(payload.get("total_steps", 0))
+    summary = str(payload.get("summary", "")).strip()
+    return _history_title_with_body(f"Step {index}/{total} completed:", summary)
+
+
+def _format_verify_started_history_event(payload: dict[str, Any]) -> str:
+    """把 `verify_started` 事件转换成前端可渲染的历史文本。"""
+    file_path = str(payload.get("file_path", "")).strip()
+    phase = str(payload.get("phase", "")).strip()
+    suffix = f" ({phase})" if phase else ""
+    return _history_title_with_body("Verify started:", f"{file_path}{suffix}".strip())
+
+
+def _format_verify_completed_history_event(payload: dict[str, Any]) -> str:
+    """把 `verify_completed` 事件转换成前端可渲染的历史文本。"""
+    summary = str(payload.get("summary", "")).strip()
+    if bool(payload.get("passed", False)):
+        return _history_title_with_body("Verify passed:", summary)
+    issues_count = int(payload.get("issues_count", 0))
+    return _history_title_with_body(f"Verify found {issues_count} issue(s):", summary)
+
+
+def _history_item_for_event(event: Event) -> SessionHistoryItemDTO | None:
+    """把可回放的 workflow 事件转换成单条历史条目。"""
+    payload = event.payload
+    match event.type:
+        case "plan_created":
+            return SessionHistoryItemDTO(role="system", text=_format_plan_created_history_event(payload))
+        case "plan_step_started":
+            return SessionHistoryItemDTO(role="system", text=_format_plan_step_started_history_event(payload))
+        case "plan_step_completed":
+            return SessionHistoryItemDTO(role="system", text=_format_plan_step_completed_history_event(payload))
+        case "verify_started":
+            return SessionHistoryItemDTO(role="system", text=_format_verify_started_history_event(payload))
+        case "verify_completed":
+            return SessionHistoryItemDTO(role="system", text=_format_verify_completed_history_event(payload))
+        case _:
+            return None
+
+
+def _history_item_for_stream_event(event: Event) -> SessionHistoryItemDTO | None:
+    """把最后一次流式增量转换成历史条目，保留中间 Thought/子 agent 输出。"""
+    text = str(event.payload.get("text", "")).strip()
+    if not text:
+        return None
+    frame_id = str(event.payload.get("frame_id", "")) or None
+    if event.type == "agent_reasoning_delta":
+        text = f"Thought for 0.00s\n{text}"
+    return SessionHistoryItemDTO(role="assistant", text=text, frame_id=frame_id)
+
+
+def _history_items_for_events(events: list[Event], seen: set[str]) -> list[SessionHistoryItemDTO]:
+    """从事件日志中恢复不在 frame messages 里的 workflow 历史条目。"""
+    items: list[SessionHistoryItemDTO] = []
+    current_stream: Event | None = None
+    current_stream_key: tuple[str, str, str] | None = None
+
+    def flush_stream() -> None:
+        nonlocal current_stream, current_stream_key
+        stream_item = _history_item_for_stream_event(current_stream) if current_stream else None
+        _append_history_item_if_new(items, seen, stream_item)
+        current_stream = None
+        current_stream_key = None
+
+    for event in events:
+        if event.type in {"agent_text_delta", "agent_reasoning_delta"}:
+            payload = event.payload
+            stream_key = (
+                event.type,
+                str(payload.get("frame_id", "")),
+                str(payload.get("loop", "")),
+            )
+            if current_stream_key is not None and stream_key != current_stream_key:
+                flush_stream()
+            current_stream = event
+            current_stream_key = stream_key
+            continue
+
+        flush_stream()
+        _append_history_item_if_new(items, seen, _history_item_for_event(event))
+
+    flush_stream()
+    return items
+
+
 def _pending_anchor_index(frame: Frame, pending_ids: set[str]) -> int | None:
     """找到包含 pending tool_call 的 assistant 消息位置。"""
     if not pending_ids:
@@ -435,6 +665,9 @@ class QueryEngine:
         items: list[SessionHistoryItemDTO] = []
         for frame in session.agent_stack:
             items.extend(_history_items_for_frame(frame))
+        seen = {_history_text_fingerprint(item.text) for item in items}
+        if self._events is not None:
+            items.extend(_history_items_for_events(self._events.list_after(session_id, 0), seen))
         if limit > 0 and len(items) > limit:
             items = items[-limit:]
         logger.info(

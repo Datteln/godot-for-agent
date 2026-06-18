@@ -83,12 +83,29 @@ func split_thought_header(fl: String) -> Dictionary:
 	return {"header": fl + " >", "inline": ""}
 
 
+func is_workflow_summary_start(line: String) -> bool:
+	if line.begins_with("Plan created"):
+		return true
+	if line.begins_with("Delegate results") or line.begins_with("Delegate result:"):
+		return true
+	if line.begins_with("Step ") and line.contains("/") and (
+		line.contains(" started:") or line.contains(" completed:") or line.contains(" done:")
+	):
+		return true
+	if line.begins_with("Executing step "):
+		return true
+	if line.begins_with("Verify started:") or line.begins_with("Verify passed:") or line.begins_with("Verify found "):
+		return true
+	return false
+
+
 func log_entry_kind(entry: String) -> String:
 	var fl := first_line(entry)
 	if fl.begins_with("Grep "): return "grep"
 	if fl.begins_with("Read "): return "read"
 	if fl.begins_with("Thought ") or fl.begins_with("Thought:"): return "thought"
 	if fl.begins_with("Edit "): return "edit"
+	if is_workflow_summary_start(fl): return "workflow_summary"
 	return "text"
 
 
@@ -131,7 +148,8 @@ func is_log_action_start(line: String) -> bool:
 		or line.begins_with("Read ") \
 		or line.begins_with("Thought ") \
 		or line.begins_with("Thought:") \
-		or line.begins_with("Edit ")
+		or line.begins_with("Edit ") \
+		or is_workflow_summary_start(line)
 
 
 func normalize_action_message(text: String) -> String:
@@ -375,6 +393,13 @@ func append_edit_entry(content: VBoxContainer, entry: String, marker_text: Strin
 		content.add_child(make_log_rich_text(stats, _theme_color("success_text")))
 
 
+func append_workflow_summary_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
+	content.add_child(make_log_rich_text(first_line(entry), _theme_color("muted_text"), marker_text))
+	var body := rest_lines(entry).strip_edges()
+	if body != "":
+		content.add_child(make_log_rich_text(body, null, "", true))
+
+
 ## 核心方法：拆分并追加一条日志流消息到 message_list。
 func append_log_stream_message(message_list: VBoxContainer, text: String, color = null, mark_text: bool = false, indent: bool = false) -> void:
 	for entry in split_log_entries(normalize_action_message(text)):
@@ -396,6 +421,8 @@ func _append_log_entry(message_list: VBoxContainer, entry: String, color, mark_t
 			append_grep_entry(content, entry, marker_text)
 		"edit":
 			append_edit_entry(content, entry, marker_text)
+		"workflow_summary":
+			append_workflow_summary_entry(content, entry, marker_text)
 		_:
 			content.add_child(make_log_rich_text(entry, color, marker_text, indent))
 	message_list.add_child(content)

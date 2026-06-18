@@ -17,6 +17,8 @@ var _event_http: HTTPRequest
 var _queue: Array[Dictionary] = []
 var _busy := false
 var _inflight_generation := -1
+var _inflight_path := ""
+var _inflight_session_id := ""
 var _request_generation := 0
 var _last_event_seq := 0
 var _suppress_events := false
@@ -81,6 +83,28 @@ func reset_session() -> void:
 	_suppress_events = false
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing session reset.", {"session_id": _session_id()})
 	_enqueue("POST", "/reset", {"session_id": _session_id()})
+
+
+func start_new_session(previous_session_id: String, new_session_id: String) -> void:
+	FrontendLogger.warn(editor_interface, "HTTP", "Starting new session.", {
+		"previous_session_id": previous_session_id,
+		"new_session_id": new_session_id,
+		"queue_size": _queue.size()
+	})
+	_request_generation += 1
+	_queue.clear()
+	if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+		_http.cancel_request()
+	_busy = false
+	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+		_event_http.cancel_request()
+	current_turn_id = ""
+	_last_event_seq = 0
+	_suppress_events = false
+	if previous_session_id.strip_edges() != "" and previous_session_id != new_session_id:
+		_enqueue("POST", "/chat/interrupt", {"session_id": previous_session_id})
+	_enqueue("POST", "/reset", {"session_id": new_session_id})
+	_configure_event_timer()
 
 
 func interrupt_current() -> void:
@@ -199,6 +223,9 @@ func _pump() -> void:
 		item = _queue.pop_front()
 	_busy = true
 	_inflight_generation = int(item.get("generation", _request_generation))
+	_inflight_path = str(item["path"])
+	var payload: Dictionary = item.get("payload", {}) if item.get("payload", {}) is Dictionary else {}
+	_inflight_session_id = str(payload.get("session_id", ""))
 	var method_name := str(item["method"])
 	var method := HTTPClient.METHOD_GET
 	var body := ""
@@ -265,10 +292,13 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 		if response.has("cancelled") and response.has("last_event_seq"):
 			# `/chat/interrupt` 的确认：跳过中断前后后端可能残留写入的旧事件，
 			# 不把这条纯内部 ack 转发给 ChatPanel。
-			_last_event_seq = max(_last_event_seq, int(response.get("last_event_seq", 0)))
+			if _inflight_session_id == _session_id():
+				_last_event_seq = max(_last_event_seq, int(response.get("last_event_seq", 0)))
 			FrontendLogger.info(editor_interface, "HTTP", "Interrupt acknowledged by backend.", {
 				"cancelled": response.get("cancelled", false),
-				"last_event_seq": _last_event_seq
+				"last_event_seq": _last_event_seq,
+				"path": _inflight_path,
+				"session_id": _inflight_session_id
 			})
 			_pump()
 			return

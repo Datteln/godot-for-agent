@@ -52,6 +52,13 @@ static func extract_first_int_after(text: String, marker: String, fallback: int)
 	return int(digits) if digits != "" else fallback
 
 
+static func _title_with_body(title: String, body: String) -> String:
+	var stripped := body.strip_edges()
+	if stripped == "":
+		return title
+	return "%s\n%s" % [title, stripped]
+
+
 static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 	var payload: Dictionary = event.get("payload", {})
 	match str(event.get("type", "")):
@@ -107,30 +114,33 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 		"plan_created":
 			return format_plan_created_event(payload)
 		"plan_step_started":
-			return ui_text.get("event_plan_step_started", "Executing step %d/%d: %s (%s)...") % [
+			var start_title := "Step %d/%d started:" % [
 				int(payload.get("step_index", 0)),
-				int(payload.get("total_steps", 0)),
+				int(payload.get("total_steps", 0))
+			]
+			var start_body := "%s (%s)" % [
 				str(payload.get("title", "")),
 				str(payload.get("agent", ""))
 			]
+			return _title_with_body(start_title, start_body)
 		"plan_step_completed":
-			return ui_text.get("event_plan_step_completed", "[Done] Step %d/%d completed: %s") % [
+			var done_title := "Step %d/%d completed:" % [
 				int(payload.get("step_index", 0)),
-				int(payload.get("total_steps", 0)),
-				str(payload.get("summary", ""))
+				int(payload.get("total_steps", 0))
 			]
+			return _title_with_body(done_title, str(payload.get("summary", "")))
 		"verify_started":
-			return ui_text.get("event_verify_started", "Verifying %s (%s)...") % [
+			return _title_with_body("Verify started:", "%s (%s)" % [
 				str(payload.get("file_path", "")),
 				str(payload.get("phase", ""))
-			]
+			])
 		"verify_completed":
 			if bool(payload.get("passed", false)):
-				return ui_text.get("event_verify_passed", "[Passed] Verify passed: %s") % str(payload.get("summary", ""))
-			return ui_text.get("event_verify_failed", "[Issue] Verify found %d issue(s): %s") % [
-				int(payload.get("issues_count", 0)),
+				return _title_with_body("Verify passed:", str(payload.get("summary", "")))
+			return _title_with_body(
+				"Verify found %d issue(s):" % int(payload.get("issues_count", 0)),
 				str(payload.get("summary", ""))
-			]
+			)
 		_:
 			return ui_text.get("event_unknown", "Event: %s %s") % [str(event.get("type", "unknown")), JSON.stringify(payload)]
 
@@ -180,7 +190,11 @@ static func format_grep_event_entry(summary: Dictionary) -> String:
 static func format_plan_created_event(payload: Dictionary) -> String:
 	var summary := str(payload.get("summary", ""))
 	var steps: Array = payload.get("steps", []) if payload.get("steps", []) is Array else []
-	var lines: Array[String] = ["Plan", "  Summary: %s" % summary, ""]
+	var lines: Array[String] = []
+	if summary.strip_edges() != "":
+		lines.append(summary.strip_edges())
+	if not steps.is_empty() and not lines.is_empty():
+		lines.append("")
 	for step in steps:
 		if not (step is Dictionary):
 			continue
@@ -192,7 +206,7 @@ static func format_plan_created_event(payload: Dictionary) -> String:
 		var task := str(step.get("task", ""))
 		if task != "":
 			lines.append("     %s" % task)
-	return "\n".join(lines)
+	return _title_with_body("Plan created:", "\n".join(lines))
 
 
 static func _format_event_args(payload: Dictionary) -> String:

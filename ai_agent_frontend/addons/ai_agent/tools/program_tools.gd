@@ -32,11 +32,22 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 		return {"ok": false, "message": "writing to this path is not allowed: " + path, "error_code": "write_denied"}
 
 	if file_state_cache != null and file_state_cache.is_stale(path):
+		# 把磁盘上的最新内容直接带回去，让 LLM 不用再额外调一次 read_file 才能拿到
+		# 最新内容；同时刷新快照，避免基于这份最新内容重新提交的编辑又被误判一次 stale。
+		var current_content := ""
+		if FileAccess.file_exists(ProjectSettings.globalize_path(path)):
+			current_content = FileAccess.get_file_as_string(ProjectSettings.globalize_path(path))
+		file_state_cache.snapshot(path, true)
 		return {
 			"ok": false,
-			"message": "file changed on disk since it was last read: " + path,
+			"message": (
+				"file changed on disk since it was last read: " + path
+				+ ". The up-to-date content is included as `current_content` below — "
+				+ "use it directly to construct your next edit instead of calling read_file again."
+			),
 			"error_code": "file_stale",
-			"path": path
+			"path": path,
+			"current_content": current_content
 		}
 
 	var before_text := ""

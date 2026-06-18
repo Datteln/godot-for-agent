@@ -7,6 +7,9 @@ const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations
 const ContextCollector = preload("res://addons/ai_agent/context/context_collector.gd")
 const EventFormatter = preload("res://addons/ai_agent/ui/event_formatter.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
+const ChatPanelText = preload("res://addons/ai_agent/ui/chat_panel_text.gd")
+const ChatPanelTheme = preload("res://addons/ai_agent/ui/chat_panel_theme.gd")
+const InlineToolConfirmation = preload("res://addons/ai_agent/ui/inline_tool_confirmation.gd")
 const LogEntryRenderer = preload("res://addons/ai_agent/ui/log_entry_renderer.gd")
 const MarkdownRenderer = preload("res://addons/ai_agent/ui/markdown_renderer.gd")
 const RecoveryPrompt = preload("res://addons/ai_agent/ui/recovery_prompt.gd")
@@ -16,7 +19,6 @@ const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_rende
 enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
 
 const PENDING_TOOL_RESULTS_ERROR := "当前会话仍有待回传的工具结果，不能开始新的用户消息"
-const HIGH_RISK_TOOLS := ["run_tests", "run_headless_self_test", "set_project_setting", "batch_rename"]
 ## Plan/Verify 的展示性事件：通常没有活跃 LLM 文本流陪同到达，需要强制滚动一次，
 ## 否则容易在 ScrollContainer 重新计算高度期间被误判为"用户已上滑"而停止跟随。
 const _MILESTONE_EVENT_TYPES := {
@@ -25,117 +27,6 @@ const _MILESTONE_EVENT_TYPES := {
 	"plan_step_completed": true,
 	"verify_started": true,
 	"verify_completed": true,
-}
-
-const UI_TEXT := {
-	"zh": {
-		"send": "发送",
-		"stop": "停止",
-		"new_session": "新会话",
-		"doctor": "诊断",
-		"extensions": "扩展",
-		"commands": "命令",
-		"memory": "记忆",
-		"reset": "重置",
-		"input_placeholder": "向 AI Agent 提问...",
-		"idle": "空闲",
-		"waiting_model": "等待模型响应...",
-		"waiting_confirm": "等待工具确认",
-		"executing": "正在执行工具",
-		"compacting": "正在压缩会话历史",
-		"confirm_title": "需要确认的工具调用",
-		"apply": "应用",
-		"reject": "拒绝",
-		"always_allow": "本会话内自动允许相似低风险更改",
-		"high_risk_hint": "执行类或高风险工具需要每次手动确认。",
-		"interrupted": "已停止当前请求，晚到的响应和事件不会继续显示。",
-		"new_session_started": "已创建新会话：%s",
-		"pending_notice": "上一次工具结果还没有回传。你可以丢弃待回传结果继续当前会话，或重置整个会话。",
-		"discard_pending": "丢弃待回传结果",
-		"recovered_pending": "已恢复会话 %s，存在待处理回合 %s。继续发送消息前请先处理或重置。",
-		"recovery_dismissed": "已忽略恢复信息，会话已重置。",
-		"service_manual": "AI 服务未自动启动。请连接 %s，令牌：%s",
-		"service_failed": "服务启动失败：%s",
-		"service_manual_full": "请手动启动服务。Base URL：%s  Token：%s",
-		"event_user": "消息已提交%s。",
-		"event_with_context": "，包含项目上下文",
-		"event_error": "错误：%s",
-		"event_reset": "会话已重置。",
-		"event_config": "配置已更新（%s）。",
-		"event_compact": "已压缩会话历史：%s 个 frame，移除 %s 条消息，保留最近 %s 条，保留待处理：%s。",
-		"event_unknown": "事件：%s %s",
-		"history_restored": "已恢复上次会话记录：%s 条。",
-		"event_delegate": "Task(%s)",
-		"event_model_fallback": "主模型不可用，已切换到备用模型：%s -> %s",
-		"event_tool_start": "%s(%s)",
-		"event_tool_done": "%s 完成",
-		"event_tool_done_count": "%s 完成（%d 个结果）",
-		"event_tool_failed": "%s 出错",
-		"tool_read_lines": "读取了 %s 行",
-		"tool_wrote_lines": "已写入 `%s`（%s 行）",
-		"tool_run_result": "%s（exit=%s）",
-		"tool_items_count": "返回 %s 条结果",
-		"tool_done": "完成",
-		"tool_done_path": "完成：`%s`",
-		"tool_rejected": "已拒绝",
-		"tool_error_detail": "出错：%s",
-		"tool_unknown_error": "未知错误",
-		"rejected_turn_ended": "已拒绝本次工具调用，会话已结束，可以继续发送新消息。"
-	},
-	"en": {
-		"send": "Send",
-		"stop": "Stop",
-		"new_session": "New Chat",
-		"doctor": "Doctor",
-		"extensions": "Extensions",
-		"commands": "Commands",
-		"memory": "Memory",
-		"reset": "Reset",
-		"input_placeholder": "Ask the AI agent...",
-		"idle": "Idle",
-		"waiting_model": "Waiting for model...",
-		"waiting_confirm": "Waiting for confirmation",
-		"executing": "Executing tools",
-		"compacting": "Compacting conversation history",
-		"confirm_title": "Confirm tool calls",
-		"apply": "Apply",
-		"reject": "Reject",
-		"always_allow": "Always allow similar low-risk changes in this session",
-		"high_risk_hint": "Execution or high-risk tools must be confirmed every time.",
-		"interrupted": "Current request stopped. Late responses and events will not be shown.",
-		"new_session_started": "New session created: %s",
-		"pending_notice": "The previous tool results have not been submitted yet. Discard them to continue this session, or reset the whole session.",
-		"discard_pending": "Discard pending results",
-		"recovered_pending": "Recovered session %s with a pending turn %s. Resolve it or reset before sending another message.",
-		"recovery_dismissed": "Recovery dismissed; session was reset.",
-		"service_manual": "AI service was not auto-started. Connect to %s with token: %s",
-		"service_failed": "Service failed to start: %s",
-		"service_manual_full": "Start the service manually. Base URL: %s  Token: %s",
-		"event_user": "Message submitted%s.",
-		"event_with_context": " with project context",
-		"event_error": "Error: %s",
-		"event_reset": "Session was reset.",
-		"event_config": "Configuration changed (%s).",
-		"event_compact": "Compacted conversation history: %s frame(s), %s message(s) removed, %s recent kept, pending preserved: %s.",
-		"event_unknown": "Event: %s %s",
-		"history_restored": "Restored previous session history: %s item(s).",
-		"event_delegate": "Task(%s)",
-		"event_model_fallback": "Primary model unavailable, switched to fallback model: %s -> %s",
-		"event_tool_start": "%s(%s)",
-		"event_tool_done": "%s done",
-		"event_tool_done_count": "%s done (%d result(s))",
-		"event_tool_failed": "%s failed",
-		"tool_read_lines": "Read %s lines",
-		"tool_wrote_lines": "Wrote `%s` (%s lines)",
-		"tool_run_result": "%s (exit=%s)",
-		"tool_items_count": "Returned %s item(s)",
-		"tool_done": "Done",
-		"tool_done_path": "Done: `%s`",
-		"tool_rejected": "Rejected",
-		"tool_error_detail": "Error: %s",
-		"tool_unknown_error": "Unknown error",
-		"rejected_turn_ended": "Rejected this tool call. The turn has ended; you can send a new message."
-	}
 }
 
 var editor_interface: EditorInterface
@@ -168,14 +59,7 @@ var _state := AgentState.IDLE
 var _last_doctor_report: Dictionary = {}
 var _pending_calls: Array = []
 var _pending_silent_results: Array = []
-var _inline_checkboxes: Array[CheckBox] = []
-var _inline_previews: Array[Control] = []
-var _inline_diff_stats: Array[Dictionary] = []
-var _inline_always_allow: CheckBox
-var _inline_apply_btn: Button
-var _inline_reject_btn: Button
-var _inline_confirm_box: Control
-var _inline_busy := false
+var _inline_confirm := InlineToolConfirmation.new()
 var _interrupted_locally := false
 var _indent_current_text := false
 var _event_queue: Array = []
@@ -403,157 +287,20 @@ func _connect_signals() -> void:
 
 
 func _refresh_theme_colors() -> void:
-	var base := _get_editor_theme_color("base_color", Color(0.14, 0.14, 0.14))
-	var font := _get_editor_theme_color("font_color", Color(0.875, 0.875, 0.875))
-	var accent := _get_editor_theme_color("accent_color", Color(0.34, 0.62, 1.0))
-	var error := _get_editor_theme_color("error_color", Color(0.95, 0.35, 0.35))
-	var success := _get_editor_theme_color("success_color", Color(0.35, 0.82, 0.48))
-	var is_dark := base.get_luminance() < 0.5
-	var contrast := Color(1, 1, 1) if is_dark else Color(0, 0, 0)
-	var surface := base.lerp(contrast, 0.08 if is_dark else 0.04)
-	var surface_alt := base.lerp(contrast, 0.13 if is_dark else 0.07)
-	var code_bg := base.lerp(contrast, 0.16 if is_dark else 0.06)
-	var muted := font.lerp(base, 0.42)
-	var subtle := font.lerp(base, 0.62)
-	var panel_border := surface.lerp(font, 0.22)
-	var user_bg := base.lerp(accent, 0.32 if is_dark else 0.16)
-	var error_bg := base.lerp(error, 0.24 if is_dark else 0.11)
-
-	var new_colors := {
-		"text": font,
-		"muted_text": muted,
-		"subtle_text": subtle,
-		"hover_text": font.lerp(accent, 0.28),
-		"panel_bg": surface,
-		"panel_border": panel_border,
-		"panel_alt_bg": surface_alt,
-		"panel_alt_border": surface_alt.lerp(font, 0.26),
-		"user_panel_bg": user_bg,
-		"user_panel_border": user_bg.lerp(accent, 0.55),
-		"error_panel_bg": error_bg,
-		"error_panel_border": error_bg.lerp(error, 0.55),
-		"error_text": error,
-		"success_text": success,
-		"accent_text": accent,
-		"marker_text": subtle,
-		"marker_action": accent,
-		"code_bg": code_bg,
-		"syntax_comment": _get_editor_setting_color("text_editor/theme/highlighting/comment_color", Color(0.42, 0.72, 0.36) if is_dark else Color(0.25, 0.48, 0.18)),
-		"syntax_string": _get_editor_setting_color("text_editor/theme/highlighting/string_color", Color(0.81, 0.57, 0.47) if is_dark else Color(0.62, 0.24, 0.12)),
-		"syntax_number": _get_editor_setting_color("text_editor/theme/highlighting/number_color", Color(0.71, 0.81, 0.66) if is_dark else Color(0.48, 0.40, 0.08)),
-		"syntax_keyword": _get_editor_setting_color("text_editor/theme/highlighting/keyword_color", Color(0.34, 0.61, 0.84) if is_dark else Color(0.13, 0.36, 0.77)),
-	}
-	# 原地更新，使 _log_renderer.theme_colors 引用自动同步
-	_theme_colors.clear()
-	_theme_colors.merge(new_colors)
+	ChatPanelTheme.refresh_theme_colors(self, editor_interface, _theme_colors)
 
 
 func _refresh_live_theme_overrides() -> void:
 	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		_stream_content_rich.add_theme_color_override("default_color", _theme_color("text"))
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
-		_set_button_text_colors(_reasoning_toggle, _theme_color("muted_text"), _theme_color("hover_text"))
+		ChatPanelTheme.set_button_text_colors(_reasoning_toggle, _theme_color("muted_text"), _theme_color("hover_text"))
 	if _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
 		_reasoning_detail_rich.add_theme_color_override("default_color", _theme_color("muted_text"))
 
 
-func _get_editor_theme_color(name: String, fallback: Color) -> Color:
-	var editor_theme: Theme = null
-	if editor_interface != null:
-		editor_theme = editor_interface.get_editor_theme()
-	if editor_theme != null and editor_theme.has_color(name, "Editor"):
-		return editor_theme.get_color(name, "Editor")
-	if has_theme_color(name, "Editor"):
-		return get_theme_color(name, "Editor")
-	return fallback
-
-
-func _get_editor_setting_color(path: String, fallback: Color) -> Color:
-	if editor_interface == null:
-		return fallback
-	var settings := editor_interface.get_editor_settings()
-	if settings == null or not settings.has_setting(path):
-		return fallback
-	var value = settings.get_setting(path)
-	return value if value is Color else fallback
-
-
-func _fallback_theme_color(key: String) -> Color:
-	match key:
-		"text":
-			return Color(0.875, 0.875, 0.875)
-		"muted_text", "subtle_text", "marker_text":
-			return Color(0.55, 0.55, 0.55)
-		"hover_text":
-			return Color(1, 1, 1)
-		"accent_text", "marker_action":
-			return Color(0.34, 0.62, 1.0)
-		"success_text":
-			return Color(0.35, 0.82, 0.48)
-		"error_text":
-			return Color(0.95, 0.35, 0.35)
-		"code_bg":
-			return Color(0.12, 0.12, 0.12)
-		"syntax_comment":
-			return Color(0.42, 0.72, 0.36)
-		"syntax_string":
-			return Color(0.81, 0.57, 0.47)
-		"syntax_number":
-			return Color(0.71, 0.81, 0.66)
-		"syntax_keyword":
-			return Color(0.34, 0.61, 0.84)
-		"user_panel_bg":
-			return Color(0.15, 0.22, 0.27)
-		"user_panel_border":
-			return Color(0.27, 0.38, 0.44)
-		"panel_bg":
-			return Color(0.16, 0.16, 0.16)
-		"panel_border":
-			return Color(0.25, 0.25, 0.25)
-		"error_panel_bg":
-			return Color(0.23, 0.14, 0.14)
-		"error_panel_border":
-			return Color(0.50, 0.27, 0.27)
-		"panel_alt_bg":
-			return Color(0.14, 0.14, 0.14)
-		"panel_alt_border":
-			return Color(0.36, 0.36, 0.36)
-		_:
-			return Color(0.16, 0.16, 0.16)
-
-
 func _theme_color(key: String) -> Color:
-	var value = _theme_colors.get(key, _fallback_theme_color(key))
-	return value if value is Color else _fallback_theme_color(key)
-
-
-func _resolve_color(value, fallback_key: String) -> Color:
-	if value is Color:
-		return value
-	if value is String and str(value) != "":
-		return Color(str(value))
-	return _theme_color(fallback_key)
-
-
-func _color_tag(color: Color) -> String:
-	return "#" + color.to_html(color.a < 1.0)
-
-
-func _theme_color_tag(key: String) -> String:
-	return _color_tag(_theme_color(key))
-
-
-func _marker_color(marker_text: String) -> Color:
-	return _theme_color("marker_action") if marker_text == "●" else _theme_color("marker_text")
-
-
-func _marker_color_tag(marker_text: String) -> String:
-	return _color_tag(_marker_color(marker_text))
-
-
-func _set_button_text_colors(button: Button, font_color: Color, hover_color: Color) -> void:
-	button.add_theme_color_override("font_color", font_color)
-	button.add_theme_color_override("font_hover_color", hover_color)
+	return ChatPanelTheme.theme_color(_theme_colors, key)
 
 
 func _on_send() -> void:
@@ -907,7 +654,7 @@ func _handle_session_history(response: Dictionary) -> void:
 		if not (item is Dictionary):
 			continue
 		var role := str(item.get("role", "system"))
-		var text := _strip_think_xml(str(item.get("text", ""))).strip_edges()
+		var text := _normalize_history_text(role, _strip_think_xml(str(item.get("text", "")))).strip_edges()
 		if text == "":
 			continue
 		# agent_tool_calls 事件对应的历史条目，实时对话不显示，历史也跳过
@@ -922,8 +669,120 @@ func _handle_session_history(response: Dictionary) -> void:
 			_append_message(role, processed)
 	if pending_turn_id != null:
 		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
+		_show_pending_results_notice()
+		_set_state(AgentState.WAITING_CONFIRM)
 	if not items.is_empty():
 		_append_message("system", _ui("history_restored") % str(items.size()))
+
+
+func _normalize_history_text(role: String, text: String) -> String:
+	if role != "system":
+		return text
+	var json_text := _extract_history_json_text(text)
+	if not _looks_like_history_json_text(json_text):
+		return text
+	var parser := JSON.new()
+	if parser.parse(json_text) != OK:
+		return text
+	var parsed = parser.data
+	if not (parsed is Dictionary):
+		return text
+	var payload: Dictionary = parsed
+	if _history_payload_has_delegate_results(payload):
+		return _format_history_delegate_results(payload)
+	if _history_payload_has_delegate_summary(payload):
+		return _format_history_delegate_summary(payload)
+	if _history_payload_has_plan_tasks(payload):
+		return _format_history_plan_result(payload)
+	return text
+
+
+func _extract_history_json_text(text: String) -> String:
+	var stripped := text.strip_edges()
+	if stripped.begins_with("```json"):
+		stripped = stripped.substr("```json".length()).strip_edges()
+		if stripped.ends_with("```"):
+			stripped = stripped.substr(0, stripped.length() - 3).strip_edges()
+	return stripped
+
+
+func _looks_like_history_json_text(text: String) -> bool:
+	return text.strip_edges().begins_with("{")
+
+
+func _history_payload_has_delegate_results(payload: Dictionary) -> bool:
+	var results = payload.get("results")
+	if not (results is Array) or results.is_empty():
+		return false
+	for item in results:
+		if not (item is Dictionary) or not item.has("summary"):
+			return false
+	return true
+
+
+func _history_payload_has_delegate_summary(payload: Dictionary) -> bool:
+	return payload.has("summary") and not payload.has("results")
+
+
+func _history_payload_has_plan_tasks(payload: Dictionary) -> bool:
+	return bool(payload.get("ok", false)) and payload.get("tasks") is Array
+
+
+func _format_history_delegate_results(payload: Dictionary) -> String:
+	var lines := ["Delegate results:"]
+	var results: Array = payload.get("results", [])
+	var limit = mini(results.size(), 8)
+	for index in range(limit):
+		var item = results[index]
+		if not (item is Dictionary):
+			continue
+		var agent := str(item.get("agent", "")).strip_edges()
+		var summary := _truncate_history_markdown(str(item.get("summary", "")), 1600)
+		lines.append("")
+		lines.append("**%d. %s**" % [index + 1, agent if agent != "" else "delegate"])
+		lines.append(summary if summary != "" else "No summary")
+	if results.size() > limit:
+		lines.append("")
+		lines.append("... %d more result(s)" % [results.size() - limit])
+	return "\n".join(lines)
+
+
+func _format_history_delegate_summary(payload: Dictionary) -> String:
+	var agent := str(payload.get("agent", "")).strip_edges()
+	var summary := _truncate_history_markdown(str(payload.get("summary", "")), 2000)
+	var title := "Delegate result: %s" % agent if agent != "" else "Delegate result:"
+	return "%s\n%s" % [title, summary if summary != "" else "No summary"]
+
+
+func _format_history_plan_result(payload: Dictionary) -> String:
+	var lines := ["Plan created"]
+	var tasks: Array = payload.get("tasks", [])
+	var limit = mini(tasks.size(), 8)
+	for index in range(limit):
+		var task = tasks[index]
+		if not (task is Dictionary):
+			continue
+		var agent := str(task.get("agent", "")).strip_edges()
+		var label := _compact_history_summary(str(task.get("task", "")), 180)
+		var suffix := " (%s)" % agent if agent != "" else ""
+		lines.append("%d. %s%s" % [index + 1, label if label != "" else "Untitled task", suffix])
+	if tasks.size() > limit:
+		lines.append("... %d more task(s)" % [tasks.size() - limit])
+	return "\n".join(lines)
+
+
+func _compact_history_summary(text: String, max_chars: int) -> String:
+	var compact := " ".join(text.strip_edges().split())
+	if compact.length() > max_chars:
+		return compact.left(max_chars) + "..."
+	return compact
+
+
+func _truncate_history_markdown(text: String, max_chars: int) -> String:
+	var stripped := text.strip_edges()
+	if stripped.length() > max_chars:
+		return stripped.left(max_chars) + "\n... (truncated)"
+	return stripped
 
 
 func _on_error(message: String) -> void:
@@ -938,6 +797,7 @@ func _on_error(message: String) -> void:
 	_set_state(AgentState.IDLE)
 	if message == PENDING_TOOL_RESULTS_ERROR or message.contains("工具结果") or message.contains("tool result"):
 		_show_pending_results_notice()
+		_set_state(AgentState.WAITING_CONFIRM)
 
 
 func _show_pending_results_notice() -> void:
@@ -976,6 +836,7 @@ func _discard_pending_results() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Discarding pending tool results.")
 	_http_client.discard_pending()
 	_append_message("system", _ui("discard_pending"))
+	_set_state(AgentState.WAITING_LLM)
 
 
 func _on_reset() -> void:
@@ -1014,17 +875,19 @@ func _on_interrupt() -> void:
 
 
 func _on_new_session() -> void:
+	var previous_session_id := _current_session_id()
 	var session_id := "session_%d" % int(Time.get_unix_time_from_system())
 	FrontendLogger.info(editor_interface, "ChatPanel", "New session requested.", {"session_id": session_id})
 	_auto_scroll = true
 	_interrupted_locally = false
+	_event_queue.clear()
+	_draining_events = false
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", session_id)
 	_clear_inline_confirmation()
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	if _http_client != null:
-		_http_client.interrupt_current()
-		_http_client.reset_session()
+		_http_client.start_new_session(previous_session_id, session_id)
 	if state_store != null:
 		state_store.reset()
 		state_store.set_value("session_id", session_id)
@@ -1127,9 +990,10 @@ func _drain_event_queue() -> void:
 	elif event_type == "agent_text_delta":
 		_on_text_delta(event)
 	elif event_type == "final":
-		# SSE event 路径的 final 也需要路由到 _handle_final
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (via event stream)", {})
-		_handle_final(event.get("payload", event))
+		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+		if payload.has("text"):
+			FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (via event stream)", {})
+			_handle_final(payload)
 	else:
 		var previous_state := _state
 		var is_compacting := event_type == "compact_boundary" and previous_state != AgentState.IDLE
@@ -1204,67 +1068,7 @@ func _update_output_styles(styles: Array) -> void:
 
 
 func _show_inline_confirmation(calls: Array) -> void:
-	_clear_inline_confirmation_ui()
-	_inline_checkboxes.clear()
-	_inline_previews.clear()
-	_inline_diff_stats.clear()
-
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
-	var panel := _log_renderer.make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(panel)
-
-	var body := VBoxContainer.new()
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	body.add_theme_constant_override("separation", 8)
-	panel.add_child(body)
-
-	var title := Label.new()
-	title.text = _ui("confirm_title")
-	body.add_child(title)
-
-	for call in calls:
-		if not (call is Dictionary):
-			continue
-		var item := HBoxContainer.new()
-		item.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		var checkbox := CheckBox.new()
-		checkbox.text = _ui("apply")
-		checkbox.button_pressed = true
-		_inline_checkboxes.append(checkbox)
-		item.add_child(checkbox)
-		var preview := ToolPreviewRenderer.render_call(call, _theme_colors)
-		preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		item.add_child(preview)
-		_inline_previews.append(preview)
-		# 此时文件还未被改动，是计算 diff 行数统计的唯一正确时机——执行后文件
-		# 内容已变成 after_text，"before" 就读不到了。
-		_inline_diff_stats.append(ToolPreviewRenderer.diff_stats(call))
-		body.add_child(item)
-		body.add_child(HSeparator.new())
-
-	_inline_always_allow = CheckBox.new()
-	_inline_always_allow.text = _ui("always_allow")
-	body.add_child(_inline_always_allow)
-	_configure_session_allow()
-
-	var actions := HBoxContainer.new()
-	body.add_child(actions)
-
-	_inline_apply_btn = Button.new()
-	_inline_apply_btn.text = _ui("apply")
-	_inline_apply_btn.pressed.connect(_on_inline_apply)
-	actions.add_child(_inline_apply_btn)
-
-	_inline_reject_btn = Button.new()
-	_inline_reject_btn.text = _ui("reject")
-	_inline_reject_btn.pressed.connect(_on_inline_reject)
-	actions.add_child(_inline_reject_btn)
-
-	_inline_confirm_box = row
-	_message_list.add_child(row)
+	_inline_confirm.show(_message_list, calls, _ui_table(), _theme_colors, _on_inline_apply, _on_inline_reject)
 	# 确保确认面板出现时自动滚动到底部，让用户看到需要操作的内容
 	_auto_scroll = true
 	_force_scroll_once = true
@@ -1274,21 +1078,21 @@ func _show_inline_confirmation(calls: Array) -> void:
 
 
 func _on_inline_apply() -> void:
-	if _inline_busy:
+	if _inline_confirm.is_busy():
 		return
-	_set_inline_busy(true)
+	_inline_confirm.set_busy(true)
 	var results := _pending_silent_results.duplicate(true)
 	for index in range(_pending_calls.size()):
 		var call = _pending_calls[index]
 		if not (call is Dictionary):
 			continue
-		var should_apply := index < _inline_checkboxes.size() and _inline_checkboxes[index].button_pressed
+		var should_apply := _inline_confirm.should_apply(index)
 		# 只对 workflow 工具（Edit/Write）合并成带 diff 的单条目；其它工具（如
 		# set_node_property/add_node）走旧的"宣告 + 结果"两条文本消息——它们的
 		# 宣告消息在上面没有被跳过，混进新面板只会再造一次重复条目。
 		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-		var preview: Control = (_inline_previews[index] if index < _inline_previews.size() else null) if is_workflow else null
-		var stats: Dictionary = (_inline_diff_stats[index] if index < _inline_diff_stats.size() else {}) if is_workflow else {}
+		var preview := _inline_confirm.preview_for(index, is_workflow)
+		var stats := _inline_confirm.diff_stats_for(index, is_workflow)
 		if should_apply:
 			if _interrupted_locally:
 				return
@@ -1296,21 +1100,21 @@ func _on_inline_apply() -> void:
 			var result: Dictionary = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
-			result["grant_session_allow"] = _inline_always_allow != null and _inline_always_allow.button_pressed
+			result["grant_session_allow"] = _inline_confirm.grant_session_allow()
 			results.append(result)
 			_append_tool_result(call, result, preview, stats)
 		else:
 			var rejected := AgentDTO.rejected_result(call)
 			results.append(rejected)
 			_append_tool_result(call, rejected, preview, stats)
-	_set_inline_busy(false)
+	_inline_confirm.set_busy(false)
 	_on_decision(results)
 
 
 func _on_inline_reject() -> void:
-	if _inline_busy:
+	if _inline_confirm.is_busy():
 		return
-	_set_inline_busy(true)
+	_inline_confirm.set_busy(true)
 	var calls := _pending_calls.duplicate(true)
 	# 拒绝不等于挂断：把 rejected 结果回传给模型，让它读到"用户拒绝了这个
 	# 编辑"之后继续给出建设性回复（如手动修改步骤、改成只读分析或降级
@@ -1323,10 +1127,10 @@ func _on_inline_reject() -> void:
 		var rejected := AgentDTO.rejected_result(call)
 		results.append(rejected)
 		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-		var preview: Control = (_inline_previews[index] if index < _inline_previews.size() else null) if is_workflow else null
-		var stats: Dictionary = (_inline_diff_stats[index] if index < _inline_diff_stats.size() else {}) if is_workflow else {}
+		var preview := _inline_confirm.preview_for(index, is_workflow)
+		var stats := _inline_confirm.diff_stats_for(index, is_workflow)
 		_append_tool_result(call, rejected, preview, stats)
-	_set_inline_busy(false)
+	_inline_confirm.set_busy(false)
 	_on_decision(results)
 
 
@@ -1336,47 +1140,13 @@ func _on_inline_reject() -> void:
 ## 完整版本，就会把调用者刚刚（在它之前一行）写入的 `_pending_calls` 清空，
 ## 导致确认框显示正常，但用户点"应用"/"拒绝"时已经没有数据可回传。
 func _clear_inline_confirmation_ui() -> void:
-	if _inline_confirm_box != null and is_instance_valid(_inline_confirm_box):
-		_inline_confirm_box.queue_free()
-	_inline_confirm_box = null
-	_inline_checkboxes.clear()
-	_inline_previews.clear()
-	_inline_diff_stats.clear()
-	_inline_busy = false
+	_inline_confirm.clear_ui()
 
 
 func _clear_inline_confirmation() -> void:
 	_clear_inline_confirmation_ui()
 	_pending_calls.clear()
 	_pending_silent_results.clear()
-
-
-func _set_inline_busy(value: bool) -> void:
-	_inline_busy = value
-	if _inline_apply_btn != null:
-		_inline_apply_btn.disabled = value
-	if _inline_reject_btn != null:
-		_inline_reject_btn.disabled = value
-
-
-func _configure_session_allow() -> void:
-	if _inline_always_allow == null:
-		return
-	var can_session_allow := true
-	for call in _pending_calls:
-		if call is Dictionary:
-			var name := str(call.get("name", ""))
-			var render_kind := str(call.get("render_kind", ""))
-			if HIGH_RISK_TOOLS.has(name) or render_kind == "run":
-				can_session_allow = false
-				break
-	if can_session_allow:
-		_inline_always_allow.disabled = false
-		_inline_always_allow.tooltip_text = ""
-	else:
-		_inline_always_allow.button_pressed = false
-		_inline_always_allow.disabled = true
-		_inline_always_allow.tooltip_text = _ui("high_risk_hint")
 
 
 func _set_state(value: int) -> void:
@@ -1742,16 +1512,17 @@ func _ui(key: String) -> String:
 	var lang := "zh"
 	if editor_interface != null:
 		lang = str(ConfigMigrations.get_value(editor_interface, "ai_agent/ui_language"))
-	if not UI_TEXT.has(lang):
-		lang = "zh"
-	var table: Dictionary = UI_TEXT.get(lang, UI_TEXT["zh"])
-	return str(table.get(key, key))
+	return ChatPanelText.text(lang, key)
 
 
 func _ui_table() -> Dictionary:
 	var lang := "zh"
 	if editor_interface != null:
 		lang = str(ConfigMigrations.get_value(editor_interface, "ai_agent/ui_language"))
-	if not UI_TEXT.has(lang):
-		lang = "zh"
-	return UI_TEXT.get(lang, UI_TEXT["zh"])
+	return ChatPanelText.table(lang)
+
+
+func _current_session_id() -> String:
+	if editor_interface == null:
+		return "default"
+	return str(ConfigMigrations.get_value(editor_interface, "ai_agent/session_id"))
