@@ -130,6 +130,26 @@ func interrupt_current() -> void:
 	_enqueue("POST", "/chat/interrupt", {"session_id": _session_id()})
 
 
+func switch_to_session(previous_session_id: String) -> void:
+	FrontendLogger.info(editor_interface, "HTTP", "Switching session.", {
+		"from": previous_session_id,
+		"to": _session_id()
+	})
+	_request_generation += 1
+	_queue.clear()
+	if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+		_http.cancel_request()
+	_busy = false
+	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+		_event_http.cancel_request()
+	current_turn_id = ""
+	_last_event_seq = 0
+	_suppress_events = false
+	if previous_session_id.strip_edges() != "" and previous_session_id != _session_id():
+		_enqueue("POST", "/chat/interrupt", {"session_id": previous_session_id})
+	_configure_event_timer()
+
+
 func discard_pending() -> void:
 	current_turn_id = ""
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing pending tool result discard.", {"session_id": _session_id()})

@@ -60,6 +60,9 @@ var _extensions_btn: Button
 var _commands_btn: Button
 var _memory_btn: Button
 var _reset_btn: Button
+var _history_btn: Button
+var _history_popup: PopupMenu
+var _history_session_ids: Array = []
 var _effort_options: OptionButton
 var _style_options: OptionButton
 
@@ -107,6 +110,7 @@ func _ready() -> void:
 	_build_children()
 	_connect_signals()
 	_set_state(AgentState.IDLE)
+	_save_session_to_history(_current_session_id())
 	_fetch_initial_service_data()
 
 
@@ -261,6 +265,10 @@ func _build_ui() -> void:
 	_reset_btn.text = _ui("reset")
 	toolbar.add_child(_reset_btn)
 
+	_history_btn = Button.new()
+	_history_btn.text = _ui("history")
+	toolbar.add_child(_history_btn)
+
 	_scroll = ScrollContainer.new()
 	_scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -304,6 +312,9 @@ func _build_children() -> void:
 	_recovery_prompt = RecoveryPrompt.new()
 	add_child(_recovery_prompt)
 
+	_history_popup = PopupMenu.new()
+	add_child(_history_popup)
+
 	_log_renderer = LogEntryRenderer.new()
 	_log_renderer.theme_colors = _theme_colors
 	_log_renderer.editor_interface = editor_interface
@@ -321,6 +332,8 @@ func _connect_signals() -> void:
 	_commands_btn.pressed.connect(func(): _http_client.fetch_commands())
 	_memory_btn.pressed.connect(func(): _http_client.fetch_memory())
 	_reset_btn.pressed.connect(_on_reset)
+	_history_btn.pressed.connect(_on_show_history)
+	_history_popup.index_pressed.connect(_on_history_item_selected)
 	_http_client.response_received.connect(_on_response)
 	_http_client.events_received.connect(_on_events)
 	_http_client.error_occurred.connect(_on_error)
@@ -690,15 +703,15 @@ func _handle_session_history(response: Dictionary) -> void:
 			"state": _status.text
 		})
 		return
-	# 消息列表已有内容说明当前会话已在进行，忽略此次历史加载（防止服务重启触发
-	# 的意外历史响应覆盖当前对话内容）。
-	if _message_list.get_child_count() > 0:
-		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored session history: messages already present.", {
-			"count": _message_list.get_child_count()
-		})
-		return
 	var items: Array = response.get("items", [])
 	var session_id := str(response.get("session_id", ""))
+	# 响应 session_id 与当前不符说明是切换会话后迟到的过期响应，直接丢弃。
+	if session_id != "" and session_id != _current_session_id():
+		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored stale session history: session mismatch.", {
+			"response_session": session_id,
+			"current": _current_session_id()
+		})
+		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Restoring session history.", {
 		"session_id": session_id,
 		"count": items.size()
@@ -711,6 +724,8 @@ func _handle_session_history(response: Dictionary) -> void:
 		_http_client.current_turn_id = str(pending_turn_id)
 		if state_store != null:
 			state_store.set_value("current_turn_id", _http_client.current_turn_id)
+	var saved_auto_scroll := _auto_scroll
+	_auto_scroll = false
 	for item in items:
 		if not (item is Dictionary):
 			continue
@@ -726,7 +741,9 @@ func _handle_session_history(response: Dictionary) -> void:
 		if text.begins_with("Tool calls"):
 			continue
 		var processed := _apply_thought_prefix(text) if role == "assistant" else text
-		if role == "assistant":
+		if role == "assistant" and processed.begins_with("Thought for "):
+			_append_history_thought_item(processed)
+		elif role == "assistant":
 			_indent_current_text = true
 			_append_message(role, processed)
 			_indent_current_text = false
@@ -738,6 +755,11 @@ func _handle_session_history(response: Dictionary) -> void:
 		_set_state(AgentState.WAITING_CONFIRM)
 	if not items.is_empty():
 		_append_message("system", _ui("history_restored") % str(items.size()))
+	elif items.is_empty() and _message_list.get_child_count() == 0:
+		_append_message("system", _ui("switch_session_empty"))
+	_auto_scroll = saved_auto_scroll
+	_force_scroll_once = true
+	_scroll_to_bottom()
 
 
 func _normalize_history_text(role: String, text: String) -> String:
@@ -941,6 +963,7 @@ func _on_interrupt() -> void:
 
 func _on_new_session() -> void:
 	var previous_session_id := _current_session_id()
+	_save_session_to_history(previous_session_id)
 	var session_id := "session_%d" % int(Time.get_unix_time_from_system())
 	FrontendLogger.info(editor_interface, "ChatPanel", "New session requested.", {"session_id": session_id})
 	_auto_scroll = true
@@ -948,6 +971,7 @@ func _on_new_session() -> void:
 	_event_queue.clear()
 	_draining_events = false
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", session_id)
+	_save_session_to_history(session_id)
 	_clear_inline_confirmation()
 	if undo_manager != null:
 		undo_manager.abort_batch()
@@ -1667,6 +1691,105 @@ func _ui_table() -> Dictionary:
 	if editor_interface != null:
 		lang = str(ConfigMigrations.get_value(editor_interface, "ai_agent/ui_language"))
 	return ChatPanelText.table(lang)
+
+
+func _session_label(session_id: String) -> String:
+	if session_id.begins_with("session_"):
+		var ts_str := session_id.substr("session_".length())
+		if ts_str.is_valid_int():
+			var dt := Time.get_datetime_dict_from_unix_time(int(ts_str))
+			return "%04d-%02d-%02d %02d:%02d" % [dt.year, dt.month, dt.day, dt.hour, dt.minute]
+	return session_id
+
+
+func _load_session_history() -> Array:
+	if editor_interface == null:
+		return []
+	var json_str := str(ConfigMigrations.get_value(editor_interface, "ai_agent/session_history_json"))
+	if json_str.strip_edges() == "" or json_str == "null":
+		return []
+	var parsed = JSON.parse_string(json_str)
+	if parsed is Array:
+		return parsed
+	return []
+
+
+func _save_session_to_history(session_id: String) -> void:
+	if editor_interface == null or session_id.strip_edges() == "":
+		return
+	var sessions := _load_session_history()
+	for i in range(sessions.size() - 1, -1, -1):
+		if sessions[i] is Dictionary and str(sessions[i].get("id", "")) == session_id:
+			sessions.remove_at(i)
+	sessions.insert(0, {"id": session_id, "label": _session_label(session_id)})
+	while sessions.size() > 20:
+		sessions.pop_back()
+	ConfigMigrations.set_value(editor_interface, "ai_agent/session_history_json", JSON.stringify(sessions))
+
+
+func _on_show_history() -> void:
+	_history_popup.clear()
+	_history_session_ids.clear()
+	var sessions := _load_session_history()
+	if sessions.is_empty():
+		_history_popup.add_item(_ui("history_empty"))
+		_history_popup.set_item_disabled(0, true)
+		_history_session_ids.append("")
+	else:
+		var current_id := _current_session_id()
+		for entry in sessions:
+			if not (entry is Dictionary):
+				continue
+			var sid := str(entry.get("id", ""))
+			var label := str(entry.get("label", sid))
+			if sid == current_id:
+				label += " ✓"
+			_history_popup.add_item(label)
+			var item_idx := _history_popup.get_item_count() - 1
+			if sid == current_id:
+				_history_popup.set_item_disabled(item_idx, true)
+			_history_session_ids.append(sid)
+	var screen_pos: Vector2 = _history_btn.get_screen_transform() * Vector2(0, _history_btn.size.y)
+	_history_popup.popup(Rect2i(Vector2i(screen_pos), Vector2i(280, 0)))
+
+
+func _on_history_item_selected(index: int) -> void:
+	if index < 0 or index >= _history_session_ids.size():
+		return
+	var session_id: String = str(_history_session_ids[index])
+	if session_id == "":
+		return
+	_switch_to_session(session_id)
+
+
+func _switch_to_session(session_id: String) -> void:
+	if session_id == _current_session_id():
+		return
+	if _state != AgentState.IDLE:
+		return
+	var previous_session_id := _current_session_id()
+	FrontendLogger.info(editor_interface, "ChatPanel", "Switching to session.", {
+		"from": previous_session_id,
+		"to": session_id
+	})
+	_auto_scroll = true
+	_post_final_scroll_frames = 0
+	_post_delta_scroll_frames = 0
+	_interrupted_locally = false
+	_event_queue.clear()
+	_draining_events = false
+	_clear_inline_confirmation()
+	if undo_manager != null:
+		undo_manager.abort_batch()
+	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", session_id)
+	if _http_client != null:
+		_http_client.switch_to_session(previous_session_id)
+	if state_store != null:
+		state_store.reset()
+		state_store.set_value("session_id", session_id)
+	_clear_messages()
+	_set_state(AgentState.IDLE)
+	_http_client.fetch_session_history()
 
 
 func _current_session_id() -> String:

@@ -35,7 +35,8 @@ const DEFAULTS := {
 	"ai_agent/headless_executable": "",
 	"ai_agent/headless_args": "",
 	"ai_agent/headless_output_log": "",
-	"ai_agent/runner_timeout_ms": 120000
+	"ai_agent/runner_timeout_ms": 120000,
+	"ai_agent/session_history_json": ""
 }
 
 const PROPERTY_HINTS := {
