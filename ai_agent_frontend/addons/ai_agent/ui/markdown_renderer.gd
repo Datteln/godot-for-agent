@@ -104,10 +104,15 @@ static func render_markdown_table(table_lines: Array[String], theme_colors: Dict
 	if header_cells.is_empty():
 		return escape_bbcode("\n".join(table_lines))
 	var column_count := header_cells.size()
+	# 标准 Markdown 表格第二行是 `|---|---|` 分隔符；但模型有时会省略分隔符，
+	# 直接在表头后紧跟数据行（如 `|改动|说明|` 后面直接是数据），此时仍要把
+	# 整块识别为表格，只是数据从第 1 行（而不是第 2 行）开始。
+	var has_separator := is_markdown_table_separator(table_lines[1])
+	var data_start := 2 if has_separator else 1
 	var bbcode := "[table=%d]" % column_count
 	for cell in header_cells:
 		bbcode += "[cell][b]%s[/b][/cell]" % format_table_cell(str(cell))
-	for row_index in range(2, table_lines.size()):
+	for row_index in range(data_start, table_lines.size()):
 		var cells := split_table_row(table_lines[row_index])
 		for col_index in range(column_count):
 			var cell_text := str(cells[col_index]) if col_index < cells.size() else ""
@@ -157,7 +162,20 @@ static func looks_like_table_start(lines: PackedStringArray, index: int) -> bool
 		return false
 	var line := str(lines[index])
 	var next := str(lines[index + 1])
-	return line.contains("|") and is_markdown_table_separator(next)
+	if not line.contains("|"):
+		return false
+	if is_markdown_table_separator(next):
+		return true
+	# 模型有时会省略表头分隔符（`|---|---|`），直接连续输出 `|cell|cell|` 行。
+	# 只要相邻两行都是规整的管道行且列数一致，也当作表格起点，否则降级为纯文本。
+	if not (is_pipe_row(line) and is_pipe_row(next)):
+		return false
+	return split_table_row(line).size() == split_table_row(next).size()
+
+
+static func is_pipe_row(line: String) -> bool:
+	var stripped := line.strip_edges()
+	return stripped.begins_with("|") and stripped.ends_with("|") and stripped.length() > 2
 
 
 static func is_markdown_table_separator(line: String) -> bool:

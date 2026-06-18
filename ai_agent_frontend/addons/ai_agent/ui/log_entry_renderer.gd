@@ -246,6 +246,10 @@ func make_rich_text(text: String, color = null, marker_text: String = "") -> Ric
 	rich.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	rich.add_theme_stylebox_override("normal", StyleBoxEmpty.new())
 	rich.add_theme_color_override("default_color", _resolve_color(color, "text"))
+	# RichTextLabel 默认 mouse_filter 是 STOP（因为支持选中/链接点击），这会让鼠标
+	# 悬停在任意一条消息文本上时，滚轮事件被吸收在这里、传不到外层 ScrollContainer。
+	# 改成 PASS：消息本身仍能响应选中/右键菜单，同时滚轮继续向上传递。
+	rich.mouse_filter = Control.MOUSE_FILTER_PASS
 	apply_mono_font(rich)
 	var bbcode := MarkdownRenderer.markdown_to_bbcode(text, theme_colors)
 	if marker_text != "":
@@ -275,6 +279,10 @@ func make_workflow_toggle(text: String, color = null) -> Button:
 	toggle.add_theme_color_override("font_color", _resolve_color(color, "text"))
 	toggle.add_theme_color_override("font_hover_color", _theme_color("hover_text"))
 	toggle.text = text
+	# 同上：Button 默认 mouse_filter=STOP，悬停在 "Thought for Xs" 这类常驻可点击
+	# 标题上时会拦住滚轮事件，导致 Thought 进行中无法上滑浏览历史消息。改成 PASS
+	# 保留点击展开/折叠功能，同时让滚轮事件继续传给 ScrollContainer。
+	toggle.mouse_filter = Control.MOUSE_FILTER_PASS
 	return toggle
 
 
@@ -310,6 +318,7 @@ func append_collapsible(content: VBoxContainer, toggle: Button, detail: String, 
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_theme_constant_override("separation", 4)
+	row.mouse_filter = Control.MOUSE_FILTER_PASS
 
 	var arrow := Label.new()
 	arrow.text = ">"
@@ -317,6 +326,7 @@ func append_collapsible(content: VBoxContainer, toggle: Button, detail: String, 
 	arrow.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
 	arrow.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	arrow.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	arrow.mouse_filter = Control.MOUSE_FILTER_PASS
 	call_deferred("_set_arrow_pivot", arrow)
 	arrow.add_theme_color_override("font_color", toggle.get_theme_color("font_color"))
 
@@ -339,6 +349,25 @@ func append_collapsible(content: VBoxContainer, toggle: Button, detail: String, 
 
 
 # ─── 各类型日志条目追加 ───────────────────────────────────────────────────────
+
+## 历史会话回放专用：把后端重建的 "Thought for Xs\n<完整思考正文>" 历史条目渲染成
+## 与实时流式接收时同样的可折叠 "✻ Thought for Xs" 组件。
+## 之所以不走 `append_log_stream_message` -> `split_log_entries` 的通用拆分逻辑：
+## 思考正文是模型自由生成的自然语言，可能凑巧有某一行以 "Read "/"Edit "/"Grep "/
+## "Thought:" 开头，会被那套按"工具日志动作前缀"设计的启发式拆分逻辑误判为
+## 新日志条目的开始，把同一段思考拦腰截断、甚至把后半段丢给 Read/Edit 等条目
+## 类型而丢弃多余内容——表现就是"历史里 Thought 内容缺失/被截断"。这里把整段
+## detail 原样塞进同一个折叠组件，不做任何按行重新分类。
+func append_history_thought_entry(message_list: VBoxContainer, header: String, detail: String) -> void:
+	var content := VBoxContainer.new()
+	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	content.add_theme_constant_override("separation", 2)
+	if detail.strip_edges() == "":
+		content.add_child(make_log_rich_text(header, _theme_color("muted_text"), "✻"))
+	else:
+		append_collapsible(content, make_workflow_toggle(header, _theme_color("muted_text")), detail, "✻")
+	message_list.add_child(content)
+
 
 func append_thought_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
 	var split := split_thought_header(first_line(entry))
@@ -394,7 +423,12 @@ func append_edit_entry(content: VBoxContainer, entry: String, marker_text: Strin
 
 
 func append_workflow_summary_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
-	content.add_child(make_log_rich_text(first_line(entry), _theme_color("muted_text"), marker_text))
+	var header_text := first_line(entry)
+	# `Delegate result(s):` 是子 agent（如 programming-agent）执行完成后的摘要块；
+	# 标题行原来不带缩进，只有正文缩进 48px，导致整块的视觉宽度仍是满宽，跟其它
+	# 缩进 48px 的中间文本消息不一致。这里让标题也一起缩进，使整块宽度统一。
+	var header_indent := header_text.begins_with("Delegate result")
+	content.add_child(make_log_rich_text(header_text, _theme_color("muted_text"), marker_text, header_indent))
 	var body := rest_lines(entry).strip_edges()
 	if body != "":
 		content.add_child(make_log_rich_text(body, null, "", true))

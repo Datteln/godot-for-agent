@@ -608,6 +608,17 @@ func _apply_thought_prefix(text: String) -> String:
 	return "%s\n\n%s" % [thought_line, rest]
 
 
+## 渲染后端为历史回放重建的 "Thought for Xs\n<思考正文>" 条目：第一行做折叠标题，
+## 剩余部分原样作为 detail，整段不经过通用的按行动作前缀拆分（见调用处注释）。
+func _append_history_thought_item(text: String) -> void:
+	var stripped := text.strip_edges()
+	var newline := stripped.find("\n")
+	var header := stripped if newline == -1 else stripped.substr(0, newline)
+	var detail := "" if newline == -1 else stripped.substr(newline + 1).strip_edges()
+	_log_renderer.append_history_thought_entry(_message_list, header, detail)
+	_scroll_to_bottom()
+
+
 func _handle_final(response: Dictionary) -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Received final response.", {
 		"chars": str(response.get("text", "")).length()
@@ -704,7 +715,11 @@ func _handle_session_history(response: Dictionary) -> void:
 		if not (item is Dictionary):
 			continue
 		var role := str(item.get("role", "system"))
-		var text := _normalize_history_text(role, _strip_think_xml(str(item.get("text", "")))).strip_edges()
+		var raw_text := str(item.get("text", ""))
+		if role == "assistant" and raw_text.strip_edges().begins_with("Thought for "):
+			_append_history_thought_item(raw_text)
+			continue
+		var text := _normalize_history_text(role, _strip_think_xml(raw_text)).strip_edges()
 		if text == "":
 			continue
 		# agent_tool_calls 事件对应的历史条目，实时对话不显示，历史也跳过
@@ -1360,6 +1375,9 @@ func _ensure_reasoning_entry(key: String) -> void:
 	var body := VBoxContainer.new()
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	body.add_theme_constant_override("separation", 2)
+	# 容器默认 mouse_filter=STOP；鼠标悬停在 Thought 区块（即使没有点在 toggle/
+	# 文本上，比如行间空隙）时会拦住滚轮事件，导致流式思考期间无法上滑看历史。
+	body.mouse_filter = Control.MOUSE_FILTER_PASS
 
 	var toggle := _log_renderer.make_workflow_toggle(_format_reasoning_header(), _theme_color("muted_text"))
 	var detail_rich := _log_renderer.append_collapsible(body, toggle, "", "✻")
