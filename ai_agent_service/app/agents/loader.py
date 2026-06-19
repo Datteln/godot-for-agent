@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, cast
 
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_scalar(value: str) -> str:
@@ -99,10 +102,11 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 
 def load_agent_file(path: Path) -> AgentDefinition:
     """从 markdown 文件加载一个 bundled AgentDefinition。"""
+    logger.debug("Loading agent definition path=%s", path)
     meta, body = _parse_frontmatter(path.read_text(encoding="utf-8"))
     name = str(meta.get("name") or path.stem)
     hooks = meta.get("hooks")
-    return AgentDefinition(
+    definition = AgentDefinition(
         name=name,
         source="bundled",
         description=str(meta.get("description") or ""),
@@ -116,3 +120,15 @@ def load_agent_file(path: Path) -> AgentDefinition:
         can_delegate=bool(meta.get("can_delegate") or meta.get("can-delegate") or False),
         hooks=hooks if isinstance(hooks, dict) and hooks else None,
     )
+    logger.info(
+        "Agent definition loaded name=%s source=%s tools=%d skills=%d max_turns=%d "
+        "can_delegate=%s prompt_chars=%d",
+        definition.name,
+        definition.source,
+        len(definition.tools),
+        len(definition.skills),
+        definition.max_turns,
+        definition.can_delegate,
+        len(definition.prompt),
+    )
+    return definition

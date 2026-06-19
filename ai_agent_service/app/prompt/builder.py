@@ -101,11 +101,12 @@ class LayeredPrompt:
 
     core: str
     project_context: str = ""
+    structure_context: str = ""
     rag_context: str = ""
 
     def layers(self) -> list[str]:
         """返回非空层的有序列表（L0 -> L2 -> L3）。"""
-        return [layer for layer in (self.core, self.project_context, self.rag_context) if layer.strip()]
+        return [layer for layer in (self.core, self.project_context, self.structure_context, self.rag_context) if layer.strip()]
 
     def to_text(self) -> str:
         """把各层拼成单一字符串（供 `agent.prompt` 等需要纯文本的场景）。"""
@@ -126,6 +127,7 @@ def build_layered_system_prompt(
     output_style_catalog: OutputStyleCatalog | None = None,
     output_style_id: str | None = None,
     project_context: str = "",
+    structure_context: str = "",
     rag_context: str = "",
 ) -> LayeredPrompt:
     """构造分层 system prompt：L0 复用 `build_system_prompt`，再叠加 L2/L3。
@@ -142,4 +144,4 @@ def build_layered_system_prompt(
         分层 prompt；`to_content_blocks()` 用于写入 system 消息以启用多断点缓存。
     """
     core = build_system_prompt(agent, skill_catalog, output_style_catalog, output_style_id)
-    return LayeredPrompt(core=core, project_context=project_context.strip(), rag_context=rag_context.strip())
+    return LayeredPrompt(core=core, project_context=project_context.strip(), structure_context=structure_context.strip(), rag_context=rag_context.strip())

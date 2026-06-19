@@ -21,6 +21,24 @@ const DEFAULTS := {
 	"ai_agent/llm_advisor_model": "",
 	"ai_agent/llm_fallback_model": "",
 	"ai_agent/llm_request_timeout_s": 60.0,
+	"ai_agent/embedding_provider": "disabled",
+	"ai_agent/embedding_model": "text-embedding-3-small",
+	"ai_agent/embedding_endpoint": "https://api.openai.com/v1",
+	"ai_agent/embedding_api_key": "",
+	"ai_agent/embedding_timeout_s": 3.0,
+	"ai_agent/embedding_retries": 1,
+	"ai_agent/rerank_model": "",
+	"ai_agent/rerank_timeout_s": 2.0,
+	"ai_agent/rag_query_router_enabled": true,
+	"ai_agent/rag_token_budget": 1500,
+	"ai_agent/graph_max_depth": 2,
+	"ai_agent/graph_max_neighbors": 5,
+	"ai_agent/asset_understanding_enabled": false,
+	"ai_agent/asset_understanding_model": "",
+	"ai_agent/asset_understanding_endpoint": "",
+	"ai_agent/asset_understanding_api_key": "",
+	"ai_agent/asset_understanding_timeout_s": 10.0,
+	"ai_agent/asset_understanding_max_tokens": 500,
 	"ai_agent/log_level": "info",
 	"ai_agent/log_to_file": true,
 	"ai_agent/log_file_path": "res://logs/ai_agent_frontend.log",
@@ -59,6 +77,50 @@ const PROPERTY_HINTS := {
 	"ai_agent/llm_request_timeout_s": {
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "1,600,1,suffix:s"
+	},
+	"ai_agent/embedding_provider": {
+		"hint": PROPERTY_HINT_ENUM,
+		"hint_string": "disabled,openai,local,bge-m3"
+	},
+	"ai_agent/embedding_api_key": {
+		"hint": PROPERTY_HINT_PASSWORD,
+		"hint_string": ""
+	},
+	"ai_agent/embedding_timeout_s": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "0.1,3,0.1,suffix:s"
+	},
+	"ai_agent/embedding_retries": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "0,2,1"
+	},
+	"ai_agent/rerank_timeout_s": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "0.1,2,0.1,suffix:s"
+	},
+	"ai_agent/rag_token_budget": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "128,16384,128,suffix:tokens"
+	},
+	"ai_agent/graph_max_depth": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "0,8,1"
+	},
+	"ai_agent/graph_max_neighbors": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,100,1"
+	},
+	"ai_agent/asset_understanding_api_key": {
+		"hint": PROPERTY_HINT_PASSWORD,
+		"hint_string": ""
+	},
+	"ai_agent/asset_understanding_timeout_s": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "0.1,120,0.1,suffix:s"
+	},
+	"ai_agent/asset_understanding_max_tokens": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,4096,1,suffix:tokens"
 	},
 	"ai_agent/log_level": {
 		"hint": PROPERTY_HINT_ENUM,

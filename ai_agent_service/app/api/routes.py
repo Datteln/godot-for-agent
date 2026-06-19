@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter
@@ -35,7 +36,7 @@ from app.llm.provider import LLMProvider
 from app.memory.store import MemoryStore
 from app.output_styles.catalog import OutputStyleCatalog
 from app.query.engine import QueryEngine
-from app.rag.index import CodebaseIndex
+from app.rag.factory import create_codebase_index
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import SecuritySettings
 from app.skills.catalog import SkillCatalog
@@ -249,10 +250,15 @@ def create_router(
             if not isinstance(max_files, int) or max_files <= 0:
                 logger.warning("Command rebuild_index rejected: invalid max_files")
                 return CommandResponse(ok=False, text="max_files 必须是正整数")
-            result = CodebaseIndex(
-                security,
-                settings.resolved_rag_index_path(),
-            ).build(include=include, max_files=max_files)
+            incremental = request.args.get("incremental", True)
+            if not isinstance(incremental, bool):
+                return CommandResponse(ok=False, text="incremental 必须是布尔值")
+            result = await asyncio.to_thread(
+                create_codebase_index(settings, security).build,
+                include,
+                max_files,
+                incremental,
+            )
             logger.info(
                 "Command rebuild_index completed files=%s chunks=%s truncated=%s",
                 result.get("files"),

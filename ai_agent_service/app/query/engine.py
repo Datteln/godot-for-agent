@@ -67,10 +67,11 @@ from app.orchestrator.agent import (
 )
 from app.output_styles.catalog import OutputStyleCatalog
 from app.permissions.engine import make_session_allow_grant
-from app.prompt.builder import build_layered_system_prompt, build_system_prompt
+from app.prompt.builder import LayeredPrompt, build_system_prompt
+from app.prompt.context_builder import ContextBuilder
 from app.prompt.project_context import build_project_context
 from app.prompt.rag_context import build_rag_context
-from app.rag.index import CodebaseIndex
+from app.rag.factory import create_codebase_index
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import SecuritySettings, security_settings_from_app
 from app.sessions.store import Session, SessionStore
@@ -1571,13 +1572,21 @@ class QueryEngine:
             session.rag_context = await self._retrieve_rag_context(security, request.user_message)
 
         coordinator = get_agent("coordinator", self.available_tools)
-        layered_prompt = build_layered_system_prompt(
-            coordinator,
-            self._skill_catalog,
-            self._output_styles,
-            session.output_style,
-            project_context=build_project_context(security.project_root),
-            rag_context=session.rag_context,
+        cache_context = ContextBuilder().build(
+            stable_prefix=build_system_prompt(
+                coordinator,
+                self._skill_catalog,
+                self._output_styles,
+                session.output_style,
+            ),
+            structure_context=build_project_context(security.project_root),
+            dynamic_context=session.rag_context,
+            query=request.user_message or "",
+        )
+        layered_prompt = LayeredPrompt(
+            core=cache_context.stable_prefix,
+            structure_context=cache_context.structure_context,
+            rag_context=cache_context.dynamic_context,
         )
         # `agent.prompt` 保留拼平后的纯文本（供委派子帧继承等需要字符串的场景）；
         # 根帧的 system 消息则写成分层 content-block 数组，使缓存层可为每层（L0
@@ -2227,7 +2236,7 @@ class QueryEngine:
         Returns:
             组装好的 L3 RAG 上下文文本；无索引/无结果/出错时为空串。
         """
-        index = CodebaseIndex(security, self._settings.resolved_rag_index_path())
+        index = create_codebase_index(self._settings, security)
         return await asyncio.to_thread(build_rag_context, index, user_message)
 
     def _emit(self, session_id: str, event_type: str, payload: dict[str, Any]) -> int:

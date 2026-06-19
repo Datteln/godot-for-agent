@@ -16,7 +16,7 @@ from typing import Any
 from app.security.paths import path_ok
 from app.security.settings import SecuritySettings
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_FILE_BYTES = 256 * 1024
 MAX_SNIPPET_CHARS = 1200
 CHUNK_LINES = 48
@@ -116,10 +116,57 @@ def _iter_text_files(root: Path, security: SecuritySettings, include: str) -> li
 class CodebaseIndex:
     """工程内纯本地 TF-IDF 风格检索索引。"""
 
-    def __init__(self, security: SecuritySettings, index_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        security: SecuritySettings,
+        index_path: Path | None = None,
+        embedding_client: Any | None = None,
+        asset_llm_client: Any | None = None,
+        asset_enabled: bool = False,
+        *,
+        query_router_enabled: bool = True,
+        graph_max_depth: int = 2,
+        graph_max_neighbors: int = 5,
+        rerank_model: str = "",
+        rerank_timeout_s: float = 2.0,
+        token_budget: int = 1500,
+    ) -> None:
         """初始化索引读写器。"""
         self._security = security
         self._index_path = index_path or default_index_path(security)
+        self._embedding_client = embedding_client
+        self._asset_llm_client = asset_llm_client
+        self._asset_enabled = asset_enabled
+        self._query_router_enabled = query_router_enabled
+        self._graph_max_depth = graph_max_depth
+        self._graph_max_neighbors = graph_max_neighbors
+        self._rerank_model = rerank_model
+        self._rerank_timeout_s = rerank_timeout_s
+        self.token_budget = token_budget
+
+    @property
+    def index_dir(self) -> Path:
+        return self._index_path.parent
+
+    @property
+    def embedding_path(self) -> Path:
+        return self.index_dir / "rag_embeddings.json"
+
+    @property
+    def symbol_path(self) -> Path:
+        return self.index_dir / "rag_symbols.json"
+
+    @property
+    def scene_graph_path(self) -> Path:
+        return self.index_dir / "scene_graph.json"
+
+    @property
+    def signal_graph_path(self) -> Path:
+        return self.index_dir / "signal_graph.json"
+
+    @property
+    def asset_index_path(self) -> Path:
+        return self.index_dir / "asset_index.json"
 
     @property
     def path(self) -> Path:
@@ -171,20 +218,38 @@ class CodebaseIndex:
         )
         return status
 
-    def build(self, include: str = "**/*", max_files: int = 4000) -> dict[str, Any]:
-        """扫描工程并重建本地索引。"""
+    def build(self, include: str = "**/*", max_files: int = 4000, incremental: bool = True) -> dict[str, Any]:
+        """扫描工程并增量更新代码、符号、向量及引擎图索引。"""
         root = self._security.project_root
         logger.info("RAG index build start root=%s include=%s max_files=%d", root, include, max_files)
         files = _iter_text_files(root, self._security, include)
-        chunks: list[dict[str, Any]] = []
+        old_data: dict[str, Any] = {}
+        if incremental and self._index_path.exists():
+            try:
+                old_data = self._load(allow_legacy=True)
+            except ValueError:
+                old_data = {}
+        old_chunks = [c for c in old_data.get("chunks", []) if isinstance(c, dict)]
+        old_states = old_data.get("file_states", {}) if isinstance(old_data.get("file_states", {}), dict) else {}
+        current_states: dict[str, dict[str, int]] = {}
+        file_map = {candidate.relative_to(root).as_posix(): candidate for candidate in files[:max_files]}
+        for rel, candidate in file_map.items():
+            stat = candidate.stat()
+            current_states[rel] = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+        changed_paths = {
+            rel for rel, state in current_states.items()
+            if not incremental or old_states.get(rel) != state
+        } | (set(old_states) - set(current_states))
+        chunks: list[dict[str, Any]] = [c for c in old_chunks if c.get("path") not in changed_paths] if incremental else []
         indexed_files = 0
-        for candidate in files[:max_files]:
-            rel = candidate.relative_to(root).as_posix()
+        for rel, candidate in file_map.items():
+            indexed_files += 1
+            if incremental and rel not in changed_paths:
+                continue
             text = _read_text(candidate)
             lines = text.splitlines()
             if not lines:
                 continue
-            indexed_files += 1
             stat = candidate.stat()
             for start_line, end_line, snippet in _chunk_lines(lines):
                 counts = token_counts(snippet)
@@ -204,23 +269,54 @@ class CodebaseIndex:
 
         data = {
             "schema_version": SCHEMA_VERSION,
-            "mode": "local_tfidf",
+            "mode": "ears_hybrid",
             "built_at": time.time(),
             "project_root": str(root),
             "include": include,
             "files": indexed_files,
+            "file_states": current_states,
             "chunks": chunks,
         }
         self._index_path.parent.mkdir(parents=True, exist_ok=True)
         self._index_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         result = {
-            "mode": "local_tfidf",
+            "mode": "ears_hybrid",
             "index_rebuilt": True,
             "index_path": str(self._index_path),
             "files": indexed_files,
             "chunks": len(chunks),
             "truncated_files": len(files) > max_files,
+            "changed_files": len(changed_paths),
         }
+        # Optional sub-index failures are isolated: BM25 remains usable.
+        try:
+            from app.rag.symbol_index import SymbolIndex
+
+            result["symbols"] = SymbolIndex(self.symbol_path).build(root, list(file_map.values()), changed_paths if incremental else None)
+        except Exception as exc:
+            logger.warning("Symbol index build skipped: %s", exc)
+        try:
+            from app.rag.embedding_index import EmbeddingIndex
+
+            embedding = EmbeddingIndex(self.embedding_path, self._embedding_client)
+            result["vectors"] = embedding.build(chunks, changed_paths if incremental else None)
+        except Exception as exc:
+            logger.warning("Embedding index build skipped: %s", exc)
+        try:
+            from app.rag.engine.scene_graph_index import SceneGraphIndex
+            from app.rag.engine.signal_graph_index import SignalGraphIndex
+
+            result["scene_graph"] = SceneGraphIndex(self.scene_graph_path).build(root, list(file_map.values()), incremental)
+            result["signals"] = SignalGraphIndex(self.signal_graph_path).build(root, list(file_map.values()), incremental)
+        except Exception as exc:
+            logger.warning("Engine graph build skipped: %s", exc)
+        if self._asset_enabled:
+            try:
+                from app.rag.engine.asset_index import AssetIndex
+
+                result["assets"] = AssetIndex(self.asset_index_path, self._asset_llm_client, enabled=True).build(root, incremental=incremental)
+            except Exception as exc:
+                logger.warning("Asset index build skipped: %s", exc)
         logger.info(
             "RAG index build complete path=%s files=%d chunks=%d truncated=%s",
             self._index_path,
@@ -249,6 +345,22 @@ class CodebaseIndex:
         chunks = data.get("chunks", [])
         if not isinstance(chunks, list):
             raise ValueError("索引 chunks 格式不正确")
+        # Public API remains a dict with legacy fields, while ranking now uses EARS.
+        try:
+            unified = self.hybrid_search(query, max_results=max_results)
+            if include != "**/*":
+                unified = [item for item in unified if fnmatch(item.file_path, include)]
+            logger.info("RAG search complete mode=ears_hybrid results=%d", len(unified))
+            return {
+                "query": query,
+                "mode": "ears_hybrid",
+                "index_path": str(self._index_path),
+                "results": [item.to_dict(legacy=True) for item in unified[:max_results]],
+                "truncated": len(unified) >= max_results,
+                "note": "这是索引片段视图；写文件前必须用 read_file 读取完整文件。",
+            }
+        except Exception as exc:
+            logger.warning("EARS search degraded to keyword index: %s", exc)
         results = self._rank_chunks(query_counts, chunks, include, max_results)
         logger.info(
             "RAG search complete mode=index path=%s chunks=%d results=%d",
@@ -309,17 +421,85 @@ class CodebaseIndex:
             "note": "未找到持久化索引，已即时扫描；可运行 /index rebuild 提升后续检索速度。",
         }
 
-    def _load(self) -> dict[str, Any]:
+    def _load(self, allow_legacy: bool = False) -> dict[str, Any]:
         """读取并校验索引文件。"""
         try:
             data = json.loads(self._index_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("RAG index load failed path=%s error=%s", self._index_path, exc)
             raise ValueError(f"无法读取 RAG 索引：{exc}") from exc
-        if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+        valid_versions = {SCHEMA_VERSION, 1} if allow_legacy else {SCHEMA_VERSION}
+        if not isinstance(data, dict) or data.get("schema_version") not in valid_versions:
             logger.warning("RAG index schema mismatch path=%s", self._index_path)
             raise ValueError("RAG 索引 schema_version 不匹配，请重建索引")
         return data
+
+    def keyword_results(self, query: str, limit: int = 10) -> list[Any]:
+        """返回统一 SearchResult 格式的 BM25/TF-IDF 结果。"""
+        from app.rag.models import SearchResult as UnifiedResult
+
+        query_counts = token_counts(query)
+        if not query_counts or not self._index_path.exists():
+            return []
+        data = self._load()
+        ranked = self._rank_chunks(query_counts, data.get("chunks", []), "**/*", limit)
+        maximum = max((item.score for item in ranked), default=1.0) or 1.0
+        return [UnifiedResult(
+            id=f"chunk:{item.path}:{item.start_line}", content=item.snippet, source="kw",
+            score=item.score / maximum, file_path=item.path, span=(item.start_line, item.end_line),
+        ) for item in ranked]
+
+    def hybrid_search(self, query: str, max_results: int = 4, router_enabled: bool = True) -> list[Any]:
+        """执行完整 EARS 管线并返回统一结果。"""
+        from app.rag.embedding_index import EmbeddingIndex
+        from app.rag.engine.asset_index import AssetIndex
+        from app.rag.engine.scene_graph_index import SceneGraphIndex
+        from app.rag.engine.signal_graph_index import SignalGraphIndex
+        from app.rag.graph_fusion import GraphFusion, merge_graphs
+        from app.rag.graph_reranker import GraphAwareReranker
+        from app.rag.hybrid import HybridRetriever
+        from app.rag.query_router import QueryRouter
+        from app.rag.symbol_index import SymbolIndex
+
+        embedding = EmbeddingIndex(self.embedding_path, self._embedding_client)
+        symbols = SymbolIndex(self.symbol_path)
+        scene = SceneGraphIndex(self.scene_graph_path)
+        scene.load()
+        signal = SignalGraphIndex(self.signal_graph_path)
+        signal.load()
+        asset = AssetIndex(
+            self.asset_index_path, self._asset_llm_client, enabled=self._asset_enabled
+        )
+        asset.load()
+        nodes, edges = merge_graphs(scene, signal, asset)
+        channels = {
+            "kw": lambda q, n: self.keyword_results(q, n),
+            "vec": embedding.search,
+            "sym": symbols.search,
+            "scene_graph": scene.search,
+            "signal_graph": signal.search,
+            "asset": asset.search,
+        }
+        return HybridRetriever(
+            channels,
+            router=QueryRouter(router_enabled and self._query_router_enabled),
+            graph_fusion=GraphFusion(
+                nodes,
+                edges,
+                max_depth=self._graph_max_depth,
+                max_neighbors=self._graph_max_neighbors,
+            ),
+            reranker=GraphAwareReranker(
+                model=self._rerank_model,
+                timeout_s=self._rerank_timeout_s,
+                top_n=10,
+                top_k=max_results,
+                alpha=0.7,
+                beta=0.2,
+                gamma=0.1,
+            ),
+            final_limit=max_results,
+        ).search(query)
 
     def _rank_chunks(
         self,

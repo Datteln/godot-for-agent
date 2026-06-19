@@ -8,3 +8,10 @@ Requires-Dist: uvicorn[standard]>=0.27
 Requires-Dist: pydantic>=2.6
 Requires-Dist: pydantic-settings>=2.2
 Requires-Dist: openai>=1.14
+Requires-Dist: faiss-cpu>=1.8
+Requires-Dist: numpy>=1.24
+Requires-Dist: sentence-transformers>=2.7
+Requires-Dist: tiktoken>=0.7
+Requires-Dist: tree-sitter>=0.21
+Requires-Dist: tree-sitter-gdscript
+Requires-Dist: tree-sitter-c-sharp

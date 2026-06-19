@@ -31,6 +31,7 @@ from app.llm.cache_manager import (
     compute_repo_fingerprint,
     compute_system_core_hash,
     compute_tool_schema_version,
+    read_graph_versions,
 )
 from app.llm.message_transformer import (
     CacheBreakpoint,
@@ -136,13 +137,22 @@ class CacheDecisionEngine:
         system_core_hash = compute_system_core_hash(messages)
         repo_fingerprint = await asyncio.to_thread(compute_repo_fingerprint, project_root)
         project_id = compute_project_id(project_root)
-        rag_fingerprint = compute_rag_fingerprint(rag_index_path)
+        query = ""
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                content = message.get("content", "")
+                query = content if isinstance(content, str) else str(content)
+                break
+        rag_fingerprint = compute_rag_fingerprint(rag_index_path, query)
+        scene_graph_version, asset_graph_version = read_graph_versions(rag_index_path)
         cache_key = build_cache_key(
             system_core_hash=system_core_hash,
             tool_schema_version=tool_schema_version,
             repo_fingerprint=repo_fingerprint,
             project_id=project_id,
             rag_fingerprint=rag_fingerprint,
+            scene_graph_version=scene_graph_version,
+            asset_graph_version=asset_graph_version,
         )
 
         track_key = (session_id, frame_id)

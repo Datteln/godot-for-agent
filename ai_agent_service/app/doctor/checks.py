@@ -53,6 +53,14 @@ def run_doctor(
         warnings.append("默认 OpenAI 端点未配置 API key")
     if not REGISTRY:
         warnings.append("没有注册任何工具")
+    if settings.embedding_provider == "openai" and not settings.embedding_api_key.get_secret_value():
+        warnings.append("Embedding 已选择 OpenAI，但未配置 embedding API key；将降级为 BM25")
+    if settings.asset_understanding_enabled and not (
+        settings.asset_understanding_model and settings.asset_understanding_endpoint
+    ):
+        warnings.append("资产语义理解已启用但 model/endpoint 不完整；仅使用确定性元数据索引")
+    if not settings.rerank_model:
+        warnings.append("未配置 rerank 模型；检索结果使用融合分数排序（跳过 cross-encoder 重排）")
     if not llm.supports_tool_calling:
         warnings.append("当前 LLM provider 未声明支持 tool calling")
     if skill_catalog is not None:

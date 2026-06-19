@@ -13,6 +13,13 @@ dependencies = [
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "openai>=1.14",
+    "faiss-cpu>=1.8",
+    "numpy>=1.24",
+    "sentence-transformers>=2.7",
+    "tiktoken>=0.7",
+    "tree-sitter>=0.21",
+    "tree-sitter-gdscript",
+    "tree-sitter-c-sharp",
 ]
 
 [tool.setuptools.packages.find]

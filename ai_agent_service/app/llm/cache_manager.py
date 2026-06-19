@@ -177,8 +177,8 @@ def compute_project_id(project_root: Path) -> str:
     return hashlib.sha256(str(project_root.resolve()).encode()).hexdigest()[:16]
 
 
-def compute_rag_fingerprint(rag_index_path: Path | None) -> str:
-    """对 RAG 索引文件的大小 + mtime 做指纹，索引缺失/不可读时返回 `no-rag`。
+def compute_rag_fingerprint(rag_index_path: Path | None, query: str = "") -> str:
+    """计算 deterministic(query + index_state + strategy_version) 指纹。
 
     RAG 索引重建后该指纹变化，使依赖检索结果的缓存段（L3）随之失效；只读
     元数据、不读取索引全文，避免大文件 I/O。
@@ -190,13 +190,70 @@ def compute_rag_fingerprint(rag_index_path: Path | None) -> str:
         指纹字符串，或 `no-rag`（无索引/不可读）。
     """
     if rag_index_path is None:
+        logger.debug("RAG fingerprint skipped reason=no_index_path")
         return "no-rag"
     try:
-        stat = rag_index_path.stat()
-    except OSError:
+        import json
+
+        raw = rag_index_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.debug("RAG fingerprint unavailable path=%s error=%s", rag_index_path, exc)
         return "no-rag"
-    digest = hashlib.sha256(f"{stat.st_size}:{int(stat.st_mtime)}".encode())
-    return digest.hexdigest()[:16]
+    try:
+        parsed = json.loads(raw)
+        data = parsed if isinstance(parsed, dict) else {}
+    except ValueError:
+        data = {}
+    file_states = data.get("file_states", {}) if isinstance(data, dict) else {}
+    if isinstance(file_states, dict) and file_states:
+        state = "\n".join(
+            f"{path}:{value.get('size', 0)}:{value.get('mtime_ns', 0)}"
+            for path, value in sorted(file_states.items()) if isinstance(value, dict)
+        )
+    else:
+        # Legacy indexes still use content rather than coarse filesystem metadata.
+        state = raw
+    from app.rag.hybrid import RETRIEVAL_STRATEGY_VERSION
+
+    normalized_query = " ".join(query.strip().lower().split())
+    index_state_hash = hashlib.sha256(
+        f"schema:{data.get('schema_version', 'unknown')}\n{state}".encode()
+    ).hexdigest()
+    digest = hashlib.sha256(
+        f"{normalized_query}\n{index_state_hash}\n{RETRIEVAL_STRATEGY_VERSION}".encode()
+    )
+    fingerprint = digest.hexdigest()[:16]
+    logger.debug(
+        "RAG fingerprint computed path=%s query_length=%d schema=%s strategy=%s fingerprint=%s",
+        rag_index_path,
+        len(query),
+        data.get("schema_version", "unknown"),
+        RETRIEVAL_STRATEGY_VERSION,
+        fingerprint,
+    )
+    return fingerprint
+
+
+def read_graph_versions(rag_index_path: Path | None) -> tuple[str, str]:
+    """读取确定性的 scene/asset graph 版本；未构建固定返回 none。"""
+    if rag_index_path is None:
+        return "none", "none"
+    import json
+
+    values: list[str] = []
+    for name in ("scene_graph.json", "asset_index.json"):
+        try:
+            data = json.loads((rag_index_path.parent / name).read_text(encoding="utf-8"))
+            values.append(str(data.get("version", "none")))
+        except (OSError, ValueError):
+            values.append("none")
+    logger.debug(
+        "RAG graph versions read directory=%s scene=%s asset=%s",
+        rag_index_path.parent,
+        values[0],
+        values[1],
+    )
+    return values[0], values[1]
 
 
 def build_cache_key(
@@ -206,6 +263,8 @@ def build_cache_key(
     repo_fingerprint: str,
     project_id: str = "",
     rag_fingerprint: str = "",
+    scene_graph_version: str = "none",
+    asset_graph_version: str = "none",
 ) -> str:
     """组合各稳定性指纹为单一缓存键，仅供本服务内部判断前缀是否变化。
 
@@ -220,6 +279,7 @@ def build_cache_key(
         各维度拼接后的 sha256 摘要；不会出现在发给 LLM 端点的请求体里。
     """
     material = ":".join(
-        [system_core_hash, tool_schema_version, repo_fingerprint, project_id, rag_fingerprint]
+        [system_core_hash, tool_schema_version, repo_fingerprint, project_id,
+         scene_graph_version, asset_graph_version, rag_fingerprint]
     )
     return hashlib.sha256(material.encode()).hexdigest()

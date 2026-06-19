@@ -3,6 +3,7 @@ extends RefCounted
 
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
+const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 
 const MAX_STALE_CONTENT_CHARS := 40000
 
@@ -25,12 +26,13 @@ static func read_file(input: Dictionary, file_state_cache: Node = null) -> Dicti
 	}
 
 
-static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: Node) -> Dictionary:
+static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: Node, editor_interface: EditorInterface = null) -> Dictionary:
 	var path := PathUtils.to_res_path(str(input.get("path", input.get("target_path", ""))))
 	var after_text := str(input.get("content", input.get("after_text", "")))
 	if path == "":
 		return {"ok": false, "message": "path is required"}
 	if not PathUtils.is_write_allowed(path):
+		FrontendLogger.warn(editor_interface, "ProgramTools", "Blocked write outside allowed paths.", {"path": path})
 		return {"ok": false, "message": "writing to this path is not allowed: " + path, "error_code": "write_denied"}
 
 	if file_state_cache != null and file_state_cache.is_stale(path):
@@ -42,6 +44,7 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 			if current_content.length() > MAX_STALE_CONTENT_CHARS:
 				current_content = current_content.left(MAX_STALE_CONTENT_CHARS) + "\n\n... (content truncated)"
 		file_state_cache.snapshot(path, true)
+		FrontendLogger.warn(editor_interface, "ProgramTools", "Rejected write of stale file.", {"path": path})
 		return {
 			"ok": false,
 			"message": (
@@ -71,6 +74,11 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 	if file_state_cache != null:
 		after_state = file_state_cache.snapshot(path, true)
 
+	FrontendLogger.info(editor_interface, "ProgramTools", "Wrote file.", {
+		"path": path,
+		"before_bytes": before_text.length(),
+		"after_bytes": after_text.length(),
+	})
 	return {
 		"ok": true,
 		"path": path,
@@ -109,14 +117,33 @@ static func run_tests(input: Dictionary, editor_interface: EditorInterface) -> D
 	var requested_timeout := int(input.get("timeout_ms", configured_timeout))
 	var timeout_ms = min(max(requested_timeout, 1000), max(configured_timeout, 1000))
 	var log_path := str(ConfigMigrations.get_value(editor_interface, log_key)).strip_edges()
+	FrontendLogger.info(editor_interface, "ProgramTools", "Launching runner process.", {
+		"kind": kind,
+		"executable": executable,
+		"timeout_ms": timeout_ms,
+	})
 	var run_result: Dictionary = await _run_process_with_timeout(executable, args, timeout_ms)
 	var output_text := _read_optional_log(log_path)
+	var status := str(run_result.get("status", "failed"))
+	if bool(run_result.get("ok", false)):
+		FrontendLogger.info(editor_interface, "ProgramTools", "Runner process completed.", {
+			"kind": kind,
+			"pid": run_result.get("pid", -1),
+			"exit_code": run_result.get("exit_code", null),
+		})
+	else:
+		FrontendLogger.warn(editor_interface, "ProgramTools", "Runner process did not complete successfully.", {
+			"kind": kind,
+			"status": status,
+			"pid": run_result.get("pid", -1),
+			"exit_code": run_result.get("exit_code", null),
+		})
 	return {
 		"ok": bool(run_result.get("ok", false)),
 		"kind": kind,
 		"pid": run_result.get("pid", -1),
 		"exit_code": run_result.get("exit_code", null),
-		"status": run_result.get("status", "failed"),
+		"status": status,
 		"executable_setting": executable_key,
 		"args_setting": args_key,
 		"log_setting": log_key,

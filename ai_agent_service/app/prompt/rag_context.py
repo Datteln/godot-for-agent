@@ -1,74 +1,102 @@
-"""RAG 临时上下文层（L3）内容组装（§16.1 / RAG 段缓存）。
-
-在用户提问到达时，用本地代码库索引检索与问题最相关的若干片段，拼成分层 prompt
-的 L3 临时上下文层。该层在一整轮 agent 循环（多次工具往返）内保持不变，因此为它
-单独标记 `cache_control` 后，循环内的多次 LLM 调用能复用同一段 L3 缓存前缀；下一轮
-用户提问换了检索结果时，L3 随 `rag_fingerprint`/内容变化而失效，而 L0/L2 仍命中。
-
-仅在持久化索引存在时检索（避免每条消息都触发整库即时扫描）；检索失败或无结果时
-返回空串，不产出 L3 层，行为与未启用 RAG 段时一致。
-"""
+"""EARS 动态上下文（L3）检索与 token-aware 打包。"""
 
 from __future__ import annotations
 
 import logging
+import re
+from collections import defaultdict
 
 from app.rag.index import CodebaseIndex
+from app.rag.models import SearchResult
 
 logger = logging.getLogger(__name__)
-
-# L3 RAG 段最多注入的片段数与字符上限：片段直接进入每轮固定输入，过多反而抬高
-# 成本、稀释注意力；超出预算即截断。
 _MAX_SNIPPETS = 4
-_MAX_CONTEXT_CHARS = 3000
-
+_TOKEN_BUDGET = 1500
 _HEADER = "相关代码片段（自动检索，仅供参考；写文件前必须用 read_file 读取完整文件）："
 
 
-def build_rag_context(index: CodebaseIndex, query: str) -> str:
-    """检索并组装 L3 RAG 上下文文本；无索引/无结果/出错时返回空串。
-
-    Args:
-        index: 本地代码库索引。
-        query: 当前用户提问（用于检索）。
-
-    Returns:
-        形如 "相关代码片段……\\n--- path:start-end ---\\n<snippet>" 的有界文本；
-        没有持久化索引或检索不到相关片段时为空串。
-    """
-    if not query.strip():
-        return ""
-    # 只用已构建的持久化索引，不为单条消息触发整库即时扫描（成本不可控）。
-    if not index.path.exists():
-        return ""
+def _tokens(text: str) -> int:
     try:
-        result = index.search(query, max_results=_MAX_SNIPPETS)
-    except Exception as exc:  # 检索是非关键增强，任何失败都不应阻断聊天主流程
-        logger.debug("RAG context retrieval skipped query_len=%d error=%s", len(query), exc)
-        return ""
+        import tiktoken  # type: ignore[import-not-found]
 
-    results = result.get("results", [])
-    if not isinstance(results, list) or not results:
-        return ""
+        return len(tiktoken.get_encoding("cl100k_base").encode(text))
+    except Exception:
+        # Unicode-aware local tokenizer is deterministic and more precise than a character ratio.
+        return len(re.findall(r"[A-Za-z_]\w*|[\u4e00-\u9fff]|[^\s]", text))
 
-    parts: list[str] = [_HEADER]
-    used = len(_HEADER)
-    for item in results[:_MAX_SNIPPETS]:
-        if not isinstance(item, dict):
+
+def _similarity(left: str, right: str) -> float:
+    a = set(re.findall(r"\w+", left.lower()))
+    b = set(re.findall(r"\w+", right.lower()))
+    return len(a & b) / len(a | b) if a or b else 1.0
+
+
+def pack_results(results: list[SearchResult], token_budget: int = _TOKEN_BUDGET) -> str:
+    """按相关度去重、按文件聚合，并严格遵守 token 预算。"""
+    selected: list[SearchResult] = []
+    for item in sorted(results, key=lambda value: (-value.score, value.id)):
+        if any(_similarity(item.content, previous.content) >= 0.85 for previous in selected):
             continue
-        path = str(item.get("path", ""))
-        start = item.get("start_line", "")
-        end = item.get("end_line", "")
-        snippet = str(item.get("snippet", "")).strip()
-        if not path or not snippet:
-            continue
-        block = f"\n--- {path}:{start}-{end} ---\n{snippet}"
-        if used + len(block) > _MAX_CONTEXT_CHARS:
+        selected.append(item)
+        if len(selected) >= _MAX_SNIPPETS:
             break
+    groups: defaultdict[str, list[SearchResult]] = defaultdict(list)
+    for item in selected:
+        groups[item.file_path or item.id].append(item)
+    ordered_groups = sorted(groups.items(), key=lambda pair: -max(item.score for item in pair[1]))
+    parts = [_HEADER]
+    used = _tokens(_HEADER)
+    for path, items in ordered_groups:
+        blocks = []
+        for item in sorted(items, key=lambda value: (-value.score, value.span[0])):
+            location = f"{item.span[0]}-{item.span[1]}" if item.span != (0, 0) else item.source
+            blocks.append(f"[{location}]\n{item.content.strip()}")
+        block = f"\n--- {path} ---\n" + "\n\n".join(blocks)
+        cost = _tokens(block)
+        if used + cost > token_budget:
+            continue
         parts.append(block)
-        used += len(block)
+        used += cost
+    packed = "\n".join(parts) if len(parts) > 1 else ""
+    logger.debug(
+        "RAG context packed candidates=%d selected=%d deduplicated=%d files=%d "
+        "tokens_used=%d token_budget=%d output_chars=%d",
+        len(results),
+        len(selected),
+        len(results) - len(selected),
+        max(0, len(parts) - 1),
+        used if packed else 0,
+        token_budget,
+        len(packed),
+    )
+    return packed
 
-    if len(parts) == 1:
+
+def build_rag_context(index: CodebaseIndex, query: str) -> str:
+    """保持原接口不变，内部切换为 Hybrid + Graph EARS 管线。"""
+    if not query.strip():
+        logger.debug("RAG context skipped reason=blank_query")
         return ""
-    logger.debug("RAG context layer built snippets=%d chars=%d", len(parts) - 1, used)
-    return "\n".join(parts)
+    if not index.path.exists():
+        logger.debug("RAG context skipped reason=index_missing path=%s", index.path)
+        return ""
+    retrieval_mode = "hybrid"
+    try:
+        results = index.hybrid_search(query, max_results=_MAX_SNIPPETS)
+    except Exception as exc:
+        logger.warning("Hybrid RAG failed; falling back to keyword search: %s", exc)
+        retrieval_mode = "keyword_fallback"
+        try:
+            results = index.keyword_results(query, _MAX_SNIPPETS)
+        except Exception as fallback_exc:
+            logger.warning("RAG keyword fallback failed error=%s", fallback_exc)
+            return ""
+    context = pack_results(results, token_budget=index.token_budget)
+    logger.info(
+        "RAG context build complete mode=%s query_length=%d results=%d context_chars=%d",
+        retrieval_mode,
+        len(query),
+        len(results),
+        len(context),
+    )
+    return context

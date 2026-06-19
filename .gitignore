@@ -405,3 +405,4 @@ ai_map_agent/
 **/*.gd.uid
 **/ai_agent_service.egg-info/
 .godot/
+*.md

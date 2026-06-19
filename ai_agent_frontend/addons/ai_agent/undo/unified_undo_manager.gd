@@ -1,6 +1,8 @@
 @tool
 extends Node
 
+const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
+
 var undo_redo: EditorUndoRedoManager
 var editor_interface: EditorInterface
 
@@ -121,9 +123,18 @@ func commit_batch() -> void:
 	if not _active:
 		return
 	if undo_redo == null or _ops.is_empty():
+		if undo_redo == null and not _ops.is_empty():
+			FrontendLogger.warn(editor_interface, "UndoManager", "Discarding batch: EditorUndoRedoManager unavailable.", {
+				"description": _batch_desc,
+				"ops": _ops.size(),
+			})
 		_clear()
 		return
 
+	FrontendLogger.info(editor_interface, "UndoManager", "Committing undo batch.", {
+		"description": _batch_desc,
+		"ops": _ops.size(),
+	})
 	undo_redo.create_action(_batch_desc)
 	for op in _ops:
 		match op.get("type", ""):
@@ -160,6 +171,10 @@ func commit_batch() -> void:
 func abort_batch() -> void:
 	if not _active:
 		return
+	FrontendLogger.warn(editor_interface, "UndoManager", "Aborting undo batch; reverting recorded ops.", {
+		"description": _batch_desc,
+		"ops": _ops.size(),
+	})
 	for index in range(_ops.size() - 1, -1, -1):
 		var op: Dictionary = _ops[index]
 		match op.get("type", ""):
@@ -173,39 +188,39 @@ func abort_batch() -> void:
 				if is_instance_valid(parent) and is_instance_valid(node):
 					_remove_node(parent, node)
 				else:
-					push_warning("Skipping undo of node_add: parent or node is no longer valid")
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of node_add: parent or node is no longer valid.")
 			"node_property":
 				var node: Object = op["node"]
 				if is_instance_valid(node) and node.has_method("set"):
 					node.set(op["property"], op["before"])
 				else:
-					push_warning("Skipping undo of node_property: node is no longer valid")
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of node_property: node is no longer valid.")
 			"tile_cells":
 				var layer: Object = op["layer"]
 				if is_instance_valid(layer) and layer.has_method("set_cell"):
 					_set_tile_cells(layer, op["before"])
 				else:
-					push_warning("Skipping undo of tile_cells: layer is no longer valid")
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of tile_cells: layer is no longer valid.")
 			"node_remove":
 				var parent: Object = op["parent"]
 				var node: Object = op["node"]
 				if is_instance_valid(parent) and is_instance_valid(node):
 					_add_node_at(parent, node, op["owner"], op["index"])
 				else:
-					push_warning("Skipping undo of node_remove: parent or node is no longer valid")
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of node_remove: parent or node is no longer valid.")
 			"node_reparent":
 				var node: Object = op["node"]
 				var old_parent: Object = op["old_parent"]
 				if is_instance_valid(node) and is_instance_valid(old_parent):
 					_reparent_node_to(node, old_parent, op["old_index"], op["owner"])
 				else:
-					push_warning("Skipping undo of node_reparent: node or old parent is no longer valid")
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of node_reparent: node or old parent is no longer valid.")
 			"node_rename":
 				var node: Object = op["node"]
 				if is_instance_valid(node):
 					_rename_node(node, op["before"])
 				else:
-					push_warning("Skipping undo of node_rename: node is no longer valid")
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of node_rename: node is no longer valid.")
 	_clear()
 
 
@@ -221,7 +236,7 @@ func _write_file_text(path: String, text: String) -> void:
 	DirAccess.make_dir_recursive_absolute(dir_path)
 	var file := FileAccess.open(absolute, FileAccess.WRITE)
 	if file == null:
-		push_error("Failed to write file: " + path)
+		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file.", {"path": path})
 		return
 	file.store_string(text)
 	file.close()
@@ -238,7 +253,7 @@ func _write_file_bytes(path: String, bytes: PackedByteArray, exists: bool) -> vo
 	DirAccess.make_dir_recursive_absolute(absolute.get_base_dir())
 	var file := FileAccess.open(absolute, FileAccess.WRITE)
 	if file == null:
-		push_error("Failed to write file: " + path)
+		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file.", {"path": path})
 		return
 	file.store_buffer(bytes)
 	file.close()

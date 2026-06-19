@@ -124,6 +124,26 @@ class AppSettings(BaseSettings):
         default_factory=lambda: Path(".ai_agent_service") / "rag_index.json",
         description="本地 RAG 检索索引路径；仅保存工程内代码片段 token，不包含密钥。",
     )
+    embedding_provider: Literal["disabled", "openai", "local", "bge-m3"] = Field(
+        default="disabled", description="Embedding 提供方；disabled 时静默降级为 BM25。"
+    )
+    embedding_model: str = Field(default="text-embedding-3-small")
+    embedding_endpoint: str = Field(default="https://api.openai.com/v1")
+    embedding_api_key: SecretStr = Field(default=SecretStr(""))
+    embedding_timeout_s: float = Field(default=3.0, ge=0.1, le=3.0)
+    embedding_retries: int = Field(default=1, ge=0, le=2)
+    rerank_model: str = Field(default="", description="空值表示跳过 cross-encoder 重排。")
+    rerank_timeout_s: float = Field(default=2.0, ge=0.1, le=2.0)
+    rag_query_router_enabled: bool = Field(default=True)
+    rag_token_budget: int = Field(default=1500, ge=128)
+    graph_max_depth: int = Field(default=2, ge=0, le=8)
+    graph_max_neighbors: int = Field(default=5, ge=1, le=100)
+    asset_understanding_enabled: bool = Field(default=False)
+    asset_understanding_model: str = Field(default="")
+    asset_understanding_endpoint: str = Field(default="")
+    asset_understanding_api_key: SecretStr = Field(default=SecretStr(""))
+    asset_understanding_timeout_s: float = Field(default=10.0, ge=0.1)
+    asset_understanding_max_tokens: int = Field(default=500, ge=1)
     output_styles_dir: Path = Field(
         default_factory=lambda: Path(".ai_agent") / "output_styles",
         description="项目级 OutputStyle 目录；未信任工程默认不启用项目级样式。",

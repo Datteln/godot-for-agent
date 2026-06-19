@@ -11,6 +11,27 @@ const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd
 const PORT_MIN := 49152
 const PORT_MAX := 65535
 
+const RAG_ENV_SETTINGS := {
+	"AI_AGENT_EMBEDDING_PROVIDER": "ai_agent/embedding_provider",
+	"AI_AGENT_EMBEDDING_MODEL": "ai_agent/embedding_model",
+	"AI_AGENT_EMBEDDING_ENDPOINT": "ai_agent/embedding_endpoint",
+	"AI_AGENT_EMBEDDING_API_KEY": "ai_agent/embedding_api_key",
+	"AI_AGENT_EMBEDDING_TIMEOUT_S": "ai_agent/embedding_timeout_s",
+	"AI_AGENT_EMBEDDING_RETRIES": "ai_agent/embedding_retries",
+	"AI_AGENT_RERANK_MODEL": "ai_agent/rerank_model",
+	"AI_AGENT_RERANK_TIMEOUT_S": "ai_agent/rerank_timeout_s",
+	"AI_AGENT_RAG_QUERY_ROUTER_ENABLED": "ai_agent/rag_query_router_enabled",
+	"AI_AGENT_RAG_TOKEN_BUDGET": "ai_agent/rag_token_budget",
+	"AI_AGENT_GRAPH_MAX_DEPTH": "ai_agent/graph_max_depth",
+	"AI_AGENT_GRAPH_MAX_NEIGHBORS": "ai_agent/graph_max_neighbors",
+	"AI_AGENT_ASSET_UNDERSTANDING_ENABLED": "ai_agent/asset_understanding_enabled",
+	"AI_AGENT_ASSET_UNDERSTANDING_MODEL": "ai_agent/asset_understanding_model",
+	"AI_AGENT_ASSET_UNDERSTANDING_ENDPOINT": "ai_agent/asset_understanding_endpoint",
+	"AI_AGENT_ASSET_UNDERSTANDING_API_KEY": "ai_agent/asset_understanding_api_key",
+	"AI_AGENT_ASSET_UNDERSTANDING_TIMEOUT_S": "ai_agent/asset_understanding_timeout_s",
+	"AI_AGENT_ASSET_UNDERSTANDING_MAX_TOKENS": "ai_agent/asset_understanding_max_tokens"
+}
+
 var editor_interface: EditorInterface
 var token: String = ""
 var base_url: String = ""
@@ -93,10 +114,12 @@ func _start_python_service() -> void:
 	var old_llm_advisor_model := OS.get_environment("AI_AGENT_LLM_ADVISOR_MODEL")
 	var old_llm_fallback_model := OS.get_environment("AI_AGENT_LLM_FALLBACK_MODEL")
 	var old_llm_timeout := OS.get_environment("AI_AGENT_LLM_REQUEST_TIMEOUT_S")
+	var old_rag_environment := _capture_environment(RAG_ENV_SETTINGS.keys())
 	OS.set_environment("AI_AGENT_PROJECT_ROOT", ProjectSettings.globalize_path("res://"))
 	OS.set_environment("AI_AGENT_PORT", _port_from_url(base_url))
 	OS.set_environment("PYTHONPATH", module_dir + _path_separator() + old_pythonpath)
 	_apply_llm_environment()
+	_apply_rag_environment()
 	# token 经 stdin 首行传入（--token-stdin），不放命令行/环境变量——避免出现在系统进程列表。
 	var args := ["-m", "app.main", "--token-stdin"]
 	FrontendLogger.info(editor_interface, "Service", "Launching Python service.", {
@@ -118,6 +141,7 @@ func _start_python_service() -> void:
 	OS.set_environment("AI_AGENT_LLM_ADVISOR_MODEL", old_llm_advisor_model)
 	OS.set_environment("AI_AGENT_LLM_FALLBACK_MODEL", old_llm_fallback_model)
 	OS.set_environment("AI_AGENT_LLM_REQUEST_TIMEOUT_S", old_llm_timeout)
+	_restore_environment(old_rag_environment)
 
 	if pipe.is_empty() or int(pipe.get("pid", -1)) <= 0:
 		FrontendLogger.error(editor_interface, "Service", "Failed to create Python service process.", {
@@ -169,6 +193,23 @@ func _apply_llm_environment() -> void:
 	_set_env_from_setting("AI_AGENT_LLM_ADVISOR_MODEL", "ai_agent/llm_advisor_model")
 	_set_env_from_setting("AI_AGENT_LLM_FALLBACK_MODEL", "ai_agent/llm_fallback_model")
 	_set_env_from_setting("AI_AGENT_LLM_REQUEST_TIMEOUT_S", "ai_agent/llm_request_timeout_s")
+
+
+func _apply_rag_environment() -> void:
+	for env_key in RAG_ENV_SETTINGS:
+		_set_env_from_setting(str(env_key), str(RAG_ENV_SETTINGS[env_key]))
+
+
+func _capture_environment(keys: Array) -> Dictionary:
+	var snapshot := {}
+	for key in keys:
+		snapshot[str(key)] = OS.get_environment(str(key))
+	return snapshot
+
+
+func _restore_environment(snapshot: Dictionary) -> void:
+	for key in snapshot:
+		OS.set_environment(str(key), str(snapshot[key]))
 
 
 func _set_env_from_setting(env_key: String, setting_key: String) -> void:
