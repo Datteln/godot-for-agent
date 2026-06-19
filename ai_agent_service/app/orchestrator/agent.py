@@ -28,7 +28,9 @@ from typing import Any, Literal, cast
 
 from app.agents.bundled import get_agent
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
-from app.llm.provider import LLMError, LLMProvider
+from app.llm.cache_decision_engine import CacheDecision, CacheDecisionEngine
+from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnapshot
+from app.llm.provider import AssistantTurn, LLMError, LLMProvider
 from app.permissions.engine import PermissionContext, SessionAllowGrant, check
 from app.security.settings import SecuritySettings
 from app.sessions.store import Session
@@ -1072,6 +1074,74 @@ def _delta_callback(
     return _on_delta
 
 
+def _record_cache_metrics(
+    cache_metrics: CacheMetricsCollector | None,
+    decision: CacheDecision | None,
+    turn: AssistantTurn,
+) -> None:
+    """把本轮缓存决策与实际命中结果写入观测层（§16.1 非功能需求：仅日志/监控）。
+
+    Args:
+        cache_metrics: 进程内缓存指标聚合器；为 None 时不记录。
+        decision: 本轮的 `CacheDecisionEngine.decide()` 结果；为 None 表示
+            本次请求未启用缓存决策（如 provider 不支持显式缓存）。
+        turn: 本轮 `LLMProvider.chat()` 的返回。
+    """
+    if cache_metrics is None or decision is None:
+        return
+    total = turn.total_input_tokens or 0
+    cached = turn.cached_tokens or 0
+    hit_ratio = cached / total if total > 0 else 0.0
+    cache_metrics.record(
+        CacheMetricsSnapshot(
+            cache_key=decision.cache_key,
+            repo_fingerprint=decision.repo_fingerprint,
+            tool_schema_version=decision.tool_schema_version,
+            cached_tokens=cached,
+            total_tokens=total,
+            hit_ratio=hit_ratio,
+            prefix_segments_used=decision.segments_used,
+            cache_enabled=decision.enabled,
+        )
+    )
+
+
+def _emit_cache_hit_event(
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+    frame: Frame,
+    loop: int,
+    turn: AssistantTurn,
+) -> None:
+    """命中上下文缓存时发出 `cache_hit` 事件（§16.1）。
+
+    仅在 usage 报告了命中缓存 token（`cached_tokens > 0`）且总输入 token 可用时
+    发出；未命中则静默，避免在消息列表里堆噪音。不附带"节省比例"——百炼的
+    实际折扣因命中类型（隐式/显式）与路由到的具体模型而异，usage 字段无法
+    反推具体属于哪种，硬编码一个比例只会是误导性的假精度。
+
+    Args:
+        event_callback: 编排事件回调；为 None 时不产生事件。
+        frame: 本轮所属的 agent 帧。
+        loop: 本轮在 `run_turn` 中的循环序号（从 1 开始）。
+        turn: 本轮 `LLMProvider.chat()` 的返回，携带 `cached_tokens`/
+            `total_input_tokens`/`cache_creation_tokens`。
+    """
+    cached = turn.cached_tokens
+    total = turn.total_input_tokens
+    if event_callback is None or not cached or cached <= 0 or not total or total <= 0:
+        return
+    event_callback(
+        "cache_hit",
+        {
+            "frame_id": frame.id,
+            "loop": loop,
+            "cached_tokens": cached,
+            "total_input_tokens": total,
+            "cache_creation_tokens": turn.cache_creation_tokens or 0,
+        },
+    )
+
+
 def _fallback_callback(
     event_callback: Callable[[str, dict[str, Any]], None] | None,
     frame_id: str,
@@ -1120,6 +1190,8 @@ async def run_turn(
     model_override: str | None = None,
     thinking_budget_selector: Callable[[EffortLevel], int | None] | None = None,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    cache_engine: CacheDecisionEngine | None = None,
+    cache_metrics: CacheMetricsCollector | None = None,
 ) -> StepResult:
     """驱动当前会话的活跃帧完成一轮（或多轮）编排循环。
 
@@ -1130,6 +1202,9 @@ async def run_turn(
         tool_ctx: server 工具执行上下文。
         max_turns: 本次调用允许驱动的最大 LLM 往返轮数，超出则返回
             `ErrorResult`，避免死循环消耗配额。
+        cache_engine: 上下文缓存决策引擎（§16.1）；为 None 或
+            `llm.supports_prompt_cache=False` 时不标记任何显式缓存断点。
+        cache_metrics: 缓存命中率观测聚合器；为 None 时不记录指标。
 
     Returns:
         `ToolCallsResult`（需前端执行/确认）、`FinalResult`（已得到最终回复）
@@ -1210,6 +1285,17 @@ async def run_turn(
                         "model": resolved_model,
                     },
                 )
+            cache_decision: CacheDecision | None = None
+            if cache_engine is not None and llm.supports_prompt_cache:
+                cache_decision = await cache_engine.decide(
+                    session_id=session.session_id,
+                    frame_id=frame.id,
+                    messages=frame.messages,
+                    tools=visible_tools,
+                    project_root=tool_ctx.security.project_root,
+                    rag_index_path=tool_ctx.rag_index_path,
+                )
+
             turn = await llm.chat(
                 frame.messages,
                 visible_tools,
@@ -1229,12 +1315,17 @@ async def run_turn(
                     ),
                 ),
                 on_fallback=_fallback_callback(event_callback, frame.id, loop_index + 1),
+                cache_breakpoints=(
+                    cache_decision.breakpoints if cache_decision is not None and cache_decision.enabled else None
+                ),
             )
         except LLMError as exc:
             logger.warning("Agent LLM step failed session=%s frame=%s error=%s", session.session_id, frame.id, exc)
             return ErrorResult(text=str(exc))
 
         frame.messages.append(turn.raw_message)
+        _record_cache_metrics(cache_metrics, cache_decision, turn)
+        _emit_cache_hit_event(event_callback, frame, loop_index + 1, turn)
 
         if not turn.tool_calls:
             result = _finish_frame(session, turn.content or "", agent_prompt_factory, event_callback)

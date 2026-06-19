@@ -14,6 +14,8 @@ from typing import Any, Protocol
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
+from app.llm.message_transformer import CacheBreakpoint, inject_cache_breakpoints
+
 logger = logging.getLogger(__name__)
 
 # 流式增量回调：`(kind, accumulated_text)`，`kind` 为 `"content"`（回复正文）
@@ -66,7 +68,33 @@ class AssistantTurn:
     finish_reason: str | None = None
     reasoning: str | None = None
     reasoning_tokens: int | None = None
+    cached_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    total_input_tokens: int | None = None
     model: str = ""
+
+
+def _is_valid_token_count(value: Any) -> bool:
+    """判断 usage 字段是否为可用的非负 token 计数（排除 bool）。"""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _max_token_count(current: int | None, candidate: int | None) -> int | None:
+    """取两个可空 token 计数中的较大者，用于跨 chunk 累积 usage（None 视为缺省）。"""
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    return max(current, candidate)
+
+
+def _usage_detail_value(details: Any, key: str) -> Any:
+    """从 usage 的明细子对象中取字段，兼容对象属性与 dict 两种返回形态。"""
+    if details is None:
+        return None
+    if isinstance(details, dict):
+        return details.get(key)
+    return getattr(details, key, None)
 
 
 def _reasoning_tokens_from_usage(usage: Any) -> int | None:
@@ -74,10 +102,32 @@ def _reasoning_tokens_from_usage(usage: Any) -> int | None:
     if usage is None:
         return None
     details = getattr(usage, "completion_tokens_details", None)
-    value = getattr(details, "reasoning_tokens", None)
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-        return value
-    return None
+    value = _usage_detail_value(details, "reasoning_tokens")
+    return value if _is_valid_token_count(value) else None
+
+
+def _cache_tokens_from_usage(usage: Any) -> tuple[int | None, int | None, int | None]:
+    """从 usage 中提取 `(命中缓存 token 数, 总输入 token 数, 新建缓存 token 数)`（§16.1）。
+
+    命中数优先取 `prompt_tokens_details.cached_tokens`（OpenAI/百炼缓存命中的
+    标准位置），回退到 usage 顶层的 `cached_tokens`；新建缓存数取
+    `prompt_tokens_details.cache_creation_input_tokens`（百炼显式缓存命中
+    `cache_control` 但前缀尚未被缓存时，本次按 125% 价格创建新缓存块的 token
+    数）；总输入数取 `prompt_tokens`。任一字段缺失或非法时对应位置返回 None。
+    """
+    if usage is None:
+        return None, None, None
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = _usage_detail_value(details, "cached_tokens")
+    if not _is_valid_token_count(cached):
+        cached = getattr(usage, "cached_tokens", None)
+    cache_creation = _usage_detail_value(details, "cache_creation_input_tokens")
+    total = getattr(usage, "prompt_tokens", None)
+    return (
+        cached if _is_valid_token_count(cached) else None,
+        total if _is_valid_token_count(total) else None,
+        cache_creation if _is_valid_token_count(cache_creation) else None,
+    )
 
 
 class LLMError(Exception):
@@ -106,6 +156,7 @@ class LLMProvider(Protocol):
         thinking_budget: int = -1,
         on_delta: DeltaCallback | None = None,
         on_fallback: FallbackCallback | None = None,
+        cache_breakpoints: list[CacheBreakpoint] | None = None,
     ) -> AssistantTurn:
         """发起一次对话补全请求。
 
@@ -124,6 +175,8 @@ class LLMProvider(Protocol):
                 usage 可用时传入，否则为 None。
             on_fallback: 降级回调，主模型失败、即将用 `fallback_model`
                 重试前触发一次；为 None 时不通知。
+            cache_breakpoints: 待标记 `cache_control` 的消息下标（§16.1），
+                不支持显式缓存的 provider 可忽略该参数。
 
         Returns:
             模型本轮的回应。
@@ -186,8 +239,9 @@ class OpenAICompatibleProvider:
 
     @property
     def supports_prompt_cache(self) -> bool:
-        """M0 不做缓存前缀治理，统一报告不支持（§16.1 留待 M1+）。"""
-        return False
+        """启用上下文缓存（§16.1）：隐式缓存由端点自动命中稳定前缀，显式缓存由
+        `_chat_once` 在前缀足够长时注入 `cache_control` 断点。"""
+        return True
 
     async def chat(
         self,
@@ -198,6 +252,7 @@ class OpenAICompatibleProvider:
         thinking_budget: int = -1,
         on_delta: DeltaCallback | None = None,
         on_fallback: FallbackCallback | None = None,
+        cache_breakpoints: list[CacheBreakpoint] | None = None,
     ) -> AssistantTurn:
         """调用 `chat.completions.create` 并转换为 `AssistantTurn`。
 
@@ -213,6 +268,9 @@ class OpenAICompatibleProvider:
             on_delta: 流式增量回调，参见 `LLMProvider.chat`。
             on_fallback: 降级回调，参见 `LLMProvider.chat`；在实际发起
                 降级请求前调用一次，便于编排层把这次模型切换暴露为事件。
+            cache_breakpoints: 待标记 `cache_control` 的消息下标（§16.1），
+                由编排层的 `CacheDecisionEngine` 决定；为 None 或空列表时不
+                注入任何缓存标记。
 
         Returns:
             模型本轮的回应。
@@ -222,7 +280,9 @@ class OpenAICompatibleProvider:
         """
         resolved_model = model or self._default_model
         try:
-            return await self._chat_once(messages, tools, resolved_model, temperature, thinking_budget, on_delta)
+            return await self._chat_once(
+                messages, tools, resolved_model, temperature, thinking_budget, on_delta, cache_breakpoints
+            )
         except LLMError as exc:
             if self._fallback_model is None or self._fallback_model == resolved_model:
                 logger.warning(
@@ -236,7 +296,9 @@ class OpenAICompatibleProvider:
             )
             if on_fallback is not None:
                 on_fallback(resolved_model, self._fallback_model)
-            return await self._chat_once(messages, tools, self._fallback_model, temperature, thinking_budget, on_delta)
+            return await self._chat_once(
+                messages, tools, self._fallback_model, temperature, thinking_budget, on_delta, cache_breakpoints
+            )
 
     async def _chat_once(
         self,
@@ -246,6 +308,7 @@ class OpenAICompatibleProvider:
         temperature: float | None,
         thinking_budget: int = -1,
         on_delta: DeltaCallback | None = None,
+        cache_breakpoints: list[CacheBreakpoint] | None = None,
     ) -> AssistantTurn:
         """发起一次流式 `chat.completions.create` 请求并转换为 `AssistantTurn`。
 
@@ -256,6 +319,8 @@ class OpenAICompatibleProvider:
             temperature: 采样温度；为 None 时使用端点默认值。
             thinking_budget: 思考 token 预算，参见 `LLMProvider.chat`。
             on_delta: 流式增量回调，参见 `LLMProvider.chat`。
+            cache_breakpoints: 待标记 `cache_control` 的消息下标，参见
+                `LLMProvider.chat`。
 
         Returns:
             模型本轮的回应。
@@ -270,6 +335,18 @@ class OpenAICompatibleProvider:
         else:
             extra_body = {"enable_thinking": True}
 
+        # 显式上下文缓存：断点位置由编排层的 CacheDecisionEngine 决定，这里只
+        # 负责把标记写进请求体；标记加在消息副本上，不污染调用方持有的
+        # `frame.messages`（§16.1）。
+        request_messages = messages
+        if cache_breakpoints:
+            request_messages = inject_cache_breakpoints(messages, cache_breakpoints)
+            logger.info(
+                "Explicit prompt cache markers injected count=%d segments=%s",
+                len(cache_breakpoints),
+                [bp.segment for bp in cache_breakpoints],
+            )
+
         logger.info(
             "LLM chat request messages=%d tools=%d temperature=%s thinking_budget=%s",
             len(messages),
@@ -280,7 +357,7 @@ class OpenAICompatibleProvider:
         try:
             stream = await self._client.chat.completions.create(
                 model=model,
-                messages=messages,  # type: ignore[arg-type]
+                messages=request_messages,  # type: ignore[arg-type]
                 tools=tools or None,  # type: ignore[arg-type]
                 tool_choice="auto" if tools else None,
                 temperature=temperature,
@@ -306,12 +383,23 @@ class OpenAICompatibleProvider:
         last_content_emit = 0.0
         last_reasoning_emit = 0.0
         reasoning_tokens: int | None = None
+        cached_tokens: int | None = None
+        cache_creation_tokens: int | None = None
+        total_input_tokens: int | None = None
 
         try:
             async for chunk in stream:
-                chunk_reasoning_tokens = _reasoning_tokens_from_usage(getattr(chunk, "usage", None))
+                chunk_usage = getattr(chunk, "usage", None)
+                chunk_reasoning_tokens = _reasoning_tokens_from_usage(chunk_usage)
                 if chunk_reasoning_tokens is not None:
                     reasoning_tokens = chunk_reasoning_tokens
+                # usage 在流式响应里通常只出现在末尾一个 chunk，但部分端点会在
+                # 多个 chunk 重复/分段报告；用 max 累积而非直接覆盖，避免后到的
+                # 0/缺省值把先前已读到的真实计数清掉。
+                chunk_cached, chunk_total, chunk_cache_creation = _cache_tokens_from_usage(chunk_usage)
+                cached_tokens = _max_token_count(cached_tokens, chunk_cached)
+                total_input_tokens = _max_token_count(total_input_tokens, chunk_total)
+                cache_creation_tokens = _max_token_count(cache_creation_tokens, chunk_cache_creation)
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
@@ -406,5 +494,8 @@ class OpenAICompatibleProvider:
             finish_reason=finish_reason,
             reasoning=reasoning,
             reasoning_tokens=reasoning_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            total_input_tokens=total_input_tokens,
             model=model,
         )

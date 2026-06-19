@@ -53,6 +53,8 @@ from app.api.schemas import (
 )
 from app.config import AppSettings
 from app.events.store import Event, EventStore
+from app.llm.cache_decision_engine import CacheDecisionEngine
+from app.llm.cache_observability import CacheMetricsCollector
 from app.llm.provider import LLMError, LLMProvider
 from app.orchestrator.agent import (
     EFFORT_TEMPERATURE,
@@ -65,7 +67,10 @@ from app.orchestrator.agent import (
 )
 from app.output_styles.catalog import OutputStyleCatalog
 from app.permissions.engine import make_session_allow_grant
-from app.prompt.builder import build_system_prompt
+from app.prompt.builder import build_layered_system_prompt, build_system_prompt
+from app.prompt.project_context import build_project_context
+from app.prompt.rag_context import build_rag_context
+from app.rag.index import CodebaseIndex
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import SecuritySettings, security_settings_from_app
 from app.sessions.store import Session, SessionStore
@@ -1406,6 +1411,8 @@ class QueryEngine:
         output_style_catalog: OutputStyleCatalog | None = None,
         event_store: EventStore | None = None,
         recovery_store: RecoveryPointerStore | None = None,
+        cache_engine: CacheDecisionEngine | None = None,
+        cache_metrics: CacheMetricsCollector | None = None,
     ) -> None:
         """构造 QueryEngine。
 
@@ -1414,6 +1421,8 @@ class QueryEngine:
             session_store: 会话持久化存储。
             llm: 大模型 provider。
             base_security: 启动时解析出的安全边界；缺省时从 settings 构造。
+            cache_engine: 上下文缓存决策引擎（§16.1）；缺省时构造新实例。
+            cache_metrics: 缓存命中率观测聚合器；缺省时构造新实例。
         """
         self._settings = settings
         self._store = session_store
@@ -1423,6 +1432,8 @@ class QueryEngine:
         self._output_styles = output_style_catalog
         self._events = event_store
         self._recovery = recovery_store
+        self._cache_engine = cache_engine or CacheDecisionEngine()
+        self._cache_metrics = cache_metrics or CacheMetricsCollector()
         # session_id -> 该会话当前所有"正在处理 /chat 请求"的任务集合（通常只有
         # 一个，但用户可能在前一个请求仍卡在 per-session 锁等待时就发出下一条
         # 消息/中断，short-lived 地出现多个；用 set 而不是单个槎位，避免新任务
@@ -1553,19 +1564,37 @@ class QueryEngine:
                 request.output_style,
             )
 
+        # RAG 段（L3）：用户新提问时刷新检索结果，工具结果回填等同一轮的后续
+        # 请求里复用 `session.rag_context`，使该段在整轮 agent 循环内保持稳定、
+        # 可被缓存（§16.1 RAG 段缓存）。
+        if request.user_message is not None:
+            session.rag_context = await self._retrieve_rag_context(security, request.user_message)
+
         coordinator = get_agent("coordinator", self.available_tools)
-        prompt = build_system_prompt(
+        layered_prompt = build_layered_system_prompt(
             coordinator,
             self._skill_catalog,
             self._output_styles,
             session.output_style,
+            project_context=build_project_context(security.project_root),
+            rag_context=session.rag_context,
         )
-        coordinator = replace(coordinator, prompt=prompt)
+        # `agent.prompt` 保留拼平后的纯文本（供委派子帧继承等需要字符串的场景）；
+        # 根帧的 system 消息则写成分层 content-block 数组，使缓存层可为每层（L0
+        # 核心 / L2 项目上下文 / L3 RAG）独立标记 `cache_control`，实现多断点缓存
+        # （§16.1 / 文档 3.1）。content_blocks 不带 `cache_control`，标记在请求时
+        # 由 provider 按 CacheDecisionEngine 的断点注入，不写入会话历史。
+        coordinator = replace(coordinator, prompt=layered_prompt.to_text())
         session.ensure_root_frame(coordinator)
         root = session.agent_stack[0]
         root.agent = coordinator
         if root.messages and root.messages[0].get("role") == "system":
-            root.messages[0]["content"] = prompt
+            # 只有真正分层（≥2 层）时才写成 content-block 数组以启用多断点；单层
+            # （无项目文档/RAG，最常见）保持纯字符串，与改造前完全一致、零行为变化。
+            layers = layered_prompt.layers()
+            root.messages[0]["content"] = (
+                layered_prompt.to_content_blocks() if len(layers) >= 2 else layered_prompt.to_text()
+            )
 
         if has_results:
             self._emit(session.session_id, "tool_results_received", {"count": len(request.tool_results or [])})
@@ -1624,6 +1653,8 @@ class QueryEngine:
             model_override=model_override,
             thinking_budget_selector=self._thinking_budget_for_effort,
             event_callback=lambda event_type, payload: self._emit(session.session_id, event_type, payload),
+            cache_engine=self._cache_engine,
+            cache_metrics=self._cache_metrics,
         )
         response = _step_to_response(step)
         if isinstance(response, ChatToolCallsResponse):
@@ -2185,6 +2216,19 @@ class QueryEngine:
             "last_event_seq": seq,
             "pending_turn_id": session.pending_turn_id,
         }
+
+    async def _retrieve_rag_context(self, security: SecuritySettings, user_message: str) -> str:
+        """为当前用户提问检索 RAG 上下文（L3 段），在线程池里执行避免阻塞事件循环。
+
+        Args:
+            security: 当前请求的安全边界（限定检索范围与索引路径）。
+            user_message: 当前用户提问原文。
+
+        Returns:
+            组装好的 L3 RAG 上下文文本；无索引/无结果/出错时为空串。
+        """
+        index = CodebaseIndex(security, self._settings.resolved_rag_index_path())
+        return await asyncio.to_thread(build_rag_context, index, user_message)
 
     def _emit(self, session_id: str, event_type: str, payload: dict[str, Any]) -> int:
         """记录内部事件；未配置事件存储时返回 0。"""

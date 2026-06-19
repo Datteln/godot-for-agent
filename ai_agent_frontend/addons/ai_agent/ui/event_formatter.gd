@@ -66,6 +66,8 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 			return ""
 		"delegate_start":
 			return ui_text.get("event_delegate", "Task(%s)") % _format_delegate_args(payload)
+		"cache_hit":
+			return _format_cache_hit_event(payload, ui_text)
 		"agent_model_fallback":
 			return ui_text.get("event_model_fallback", "Model fallback: %s -> %s") % [
 				str(payload.get("primary_model", "")),
@@ -231,6 +233,35 @@ static func _format_delegate_args(payload: Dictionary) -> String:
 	if args_text != "":
 		return args_text
 	return str(payload.get("tool", "delegate"))
+
+
+## 命中上下文缓存时生成系统消息文本；未命中（cached <= 0）时返回空串以静默。
+## 不展示节省比例：百炼的实际折扣因命中类型（隐式/显式）与路由到的具体模型
+## 而异，事件 payload 无法反推具体属于哪种，展示一个猜测出来的百分比只会
+## 造成误导性的假精度，因此只展示 cached_tokens/total_input_tokens 这两个
+## 直接来自端点 usage 的真实数字。
+static func _format_cache_hit_event(payload: Dictionary, ui_text: Dictionary) -> String:
+	var cached := int(payload.get("cached_tokens", 0))
+	if cached <= 0:
+		return ""
+	var total := int(payload.get("total_input_tokens", 0))
+	return ui_text.get("event_cache_hit", "Context cache hit · cached %s / %s tokens") % [
+		_format_thousands(cached),
+		_format_thousands(total)
+	]
+
+
+## 把整数格式化为带千分位逗号的字符串（如 3840 -> "3,840"）。
+static func _format_thousands(value: int) -> String:
+	var digits := str(abs(value))
+	var grouped := ""
+	var count := 0
+	for index in range(digits.length() - 1, -1, -1):
+		grouped = digits[index] + grouped
+		count += 1
+		if count % 3 == 0 and index > 0:
+			grouped = "," + grouped
+	return ("-" + grouped) if value < 0 else grouped
 
 
 static func format_tool_call_header(call: Dictionary) -> String:

@@ -49,6 +49,9 @@ class Session:
             不存在活跃计划时为 None。
         verify_retry_count: 文件路径 → 该文件已触发的"校验失败-修复"重试次数，
             用于防止 Verify 与 LLM 修复之间死循环。
+        rag_context: 当前用户提问检索到的 RAG 上下文（分层 prompt 的 L3 段），
+            在新用户消息到达时刷新、在工具结果回填等同一轮的后续请求里复用，
+            使该段在整轮 agent 循环内保持稳定、可被缓存（§16.1 RAG 段缓存）。
     """
 
     session_id: str
@@ -67,6 +70,7 @@ class Session:
     verify_retry_count: dict[str, int] = field(default_factory=dict)
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
+    rag_context: str = ""
 
     def top_frame(self) -> Frame | None:
         """返回当前活跃帧（栈顶），栈为空时返回 None。
@@ -250,6 +254,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "verify_retry_count": session.verify_retry_count,
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
+        "rag_context": session.rag_context,
     }
 
 
@@ -301,6 +306,7 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         verify_retry_count=data.get("verify_retry_count", {}),
         history_event_counter=history_event_counter,
         history_events=history_events,
+        rag_context=str(data.get("rag_context", "")),
     )
 
 

@@ -35,6 +35,7 @@ const _MILESTONE_EVENT_TYPES := {
 	"plan_step_completed": true,
 	"verify_started": true,
 	"verify_completed": true,
+	"cache_hit": true,
 }
 
 var editor_interface: EditorInterface
