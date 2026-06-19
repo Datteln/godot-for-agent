@@ -8,7 +8,7 @@ const AgentDTO = preload("res://addons/ai_agent/dto/agent_dto.gd")
 const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_renderer.gd")
 
 ## 即使勾选了"本会话内自动允许"，下列高风险工具/渲染类型仍必须每次手动确认。
-const HIGH_RISK_TOOLS := ["run_tests", "run_headless_self_test", "set_project_setting", "batch_rename"]
+const HIGH_RISK_TOOLS := ["run_tests", "run_headless_self_test", "set_project_setting", "batch_rename", "open_scene", "add_autoload", "remove_autoload", "add_input_action", "remove_input_action"]
 
 var tool_executor: Node
 var _calls: Array = []
@@ -120,7 +120,7 @@ func _configure_session_allow() -> void:
 		if call is Dictionary:
 			var name := str(call.get("name", ""))
 			var render_kind := str(call.get("render_kind", ""))
-			if HIGH_RISK_TOOLS.has(name) or (render_kind == "run" and name != "run_system_command"):
+			if HIGH_RISK_TOOLS.has(name) or (render_kind == "run" and name != "run_system_command" and name != "execute_gd_script"):
 				can_session_allow = false
 				break
 	if can_session_allow:

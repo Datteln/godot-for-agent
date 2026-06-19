@@ -58,6 +58,8 @@ const DEFAULTS := {
 	"ai_agent/headless_output_log": "",
 	"ai_agent/runner_timeout_ms": 120000,
 	"ai_agent/system_command_timeout_ms": 120000,
+	"ai_agent/gd_script_timeout_ms": 60000,
+	"ai_agent/export_timeout_ms": 600000,
 	"ai_agent/session_history_json": ""
 }
 
@@ -169,6 +171,14 @@ const PROPERTY_HINTS := {
 	"ai_agent/system_command_timeout_ms": {
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "1000,600000,1000,suffix:ms"
+	},
+	"ai_agent/gd_script_timeout_ms": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1000,600000,1000,suffix:ms"
+	},
+	"ai_agent/export_timeout_ms": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1000,1800000,1000,suffix:ms"
 	}
 }
 

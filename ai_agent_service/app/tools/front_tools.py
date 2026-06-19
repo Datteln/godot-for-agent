@@ -418,6 +418,116 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="execute_gd_script",
+            domain="program",
+            side="front",
+            reads_project=True,
+            executes_process=True,
+            needs_preview=True,
+            timeout_ms=60000,
+            render_kind="run",
+            read_path_args=["path"],
+            schema={
+                "name": "execute_gd_script",
+                "description": (
+                    "Run a project-relative .gd file directly with the editor's own Godot executable "
+                    "(headless --script) and return its stdout/stderr and exit code. Use this to execute "
+                    "one-off GDScript utility/generator scripts, not to launch the game itself."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "path": {
+                            "type": "string",
+                            "description": "Project-relative .gd file path, for example tools/generate_map.gd.",
+                        },
+                        "args": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Extra string arguments passed through to the script.",
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Requested timeout; frontend clamps it to the configured local limit.",
+                        },
+                    },
+                    ["path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="git_status",
+            domain="program",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="run",
+            schema={
+                "name": "git_status",
+                "description": "Run `git status --porcelain=v1 -b` in the project root and return its output. Fixed, read-only command.",
+                "parameters": _object_schema({}),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="git_diff",
+            domain="program",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="run",
+            read_path_args=["path"],
+            schema={
+                "name": "git_diff",
+                "description": "Run `git diff` (optionally --staged, optionally scoped to one path) and return its output. Fixed, read-only command.",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "Optional relative path to scope the diff to."},
+                        "staged": {"type": "boolean", "description": "Show staged changes instead of the working tree."},
+                    },
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="export_project",
+            domain="program",
+            side="front",
+            reads_project=True,
+            executes_process=True,
+            needs_preview=True,
+            timeout_ms=600000,
+            render_kind="run",
+            write_path_args=["output_path"],
+            schema={
+                "name": "export_project",
+                "description": (
+                    "Trigger a project export using a configured export preset, via the editor's own Godot "
+                    "executable (--export-release/--export-debug). Requires export templates to be installed "
+                    "and can take a long time; must be confirmed every time."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "preset": {"type": "string", "description": "Export preset name, from list_export_presets."},
+                        "output_path": {"type": "string", "description": "Project-relative output file path."},
+                        "debug": {"type": "boolean", "description": "Export a debug build instead of release."},
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Requested timeout; frontend clamps it to the configured local limit.",
+                        },
+                    },
+                    ["preset", "output_path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="add_node",
             domain="scene",
             side="front",
@@ -460,6 +570,591 @@ def register_front_tools() -> None:
                     },
                     ["path", "property", "value"],
                 ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="delete_node",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "delete_node",
+                "description": "Delete a node from the currently edited scene. The scene root cannot be deleted.",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "NodePath to the node, relative to the scene root."},
+                    },
+                    ["path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="reparent_node",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "reparent_node",
+                "description": "Move a node to a new parent within the currently edited scene, preserving the node and its children.",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "NodePath to the node, relative to the scene root."},
+                        "new_parent_path": {
+                            "type": "string",
+                            "description": "NodePath of the new parent, relative to the scene root, or '.' for root.",
+                        },
+                    },
+                    ["path", "new_parent_path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="rename_node",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "rename_node",
+                "description": "Rename a node within the currently edited scene. The scene root cannot be renamed.",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "NodePath to the node, relative to the scene root."},
+                        "name": {"type": "string", "description": "New node name."},
+                    },
+                    ["path", "name"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="instance_scene",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            read_path_args=["scene_path"],
+            schema={
+                "name": "instance_scene",
+                "description": "Instantiate a .tscn/.scn file as a new child node in the currently edited scene.",
+                "parameters": _object_schema(
+                    {
+                        "parent_path": {
+                            "type": "string",
+                            "description": "NodePath of the parent, relative to the scene root, or '.' for root.",
+                        },
+                        "scene_path": {"type": "string", "description": "Relative .tscn/.scn path to instantiate."},
+                        "name": {"type": "string", "description": "Optional name override for the new instance root."},
+                    },
+                    ["scene_path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="duplicate_node",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "duplicate_node",
+                "description": "Duplicate a node and its children within the currently edited scene.",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "NodePath to duplicate, relative to the scene root."},
+                        "name": {"type": "string", "description": "Optional name override for the duplicate."},
+                    },
+                    ["path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="connect_signal",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "connect_signal",
+                "description": "Connect a node's signal to a method on another node (or the same node), persisted with the scene.",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "NodePath of the signal source, relative to the scene root."},
+                        "signal": {"type": "string", "description": "Signal name on the source node."},
+                        "target_path": {"type": "string", "description": "NodePath of the target, relative to the scene root."},
+                        "method": {"type": "string", "description": "Method name on the target node to call."},
+                    },
+                    ["path", "signal", "target_path", "method"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="disconnect_signal",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "disconnect_signal",
+                "description": "Disconnect a previously connected signal between two nodes in the currently edited scene.",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "NodePath of the signal source, relative to the scene root."},
+                        "signal": {"type": "string", "description": "Signal name on the source node."},
+                        "target_path": {"type": "string", "description": "NodePath of the target, relative to the scene root."},
+                        "method": {"type": "string", "description": "Method name on the target node."},
+                    },
+                    ["path", "signal", "target_path", "method"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="add_to_group",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "add_to_group",
+                "description": "Add a node to a scene group (for batch lookup, collision categorization, etc.).",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "NodePath, relative to the scene root."},
+                        "group": {"type": "string", "description": "Group name."},
+                    },
+                    ["path", "group"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="remove_from_group",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "remove_from_group",
+                "description": "Remove a node from a scene group.",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "NodePath, relative to the scene root."},
+                        "group": {"type": "string", "description": "Group name."},
+                    },
+                    ["path", "group"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="list_node_groups",
+            domain="scene",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "list_node_groups",
+                "description": "List the groups a node currently belongs to.",
+                "parameters": _object_schema(
+                    {"path": {"type": "string", "description": "NodePath, relative to the scene root."}},
+                    ["path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="list_node_signals",
+            domain="scene",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "list_node_signals",
+                "description": "List the signals a node can emit, for wiring up with connect_signal.",
+                "parameters": _object_schema(
+                    {"path": {"type": "string", "description": "NodePath, relative to the scene root."}},
+                    ["path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="list_node_methods",
+            domain="scene",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "list_node_methods",
+                "description": "List the public methods a node exposes, for wiring up with connect_signal.",
+                "parameters": _object_schema(
+                    {"path": {"type": "string", "description": "NodePath, relative to the scene root."}},
+                    ["path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="list_groups",
+            domain="scene",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "list_groups",
+                "description": (
+                    "Scan the whole currently edited scene tree and list every group in use, with which "
+                    "nodes belong to each. Use list_node_groups instead to query a single node's groups."
+                ),
+                "parameters": _object_schema({}),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="get_current_scene_path",
+            domain="scene",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "get_current_scene_path",
+                "description": "Get the file path of the scene currently being edited (empty if unsaved/none).",
+                "parameters": _object_schema({}),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="save_scene",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "save_scene",
+                "description": "Save the currently edited scene to disk, persisting pending in-editor changes.",
+                "parameters": _object_schema({}),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="list_open_scenes",
+            domain="scene",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "list_open_scenes",
+                "description": "List the scene tabs currently open in the editor and which one is active.",
+                "parameters": _object_schema({}),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="capture_viewport_screenshot",
+            domain="scene",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            write_path_args=["output_path"],
+            render_kind="json",
+            schema={
+                "name": "capture_viewport_screenshot",
+                "description": (
+                    "Capture the editor's current 2D or 3D viewport as a PNG so the model can see the actual "
+                    "result of a map/UI/animation change instead of only reading scene data."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "mode": {"type": "string", "enum": ["2d", "3d"], "description": "Which editor viewport to capture."},
+                        "viewport_index": {"type": "integer", "description": "3D viewport index, if multiple are open."},
+                        "output_path": {
+                            "type": "string",
+                            "description": "Optional project-relative output path; defaults to a temp user:// location.",
+                        },
+                    },
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="open_scene",
+            domain="scene",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            read_path_args=["path"],
+            schema={
+                "name": "open_scene",
+                "description": (
+                    "Switch the editor's currently edited scene to another .tscn/.scn file. "
+                    "This discards any unsaved in-editor edits to the scene being left, so it must be "
+                    "confirmed every time."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "Relative scene path, for example scenes/level_2.tscn."},
+                    },
+                    ["path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="bake_navigation_mesh",
+            domain="scene",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "bake_navigation_mesh",
+                "description": "Bake the navigation mesh/polygon for a NavigationRegion2D or NavigationRegion3D node.",
+                "parameters": _object_schema(
+                    {"path": {"type": "string", "description": "NodePath to the NavigationRegion2D/3D, relative to the scene root."}},
+                    ["path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="set_project_setting",
+            domain="project",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "set_project_setting",
+                "description": (
+                    "Set or clear a project setting (project.godot), for example an input map action, "
+                    "autoload, or rendering option. Pass value=null to clear an override back to default."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "key": {
+                            "type": "string",
+                            "description": "Setting key, for example rendering/textures/canvas_textures/default_texture_filter.",
+                        },
+                        "value": {"description": "JSON value to assign, or null to clear the override."},
+                    },
+                    ["key", "value"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="read_project_setting",
+            domain="project",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "read_project_setting",
+                "description": "Read a single project setting's current value (project.godot).",
+                "parameters": _object_schema(
+                    {"key": {"type": "string", "description": "Setting key, for example application/run/main_scene."}},
+                    ["key"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="list_autoloads",
+            domain="project",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "list_autoloads",
+                "description": "List configured autoload singletons (name, path, enabled).",
+                "parameters": _object_schema({}),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="add_autoload",
+            domain="project",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            read_path_args=["path"],
+            schema={
+                "name": "add_autoload",
+                "description": "Register a script or scene as an autoload singleton.",
+                "parameters": _object_schema(
+                    {
+                        "name": {"type": "string", "description": "Autoload identifier, used as the global singleton name."},
+                        "path": {"type": "string", "description": "Relative .gd/.tscn/.cs path to autoload."},
+                        "enabled": {"type": "boolean", "description": "Defaults to true."},
+                    },
+                    ["name", "path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="remove_autoload",
+            domain="project",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "remove_autoload",
+                "description": "Remove a previously registered autoload singleton.",
+                "parameters": _object_schema(
+                    {"name": {"type": "string", "description": "Autoload identifier to remove."}},
+                    ["name"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="list_input_actions",
+            domain="project",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "list_input_actions",
+                "description": "List configured InputMap actions with their deadzone and bound keys/buttons.",
+                "parameters": _object_schema({}),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="add_input_action",
+            domain="project",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "add_input_action",
+                "description": (
+                    "Create or fully replace an InputMap action's bindings. To add to existing bindings "
+                    "instead of replacing them, first read them with list_input_actions and include them "
+                    "in keys/mouse_buttons."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "action": {"type": "string", "description": "Action name."},
+                        "deadzone": {"type": "number", "description": "Defaults to 0.5."},
+                        "keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Key names parsed by Godot, for example A, Space, Enter, Escape.",
+                        },
+                        "mouse_buttons": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["left", "right", "middle", "wheel_up", "wheel_down", "wheel_left", "wheel_right", "xbutton1", "xbutton2"],
+                            },
+                        },
+                    },
+                    ["action"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="remove_input_action",
+            domain="project",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "remove_input_action",
+                "description": "Remove a previously configured InputMap action.",
+                "parameters": _object_schema(
+                    {"action": {"type": "string", "description": "Action name to remove."}},
+                    ["action"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="list_export_presets",
+            domain="project",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "list_export_presets",
+                "description": "List configured export presets (name, platform, export_path) from export_presets.cfg.",
+                "parameters": _object_schema({}),
             },
         )
     )
@@ -713,6 +1408,126 @@ def register_front_tools() -> None:
                         },
                     },
                     ["sheet_path", "output_path", "frame_width", "frame_height", "animations"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="read_resource",
+            domain="resource",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            path_args=["path"],
+            schema={
+                "name": "read_resource",
+                "description": "Read the exported/storable properties of any .tres/.res resource file.",
+                "parameters": _object_schema(
+                    {"path": {"type": "string", "description": "Relative or res:// resource path."}},
+                    ["path"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="set_resource_property",
+            domain="resource",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            path_args=["path"],
+            schema={
+                "name": "set_resource_property",
+                "description": "Set a single exported property on an existing .tres/.res resource and save it.",
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "Relative resource path."},
+                        "property": {"type": "string", "description": "Exported property name."},
+                        "value": {
+                            "description": (
+                                "JSON value to assign. To attach another resource (e.g. a Shader on a "
+                                "ShaderMaterial), pass {\"_resource_path\": \"res://...\"} instead of a raw value."
+                            ),
+                        },
+                    },
+                    ["path", "property", "value"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="create_animation_track",
+            domain="resource",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "create_animation_track",
+                "description": (
+                    "Add or replace a single VALUE track (by track_path) on an animation inside an "
+                    "AnimationPlayer's AnimationLibrary. Other existing tracks on the same animation are untouched."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "player_path": {"type": "string", "description": "NodePath to the AnimationPlayer, relative to the scene root."},
+                        "animation": {"type": "string", "description": "Animation name within the library."},
+                        "library": {"type": "string", "description": "AnimationLibrary name; defaults to the unnamed default library."},
+                        "track_path": {
+                            "type": "string",
+                            "description": "NodePath:property being animated, relative to the AnimationPlayer's root node, e.g. Sprite2D:position.",
+                        },
+                        "interpolation": {
+                            "type": "integer",
+                            "description": "Animation.InterpolationType value; defaults to linear (1).",
+                        },
+                        "keyframes": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": _object_schema(
+                                {
+                                    "time": {"type": "number"},
+                                    "value": {"description": "JSON value matching the animated property's type."},
+                                    "transition": {"type": "number"},
+                                },
+                                ["time", "value"],
+                            ),
+                        },
+                    },
+                    ["player_path", "animation", "track_path", "keyframes"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="create_shader_material",
+            domain="resource",
+            side="front",
+            writes_project=True,
+            needs_preview=True,
+            render_kind="diff",
+            path_args=["material_path", "shader_path"],
+            schema={
+                "name": "create_shader_material",
+                "description": (
+                    "Write a .gdshader file and a ShaderMaterial (.tres) that references it, in one step. "
+                    "Equivalent to propose_content_file + create_resource + set_resource_property chained together."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "material_path": {"type": "string", "description": "Relative output path for the ShaderMaterial, e.g. materials/glow.tres."},
+                        "shader_path": {"type": "string", "description": "Relative output path for the shader source, e.g. shaders/glow.gdshader."},
+                        "shader_code": {"type": "string", "description": "Complete .gdshader source code."},
+                    },
+                    ["material_path", "shader_path", "shader_code"],
                 ),
             },
         )

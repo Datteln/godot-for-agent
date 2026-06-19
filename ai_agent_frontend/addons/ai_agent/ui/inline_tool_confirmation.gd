@@ -3,7 +3,7 @@ extends RefCounted
 
 const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_renderer.gd")
 
-const HIGH_RISK_TOOLS := ["run_tests", "run_headless_self_test", "set_project_setting", "batch_rename"]
+const HIGH_RISK_TOOLS := ["run_tests", "run_headless_self_test", "set_project_setting", "batch_rename", "open_scene", "add_autoload", "remove_autoload", "add_input_action", "remove_input_action"]
 
 var confirm_box: Control
 var _checkboxes: Array[CheckBox] = []
@@ -63,7 +63,7 @@ func show(
 		body.add_child(HSeparator.new())
 
 	_always_allow = CheckBox.new()
-	var has_system_command := calls.any(func(call): return call is Dictionary and str(call.get("name", "")) == "run_system_command")
+	var has_system_command := calls.any(func(call): return call is Dictionary and ["run_system_command", "execute_gd_script"].has(str(call.get("name", ""))))
 	_always_allow.text = str(ui_text.get("always_allow_command", "Allow this exact command in this session")) if has_system_command else str(ui_text.get("always_allow", "Always allow similar low-risk changes in this session"))
 	body.add_child(_always_allow)
 	_configure_session_allow(calls, str(ui_text.get("high_risk_hint", "")))
@@ -135,7 +135,7 @@ func _configure_session_allow(calls: Array, high_risk_hint: String) -> void:
 		if call is Dictionary:
 			var name := str(call.get("name", ""))
 			var render_kind := str(call.get("render_kind", ""))
-			if HIGH_RISK_TOOLS.has(name) or (render_kind == "run" and name != "run_system_command"):
+			if HIGH_RISK_TOOLS.has(name) or (render_kind == "run" and name != "run_system_command" and name != "execute_gd_script"):
 				can_session_allow = false
 				break
 	if can_session_allow:

@@ -35,13 +35,13 @@ static func infer_render_kind(call: Dictionary) -> String:
 	if explicit != "":
 		return explicit
 	match str(call.get("name", "")):
-		"propose_script_edit", "propose_tests", "apply_text_edit":
+		"propose_script_edit", "propose_tests", "apply_text_edit", "create_shader_material":
 			return "diff"
 		"edit_map", "fill_rect", "paint_from_image_grid":
 			return "map"
-		"run_tests", "run_headless_self_test", "run_system_command":
+		"run_tests", "run_headless_self_test", "run_system_command", "execute_gd_script", "git_status", "git_diff", "export_project":
 			return "run"
-		"add_node", "set_node_property", "delete_node", "reparent_node", "rename_node", "create_resource", "create_sprite_frames_from_sheet", "batch_rename", "set_project_setting":
+		"add_node", "set_node_property", "delete_node", "reparent_node", "rename_node", "open_scene", "create_resource", "create_sprite_frames_from_sheet", "batch_rename", "set_project_setting", "instance_scene", "duplicate_node", "connect_signal", "disconnect_signal", "add_to_group", "remove_from_group", "save_scene", "add_autoload", "remove_autoload", "set_resource_property", "bake_navigation_mesh", "add_input_action", "remove_input_action", "create_animation_track":
 			return "list"
 		_:
 			return "json"
@@ -174,6 +174,27 @@ static func _render_execution_confirm(call: Dictionary) -> Control:
 			"This command can modify the system and must be confirmed every time."
 		])
 		return command_label
+	if str(call.get("name", "")) == "execute_gd_script":
+		var script_label := Label.new()
+		script_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		var script_args: Array = input.get("args", [])
+		script_label.text = "\n".join([
+			"Script: %s" % str(input.get("path", "")),
+			"Args: %s" % (", ".join(script_args.map(func(a): return str(a))) if script_args.size() > 0 else "(none)"),
+			"Timeout: %s" % ("%d ms" % int(input.get("timeout_ms", 0)) if int(input.get("timeout_ms", 0)) > 0 else "configured default"),
+			"This runs the editor's own Godot executable headlessly and must be confirmed every time."
+		])
+		return script_label
+	if str(call.get("name", "")) == "export_project":
+		var export_label := Label.new()
+		export_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		export_label.text = "\n".join([
+			"Preset: %s" % str(input.get("preset", "")),
+			"Output: %s" % str(input.get("output_path", "")),
+			"Debug build: %s" % str(bool(input.get("debug", false))),
+			"This requires export templates to be installed, can take a long time, and must be confirmed every time."
+		])
+		return export_label
 	var kind := str(input.get("kind", "project"))
 	var timeout_ms := int(input.get("timeout_ms", 0))
 	var label := Label.new()

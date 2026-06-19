@@ -8,6 +8,7 @@ const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd
 const MAX_STALE_CONTENT_CHARS := 40000
 const MAX_SYSTEM_COMMAND_CHARS := 100000
 const MAX_SYSTEM_COMMAND_OUTPUT_CHARS := 200000
+const GIT_COMMAND_TIMEOUT_MS := 15000
 
 
 static func read_file(input: Dictionary, file_state_cache: Node = null) -> Dictionary:
@@ -194,17 +195,207 @@ static func run_system_command(input: Dictionary, editor_interface: EditorInterf
 	var run_result: Dictionary = await _run_system_command_launch(launch, timeout_ms)
 	var output := _read_bounded_file(str(launch.get("output_path", "")), MAX_SYSTEM_COMMAND_OUTPUT_CHARS)
 	_cleanup_runner_files(launch)
-	return {
-		"ok": bool(run_result.get("ok", false)),
-		"status": str(run_result.get("status", "failed")),
+	var ok := bool(run_result.get("ok", false))
+	var status := str(run_result.get("status", "failed"))
+	var exit_code = run_result.get("exit_code", null)
+	var result := {
+		"ok": ok,
+		"status": status,
 		"pid": run_result.get("pid", -1),
-		"exit_code": run_result.get("exit_code", null),
+		"exit_code": exit_code,
 		"shell": shell.get("name", shell_name),
 		"working_directory": working_directory,
 		"timeout_ms": timeout_ms,
 		"output": output,
 		"output_truncated": output.length() >= MAX_SYSTEM_COMMAND_OUTPUT_CHARS,
 	}
+	if not ok:
+		result["error_code"] = status
+		result["message"] = _describe_system_command_failure(status, exit_code, output)
+	return result
+
+
+## 用本编辑器自身的 Godot 可执行文件以 `--headless --script` 方式直接运行一个项目内
+## 的 .gd 文件，并捕获其 stdout/stderr 与退出码。与 run_system_command 不同，这里
+## 不经过用户输入的自由文本 shell 命令，可执行文件与参数都是受控构造的，只有目标
+## 脚本路径和透传给脚本的参数来自工具调用入参。
+static func execute_gd_script(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "editor_interface is not available", "error_code": "editor_unavailable"}
+	var res_path := PathUtils.to_res_path(str(input.get("path", "")))
+	if res_path == "" or res_path.get_extension().to_lower() != "gd":
+		return {
+			"ok": false,
+			"message": "path must be a project-relative .gd file",
+			"error_code": "invalid_path"
+		}
+	if not FileAccess.file_exists(res_path):
+		return {
+			"ok": false,
+			"message": "script file not found: " + res_path,
+			"error_code": "script_not_found"
+		}
+
+	var script_args := PackedStringArray()
+	var raw_args = input.get("args", [])
+	if raw_args is Array:
+		for arg in raw_args:
+			script_args.append(str(arg))
+
+	var configured_timeout := int(ConfigMigrations.get_value(editor_interface, "ai_agent/gd_script_timeout_ms"))
+	var requested_timeout := int(input.get("timeout_ms", configured_timeout))
+	var timeout_ms = min(max(requested_timeout, 1000), max(configured_timeout, 1000))
+
+	var project_path := ProjectSettings.globalize_path("res://")
+	var launch_args := PackedStringArray(["--headless", "--path", project_path, "--script", res_path])
+	for arg in script_args:
+		launch_args.append(arg)
+
+	FrontendLogger.info(editor_interface, "ProgramTools", "Launching gd script.", {
+		"path": res_path,
+		"timeout_ms": timeout_ms,
+	})
+	var launch := _build_direct_process_launch(OS.get_executable_path(), launch_args, project_path, "ai_agent_gdscript")
+	if launch.is_empty():
+		return {"ok": false, "message": "failed to prepare gd script launch", "error_code": "failed_to_prepare"}
+	var run_result: Dictionary = await _run_system_command_launch(launch, timeout_ms)
+	var output := _read_bounded_file(str(launch.get("output_path", "")), MAX_SYSTEM_COMMAND_OUTPUT_CHARS)
+	_cleanup_runner_files(launch)
+	var ok := bool(run_result.get("ok", false))
+	var status := str(run_result.get("status", "failed"))
+	var exit_code = run_result.get("exit_code", null)
+	var result := {
+		"ok": ok,
+		"status": status,
+		"pid": run_result.get("pid", -1),
+		"exit_code": exit_code,
+		"path": res_path,
+		"timeout_ms": timeout_ms,
+		"output": output,
+		"output_truncated": output.length() >= MAX_SYSTEM_COMMAND_OUTPUT_CHARS,
+	}
+	if not ok:
+		result["error_code"] = status
+		result["message"] = _describe_system_command_failure(status, exit_code, output)
+	return result
+
+
+## git_status/git_diff 用固定的可执行文件名与参数数组直接拼起子进程，不经过用户输入
+## 的自由文本，所以不需要每次确认；风险等同于其他只读诊断工具。
+static func git_status(editor_interface: EditorInterface) -> Dictionary:
+	return await _run_git_command(PackedStringArray(["status", "--porcelain=v1", "-b"]), editor_interface)
+
+
+static func git_diff(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var args := PackedStringArray(["diff"])
+	if bool(input.get("staged", false)):
+		args.append("--staged")
+	var target := str(input.get("path", "")).strip_edges()
+	if target != "":
+		var res_path := PathUtils.to_res_path(target)
+		if res_path == "":
+			return {"ok": false, "message": "path must be a project-relative path", "error_code": "invalid_path"}
+		args.append("--")
+		args.append(res_path.trim_prefix("res://"))
+	return await _run_git_command(args, editor_interface)
+
+
+static func _run_git_command(args: PackedStringArray, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "editor_interface is not available", "error_code": "editor_unavailable"}
+	var project_path := ProjectSettings.globalize_path("res://")
+	var launch := _build_direct_process_launch("git", args, project_path, "ai_agent_git")
+	if launch.is_empty():
+		return {"ok": false, "message": "failed to prepare git command", "error_code": "failed_to_prepare"}
+	var run_result: Dictionary = await _run_system_command_launch(launch, GIT_COMMAND_TIMEOUT_MS)
+	var output := _read_bounded_file(str(launch.get("output_path", "")), MAX_SYSTEM_COMMAND_OUTPUT_CHARS)
+	_cleanup_runner_files(launch)
+	var ok := bool(run_result.get("ok", false))
+	var status := str(run_result.get("status", "failed"))
+	var exit_code = run_result.get("exit_code", null)
+	var result := {
+		"ok": ok,
+		"status": status,
+		"exit_code": exit_code,
+		"output": output,
+		"output_truncated": output.length() >= MAX_SYSTEM_COMMAND_OUTPUT_CHARS,
+	}
+	if not ok:
+		result["error_code"] = status
+		result["message"] = _describe_system_command_failure(status, exit_code, output)
+	return result
+
+
+## 用编辑器自身的 Godot 可执行文件以 `--export-release`/`--export-debug` 方式触发导出，
+## 复用 run_system_command 的子进程基础设施，但可执行文件与参数都是受控构造的
+## （只有 preset 名称和输出路径来自调用入参），跟 execute_gd_script 同一思路。
+static func export_project(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "editor_interface is not available", "error_code": "editor_unavailable"}
+	var preset := str(input.get("preset", "")).strip_edges()
+	if preset == "":
+		return {"ok": false, "message": "preset is required", "error_code": "preset_required"}
+	var output_path := PathUtils.to_res_path(str(input.get("output_path", "")))
+	if output_path == "":
+		return {"ok": false, "message": "output_path must be a project-relative path", "error_code": "invalid_output_path"}
+	if not PathUtils.is_write_allowed(output_path):
+		return {"ok": false, "message": "output_path is not writable: " + output_path, "error_code": "path_denied"}
+	var debug := bool(input.get("debug", false))
+
+	var output_absolute := ProjectSettings.globalize_path(output_path)
+	DirAccess.make_dir_recursive_absolute(output_absolute.get_base_dir())
+
+	var configured_timeout := int(ConfigMigrations.get_value(editor_interface, "ai_agent/export_timeout_ms"))
+	var requested_timeout := int(input.get("timeout_ms", configured_timeout))
+	var timeout_ms = min(max(requested_timeout, 1000), max(configured_timeout, 1000))
+
+	var project_path := ProjectSettings.globalize_path("res://")
+	var export_flag := "--export-debug" if debug else "--export-release"
+	var launch_args := PackedStringArray(["--headless", "--path", project_path, export_flag, preset, output_absolute])
+	var launch := _build_direct_process_launch(OS.get_executable_path(), launch_args, project_path, "ai_agent_export")
+	if launch.is_empty():
+		return {"ok": false, "message": "failed to prepare export launch", "error_code": "failed_to_prepare"}
+
+	FrontendLogger.info(editor_interface, "ProgramTools", "Launching project export.", {
+		"preset": preset,
+		"output_path": output_path,
+		"timeout_ms": timeout_ms,
+	})
+	var run_result: Dictionary = await _run_system_command_launch(launch, timeout_ms)
+	var output := _read_bounded_file(str(launch.get("output_path", "")), MAX_SYSTEM_COMMAND_OUTPUT_CHARS)
+	_cleanup_runner_files(launch)
+	var ok := bool(run_result.get("ok", false))
+	var status := str(run_result.get("status", "failed"))
+	var exit_code = run_result.get("exit_code", null)
+	var result := {
+		"ok": ok,
+		"status": status,
+		"exit_code": exit_code,
+		"preset": preset,
+		"output_path": output_path,
+		"output": output,
+		"output_truncated": output.length() >= MAX_SYSTEM_COMMAND_OUTPUT_CHARS,
+	}
+	if not ok:
+		result["error_code"] = status
+		result["message"] = _describe_system_command_failure(status, exit_code, output)
+	return result
+
+
+static func _describe_system_command_failure(status: String, exit_code, output: String) -> String:
+	var tail := output.strip_edges()
+	if tail.length() > 400:
+		tail = tail.right(400)
+	match status:
+		"failed_to_start":
+			return "failed to start the shell process"
+		"timed_out":
+			return "command timed out"
+		"exit_code_missing":
+			return "command did not report an exit code (process may have been killed)"
+		_:
+			var base := "command exited with code %s" % str(exit_code)
+			return base if tail == "" else "%s: %s" % [base, tail]
 
 
 static func _resolve_system_shell(requested: String) -> Dictionary:
@@ -250,16 +441,24 @@ static func _resolve_working_directory(value: String) -> String:
 
 
 static func _build_system_command_launch(command: String, shell: Dictionary, working_directory: String) -> Dictionary:
+	var shell_args: PackedStringArray = shell.get("args", PackedStringArray()).duplicate()
+	shell_args.append(command)
+	return _build_direct_process_launch(str(shell.get("executable", "")), shell_args, working_directory, "ai_agent_command")
+
+
+## 直接以 executable+args 数组启动子进程并捕获 stdout/stderr 与退出码到临时文件，
+## 不经过"把参数拼成一段文本再交给 shell 解析"这一步，因此调用方传入的每个
+## 参数都是字面值，不会被目标 shell 的引号/转义规则二次解释。
+static func _build_direct_process_launch(executable: String, args: PackedStringArray, working_directory: String, token_prefix: String = "ai_agent_command") -> Dictionary:
 	var token := "%d_%d" % [Time.get_ticks_usec(), randi()]
 	var windows := OS.get_name() == "Windows"
-	var script_path := "user://ai_agent_command_%s%s" % [token, ".ps1" if windows else ".sh"]
-	var exit_path := "user://ai_agent_command_%s.exit" % token
-	var output_path := "user://ai_agent_command_%s.log" % token
+	var script_path := "user://%s_%s%s" % [token_prefix, token, ".ps1" if windows else ".sh"]
+	var exit_path := "user://%s_%s.exit" % [token_prefix, token]
+	var output_path := "user://%s_%s.log" % [token_prefix, token]
 	var script_abs := ProjectSettings.globalize_path(script_path)
 	var exit_abs := ProjectSettings.globalize_path(exit_path)
 	var output_abs := ProjectSettings.globalize_path(output_path)
-	var shell_args: PackedStringArray = shell.get("args", PackedStringArray()).duplicate()
-	shell_args.append(command)
+	var shell_args: PackedStringArray = args
 	var script := ""
 	var launch_executable := ""
 	var launch_args := PackedStringArray()
@@ -268,7 +467,7 @@ static func _build_system_command_launch(command: String, shell: Dictionary, wor
 		# UTF-8 读取并报 Invalid UTF-8。通过显式 UTF-8 StreamWriter 流式合并
 		# stdout/stderr，既避免整段输出驻留内存，也兼容 PowerShell 5.1 与 pwsh。
 		script = "$exe = '%s'\n$argList = @(%s)\nSet-Location -LiteralPath '%s'\n$utf8 = New-Object System.Text.UTF8Encoding($false)\n$writer = New-Object System.IO.StreamWriter('%s', $false, $utf8)\ntry {\n  & $exe @argList 2>&1 | ForEach-Object { $writer.WriteLine($_.ToString()) }\n  $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }\n} finally {\n  $writer.Dispose()\n}\nSet-Content -LiteralPath '%s' -Value $code -Encoding ASCII\n" % [
-			_powershell_quote(str(shell.get("executable", ""))),
+			_powershell_quote(executable),
 			_powershell_array(shell_args),
 			_powershell_quote(working_directory),
 			_powershell_quote(output_abs),
@@ -279,7 +478,7 @@ static func _build_system_command_launch(command: String, shell: Dictionary, wor
 	else:
 		script = "cd %s || exit 125\n%s %s > %s 2>&1\ncode=$?\nprintf '%%s' \"$code\" > %s\n" % [
 			_shell_quote(working_directory),
-			_shell_quote(str(shell.get("executable", ""))),
+			_shell_quote(executable),
 			_shell_args(shell_args),
 			_shell_quote(output_abs),
 			_shell_quote(exit_abs),

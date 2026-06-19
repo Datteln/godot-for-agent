@@ -1,7 +1,7 @@
 ---
 name: map-agent
 description: 专注 TileMapLayer、瓦片目录、矩形/线段绘制和关卡地图编辑的专家 agent。
-tools: [describe_tilemap_selection, edit_map, fill_rect, paint_from_image_grid, read_scene_tree, read_image_metadata, read_class_docs, load_skill, search_tools]
+tools: [describe_tilemap_selection, edit_map, fill_rect, paint_from_image_grid, read_scene_tree, read_image_metadata, read_class_docs, capture_viewport_screenshot, load_skill, search_tools]
 skills: [godot-code-reading]
 model: inherit
 effort: standard
@@ -18,3 +18,4 @@ can_delegate: false
 - 地图写入必须通过前端工具并等待预览确认。
 - 草图/参考图转地图先用 `read_image_metadata` 理解尺寸和颜色，再用 `paint_from_image_grid` 生成可撤销 TileMap 改动。
 - 坐标、宽高和 tile id 不明确时，先说明缺少什么。
+- 改完之后可用 `capture_viewport_screenshot` 截当前编辑器视口确认实际效果，只读不需确认。

@@ -9,6 +9,7 @@ const ProgramTools = preload("res://addons/ai_agent/tools/program_tools.gd")
 const SceneTools = preload("res://addons/ai_agent/tools/scene_tools.gd")
 const MapTools = preload("res://addons/ai_agent/tools/map_tools.gd")
 const ResourceTools = preload("res://addons/ai_agent/tools/resource_tools.gd")
+const ProjectTools = preload("res://addons/ai_agent/tools/project_tools.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 
 var editor_interface: EditorInterface
@@ -54,6 +55,14 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = await ProgramTools.run_tests(headless_input, editor_interface)
 		"run_system_command":
 			result = await ProgramTools.run_system_command(input, editor_interface)
+		"execute_gd_script":
+			result = await ProgramTools.execute_gd_script(input, editor_interface)
+		"git_status":
+			result = await ProgramTools.git_status(editor_interface)
+		"git_diff":
+			result = await ProgramTools.git_diff(input, editor_interface)
+		"export_project":
+			result = await ProgramTools.export_project(input, editor_interface)
 		"read_scene_tree":
 			result = SceneTools.read_scene_tree(editor_interface)
 		"read_runtime_state":
@@ -68,6 +77,56 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = SceneTools.reparent_node(input, editor_interface, undo_manager)
 		"rename_node":
 			result = SceneTools.rename_node(input, editor_interface, undo_manager)
+		"instance_scene":
+			result = SceneTools.instance_scene(input, editor_interface, undo_manager)
+		"duplicate_node":
+			result = SceneTools.duplicate_node(input, editor_interface, undo_manager)
+		"connect_signal":
+			result = SceneTools.connect_signal(input, editor_interface, undo_manager)
+		"disconnect_signal":
+			result = SceneTools.disconnect_signal(input, editor_interface, undo_manager)
+		"add_to_group":
+			result = SceneTools.add_to_group(input, editor_interface, undo_manager)
+		"remove_from_group":
+			result = SceneTools.remove_from_group(input, editor_interface, undo_manager)
+		"list_node_groups":
+			result = SceneTools.list_node_groups(input, editor_interface)
+		"list_node_signals":
+			result = SceneTools.list_node_signals(input, editor_interface)
+		"list_node_methods":
+			result = SceneTools.list_node_methods(input, editor_interface)
+		"save_scene":
+			result = SceneTools.save_scene(editor_interface)
+		"list_open_scenes":
+			result = SceneTools.list_open_scenes(editor_interface)
+		"capture_viewport_screenshot":
+			result = await SceneTools.capture_viewport_screenshot(input, editor_interface)
+		"open_scene":
+			result = SceneTools.open_scene(input, editor_interface)
+		"list_groups":
+			result = SceneTools.list_groups(editor_interface)
+		"get_current_scene_path":
+			result = SceneTools.get_current_scene_path(editor_interface)
+		"bake_navigation_mesh":
+			result = SceneTools.bake_navigation_mesh(input, editor_interface, undo_manager)
+		"set_project_setting":
+			result = ProjectTools.set_project_setting(input, undo_manager)
+		"read_project_setting":
+			result = ProjectTools.read_project_setting(input)
+		"list_autoloads":
+			result = ProjectTools.list_autoloads()
+		"add_autoload":
+			result = ProjectTools.add_autoload(input, undo_manager)
+		"remove_autoload":
+			result = ProjectTools.remove_autoload(input, undo_manager)
+		"list_input_actions":
+			result = ProjectTools.list_input_actions()
+		"add_input_action":
+			result = ProjectTools.add_input_action(input, undo_manager)
+		"remove_input_action":
+			result = ProjectTools.remove_input_action(input, undo_manager)
+		"list_export_presets":
+			result = ProjectTools.list_export_presets()
 		"describe_tilemap_selection":
 			result = MapTools.describe_selection(editor_interface)
 		"edit_map":
@@ -82,6 +141,14 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = ResourceTools.read_image_metadata(input)
 		"create_sprite_frames_from_sheet":
 			result = ResourceTools.create_sprite_frames_from_sheet(input, undo_manager)
+		"read_resource":
+			result = ResourceTools.read_resource(input)
+		"set_resource_property":
+			result = ResourceTools.set_resource_property(input, undo_manager)
+		"create_animation_track":
+			result = ResourceTools.create_animation_track(input, editor_interface, undo_manager)
+		"create_shader_material":
+			result = ResourceTools.create_shader_material(input, undo_manager)
 		_:
 			FrontendLogger.warn(editor_interface, "ToolExecutor", "Unknown front tool requested.", {"tool": name})
 			return AgentDTO.error_result(tool_call, "Unknown front tool: " + name, "unknown_front_tool")

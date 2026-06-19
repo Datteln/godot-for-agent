@@ -11,6 +11,7 @@ const _TOOL_DISPLAY_NAMES := {
 	"propose_script_edit": "Edit", "apply_text_edit": "Edit",
 	"propose_tests": "Write", "propose_content_file": "Write",
 	"run_tests": "Bash", "run_headless_self_test": "Bash", "run_system_command": "Shell",
+	"execute_gd_script": "Bash", "git_status": "Bash", "git_diff": "Bash", "export_project": "Bash",
 	"delegate": "Task", "delegate_many": "Task",
 	"search_tools": "SearchTools",
 }
@@ -300,10 +301,10 @@ static func format_tool_call_args(name: String, input: Dictionary) -> String:
 		return "kind=%s" % str(input.get("kind", "project"))
 	if name == "run_system_command":
 		return truncate_text(str(input.get("command", "")), 60)
-	for key in ["path", "target_path", "file_path", "script_path", "resource_path", "scene_path"]:
+	for key in ["path", "target_path", "file_path", "script_path", "resource_path", "scene_path", "material_path", "track_path"]:
 		if input.has(key):
 			return str(input.get(key, ""))
-	for key in ["pattern", "query", "include", "command", "agent", "task", "class_name", "node_path", "name"]:
+	for key in ["pattern", "query", "include", "command", "agent", "task", "class_name", "node_path", "name", "key", "action", "group", "preset"]:
 		if input.has(key):
 			return truncate_text(str(input.get(key, "")), 60)
 	return ""
@@ -323,7 +324,7 @@ static func format_tool_result_detail(name: String, input: Dictionary, status: S
 			var after_text := str(input.get("content", input.get("after_text", "")))
 			var path := str(inner.get("path", input.get("path", input.get("target_path", ""))))
 			return ui_text.get("tool_wrote_lines", "Wrote `%s` (%s lines)") % [path, count_lines(after_text)]
-		"run_tests", "run_headless_self_test", "run_system_command":
+		"run_tests", "run_headless_self_test", "run_system_command", "execute_gd_script", "git_status", "git_diff", "export_project":
 			var run_status := str(inner.get("status", "unknown"))
 			var exit_code = inner.get("exit_code")
 			var summary := run_status
@@ -336,6 +337,31 @@ static func format_tool_result_detail(name: String, input: Dictionary, status: S
 		"read_debugger_errors":
 			var items: Array = inner.get("items", []) if inner.get("items") is Array else []
 			return ui_text.get("tool_items_count", "Returned %s item(s)") % items.size()
+		"set_project_setting", "add_autoload", "remove_autoload":
+			return ui_text.get("tool_done_path", "Done: `%s`") % str(inner.get("key", input.get("key", input.get("name", ""))))
+		"read_project_setting":
+			return ui_text.get("tool_done_path", "Done: `%s`") % str(inner.get("key", input.get("key", "")))
+		"list_open_scenes":
+			var scenes: Array = inner.get("open_scenes", []) if inner.get("open_scenes") is Array else []
+			return ui_text.get("tool_items_count", "Returned %s item(s)") % scenes.size()
+		"list_autoloads":
+			var autoloads: Array = inner.get("autoloads", []) if inner.get("autoloads") is Array else []
+			return ui_text.get("tool_items_count", "Returned %s item(s)") % autoloads.size()
+		"list_input_actions":
+			var actions: Array = inner.get("actions", []) if inner.get("actions") is Array else []
+			return ui_text.get("tool_items_count", "Returned %s item(s)") % actions.size()
+		"list_export_presets":
+			var presets: Array = inner.get("presets", []) if inner.get("presets") is Array else []
+			return ui_text.get("tool_items_count", "Returned %s item(s)") % presets.size()
+		"list_groups":
+			var groups: Array = inner.get("groups", []) if inner.get("groups") is Array else []
+			return ui_text.get("tool_items_count", "Returned %s item(s)") % groups.size()
+		"add_input_action", "remove_input_action":
+			return ui_text.get("tool_done_path", "Done: `%s`") % str(inner.get("action", input.get("action", "")))
+		"create_shader_material":
+			return ui_text.get("tool_done_path", "Done: `%s`") % str(inner.get("material_path", input.get("material_path", "")))
+		"create_animation_track":
+			return ui_text.get("tool_done_path", "Done: `%s`") % str(inner.get("track_path", input.get("track_path", "")))
 		_:
 			if inner.has("path"):
 				return ui_text.get("tool_done_path", "Done: `%s`") % str(inner.get("path"))

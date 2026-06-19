@@ -107,6 +107,70 @@ func record_node_reparented(node: Node, old_parent: Node, old_index: int, new_pa
 	})
 
 
+func record_signal_connected(source: Object, signal_name: String, target: Object, method_name: String) -> void:
+	if not _active:
+		begin_batch("AI signal changes")
+	_connect_signal(source, signal_name, target, method_name)
+	_ops.append({
+		"type": "signal_connect",
+		"source": source,
+		"signal": signal_name,
+		"target": target,
+		"method": method_name
+	})
+
+
+func record_signal_disconnected(source: Object, signal_name: String, target: Object, method_name: String) -> void:
+	if not _active:
+		begin_batch("AI signal changes")
+	_disconnect_signal(source, signal_name, target, method_name)
+	_ops.append({
+		"type": "signal_disconnect",
+		"source": source,
+		"signal": signal_name,
+		"target": target,
+		"method": method_name
+	})
+
+
+func record_group_added(node: Node, group: String) -> void:
+	if not _active:
+		begin_batch("AI group changes")
+	_add_to_group(node, group)
+	_ops.append({"type": "group_add", "node": node, "group": group})
+
+
+func record_group_removed(node: Node, group: String) -> void:
+	if not _active:
+		begin_batch("AI group changes")
+	_remove_from_group(node, group)
+	_ops.append({"type": "group_remove", "node": node, "group": group})
+
+
+func record_animation_track(animation: Resource, track_path: String, before_snapshot: Variant, after_snapshot: Variant) -> void:
+	if not _active:
+		begin_batch("AI animation changes")
+	_ops.append({
+		"type": "animation_track",
+		"animation": animation,
+		"track_path": track_path,
+		"before": before_snapshot,
+		"after": after_snapshot
+	})
+
+
+func record_project_setting(key: String, before_value: Variant, after_value: Variant) -> void:
+	if not _active:
+		begin_batch("AI project setting changes")
+	_set_project_setting(key, after_value)
+	_ops.append({
+		"type": "project_setting",
+		"key": key,
+		"before": before_value,
+		"after": after_value
+	})
+
+
 func record_node_renamed(node: Node, before_name: String, after_name: String) -> void:
 	if not _active:
 		begin_batch("AI scene changes")
@@ -164,6 +228,24 @@ func commit_batch() -> void:
 			"node_rename":
 				undo_redo.add_do_method(self, "_rename_node", op["node"], op["after"])
 				undo_redo.add_undo_method(self, "_rename_node", op["node"], op["before"])
+			"signal_connect":
+				undo_redo.add_do_method(self, "_connect_signal", op["source"], op["signal"], op["target"], op["method"])
+				undo_redo.add_undo_method(self, "_disconnect_signal", op["source"], op["signal"], op["target"], op["method"])
+			"signal_disconnect":
+				undo_redo.add_do_method(self, "_disconnect_signal", op["source"], op["signal"], op["target"], op["method"])
+				undo_redo.add_undo_method(self, "_connect_signal", op["source"], op["signal"], op["target"], op["method"])
+			"group_add":
+				undo_redo.add_do_method(self, "_add_to_group", op["node"], op["group"])
+				undo_redo.add_undo_method(self, "_remove_from_group", op["node"], op["group"])
+			"group_remove":
+				undo_redo.add_do_method(self, "_remove_from_group", op["node"], op["group"])
+				undo_redo.add_undo_method(self, "_add_to_group", op["node"], op["group"])
+			"project_setting":
+				undo_redo.add_do_method(self, "_set_project_setting", op["key"], op["after"])
+				undo_redo.add_undo_method(self, "_set_project_setting", op["key"], op["before"])
+			"animation_track":
+				undo_redo.add_do_method(self, "_apply_animation_track", op["animation"], op["track_path"], op["after"])
+				undo_redo.add_undo_method(self, "_apply_animation_track", op["animation"], op["track_path"], op["before"])
 	undo_redo.commit_action(false)
 	_clear()
 
@@ -221,6 +303,40 @@ func abort_batch() -> void:
 					_rename_node(node, op["before"])
 				else:
 					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of node_rename: node is no longer valid.")
+			"signal_connect":
+				var conn_source: Object = op["source"]
+				var conn_target: Object = op["target"]
+				if is_instance_valid(conn_source) and is_instance_valid(conn_target):
+					_disconnect_signal(conn_source, op["signal"], conn_target, op["method"])
+				else:
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of signal_connect: source or target is no longer valid.")
+			"signal_disconnect":
+				var dconn_source: Object = op["source"]
+				var dconn_target: Object = op["target"]
+				if is_instance_valid(dconn_source) and is_instance_valid(dconn_target):
+					_connect_signal(dconn_source, op["signal"], dconn_target, op["method"])
+				else:
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of signal_disconnect: source or target is no longer valid.")
+			"group_add":
+				var add_node_obj: Object = op["node"]
+				if is_instance_valid(add_node_obj):
+					_remove_from_group(add_node_obj, op["group"])
+				else:
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of group_add: node is no longer valid.")
+			"group_remove":
+				var remove_node_obj: Object = op["node"]
+				if is_instance_valid(remove_node_obj):
+					_add_to_group(remove_node_obj, op["group"])
+				else:
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of group_remove: node is no longer valid.")
+			"project_setting":
+				_set_project_setting(str(op["key"]), op["before"])
+			"animation_track":
+				var anim_obj: Object = op["animation"]
+				if is_instance_valid(anim_obj):
+					_apply_animation_track(anim_obj, str(op["track_path"]), op["before"])
+				else:
+					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of animation_track: animation is no longer valid.")
 	_clear()
 
 
@@ -308,6 +424,55 @@ func _rename_node(node: Node, new_name: String) -> void:
 	if node == null:
 		return
 	node.name = new_name
+
+
+func _connect_signal(source: Object, signal_name: String, target: Object, method_name: String) -> void:
+	if source == null or target == null:
+		return
+	var callable := Callable(target, method_name)
+	if not source.is_connected(signal_name, callable):
+		source.connect(signal_name, callable, CONNECT_PERSIST)
+
+
+func _disconnect_signal(source: Object, signal_name: String, target: Object, method_name: String) -> void:
+	if source == null or target == null:
+		return
+	var callable := Callable(target, method_name)
+	if source.is_connected(signal_name, callable):
+		source.disconnect(signal_name, callable)
+
+
+func _add_to_group(node: Node, group: String) -> void:
+	if node == null:
+		return
+	node.add_to_group(group, true)
+
+
+func _remove_from_group(node: Node, group: String) -> void:
+	if node == null:
+		return
+	node.remove_from_group(group)
+
+
+func _apply_animation_track(animation: Animation, track_path: String, snapshot: Variant) -> void:
+	if animation == null:
+		return
+	for i in range(animation.get_track_count() - 1, -1, -1):
+		if animation.track_get_type(i) == Animation.TYPE_VALUE and str(animation.track_get_path(i)) == track_path:
+			animation.remove_track(i)
+	if snapshot == null:
+		return
+	var data: Dictionary = snapshot
+	var index := animation.add_track(Animation.TYPE_VALUE)
+	animation.track_set_path(index, NodePath(str(data.get("path", track_path))))
+	animation.track_set_interpolation_type(index, int(data.get("interpolation", Animation.INTERPOLATION_LINEAR)))
+	for key in data.get("keys", []):
+		animation.track_insert_key(index, float(key.get("time", 0.0)), key.get("value"), float(key.get("transition", 1.0)))
+
+
+func _set_project_setting(key: String, value: Variant) -> void:
+	ProjectSettings.set_setting(key, value)
+	ProjectSettings.save()
 
 
 func _set_tile_cells(layer: Node, cells: Array) -> void:
