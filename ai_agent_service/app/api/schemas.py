@@ -33,6 +33,7 @@ class Context(BaseModel):
     project_files: list[Any] | None = None
     debugger_errors: list[Any] | None = None
     diagnostics: list[Any] | None = None
+    referenced_files: list[Any] | None = None
     dotnet_enabled: bool = False
 
 
@@ -296,6 +297,12 @@ class LogEditHistoryBlock(HistoryBlockBase):
     after_text: str = ""
 
 
+class NodeTreeHistoryBlock(HistoryBlockBase):
+    type: Literal["node_tree"] = "node_tree"
+    title: str = "Scene tree"
+    tree: dict[str, Any] = Field(default_factory=dict)
+
+
 class ThoughtHistoryBlock(HistoryBlockBase):
     type: Literal["thought"] = "thought"
     header: str = "Thought"
@@ -375,6 +382,7 @@ SessionHistoryBlock = Annotated[
     | LogReadHistoryBlock
     | LogGrepHistoryBlock
     | LogEditHistoryBlock
+    | NodeTreeHistoryBlock
     | ThoughtHistoryBlock
     | PlanCreatedHistoryBlock
     | StepStartedHistoryBlock

@@ -23,6 +23,7 @@ from app.llm.cache_manager import (
 )
 from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnapshot
 from app.llm.message_transformer import (
+    HISTORY_TIER_GRANULARITY,
     MAX_CACHE_BREAKPOINTS,
     CacheBreakpoint,
     build_stable_prefix,
@@ -106,6 +107,72 @@ class BuildStablePrefixTests(unittest.TestCase):
         plan = build_stable_prefix(messages)
         self.assertIn(CacheBreakpoint(2, None, "stable_history"), plan.breakpoints)
         self.assertEqual(plan.stable_prefix_end_index, 2)
+
+    def _conversation(self, turn_count: int) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = [{"role": "system", "content": "prompt"}]
+        for i in range(turn_count):
+            messages.append({"role": "user", "content": f"u{i}"})
+            messages.append({"role": "assistant", "content": f"a{i}"})
+        return messages
+
+    def test_short_history_has_no_old_tier(self) -> None:
+        # 历史长度低于一个粒度（HISTORY_TIER_GRANULARITY=20）时只有 recent 断点，
+        # 与改造前完全一致——B 不应改变短对话的行为。
+        messages = self._conversation(5)
+        plan = build_stable_prefix(messages)
+        segments = [bp.segment for bp in plan.breakpoints]
+        self.assertNotIn("history_old_tier", segments)
+        self.assertIn("stable_history", segments)
+
+    def test_old_tier_appears_once_history_crosses_granularity(self) -> None:
+        messages = self._conversation(15)  # 1 + 30 = 31 messages, stable_history_end=29
+        plan = build_stable_prefix(messages)
+        old_tier = next((bp for bp in plan.breakpoints if bp.segment == "history_old_tier"), None)
+        self.assertIsNotNone(old_tier)
+        assert old_tier is not None
+        self.assertEqual(old_tier.message_index % HISTORY_TIER_GRANULARITY, 0)
+        self.assertGreater(old_tier.message_index, 0)
+
+    def test_old_tier_position_is_stable_across_a_tier_span_then_jumps(self) -> None:
+        # 核心断言：old tier 在跨过下一个粒度边界前保持固定，不像 recent tier 那样
+        # 每轮都右移；这正是"B"要解决的问题——老段不再每轮都被当成新前缀重建。
+        positions: dict[int, int] = {}
+        for turn_count in range(18, 32):
+            plan = build_stable_prefix(self._conversation(turn_count))
+            old_tier = next((bp for bp in plan.breakpoints if bp.segment == "history_old_tier"), None)
+            if old_tier is not None:
+                positions[turn_count] = old_tier.message_index
+        distinct_positions = set(positions.values())
+        self.assertGreater(len(positions), 5)
+        self.assertLess(len(distinct_positions), len(positions))
+
+    def test_recent_tier_keeps_moving_every_turn(self) -> None:
+        plan_a = build_stable_prefix(self._conversation(15))
+        plan_b = build_stable_prefix(self._conversation(16))
+        recent_a = next(bp.message_index for bp in plan_a.breakpoints if bp.segment == "stable_history")
+        recent_b = next(bp.message_index for bp in plan_b.breakpoints if bp.segment == "stable_history")
+        self.assertNotEqual(recent_a, recent_b)
+
+    def test_old_tier_ordered_before_recent_tier(self) -> None:
+        messages = self._conversation(15)
+        plan = build_stable_prefix(messages)
+        segments = [bp.segment for bp in plan.breakpoints]
+        self.assertLess(segments.index("history_old_tier"), segments.index("stable_history"))
+
+    def test_layered_system_plus_long_history_caps_and_drops_recent_first(self) -> None:
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": f"L{i}"} for i in range(3)],
+            }
+        ]
+        messages.extend(self._conversation(15)[1:])  # reuse long history without its own system msg
+        plan = build_stable_prefix(messages)
+        self.assertLessEqual(len(plan.breakpoints), MAX_CACHE_BREAKPOINTS)
+        segments = [bp.segment for bp in plan.breakpoints]
+        self.assertEqual(segments[:3], ["system_layer_0", "system_layer_1", "system_layer_2"])
+        self.assertIn("history_old_tier", segments)
+        self.assertNotIn("stable_history", segments)
 
     def test_never_exceeds_max_breakpoints(self) -> None:
         messages = [

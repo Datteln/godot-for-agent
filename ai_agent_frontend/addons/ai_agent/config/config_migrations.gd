@@ -30,6 +30,9 @@ const DEFAULTS := {
 	"ai_agent/rerank_model": "",
 	"ai_agent/rerank_timeout_s": 2.0,
 	"ai_agent/rag_query_router_enabled": true,
+	"ai_agent/rag_auto_build_enabled": true,
+	"ai_agent/rag_auto_watch_interval_s": 1.0,
+	"ai_agent/rag_auto_watch_debounce_s": 0.75,
 	"ai_agent/rag_token_budget": 1500,
 	"ai_agent/graph_max_depth": 2,
 	"ai_agent/graph_max_neighbors": 5,
@@ -54,6 +57,7 @@ const DEFAULTS := {
 	"ai_agent/headless_args": "",
 	"ai_agent/headless_output_log": "",
 	"ai_agent/runner_timeout_ms": 120000,
+	"ai_agent/system_command_timeout_ms": 120000,
 	"ai_agent/session_history_json": ""
 }
 
@@ -159,6 +163,10 @@ const PROPERTY_HINTS := {
 		"hint_string": ""
 	},
 	"ai_agent/runner_timeout_ms": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1000,600000,1000,suffix:ms"
+	},
+	"ai_agent/system_command_timeout_ms": {
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "1000,600000,1000,suffix:ms"
 	}

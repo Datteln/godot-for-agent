@@ -63,7 +63,8 @@ func show(
 		body.add_child(HSeparator.new())
 
 	_always_allow = CheckBox.new()
-	_always_allow.text = str(ui_text.get("always_allow", "Always allow similar low-risk changes in this session"))
+	var has_system_command := calls.any(func(call): return call is Dictionary and str(call.get("name", "")) == "run_system_command")
+	_always_allow.text = str(ui_text.get("always_allow_command", "Allow this exact command in this session")) if has_system_command else str(ui_text.get("always_allow", "Always allow similar low-risk changes in this session"))
 	body.add_child(_always_allow)
 	_configure_session_allow(calls, str(ui_text.get("high_risk_hint", "")))
 
@@ -134,7 +135,7 @@ func _configure_session_allow(calls: Array, high_risk_hint: String) -> void:
 		if call is Dictionary:
 			var name := str(call.get("name", ""))
 			var render_kind := str(call.get("render_kind", ""))
-			if HIGH_RISK_TOOLS.has(name) or render_kind == "run":
+			if HIGH_RISK_TOOLS.has(name) or (render_kind == "run" and name != "run_system_command"):
 				can_session_allow = false
 				break
 	if can_session_allow:

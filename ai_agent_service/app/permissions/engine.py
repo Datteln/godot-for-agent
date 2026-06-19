@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -32,7 +34,7 @@ logger = logging.getLogger(__name__)
 # 不含具体路径——按文件路径精确授权时，用户勾选一次"自动允许相似低风险更改"
 # 后，换一个文件名又得再问一遍，体验上等同于这个授权从没生效过；同一个工具
 # 名称本身已经是足够安全的授权粒度（不同工具各自独立授权，互不放宽）。
-SessionAllowGrant = tuple[str, str, str]
+SessionAllowGrant = tuple[str, str, str, str]
 
 
 @dataclass
@@ -75,7 +77,7 @@ def _effect_of(tool: ToolDef) -> str:
     return "read_project"
 
 
-def _session_allow_match(ctx: PermissionContext, tool: ToolDef) -> bool:
+def _session_allow_match(ctx: PermissionContext, tool: ToolDef, args: dict[str, Any]) -> bool:
     """判断本次调用是否命中会话级"总是允许"授权。
 
     Args:
@@ -85,10 +87,10 @@ def _session_allow_match(ctx: PermissionContext, tool: ToolDef) -> bool:
     Returns:
         命中则返回 True。
     """
-    return make_session_allow_grant(tool) in ctx.session_allow
+    return make_session_allow_grant(tool, args) in ctx.session_allow
 
 
-def make_session_allow_grant(tool: ToolDef) -> SessionAllowGrant:
+def make_session_allow_grant(tool: ToolDef, args: dict[str, Any] | None = None) -> SessionAllowGrant:
     """构造该工具对应的会话级"总是允许"授权键。
 
     Args:
@@ -98,7 +100,20 @@ def make_session_allow_grant(tool: ToolDef) -> SessionAllowGrant:
         `(tool.name, tool.domain, effect)` 三元组；不含具体路径，因此对
         同一工具的任意一次调用授权后，本会话内该工具的后续调用都会命中。
     """
-    return (tool.name, tool.domain, _effect_of(tool))
+    signature = ""
+    if tool.executes_process:
+        safe_args = args or {}
+        if tool.name == "run_system_command":
+            fingerprint_input = {
+                "command": str(safe_args.get("command", "")).strip(),
+                "shell": str(safe_args.get("shell", "auto")).strip().lower(),
+                "working_directory": str(safe_args.get("working_directory", "res://")).strip(),
+            }
+        else:
+            fingerprint_input = safe_args
+        encoded = json.dumps(fingerprint_input, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        signature = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return (tool.name, tool.domain, _effect_of(tool), signature)
 
 
 def _default_mode(tool: ToolDef, ctx: PermissionContext) -> Decision:
@@ -165,7 +180,7 @@ def check(tool: ToolDef, args: dict[str, Any], ctx: PermissionContext) -> Decisi
     if ctx.security.trusted and match_rules(ctx.allow_rules, tool, args, "allow"):
         logger.debug("Permission allow tool=%s reason=allow_rule", tool.name)
         return "allow"
-    if _session_allow_match(ctx, tool):
+    if _session_allow_match(ctx, tool, args):
         logger.debug("Permission allow tool=%s reason=session_allow", tool.name)
         return "allow"
     decision = _MODE_HANDLERS[ctx.security.permission_mode](tool, ctx)

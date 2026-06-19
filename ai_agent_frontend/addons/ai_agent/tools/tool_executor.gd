@@ -52,6 +52,8 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			var headless_input := input.duplicate(true)
 			headless_input["kind"] = "headless_scene"
 			result = await ProgramTools.run_tests(headless_input, editor_interface)
+		"run_system_command":
+			result = await ProgramTools.run_system_command(input, editor_interface)
 		"read_scene_tree":
 			result = SceneTools.read_scene_tree(editor_interface)
 		"read_runtime_state":

@@ -10,7 +10,7 @@ const _TOOL_DISPLAY_NAMES := {
 	"write_file": "Write",
 	"propose_script_edit": "Edit", "apply_text_edit": "Edit",
 	"propose_tests": "Write", "propose_content_file": "Write",
-	"run_tests": "Bash", "run_headless_self_test": "Bash",
+	"run_tests": "Bash", "run_headless_self_test": "Bash", "run_system_command": "Shell",
 	"delegate": "Task", "delegate_many": "Task",
 	"search_tools": "SearchTools",
 }
@@ -106,6 +106,8 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 			if payload.has("output_style"):
 				parts.append("output_style=%s" % str(payload.get("output_style")))
 			return ui_text.get("event_config", "Configuration changed (%s).") % ", ".join(parts)
+		"compact_started":
+			return ui_text.get("event_compact_started", "Compacting conversation history...")
 		"compact_boundary":
 			return ui_text.get("event_compact", "Compacted: %s frame(s), %s removed, %s kept, pending: %s") % [
 				str(payload.get("compacted_frames", 0)),
@@ -251,6 +253,23 @@ static func _format_cache_hit_event(payload: Dictionary, ui_text: Dictionary) ->
 	]
 
 
+## 缓存命中的常驻状态栏摘要（区别于上面滚动进聊天记录的提示，这条不会随对话
+## 滚走）。最近一次命中的 cached/total tokens 与命中率，用于 chat_panel 底部
+## 状态行常驻展示，不需要用户翻回聊天记录确认当前缓存情况。
+## cached <= 0 时返回空串（尚无命中或本轮未走缓存），调用方据此清空指示器。
+static func format_cache_status_indicator(payload: Dictionary, ui_text: Dictionary) -> String:
+	var cached := int(payload.get("cached_tokens", 0))
+	if cached <= 0:
+		return ""
+	var total := int(payload.get("total_input_tokens", 0))
+	var ratio := (float(cached) / float(total) * 100.0) if total > 0 else 0.0
+	return ui_text.get("status_cache_indicator", "cache %s%% (%s/%s)") % [
+		String.num(ratio, 1),
+		_format_thousands(cached),
+		_format_thousands(total)
+	]
+
+
 ## 把整数格式化为带千分位逗号的字符串（如 3840 -> "3,840"）。
 static func _format_thousands(value: int) -> String:
 	var digits := str(abs(value))
@@ -279,6 +298,8 @@ static func format_tool_call_header(call: Dictionary) -> String:
 static func format_tool_call_args(name: String, input: Dictionary) -> String:
 	if name == "run_tests" or name == "run_headless_self_test":
 		return "kind=%s" % str(input.get("kind", "project"))
+	if name == "run_system_command":
+		return truncate_text(str(input.get("command", "")), 60)
 	for key in ["path", "target_path", "file_path", "script_path", "resource_path", "scene_path"]:
 		if input.has(key):
 			return str(input.get(key, ""))
@@ -302,7 +323,7 @@ static func format_tool_result_detail(name: String, input: Dictionary, status: S
 			var after_text := str(input.get("content", input.get("after_text", "")))
 			var path := str(inner.get("path", input.get("path", input.get("target_path", ""))))
 			return ui_text.get("tool_wrote_lines", "Wrote `%s` (%s lines)") % [path, count_lines(after_text)]
-		"run_tests", "run_headless_self_test":
+		"run_tests", "run_headless_self_test", "run_system_command":
 			var run_status := str(inner.get("status", "unknown"))
 			var exit_code = inner.get("exit_code")
 			var summary := run_status

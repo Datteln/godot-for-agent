@@ -120,7 +120,7 @@ func _configure_session_allow() -> void:
 		if call is Dictionary:
 			var name := str(call.get("name", ""))
 			var render_kind := str(call.get("render_kind", ""))
-			if HIGH_RISK_TOOLS.has(name) or render_kind == "run":
+			if HIGH_RISK_TOOLS.has(name) or (render_kind == "run" and name != "run_system_command"):
 				can_session_allow = false
 				break
 	if can_session_allow:

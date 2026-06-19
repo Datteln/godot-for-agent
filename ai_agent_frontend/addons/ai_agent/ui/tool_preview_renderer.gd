@@ -39,7 +39,7 @@ static func infer_render_kind(call: Dictionary) -> String:
 			return "diff"
 		"edit_map", "fill_rect", "paint_from_image_grid":
 			return "map"
-		"run_tests", "run_headless_self_test":
+		"run_tests", "run_headless_self_test", "run_system_command":
 			return "run"
 		"add_node", "set_node_property", "delete_node", "reparent_node", "rename_node", "create_resource", "create_sprite_frames_from_sheet", "batch_rename", "set_project_setting":
 			return "list"
@@ -162,6 +162,18 @@ static func _render_map_op(call: Dictionary) -> Control:
 
 static func _render_execution_confirm(call: Dictionary) -> Control:
 	var input: Dictionary = call.get("input", {})
+	if str(call.get("name", "")) == "run_system_command":
+		var command_label := Label.new()
+		command_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		command_label.text = "\n".join([
+			"Shell: %s" % str(input.get("shell", "auto")),
+			"Working directory: %s" % str(input.get("working_directory", "res://")),
+			"Timeout: %s" % ("%d ms" % int(input.get("timeout_ms", 0)) if int(input.get("timeout_ms", 0)) > 0 else "configured default"),
+			"Command:",
+			str(input.get("command", "")),
+			"This command can modify the system and must be confirmed every time."
+		])
+		return command_label
 	var kind := str(input.get("kind", "project"))
 	var timeout_ms := int(input.get("timeout_ms", 0))
 	var label := Label.new()

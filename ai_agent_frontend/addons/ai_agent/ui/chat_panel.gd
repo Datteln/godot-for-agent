@@ -36,6 +36,8 @@ const _MILESTONE_EVENT_TYPES := {
 	"verify_started": true,
 	"verify_completed": true,
 	"cache_hit": true,
+	"compact_started": true,
+	"compact_boundary": true,
 }
 
 var editor_interface: EditorInterface
@@ -52,6 +54,17 @@ var _log_renderer: LogEntryRenderer
 var _scroll: ScrollContainer
 var _message_list: VBoxContainer
 var _input: LineEdit
+var _context_bar: HFlowContainer
+var _file_suggestions_panel: PanelContainer
+var _file_suggestions: ItemList
+var _file_popup_paths: Array[String] = []
+var _project_files: Array = []
+var _referenced_files := {}
+var _dismissed_context := {}
+var _selection_signature := ""
+var _last_selection_refresh_ms := 0
+var _message_context_popup: PopupMenu
+var _message_context_source: RichTextLabel
 var _send_btn: Button
 var _stop_btn: Button
 var _new_session_btn: Button
@@ -59,6 +72,9 @@ var _status: Label
 var _doctor_btn: Button
 var _extensions_btn: Button
 var _commands_btn: Button
+var _commands_popup: PopupMenu
+var _available_commands: Array = []
+var _commands_requested := false
 var _memory_btn: Button
 var _reset_btn: Button
 var _history_btn: Button
@@ -68,9 +84,16 @@ var _effort_options: OptionButton
 var _style_options: OptionButton
 var _model_input: LineEdit
 var _active_model_name := ""
+## 最近一次 cache_hit 事件的常驻状态栏摘要；与聊天记录里的滚动提示是两套
+## 独立展示——这条不随对话滚走，方便随时确认当前缓存命中情况。
+var _last_cache_status := ""
+## `compact_started` 到达时记录下当时的状态，供 `compact_boundary` 到达时还原；
+## 压缩前后状态对应"这一轮原本在干什么"（等待模型/执行工具等），不是固定回到 IDLE。
+var _state_before_compact := AgentState.IDLE
 
 var _state := AgentState.IDLE
 var _last_doctor_report: Dictionary = {}
+var _extensions_pending := false
 var _pending_calls: Array = []
 var _pending_silent_results: Array = []
 var _inline_confirm := InlineToolConfirmation.new()
@@ -121,6 +144,10 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
+	var selection_now := Time.get_ticks_msec()
+	if selection_now - _last_selection_refresh_ms >= 500:
+		_last_selection_refresh_ms = selection_now
+		_refresh_context_bar()
 	if _stream_text_dirty and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		var now_ms := Time.get_ticks_msec()
 		if _stream_last_render_ms == 0 or now_ms - _stream_last_render_ms >= STREAM_RENDER_INTERVAL_MS:
@@ -295,6 +322,21 @@ func _build_ui() -> void:
 	_message_list.add_theme_constant_override("separation", 10)
 	_scroll.add_child(_message_list)
 
+	_file_suggestions_panel = PanelContainer.new()
+	_file_suggestions_panel.visible = false
+	_file_suggestions_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	add_child(_file_suggestions_panel)
+	_file_suggestions = ItemList.new()
+	_file_suggestions.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_file_suggestions.custom_minimum_size = Vector2(0, 180)
+	_file_suggestions_panel.add_child(_file_suggestions)
+
+	_context_bar = HFlowContainer.new()
+	_context_bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_context_bar.add_theme_constant_override("h_separation", 6)
+	_context_bar.add_theme_constant_override("v_separation", 4)
+	add_child(_context_bar)
+
 	var bottom := HBoxContainer.new()
 	bottom.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	add_child(bottom)
@@ -330,10 +372,20 @@ func _build_children() -> void:
 
 	_history_popup = PopupMenu.new()
 	add_child(_history_popup)
+	_commands_popup = PopupMenu.new()
+	add_child(_commands_popup)
+	_project_files = _collector.project_files()
+	_message_context_popup = PopupMenu.new()
+	_message_context_popup.add_item("复制", 0)
+	_message_context_popup.add_item("粘贴到输入框", 1)
+	_message_context_popup.add_separator()
+	_message_context_popup.add_item("全选", 2)
+	add_child(_message_context_popup)
 
 	_log_renderer = LogEntryRenderer.new()
 	_log_renderer.theme_colors = _theme_colors
 	_log_renderer.editor_interface = editor_interface
+	_log_renderer.rich_text_setup = _configure_message_rich_text
 
 
 func _connect_signals() -> void:
@@ -341,15 +393,23 @@ func _connect_signals() -> void:
 	_stop_btn.pressed.connect(_on_interrupt)
 	_new_session_btn.pressed.connect(_on_new_session)
 	_input.text_submitted.connect(func(_text: String): _on_send())
+	_input.text_changed.connect(_on_input_text_changed)
 	_effort_options.item_selected.connect(_on_effort_selected)
 	_style_options.item_selected.connect(_on_style_selected)
 	_doctor_btn.pressed.connect(func(): _http_client.fetch_doctor())
 	_extensions_btn.pressed.connect(_on_extensions)
-	_commands_btn.pressed.connect(func(): _http_client.fetch_commands())
+	_commands_btn.pressed.connect(_on_show_commands)
+	_commands_popup.id_pressed.connect(_on_command_selected)
 	_memory_btn.pressed.connect(func(): _http_client.fetch_memory())
 	_reset_btn.pressed.connect(_on_reset)
 	_history_btn.pressed.connect(_on_show_history)
 	_history_popup.index_pressed.connect(_on_history_item_selected)
+	_file_suggestions.item_clicked.connect(func(index: int, _position: Vector2, mouse_button: int):
+		if mouse_button == MOUSE_BUTTON_LEFT:
+			_on_file_reference_selected(index)
+	)
+	_file_suggestions.item_activated.connect(_on_file_reference_selected)
+	_message_context_popup.id_pressed.connect(_on_message_context_action)
 	_http_client.response_received.connect(_on_response)
 	_http_client.events_received.connect(_on_events)
 	_http_client.error_occurred.connect(_on_error)
@@ -386,6 +446,8 @@ func _on_send() -> void:
 			"state": _status.text
 		})
 		return
+	if _try_run_slash_command(text):
+		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length()})
 	var requested_model = _request_model()
 	_active_model_name = str(requested_model) if requested_model != null else _model_input.placeholder_text
@@ -401,6 +463,10 @@ func _on_send() -> void:
 	_live_response_keys.clear()
 	_empty_final_ignored_ms = -1   # 重置空 final 超时计时器
 	_input.clear()
+	var referenced_paths: Array = _referenced_files.keys()
+	_referenced_files.clear()
+	_selection_signature = ""
+	_refresh_context_bar()
 	# 在用户消息之前追加两条空白消息：强制撑开 ScrollContainer 使滚动到底部，
 	# 同时作为上一轮回复与当前用户消息之间的视觉间距
 	_append_message("system", " ")
@@ -410,7 +476,212 @@ func _on_send() -> void:
 	_set_state(AgentState.WAITING_LLM)
 	if undo_manager != null:
 		undo_manager.begin_batch("AI: " + text.left(40))
-	_http_client.send_user_message(text, _collector.collect("any"), requested_model)
+	_http_client.send_user_message(text, _collector.collect("any", referenced_paths), requested_model)
+
+
+func _try_run_slash_command(text: String) -> bool:
+	if not text.begins_with("/"):
+		return false
+	var command_line := text.substr(1).strip_edges()
+	if command_line.is_empty():
+		return false
+	var separator := command_line.find(" ")
+	var command_name := command_line if separator < 0 else command_line.left(separator)
+	var raw_args := "" if separator < 0 else command_line.substr(separator + 1).strip_edges()
+	var args := {}
+	if not raw_args.is_empty():
+		var parsed = JSON.parse_string(raw_args)
+		if not (parsed is Dictionary):
+			_append_message("error", "命令参数必须是 JSON 对象，例如：/rebuild_index {\"incremental\": true}")
+			FrontendLogger.warn(editor_interface, "ChatPanel", "Slash command rejected: invalid JSON args.", {
+				"command": command_name,
+				"args_chars": raw_args.length()
+			})
+			return true
+		args = parsed
+	_input.clear()
+	_auto_scroll = true
+	_force_scroll_once = true
+	_append_message("user", text)
+	_append_message("system", "正在执行命令 /%s …" % command_name)
+	_set_state(AgentState.WAITING_LLM)
+	FrontendLogger.info(editor_interface, "ChatPanel", "Running slash command.", {
+		"command": command_name,
+		"arg_keys": args.keys()
+	})
+	_http_client.run_command(command_name, args)
+	return true
+
+
+func _on_input_text_changed(text: String) -> void:
+	if _file_suggestions == null:
+		return
+	var caret := _input.caret_column
+	var before_caret := text.left(caret)
+	var at_index := before_caret.rfind("@")
+	if at_index < 0 or (at_index > 0 and not before_caret.substr(at_index - 1, 1) in [" ", "\t", "\n"]):
+		_file_suggestions_panel.visible = false
+		return
+	var query := before_caret.substr(at_index + 1)
+	if query.contains(" ") or query.contains("\t") or query.contains("\n"):
+		_file_suggestions_panel.visible = false
+		return
+	_file_suggestions.clear()
+	_file_popup_paths.clear()
+	var lowered := query.to_lower()
+	for item in _project_files:
+		var path := str(item)
+		if lowered != "" and not path.to_lower().contains(lowered) and not path.get_file().to_lower().contains(lowered):
+			continue
+		_file_suggestions.add_item(path)
+		_file_popup_paths.append(path)
+		if _file_popup_paths.size() >= 12:
+			break
+	if _file_popup_paths.is_empty():
+		_file_suggestions_panel.visible = false
+		return
+	_file_suggestions_panel.visible = true
+	_file_suggestions.custom_minimum_size.y = minf(240.0, maxf(40.0, _file_popup_paths.size() * 26.0))
+
+
+func _on_file_reference_selected(index: int) -> void:
+	if index < 0 or index >= _file_popup_paths.size():
+		return
+	var path := _file_popup_paths[index]
+	var caret := _input.caret_column
+	var text := _input.text
+	var at_index := text.left(caret).rfind("@")
+	if at_index >= 0:
+		_input.text = text.left(at_index) + "@" + path + " " + text.substr(caret)
+		_input.caret_column = at_index + path.length() + 2
+	_referenced_files[path] = true
+	_dismissed_context.erase("file:" + path)
+	_selection_signature = ""
+	_refresh_context_bar()
+	_file_suggestions_panel.visible = false
+	_input.grab_focus()
+
+
+func _refresh_context_bar() -> void:
+	if _context_bar == null or _collector == null:
+		return
+	var selection: Dictionary = _collector.collect_selection()
+	var active_context_keys := {}
+	for item in selection.get("nodes", []):
+		if item is Dictionary:
+			active_context_keys["node:" + str(item.get("path", item.get("name", "")))] = true
+	var active_script := str(selection.get("current_script", ""))
+	if active_script != "":
+		active_context_keys["file:" + active_script] = true
+	for selected_path in selection.get("selected_files", []):
+		active_context_keys["file:" + str(selected_path)] = true
+	for dismissed_key in _dismissed_context.keys():
+		if not active_context_keys.has(dismissed_key):
+			_dismissed_context.erase(dismissed_key)
+	var referenced_path_strings := PackedStringArray()
+	for referenced_path in _referenced_files.keys():
+		referenced_path_strings.append(str(referenced_path))
+	var dismissed_strings := PackedStringArray()
+	for dismissed_key in _dismissed_context.keys():
+		dismissed_strings.append(str(dismissed_key))
+	var signature := JSON.stringify(selection) + "|" + "|".join(referenced_path_strings) + "|" + "|".join(dismissed_strings)
+	if signature == _selection_signature:
+		return
+	_selection_signature = signature
+	for child in _context_bar.get_children():
+		child.queue_free()
+	var nodes: Array = selection.get("nodes", [])
+	for item in nodes:
+		if not (item is Dictionary):
+			continue
+		var node_path := str(item.get("path", item.get("name", "")))
+		var node_key := "node:" + node_path
+		if _dismissed_context.has(node_key):
+			continue
+		var chip := Button.new()
+		chip.text = "Node: %s  ×" % node_path
+		chip.tooltip_text = "%s · %s" % [str(item.get("type", "Node")), str(item.get("script", ""))]
+		chip.pressed.connect(_dismiss_auto_context.bind(node_key, ""))
+		_context_bar.add_child(chip)
+	var current_script := str(selection.get("current_script", ""))
+	if current_script != "" and not _dismissed_context.has("file:" + current_script):
+		var script_chip := Button.new()
+		script_chip.text = "@%s  ×" % current_script
+		script_chip.tooltip_text = "Current script · click to remove"
+		script_chip.pressed.connect(_dismiss_auto_context.bind("file:" + current_script, current_script))
+		_context_bar.add_child(script_chip)
+	var selected_files: Array = selection.get("selected_files", [])
+	for selected_file_value in selected_files:
+		var selected_file := str(selected_file_value)
+		if selected_file == current_script or _dismissed_context.has("file:" + selected_file):
+			continue
+		var selected_file_chip := Button.new()
+		selected_file_chip.text = "@%s  ×" % selected_file
+		selected_file_chip.tooltip_text = "Selected file · click to remove"
+		selected_file_chip.pressed.connect(_dismiss_auto_context.bind("file:" + selected_file, selected_file))
+		_context_bar.add_child(selected_file_chip)
+	for path_value in _referenced_files.keys():
+		var path := str(path_value)
+		if path == current_script:
+			continue
+		var ref_chip := Button.new()
+		ref_chip.text = "@%s  ×" % path
+		ref_chip.tooltip_text = "Remove file reference"
+		ref_chip.pressed.connect(_remove_file_reference.bind(path))
+		_context_bar.add_child(ref_chip)
+	_context_bar.visible = _context_bar.get_child_count() > 0
+
+
+func _remove_file_reference(path: String) -> void:
+	_referenced_files.erase(path)
+	_selection_signature = ""
+	_refresh_context_bar()
+
+
+func _dismiss_auto_context(key: String, referenced_path: String) -> void:
+	_dismissed_context[key] = true
+	if referenced_path != "":
+		_referenced_files.erase(referenced_path)
+	_selection_signature = ""
+	_refresh_context_bar()
+
+
+func _configure_message_rich_text(rich: RichTextLabel) -> void:
+	rich.selection_enabled = true
+	rich.context_menu_enabled = false
+	rich.gui_input.connect(_on_message_rich_input.bind(rich))
+
+
+func _on_message_rich_input(event: InputEvent, rich: RichTextLabel) -> void:
+	if not (event is InputEventMouseButton):
+		return
+	var mouse_event := event as InputEventMouseButton
+	if mouse_event.button_index != MOUSE_BUTTON_RIGHT or not mouse_event.pressed:
+		return
+	_message_context_source = rich
+	_message_context_popup.set_item_disabled(0, rich.get_selected_text() == "")
+	_message_context_popup.position = DisplayServer.mouse_get_position()
+	_message_context_popup.popup()
+	rich.accept_event()
+
+
+func _on_message_context_action(id: int) -> void:
+	match id:
+		0:
+			if _message_context_source != null and is_instance_valid(_message_context_source):
+				var selected := _message_context_source.get_selected_text()
+				if selected != "":
+					DisplayServer.clipboard_set(selected)
+		1:
+			var pasted := DisplayServer.clipboard_get()
+			if pasted != "":
+				var caret := _input.caret_column
+				_input.text = _input.text.left(caret) + pasted + _input.text.substr(caret)
+				_input.caret_column = caret + pasted.length()
+				_input.grab_focus()
+		2:
+			if _message_context_source != null and is_instance_valid(_message_context_source):
+				_message_context_source.select_all()
 
 
 func _on_response(response: Dictionary) -> void:
@@ -427,7 +698,14 @@ func _on_response(response: Dictionary) -> void:
 	})
 	if response.has("python_version"):
 		_last_doctor_report = response
-		_append_message("system", "Doctor\n\n```json\n%s\n```" % JSON.stringify(response, "\t"))
+		if _extensions_pending:
+			_extensions_pending = false
+			_append_message("system", _format_extensions_report({
+				"skills": response.get("skills", []),
+				"warnings": response.get("warnings", [])
+			}))
+		else:
+			_append_message("system", _format_doctor_report(response))
 		if state_store != null:
 			state_store.set_value("doctor_warnings", response.get("warnings", []))
 		return
@@ -441,7 +719,7 @@ func _on_response(response: Dictionary) -> void:
 		return
 
 	if response.has("items") and response.has("ok"):
-		_append_message("system", "Memory\n\n```json\n%s\n```" % JSON.stringify(response, "\t"))
+		_append_message("system", _format_memory_report(response))
 		return
 
 	if response.has("ok") and response.has("session_id") and response.size() == 2:
@@ -449,11 +727,22 @@ func _on_response(response: Dictionary) -> void:
 		return
 
 	if response.has("type") and response.get("type") == "data":
-		_append_message("system", "Data\n\n```json\n%s\n```" % JSON.stringify(response.get("value", null), "\t"))
+		var value = response.get("value", null)
+		if value is Array and _looks_like_command_list(value):
+			_populate_commands_popup(value)
+			if _commands_requested:
+				_commands_requested = false
+				_commands_btn.disabled = _state != AgentState.IDLE
+				_show_commands_popup()
+		else:
+			_append_message("system", _format_plain_value("数据", value))
 		return
 
 	if response.has("ok") and response.has("text"):
-		_append_message("system", str(response.get("text", "")))
+		var command_text := _format_command_response(response)
+		_append_message("system" if bool(response.get("ok", false)) else "error", command_text)
+		if _state == AgentState.WAITING_LLM:
+			_set_state(AgentState.IDLE)
 		return
 
 	if response.has("exists"):
@@ -480,6 +769,316 @@ func _on_response(response: Dictionary) -> void:
 				"type": str(response.get("type", ""))
 			})
 			_append_message("system", JSON.stringify(response, "\t"))
+
+
+func _format_doctor_report(report: Dictionary) -> String:
+	var capabilities: Dictionary = report.get("capabilities", {}) if report.get("capabilities", {}) is Dictionary else {}
+	var lsp: Dictionary = capabilities.get("lsp", {}) if capabilities.get("lsp", {}) is Dictionary else {}
+	var mcp: Dictionary = capabilities.get("mcp", {}) if capabilities.get("mcp", {}) is Dictionary else {}
+	var rag: Dictionary = capabilities.get("rag", {}) if capabilities.get("rag", {}) is Dictionary else {}
+	var lines: Array[String] = ["诊断报告", "", "基础状态"]
+	lines.append("• Python：%s" % str(report.get("python_version", "未知")))
+	lines.append("• 模型：%s" % str(report.get("llm_model", "未配置")))
+	lines.append("• LLM 地址：%s" % _doctor_status(bool(report.get("llm_base_url_configured", false))))
+	lines.append("• 鉴权：%s" % _doctor_status(bool(report.get("auth_enabled", false))))
+	lines.append("• 权限模式：%s" % str(report.get("permission_mode", "未知")))
+	lines.append("• 受信任项目：%s" % _doctor_status(bool(report.get("trusted_project", false))))
+	lines.append("• 项目目录：%s" % str(report.get("project_root", "未知")))
+	lines.append("• 会话目录：%s" % str(report.get("session_store_dir", "未知")))
+
+	lines.append_array(["", "能力"])
+	lines.append("• LSP：%s；模式：%s；服务：%s" % [
+		_doctor_status(bool(lsp.get("enabled", false))), str(lsp.get("mode", "未知")), str(lsp.get("lsp_server", "未知"))
+	])
+	lines.append("  诊断来源：%s" % _doctor_list(lsp.get("diagnostics_sources", [])))
+	lines.append("  回退工具：%s" % _doctor_list(lsp.get("fallbacks", [])))
+	lines.append("• MCP：%s；模式：%s；权限：%s" % [
+		_doctor_status(bool(mcp.get("enabled", false))), str(mcp.get("mode", "未知")), str(mcp.get("permission_mode_when_enabled", "未知"))
+	])
+	lines.append("  入口：%s" % str(mcp.get("entrypoint", "未配置")))
+	lines.append("• RAG：%s；模式：%s；策略：%s" % [
+		_doctor_status(bool(rag.get("enabled", false))), str(rag.get("mode", "未知")), str(rag.get("strategy", "未知"))
+	])
+	lines.append("  主索引：%s（%s）" % [
+		"已创建" if bool(rag.get("index_exists", false)) else "未创建", str(rag.get("index_path", "未知"))
+	])
+	var sub_indexes: Dictionary = rag.get("sub_indexes", {}) if rag.get("sub_indexes", {}) is Dictionary else {}
+	for index_name in sub_indexes.keys():
+		var index_info: Dictionary = sub_indexes[index_name] if sub_indexes[index_name] is Dictionary else {}
+		lines.append("  %s：%s（%s）" % [
+			str(index_name), "已创建" if bool(index_info.get("exists", false)) else "未创建", str(index_info.get("path", "未知"))
+		])
+
+	lines.append_array(["", "启用域", _doctor_list(report.get("enabled_domains", []))])
+	var tools: Array = report.get("registered_tools", []) if report.get("registered_tools", []) is Array else []
+	lines.append_array(["", "已注册工具（%d）" % tools.size(), _doctor_list(tools)])
+
+	lines.append_array(["", "输出风格"])
+	var styles: Array = report.get("output_styles", []) if report.get("output_styles", []) is Array else []
+	if styles.is_empty():
+		lines.append("• 无")
+	for style in styles:
+		if style is Dictionary:
+			lines.append("• %s：%s%s" % [
+				str(style.get("name", "未命名")), str(style.get("description", "")), "" if bool(style.get("enabled", true)) else "（已禁用）"
+			])
+
+	lines.append_array(["", "技能"])
+	var skills: Array = report.get("skills", []) if report.get("skills", []) is Array else []
+	if skills.is_empty():
+		lines.append("• 无")
+	for skill in skills:
+		if skill is Dictionary:
+			lines.append("• %s：%s" % [str(skill.get("name", "未命名")), str(skill.get("description", ""))])
+			lines.append("  工具：%s" % _doctor_list(skill.get("effective_tools", [])))
+
+	lines.append_array(["", "警告"])
+	var warnings: Array = report.get("warnings", []) if report.get("warnings", []) is Array else []
+	if warnings.is_empty():
+		lines.append("• 无")
+	else:
+		for warning in warnings:
+			lines.append("• %s" % str(warning))
+	return "\n".join(lines)
+
+
+func _doctor_status(enabled: bool) -> String:
+	return "已启用" if enabled else "未启用"
+
+
+func _doctor_list(values) -> String:
+	if not (values is Array) or values.is_empty():
+		return "无"
+	var items := PackedStringArray()
+	for value in values:
+		items.append(str(value))
+	return "、".join(items)
+
+
+func _looks_like_command_list(values: Array) -> bool:
+	if values.is_empty():
+		return true
+	for value in values:
+		if not (value is Dictionary) or not value.has("name") or not value.has("description"):
+			return false
+	return true
+
+
+func _on_show_commands() -> void:
+	if not _available_commands.is_empty():
+		_show_commands_popup()
+		return
+	_commands_requested = true
+	_commands_btn.disabled = true
+	_http_client.fetch_commands()
+
+
+func _populate_commands_popup(commands: Array) -> void:
+	_available_commands.clear()
+	_commands_popup.clear()
+	for command in commands:
+		if not (command is Dictionary):
+			continue
+		var index := _available_commands.size()
+		_available_commands.append(command)
+		_commands_popup.add_item(str(command.get("name", "未命名命令")), index)
+		_commands_popup.set_item_tooltip(index, str(command.get("description", "无说明")))
+
+
+func _show_commands_popup() -> void:
+	var popup_position := _commands_btn.get_screen_position() + Vector2(0, _commands_btn.size.y)
+	_commands_popup.position = Vector2i(roundi(popup_position.x), roundi(popup_position.y))
+	_commands_popup.reset_size()
+	_commands_popup.popup()
+
+
+func _on_command_selected(command_index: int) -> void:
+	if command_index < 0 or command_index >= _available_commands.size():
+		return
+	var command = _available_commands[command_index]
+	if not (command is Dictionary):
+		return
+	var command_name := str(command.get("name", "")).strip_edges()
+	var args := _command_default_args(command)
+	_run_selected_command(command_name, args)
+
+
+func _command_default_args(command: Dictionary) -> Dictionary:
+	var args := {}
+	var schema = command.get("args_schema", {})
+	if not (schema is Dictionary):
+		return args
+	var properties = schema.get("properties", {})
+	if not (properties is Dictionary):
+		return args
+	for property_name in properties.keys():
+		var info = properties[property_name]
+		if not (info is Dictionary):
+			continue
+		if info.has("default"):
+			var default_value = info.get("default")
+			args[property_name] = int(default_value) if str(info.get("type", "")) == "integer" else default_value
+		elif property_name == "effort":
+			args[property_name] = _effort_options.get_item_text(_effort_options.selected)
+		elif property_name == "output_style":
+			args[property_name] = _style_options.get_item_text(_style_options.selected)
+		else:
+			var enum_values = info.get("enum", [])
+			if enum_values is Array and not enum_values.is_empty():
+				args[property_name] = enum_values[0]
+	return args
+
+
+func _run_selected_command(command_name: String, args: Dictionary) -> void:
+	if _state != AgentState.IDLE:
+		_append_message("error", "当前任务尚未结束，暂时不能运行其他命令。")
+		return
+	_auto_scroll = true
+	_force_scroll_once = true
+	_append_message("user", "/%s %s" % [command_name, JSON.stringify(args)])
+	_append_message("system", "正在执行命令 /%s …" % command_name)
+	_set_state(AgentState.WAITING_LLM)
+	FrontendLogger.info(editor_interface, "ChatPanel", "Running command selected from dropdown.", {
+		"command": command_name,
+		"arg_keys": args.keys()
+	})
+	_http_client.run_command(command_name, args)
+
+
+func _format_commands_report(commands: Array) -> String:
+	var lines: Array[String] = ["命令", "", "共 %d 个可用命令" % commands.size()]
+	if commands.is_empty():
+		lines.append("• 无")
+		return "\n".join(lines)
+	for command in commands:
+		if not (command is Dictionary):
+			continue
+		lines.append("")
+		lines.append("• %s" % str(command.get("name", "未命名")))
+		lines.append("  %s" % str(command.get("description", "无说明")))
+		var schema: Dictionary = command.get("args_schema", {}) if command.get("args_schema", {}) is Dictionary else {}
+		var properties: Dictionary = schema.get("properties", {}) if schema.get("properties", {}) is Dictionary else {}
+		if properties.is_empty():
+			lines.append("  参数：无")
+		else:
+			var required: Array = schema.get("required", []) if schema.get("required", []) is Array else []
+			var args: Array[String] = []
+			for arg_name in properties.keys():
+				var info: Dictionary = properties[arg_name] if properties[arg_name] is Dictionary else {}
+				var label := str(arg_name) + "：" + str(info.get("type", "任意"))
+				if required.has(arg_name):
+					label += "，必填"
+				elif info.has("default"):
+					label += "，默认 %s" % str(info.get("default"))
+				args.append(label)
+			lines.append("  参数：%s" % "；".join(PackedStringArray(args)))
+	return "\n".join(lines)
+
+
+func _format_command_response(response: Dictionary) -> String:
+	var text := str(response.get("text", "")).strip_edges()
+	var result = response.get("result", null)
+	if not (result is Dictionary):
+		return text
+	if result.has("python_version"):
+		return _format_doctor_report(result)
+	if result.has("files") and result.has("chunks") and result.has("changed_files"):
+		return _format_rebuild_index_result(result)
+	if result.has("compacted_frames") and result.has("removed_messages"):
+		return _format_compact_result(result)
+	var formatted := _format_plain_value("命令结果", result)
+	return formatted if text.is_empty() else text + "\n\n" + formatted
+
+
+func _format_rebuild_index_result(result: Dictionary) -> String:
+	var lines: Array[String] = ["RAG 索引构建完成", ""]
+	lines.append("• 本次处理文件：%d" % int(result.get("files", 0)))
+	lines.append("• 索引片段：%d" % int(result.get("chunks", 0)))
+	lines.append("• 发生变化的文件：%d" % int(result.get("changed_files", 0)))
+	if result.has("vectors"):
+		lines.append("• 向量数量：%d" % int(result.get("vectors", 0)))
+	if result.has("symbols"):
+		lines.append("• 符号数量：%d" % int(result.get("symbols", 0)))
+	if result.has("assets"):
+		lines.append("• 资源数量：%d" % int(result.get("assets", 0)))
+	lines.append("• 文件数量是否超限：%s" % ("是" if bool(result.get("truncated_files", false)) else "否"))
+	return "\n".join(lines)
+
+
+func _format_compact_result(result: Dictionary) -> String:
+	var lines: Array[String] = ["会话上下文压缩完成", ""]
+	lines.append("• 压缩帧数：%d" % int(result.get("compacted_frames", 0)))
+	lines.append("• 移除消息：%d" % int(result.get("removed_messages", 0)))
+	lines.append("• 截断超长消息：%d" % int(result.get("truncated_messages", 0)))
+	lines.append("• 待处理任务：%s" % ("已保留" if result.get("pending_turn_id", null) != null else "无"))
+	return "\n".join(lines)
+
+
+func _format_memory_report(response: Dictionary) -> String:
+	var items: Array = response.get("items", []) if response.get("items", []) is Array else []
+	var lines: Array[String] = ["记忆", "", "状态：%s" % ("成功" if bool(response.get("ok", true)) else "失败")]
+	var response_text := str(response.get("text", "")).strip_edges()
+	if response_text != "":
+		lines.append("消息：%s" % response_text)
+	lines.append("条目：%d" % items.size())
+	if items.is_empty():
+		lines.append("• 无")
+		return "\n".join(lines)
+	for index in range(items.size()):
+		var item = items[index]
+		if not (item is Dictionary):
+			continue
+		lines.append("")
+		lines.append("%d. %s" % [index + 1, str(item.get("text", ""))])
+		lines.append("   ID：%s" % str(item.get("id", "未知")))
+		lines.append("   范围：%s；标签：%s" % [str(item.get("scope", "未知")), _doctor_list(item.get("tags", []))])
+		var updated_at := int(float(item.get("updated_at", 0.0)))
+		if updated_at > 0:
+			lines.append("   更新时间：%s" % Time.get_datetime_string_from_unix_time(updated_at, true))
+	return "\n".join(lines)
+
+
+func _format_extensions_report(payload: Dictionary) -> String:
+	var skills: Array = payload.get("skills", []) if payload.get("skills", []) is Array else []
+	var lines: Array[String] = ["扩展", "", "技能：%d" % skills.size()]
+	if skills.is_empty():
+		lines.append("• 无")
+	for skill in skills:
+		if not (skill is Dictionary):
+			continue
+		lines.append("")
+		lines.append("• %s%s" % [
+			str(skill.get("name", "未命名")), "" if bool(skill.get("enabled", true)) else "（已禁用）"
+		])
+		lines.append("  %s" % str(skill.get("description", "无说明")))
+		var qualified_name := str(skill.get("qualified_name", "")).strip_edges()
+		if qualified_name != "":
+			lines.append("  标识：%s；来源：%s" % [qualified_name, str(skill.get("source", "未知"))])
+		lines.append("  工具：%s" % _doctor_list(skill.get("effective_tools", [])))
+		var when_to_use := str(skill.get("when_to_use", "")).strip_edges()
+		if when_to_use != "":
+			lines.append("  使用时机：%s" % when_to_use)
+	var warnings: Array = payload.get("warnings", []) if payload.get("warnings", []) is Array else []
+	lines.append_array(["", "警告"])
+	if warnings.is_empty():
+		lines.append("• 无")
+	else:
+		for warning in warnings:
+			lines.append("• %s" % str(warning))
+	return "\n".join(lines)
+
+
+func _format_plain_value(title: String, value) -> String:
+	if value == null:
+		return title + "\n\n无"
+	if value is Array:
+		return title + "\n\n" + _doctor_list(value)
+	if value is Dictionary:
+		var lines: Array[String] = [title, ""]
+		for key in value.keys():
+			lines.append("• %s：%s" % [str(key), str(value[key])])
+		return "\n".join(lines)
+	return title + "\n\n" + str(value)
 
 
 func _handle_tool_calls(response: Dictionary) -> void:
@@ -832,6 +1431,8 @@ func _render_history_block(block: Dictionary) -> void:
 				var ext := str(block.get("path", "")).get_extension().to_lower()
 				var lang := "gdscript" if ext == "gd" else ("python" if ext == "py" else "")
 				_log_renderer.append_history_code_entry(_message_list, edit_after_text, lang, true)
+		"node_tree":
+			_render_history_node_tree(block)
 		"thought":
 			_log_renderer.append_history_thought_entry(
 				_message_list,
@@ -886,6 +1487,28 @@ func _render_history_block(block: Dictionary) -> void:
 func _history_agent_suffix(block: Dictionary) -> String:
 	var agent := str(block.get("agent", "")).strip_edges()
 	return " (%s)" % agent if agent != "" else ""
+
+
+func _render_history_node_tree(block: Dictionary) -> void:
+	var lines: Array[String] = [str(block.get("title", "Scene tree"))]
+	var tree = block.get("tree", {})
+	if tree is Dictionary and not tree.is_empty():
+		_append_history_node_lines(tree, "", true, lines)
+	else:
+		lines.append("(empty)")
+	_append_log_stream_message("\n".join(lines), null, true)
+
+
+func _append_history_node_lines(node: Dictionary, prefix: String, is_last: bool, lines: Array[String]) -> void:
+	var branch := "└─ " if is_last else "├─ "
+	var name := str(node.get("name", node.get("path", "Node")))
+	var type_name := str(node.get("type", "Node"))
+	lines.append(prefix + branch + name + " (" + type_name + ")")
+	var children: Array = node.get("children", []) if node.get("children", []) is Array else []
+	var child_prefix := prefix + ("   " if is_last else "│  ")
+	for index in range(children.size()):
+		if children[index] is Dictionary:
+			_append_history_node_lines(children[index], child_prefix, index == children.size() - 1, lines)
 
 
 func _render_history_grep_block(block: Dictionary) -> void:
@@ -1052,6 +1675,9 @@ func _truncate_history_markdown(text: String, max_chars: int) -> String:
 
 func _on_error(message: String) -> void:
 	FrontendLogger.error(editor_interface, "ChatPanel", "Agent error.", {"message": message})
+	if _commands_requested:
+		_commands_requested = false
+		_commands_btn.disabled = _state != AgentState.IDLE
 	_append_message("error", message)
 	_finish_streaming()
 	_finish_reasoning_stream()
@@ -1117,6 +1743,7 @@ func _on_reset() -> void:
 	_http_client.reset_session()
 	if state_store != null:
 		state_store.reset()
+	_last_cache_status = ""
 	_set_state(AgentState.IDLE)
 
 
@@ -1159,6 +1786,7 @@ func _on_new_session() -> void:
 		state_store.reset()
 		state_store.set_value("session_id", session_id)
 	_clear_messages()
+	_last_cache_status = ""
 	_set_state(AgentState.IDLE)
 	_append_message("system", _ui("new_session_started") % session_id)
 
@@ -1330,9 +1958,15 @@ func _handle_event(event: Dictionary) -> void:
 			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 			_active_model_name = str(payload.get("fallback_model", "")).strip_edges()
 			_refresh_status_text()
-		var previous_state := _state
-		var is_compacting := event_type == "compact_boundary" and previous_state != AgentState.IDLE
-		if is_compacting:
+		if event_type == "cache_hit":
+			var cache_payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+			_last_cache_status = EventFormatter.format_cache_status_indicator(cache_payload, _ui_table())
+			_refresh_status_text()
+		# `compact_started`/`compact_boundary` 总是成对到达（见后端 `compact()`），
+		# 中间跨越的才是压缩真正发生的窗口；据此让状态栏在这段时间显示"正在压缩"，
+		# 结束后还原成压缩前原本的状态（等待模型/执行工具等），而不是固定回到 IDLE。
+		if event_type == "compact_started" and _state != AgentState.IDLE:
+			_state_before_compact = _state
 			_set_state(AgentState.COMPACTING)
 		var description := EventFormatter.describe_event(event, _ui_table())
 		if description != "":
@@ -1343,20 +1977,21 @@ func _handle_event(event: Dictionary) -> void:
 			if _MILESTONE_EVENT_TYPES.has(event_type):
 				_force_scroll_once = true
 			_append_message("system", description)
-		if is_compacting:
-			_set_state(previous_state)
+		if event_type == "compact_boundary" and _state == AgentState.COMPACTING:
+			_set_state(_state_before_compact)
 
 
 func _on_extensions() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Extensions requested.")
 	if _last_doctor_report.is_empty():
+		_extensions_pending = true
 		_http_client.fetch_doctor()
 	else:
 		var payload := {
 			"skills": _last_doctor_report.get("skills", []),
 			"warnings": _last_doctor_report.get("warnings", [])
 		}
-		_append_message("system", "Extensions\n\n```json\n%s\n```" % JSON.stringify(payload, "\t"))
+		_append_message("system", _format_extensions_report(payload))
 
 
 func _on_effort_selected(index: int) -> void:
@@ -1501,7 +2136,12 @@ func _status_text_for_state(value: int) -> String:
 			base = _ui("executing")
 		AgentState.COMPACTING:
 			base = _ui("compacting")
-	return "%s · %s" % [base, _active_model_name] if _active_model_name != "" else base
+	var parts: Array[String] = [base]
+	if _active_model_name != "":
+		parts.append(_active_model_name)
+	if _last_cache_status != "":
+		parts.append(_last_cache_status)
+	return " · ".join(parts)
 
 
 func _refresh_status_text() -> void:
@@ -1514,6 +2154,7 @@ func _set_state(value: int) -> void:
 	var previous_state := _state
 	_state = value
 	_send_btn.disabled = value != AgentState.IDLE
+	_commands_btn.disabled = value != AgentState.IDLE or _commands_requested
 	_stop_btn.disabled = value == AgentState.IDLE
 	_new_session_btn.disabled = value == AgentState.EXECUTING
 	_model_input.editable = value == AgentState.IDLE
@@ -2029,6 +2670,7 @@ func _switch_to_session(session_id: String) -> void:
 		state_store.reset()
 		state_store.set_value("session_id", session_id)
 	_clear_messages()
+	_last_cache_status = ""
 	_set_state(AgentState.IDLE)
 	_http_client.fetch_session_history()
 	_save_session_to_history(session_id)

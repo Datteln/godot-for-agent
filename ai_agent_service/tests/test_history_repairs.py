@@ -250,10 +250,54 @@ def test_runtime_state_history_preserves_node_tree() -> None:
     )
 
     assert len(blocks) == 1
+    block = blocks[0].model_dump()
+    assert block["type"] == "node_tree"
+    assert block["tree"]["name"] == "Root"
+    assert block["tree"]["children"][0]["name"] == "Player"
+    assert block["tree"]["children"][0]["type"] == "CharacterBody2D"
+
+
+def test_wrapped_runtime_history_uses_node_tree_block() -> None:
+    wrapped = {
+        "status": "applied",
+        "result": {
+            "ok": True,
+            "edited_scene": {"name": "Root", "type": "Node2D", "children": []},
+        },
+        "artifact_refs": [],
+    }
+
+    blocks = _tool_history_blocks(_frame(), "read_runtime_state", {}, json.dumps(wrapped))
+
+    assert blocks[0].model_dump()["type"] == "node_tree"
+    assert blocks[0].model_dump()["tree"]["name"] == "Root"
+
+
+def test_wrapped_system_command_history_is_compact() -> None:
+    wrapped = {
+        "status": "applied",
+        "result": {
+            "ok": True,
+            "status": "completed",
+            "shell": "powershell",
+            "exit_code": 0,
+            "output": "clean output",
+        },
+        "artifact_refs": [],
+    }
+
+    blocks = _tool_history_blocks(
+        _frame(),
+        "run_system_command",
+        {"command": "git status"},
+        json.dumps(wrapped),
+    )
+
     text = blocks[0].model_dump()["text"]
-    assert "edited_scene" in text
-    assert "Player" in text
-    assert "CharacterBody2D" in text
+    assert "Shell git status" in text
+    assert "exit=0" in text
+    assert "clean output" in text
+    assert "artifact_refs" not in text
 
 
 def test_edit_history_preserves_complete_code_and_whitespace() -> None:

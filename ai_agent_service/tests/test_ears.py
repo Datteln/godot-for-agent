@@ -6,8 +6,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app.config import AppSettings
 from app.llm.cache_manager import compute_rag_fingerprint
 from app.prompt.context_builder import ContextBuilder, ContextLayer
+from app.rag.build_manager import RagIndexBuildManager
 from app.rag.embedding_client import EmbeddingClient, EmbeddingConfig
 from app.rag.engine.asset_index import AssetIndex, classify_asset
 from app.rag.engine.scene_graph_index import SceneGraphIndex
@@ -279,6 +281,85 @@ class EarsTests(unittest.TestCase):
         for field in fields:
             self.assertIn("AI_AGENT_" + field, manager)
             self.assertIn("ai_agent/" + field.lower(), migrations)
+
+    def test_frontend_routes_slash_commands_to_command_api(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        panel = (
+            repo / "ai_agent_frontend/addons/ai_agent/ui/chat_panel.gd"
+        ).read_text(encoding="utf-8")
+        manager = (
+            repo / "ai_agent_frontend/addons/ai_agent/service/service_manager.gd"
+        ).read_text(encoding="utf-8")
+        self.assertIn("func _try_run_slash_command", panel)
+        self.assertIn("_http_client.run_command(command_name, args)", panel)
+        self.assertIn("命令参数必须是 JSON 对象", panel)
+        self.assertIn('"AI_AGENT_RAG_AUTO_BUILD_ENABLED"', manager)
+
+    def test_build_manager_creates_all_configured_indexes(self) -> None:
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "player.gd").write_text("func jump():\n    pass\n", encoding="utf-8")
+            (root / "player.tscn").write_text(
+                '[node name="Player" type="Node2D"]\n', encoding="utf-8"
+            )
+            (root / "sprite.png").write_bytes(b"png")
+            settings = AppSettings(
+                project_root=root,
+                asset_understanding_enabled=True,
+                asset_understanding_model="",
+                asset_understanding_endpoint="",
+            )
+            manager = RagIndexBuildManager(settings, SecuritySettings(project_root=root))
+            result = asyncio.run(manager.build(reason="test"))
+            self.assertEqual(result["trigger"], "test")
+            for name in (
+                "rag_index.json",
+                "rag_embeddings.json",
+                "rag_symbols.json",
+                "scene_graph.json",
+                "signal_graph.json",
+                "asset_index.json",
+            ):
+                self.assertTrue((root / ".ai_agent_service" / name).exists(), name)
+
+    def test_build_manager_watches_create_modify_and_delete(self) -> None:
+        import asyncio
+        import json
+
+        async def scenario(root: Path) -> None:
+            source = root / "player.gd"
+            source.write_text("func jump():\n    pass\n", encoding="utf-8")
+            settings = AppSettings(project_root=root)
+            manager = RagIndexBuildManager(settings, SecuritySettings(project_root=root))
+            await manager.build(reason="test_initial")
+
+            watcher = asyncio.create_task(manager.watch(poll_interval_s=0.1, debounce_s=0.05))
+            try:
+                await asyncio.sleep(0.15)
+                source.write_text("func dash():\n    pass\n", encoding="utf-8")
+
+                async def wait_for_text(needle: str, *, present: bool) -> None:
+                    index_path = root / ".ai_agent_service" / "rag_index.json"
+                    for _ in range(40):
+                        payload = json.loads(index_path.read_text(encoding="utf-8"))
+                        snippets = "\n".join(str(item.get("snippet", "")) for item in payload["chunks"])
+                        if (needle in snippets) is present:
+                            return
+                        await asyncio.sleep(0.05)
+                    self.fail(f"index did not reach expected state for {needle!r}")
+
+                await wait_for_text("dash", present=True)
+                source.unlink()
+                await wait_for_text("dash", present=False)
+            finally:
+                watcher.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher
+
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(scenario(Path(tmp)))
 
 
 if __name__ == "__main__":

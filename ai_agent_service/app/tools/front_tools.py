@@ -375,6 +375,49 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="run_system_command",
+            domain="program",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            executes_process=True,
+            needs_preview=True,
+            timeout_ms=120000,
+            render_kind="run",
+            schema={
+                "name": "run_system_command",
+                "description": (
+                    "Run a system command after explicit user confirmation. Supports automatic native "
+                    "shell selection plus PowerShell, CMD, sh, bash, and zsh when installed. Use this "
+                    "for build, test, version-control, and other terminal tasks."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "command": {
+                            "type": "string",
+                            "description": "The exact command text to execute.",
+                        },
+                        "shell": {
+                            "type": "string",
+                            "enum": ["auto", "powershell", "pwsh", "cmd", "sh", "bash", "zsh"],
+                            "description": "Shell to use. auto selects PowerShell on Windows and sh on Linux/macOS.",
+                        },
+                        "working_directory": {
+                            "type": "string",
+                            "description": "Working directory. Defaults to the Godot project root; res:// paths are supported.",
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Requested timeout; frontend clamps it to the configured local limit.",
+                        },
+                    },
+                    ["command"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="add_node",
             domain="scene",
             side="front",

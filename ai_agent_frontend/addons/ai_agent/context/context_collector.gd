@@ -4,14 +4,16 @@ extends Node
 const DiagnosticsCollector = preload("res://addons/ai_agent/context/diagnostics_collector.gd")
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 
-const MAX_PROJECT_FILES := 200
-const PROJECT_FILE_MAX_DEPTH := 4
-const PROJECT_FILE_EXTENSIONS := ["gd", "cs", "tscn", "tres"]
+const MAX_PROJECT_FILES := 1000
+const PROJECT_FILE_MAX_DEPTH := 12
+const PROJECT_FILE_EXTENSIONS := ["gd", "cs", "tscn", "tres", "gdshader", "json", "md", "txt", "cfg", "ini", "py", "yaml", "yml"]
+const MAX_REFERENCED_FILES := 8
+const MAX_REFERENCED_FILE_CHARS := 40000
 
 var editor_interface: EditorInterface
 
 
-func collect(domain_hint: String = "any") -> Dictionary:
+func collect(domain_hint: String = "any", referenced_paths: Array = []) -> Dictionary:
 	var enable_diagnostics := true
 	if editor_interface != null:
 		enable_diagnostics = bool(ConfigMigrations.get_value(editor_interface, "ai_agent/enable_lsp_diagnostics"))
@@ -19,7 +21,8 @@ func collect(domain_hint: String = "any") -> Dictionary:
 	if enable_diagnostics:
 		diagnostics = DiagnosticsCollector.collect(editor_interface)
 	return {
-		"selection": _collect_selection(),
+		"selection": collect_selection(),
+		"referenced_files": _collect_referenced_files(referenced_paths),
 		"scene_tree": _collect_scene_tree(),
 		"tile_catalog": _collect_tile_catalog(),
 		"project_files": _collect_project_files(),
@@ -34,6 +37,27 @@ func _collect_project_files() -> Array:
 	var files: Array = []
 	_scan_project_dir("res://", files, 0)
 	return files
+
+
+func project_files() -> Array:
+	return _collect_project_files()
+
+
+func _collect_referenced_files(paths: Array) -> Array:
+	var result: Array = []
+	for raw_path in paths.slice(0, MAX_REFERENCED_FILES):
+		var path := str(raw_path).strip_edges()
+		if not path.begins_with("res://"):
+			continue
+		var absolute := ProjectSettings.globalize_path(path)
+		if not FileAccess.file_exists(absolute):
+			continue
+		var content := FileAccess.get_file_as_string(absolute)
+		var truncated := content.length() > MAX_REFERENCED_FILE_CHARS
+		if truncated:
+			content = content.left(MAX_REFERENCED_FILE_CHARS)
+		result.append({"path": path, "content": content, "truncated": truncated})
+	return result
 
 
 func _scan_project_dir(path: String, out: Array, depth: int) -> void:
@@ -89,7 +113,7 @@ func _relative_path(root: Node, node: Node) -> String:
 	return str(root.get_path_to(node))
 
 
-func _collect_selection() -> Dictionary:
+func collect_selection() -> Dictionary:
 	if editor_interface == null:
 		return {}
 	var root := editor_interface.get_edited_scene_root()
@@ -104,7 +128,21 @@ func _collect_selection() -> Dictionary:
 				"type": node.get_class(),
 				"script": _script_path(node)
 			})
-	return {"nodes": result}
+	var current_script := ""
+	var script_editor := editor_interface.get_script_editor()
+	if script_editor != null:
+		var script = script_editor.get_current_script()
+		if script is Resource:
+			current_script = script.resource_path
+	var selected_files: Array[String] = []
+	if editor_interface.has_method("get_selected_paths"):
+		var raw_paths = editor_interface.call("get_selected_paths")
+		if raw_paths is PackedStringArray or raw_paths is Array:
+			for raw_path in raw_paths:
+				var selected_path := str(raw_path)
+				if selected_path.begins_with("res://") and FileAccess.file_exists(ProjectSettings.globalize_path(selected_path)):
+					selected_files.append(selected_path)
+	return {"nodes": result, "current_script": current_script, "selected_files": selected_files}
 
 
 func _collect_scene_tree() -> Dictionary:

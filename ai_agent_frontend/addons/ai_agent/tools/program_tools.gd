@@ -6,6 +6,8 @@ const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 
 const MAX_STALE_CONTENT_CHARS := 40000
+const MAX_SYSTEM_COMMAND_CHARS := 100000
+const MAX_SYSTEM_COMMAND_OUTPUT_CHARS := 200000
 
 
 static func read_file(input: Dictionary, file_state_cache: Node = null) -> Dictionary:
@@ -152,6 +154,187 @@ static func run_tests(input: Dictionary, editor_interface: EditorInterface) -> D
 	}
 
 
+static func run_system_command(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var command := str(input.get("command", ""))
+	if command.strip_edges() == "":
+		return {"ok": false, "message": "command is required", "error_code": "command_required"}
+	if command.length() > MAX_SYSTEM_COMMAND_CHARS:
+		return {"ok": false, "message": "command is too long", "error_code": "command_too_long"}
+	if editor_interface == null:
+		return {"ok": false, "message": "editor_interface is not available"}
+
+	var shell_name := str(input.get("shell", "auto")).to_lower().strip_edges()
+	var shell := _resolve_system_shell(shell_name)
+	if shell.is_empty():
+		return {
+			"ok": false,
+			"message": "shell is not supported on this platform: " + shell_name,
+			"error_code": "unsupported_shell"
+		}
+	var working_directory := _resolve_working_directory(str(input.get("working_directory", "res://")))
+	if working_directory == "" or not DirAccess.dir_exists_absolute(working_directory):
+		return {
+			"ok": false,
+			"message": "working directory does not exist: " + str(input.get("working_directory", "res://")),
+			"error_code": "working_directory_missing"
+		}
+
+	var configured_timeout := int(ConfigMigrations.get_value(editor_interface, "ai_agent/system_command_timeout_ms"))
+	var requested_timeout := int(input.get("timeout_ms", configured_timeout))
+	var timeout_ms = min(max(requested_timeout, 1000), max(configured_timeout, 1000))
+	var launch := _build_system_command_launch(command, shell, working_directory)
+	if launch.is_empty():
+		return {"ok": false, "message": "failed to prepare system command", "error_code": "failed_to_prepare"}
+
+	FrontendLogger.info(editor_interface, "ProgramTools", "Launching confirmed system command.", {
+		"shell": shell.get("name", shell_name),
+		"working_directory": working_directory,
+		"timeout_ms": timeout_ms,
+	})
+	var run_result: Dictionary = await _run_system_command_launch(launch, timeout_ms)
+	var output := _read_bounded_file(str(launch.get("output_path", "")), MAX_SYSTEM_COMMAND_OUTPUT_CHARS)
+	_cleanup_runner_files(launch)
+	return {
+		"ok": bool(run_result.get("ok", false)),
+		"status": str(run_result.get("status", "failed")),
+		"pid": run_result.get("pid", -1),
+		"exit_code": run_result.get("exit_code", null),
+		"shell": shell.get("name", shell_name),
+		"working_directory": working_directory,
+		"timeout_ms": timeout_ms,
+		"output": output,
+		"output_truncated": output.length() >= MAX_SYSTEM_COMMAND_OUTPUT_CHARS,
+	}
+
+
+static func _resolve_system_shell(requested: String) -> Dictionary:
+	var name := requested if requested != "" else "auto"
+	var windows := OS.get_name() == "Windows"
+	if name == "auto":
+		name = "powershell" if windows else "sh"
+	match name:
+		"powershell":
+			return {
+				"name": "powershell",
+				"executable": "powershell.exe" if windows else "pwsh",
+				"args": PackedStringArray(["-NoProfile", "-Command"]),
+			}
+		"pwsh":
+			return {
+				"name": "pwsh",
+				"executable": "pwsh.exe" if windows else "pwsh",
+				"args": PackedStringArray(["-NoProfile", "-Command"]),
+			}
+		"cmd":
+			if not windows:
+				return {}
+			return {"name": "cmd", "executable": "cmd.exe", "args": PackedStringArray(["/D", "/S", "/C"])}
+		"sh", "bash", "zsh":
+			var executable := name + (".exe" if windows else "")
+			if name == "sh" and not windows:
+				executable = "/bin/sh"
+			return {"name": name, "executable": executable, "args": PackedStringArray(["-c"])}
+		_:
+			return {}
+
+
+static func _resolve_working_directory(value: String) -> String:
+	var path := value.strip_edges()
+	if path == "":
+		path = "res://"
+	if path.begins_with("res://") or path.begins_with("user://"):
+		return ProjectSettings.globalize_path(path).simplify_path()
+	if path.is_absolute_path():
+		return path.simplify_path()
+	return ProjectSettings.globalize_path("res://" + path).simplify_path()
+
+
+static func _build_system_command_launch(command: String, shell: Dictionary, working_directory: String) -> Dictionary:
+	var token := "%d_%d" % [Time.get_ticks_usec(), randi()]
+	var windows := OS.get_name() == "Windows"
+	var script_path := "user://ai_agent_command_%s%s" % [token, ".ps1" if windows else ".sh"]
+	var exit_path := "user://ai_agent_command_%s.exit" % token
+	var output_path := "user://ai_agent_command_%s.log" % token
+	var script_abs := ProjectSettings.globalize_path(script_path)
+	var exit_abs := ProjectSettings.globalize_path(exit_path)
+	var output_abs := ProjectSettings.globalize_path(output_path)
+	var shell_args: PackedStringArray = shell.get("args", PackedStringArray()).duplicate()
+	shell_args.append(command)
+	var script := ""
+	var launch_executable := ""
+	var launch_args := PackedStringArray()
+	if windows:
+		# Windows PowerShell 5.1 的 `>`/`*>` 默认生成 UTF-16 LE 文件，Godot 会按
+		# UTF-8 读取并报 Invalid UTF-8。通过显式 UTF-8 StreamWriter 流式合并
+		# stdout/stderr，既避免整段输出驻留内存，也兼容 PowerShell 5.1 与 pwsh。
+		script = "$exe = '%s'\n$argList = @(%s)\nSet-Location -LiteralPath '%s'\n$utf8 = New-Object System.Text.UTF8Encoding($false)\n$writer = New-Object System.IO.StreamWriter('%s', $false, $utf8)\ntry {\n  & $exe @argList 2>&1 | ForEach-Object { $writer.WriteLine($_.ToString()) }\n  $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }\n} finally {\n  $writer.Dispose()\n}\nSet-Content -LiteralPath '%s' -Value $code -Encoding ASCII\n" % [
+			_powershell_quote(str(shell.get("executable", ""))),
+			_powershell_array(shell_args),
+			_powershell_quote(working_directory),
+			_powershell_quote(output_abs),
+			_powershell_quote(exit_abs),
+		]
+		launch_executable = "powershell.exe"
+		launch_args = PackedStringArray(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_abs])
+	else:
+		script = "cd %s || exit 125\n%s %s > %s 2>&1\ncode=$?\nprintf '%%s' \"$code\" > %s\n" % [
+			_shell_quote(working_directory),
+			_shell_quote(str(shell.get("executable", ""))),
+			_shell_args(shell_args),
+			_shell_quote(output_abs),
+			_shell_quote(exit_abs),
+		]
+		launch_executable = "/bin/sh"
+		launch_args = PackedStringArray([script_abs])
+	var file := FileAccess.open(script_abs, FileAccess.WRITE)
+	if file == null:
+		return {}
+	if windows:
+		# Windows PowerShell 5.1 only recognizes non-ASCII script text as UTF-8 when
+		# the script has a BOM. This preserves Unicode commands and working paths.
+		file.store_buffer(PackedByteArray([0xEF, 0xBB, 0xBF]))
+	file.store_string(script)
+	file.close()
+	return {
+		"executable": launch_executable,
+		"args": launch_args,
+		"script_path": script_abs,
+		"exit_path": exit_abs,
+		"output_path": output_abs,
+	}
+
+
+static func _run_system_command_launch(launch: Dictionary, timeout_ms: int) -> Dictionary:
+	var launch_args: PackedStringArray = launch.get("args", PackedStringArray())
+	var pid := OS.create_process(str(launch.get("executable", "")), launch_args, false)
+	if pid <= 0:
+		return {"ok": false, "status": "failed_to_start", "pid": pid, "exit_code": null}
+	var tree := Engine.get_main_loop() as SceneTree
+	var start_ms := Time.get_ticks_msec()
+	while OS.is_process_running(pid):
+		if Time.get_ticks_msec() - start_ms > timeout_ms:
+			OS.kill(pid)
+			return {"ok": false, "status": "timed_out", "pid": pid, "exit_code": null}
+		if tree != null:
+			await tree.create_timer(0.1).timeout
+		else:
+			OS.delay_msec(100)
+	var exit_code = _read_runner_exit_code(str(launch.get("exit_path", "")))
+	if exit_code == null:
+		return {"ok": false, "status": "exit_code_missing", "pid": pid, "exit_code": null}
+	var code := int(exit_code)
+	return {"ok": code == 0, "status": "completed" if code == 0 else "failed", "pid": pid, "exit_code": code}
+
+
+static func _read_bounded_file(path: String, max_chars: int) -> String:
+	if path == "" or not FileAccess.file_exists(path):
+		return ""
+	var text := FileAccess.get_file_as_string(path)
+	if text.length() > max_chars:
+		return text.left(max_chars)
+	return text
+
+
 static func read_profiler_snapshot(_input: Dictionary = {}) -> Dictionary:
 	var monitors := {
 		"time_fps": Performance.TIME_FPS,
@@ -283,7 +466,7 @@ static func _read_runner_exit_code(exit_path: String) -> Variant:
 
 
 static func _cleanup_runner_files(launch: Dictionary) -> void:
-	for key in ["script_path", "exit_path"]:
+	for key in ["script_path", "exit_path", "output_path"]:
 		var path := str(launch.get(key, ""))
 		if path != "" and FileAccess.file_exists(path):
 			DirAccess.remove_absolute(path)

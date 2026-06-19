@@ -35,6 +35,7 @@ from app.api.schemas import (
     LogGrepHistoryBlock,
     LogReadHistoryBlock,
     LogTextHistoryBlock,
+    NodeTreeHistoryBlock,
     PlanCreatedHistoryBlock,
     PlanStepDTO,
     SessionHistoryBlock,
@@ -55,6 +56,7 @@ from app.config import AppSettings
 from app.events.store import Event, EventStore
 from app.llm.cache_decision_engine import CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector
+from app.llm.message_transformer import estimate_message_tokens, flatten_message_text
 from app.llm.provider import LLMError, LLMProvider
 from app.orchestrator.agent import (
     EFFORT_TEMPERATURE,
@@ -247,6 +249,15 @@ def _display_user_content(content: str) -> str:
 
 _HISTORY_PREVIEW_LIMIT = 2000
 
+# 单条消息允许的最大预估 token 数（见 `compact()` 里的"超大单条消息"截断）：
+# 超过此值即视为异常（粘贴了整份大文件、工具结果未经摘要直接落地等），即使
+# 帧总消息数还没到 `keep_recent` 门槛也会被截断。否则当消息数 <= keep_recent+2
+# 时 `compact()` 对该帧完全是空操作——auto-compact 会在后续每个请求里反复
+# 触发却什么都没压缩（§16.1 策略 A 的已知缺陷，已修复）。截断目标长度选得
+# 足够小，保证截断后的消息再次估算时必然低于阈值（幂等，不会被重复截断）。
+_OVERSIZED_MESSAGE_TOKEN_THRESHOLD = 4000
+_OVERSIZED_MESSAGE_TRUNCATE_CHARS = 3000
+
 # 与 chat_panel.gd 中 `_TOOL_DISPLAY_NAMES`/`_format_log_tool_result` 的分组保持一致，
 # 使会话历史里的工具结果摘要能复用前端既有的 "Read"/"Edit"/"Grep" 工作流分组渲染。
 _HISTORY_READ_TOOLS = frozenset({"read_file", "read_script"})
@@ -273,7 +284,7 @@ _HISTORY_FRONT_READ_TOOLS = frozenset(
     }
 )
 _HISTORY_FRONT_SCENE_EDIT_TOOLS = frozenset({"add_node", "set_node_property"})
-_HISTORY_FRONT_RUN_TOOLS = frozenset({"run_tests", "run_headless_self_test"})
+_HISTORY_FRONT_RUN_TOOLS = frozenset({"run_tests", "run_headless_self_test", "run_system_command"})
 _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
     {
         "agent_reasoning_delta",
@@ -359,6 +370,30 @@ def _format_delegate_history_summary(content: dict[str, Any]) -> str:
     return f"{title}\n{_truncate_text(summary or 'No summary', 2000)}"
 
 
+def _truncate_oversized_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    """单条消息预估 token 数超过 `_OVERSIZED_MESSAGE_TOKEN_THRESHOLD` 时返回截断副本。
+
+    与 `compact()` 现有的"按消息数收拢成摘要"逻辑互补：那段逻辑只在帧总长度
+    超过 `keep_recent` 门槛时才生效，对"消息数很少但单条内容巨大"的帧完全
+    不起作用。这里独立判断单条消息大小，不依赖帧总长度。
+
+    Args:
+        message: 待检查的消息字典（OpenAI message dict）。
+
+    Returns:
+        预估 token 数未超阈值，或没有可截断的文本内容时返回 None（不修改）；
+        否则返回浅拷贝并替换 `content` 为截断文本 + 提示的新消息字典。
+    """
+    flattened = flatten_message_text(message.get("content"))
+    if not flattened or estimate_message_tokens([message]) <= _OVERSIZED_MESSAGE_TOKEN_THRESHOLD:
+        return None
+    truncated = _truncate_text(flattened, _OVERSIZED_MESSAGE_TRUNCATE_CHARS)
+    note = f"\n…（原始内容过大已自动截断；原始约 {len(flattened)} 字符）"
+    new_message = dict(message)
+    new_message["content"] = truncated + note
+    return new_message
+
+
 def _truncate_text(text: str, max_chars: int) -> str:
     # 按字符数截断超长文本，避免会话历史里堆入过长内容。
     if len(text) > max_chars:
@@ -417,6 +452,21 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         title = f"Run tests ({kind})" if kind else "Run tests"
     elif name == "run_headless_self_test":
         title = "Run headless self-test"
+    elif name == "run_system_command":
+        shell = str(result.get("shell", input_args.get("shell", "auto")))
+        status = str(result.get("status", "unknown"))
+        exit_code = result.get("exit_code")
+        command = str(input_args.get("command", "")).strip()
+        summary = f"Shell {command}" if command else "Run system command"
+        detail = f"{status} (shell={shell}"
+        if exit_code is not None:
+            detail += f", exit={exit_code}"
+        detail += ")"
+        output = str(result.get("output", "")).strip()
+        lines = [summary, detail]
+        if output:
+            lines.extend(["```", _truncate_text(output, 4000), "```"])
+        return "\n".join(lines)
     return "\n".join([f"{title}:", *_front_result_lines(result)])
 
 
@@ -814,9 +864,13 @@ def _tool_history_blocks(
     input_args: dict[str, Any],
     content: str,
 ) -> list[SessionHistoryBlock]:
-    inner = _json_object(content)
+    payload = _json_object(content)
+    nested_result = payload.get("result")
+    inner = nested_result if isinstance(nested_result, dict) else payload
     origin = _history_origin(frame)
-    error_message = inner.get("error")
+    if payload.get("status") == "rejected":
+        return [ErrorHistoryBlock(text=f"{name}: rejected", **origin)]
+    error_message = inner.get("error", inner.get("message") if payload.get("status") == "error" else None)
     if isinstance(error_message, str):
         return [ErrorHistoryBlock(text=f"{name}: {error_message}", **origin)]
 
@@ -904,6 +958,12 @@ def _tool_history_blocks(
                 **origin,
             )
         ]
+
+    if name in {"read_scene_tree", "read_runtime_state"}:
+        raw_tree = inner.get("edited_scene", inner)
+        tree = raw_tree if isinstance(raw_tree, dict) else {}
+        title = "Runtime scene tree" if name == "read_runtime_state" else "Scene tree"
+        return [NodeTreeHistoryBlock(title=title, tree=tree, **origin)]
 
     if name in _HISTORY_FRONT_READ_TOOLS:
         summary = _front_tool_summary(name, input_args, inner)
@@ -1618,7 +1678,7 @@ class QueryEngine:
                 logger.warning("Front tool result rejected session=%s reason=%s", session.session_id, result_error.text)
                 return result_error
             if verify_candidates:
-                await self._run_verify(session, security, verify_candidates, model_override)
+                session.pending_verify_candidates.extend(verify_candidates)
         else:
             if session.pending_turn_id is not None:
                 logger.warning(
@@ -1632,6 +1692,7 @@ class QueryEngine:
                 logger.error("User message rejected because session has no active frame session=%s", session.session_id)
                 return ChatErrorResponse(text="会话没有活跃的 agent 帧")
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
+            session.pending_verify_candidates.clear()
             self._emit(session.session_id, "user_submitted", {"has_context": request.context is not None})
             logger.info(
                 "User turn appended session=%s has_context=%s language_hint=%s",
@@ -1639,6 +1700,30 @@ class QueryEngine:
                 request.context is not None,
                 request.language_hint,
             )
+
+        # 自动压缩（§16.1 策略 A）：新消息/工具结果已追加完毕、即将驱动 LLM 之前
+        # 检查体积——这样下面 run_turn 实际发出的请求已经是压缩后的大小，而不是
+        # "先发一次超大请求，下次才生效"。只在体积越界时才触发，不影响正常大小
+        # 会话的行为；阈值用粗估 token 数而非精确计费值，足够判断"是否该收紧"。
+        if self._settings.auto_compact_enabled and self._needs_auto_compact(session):
+            logger.info(
+                "Auto-compact triggered session=%s threshold=%d keep_recent=%d",
+                session.session_id,
+                self._settings.auto_compact_token_threshold,
+                self._settings.auto_compact_keep_recent,
+            )
+            self.compact(
+                session.session_id,
+                keep_recent=self._settings.auto_compact_keep_recent,
+                triggered_by="auto",
+            )
+
+        defer_verification_until_final = bool(session.pending_verify_candidates)
+
+        def emit_turn_event(event_type: str, payload: dict[str, Any]) -> None:
+            if defer_verification_until_final and event_type in {"agent_text_delta", "agent_reasoning_delta"}:
+                return
+            self._emit(session.session_id, event_type, payload)
 
         step = await run_turn(
             session=session,
@@ -1661,11 +1746,51 @@ class QueryEngine:
             model_selector=self._model_for_effort,
             model_override=model_override,
             thinking_budget_selector=self._thinking_budget_for_effort,
-            event_callback=lambda event_type, payload: self._emit(session.session_id, event_type, payload),
+            event_callback=emit_turn_event,
             cache_engine=self._cache_engine,
             cache_metrics=self._cache_metrics,
         )
         response = _step_to_response(step)
+        if isinstance(response, ChatFinalResponse) and session.pending_verify_candidates:
+            final_frame = session.top_frame()
+            if final_frame is not None and final_frame.messages:
+                last_message = final_frame.messages[-1]
+                if last_message.get("role") == "assistant" and not last_message.get("tool_calls"):
+                    final_frame.messages.pop()
+            latest_by_path: dict[str, dict[str, Any]] = {}
+            for candidate in session.pending_verify_candidates:
+                path = str(candidate.get("path", ""))
+                if path:
+                    latest_by_path[path] = candidate
+            session.pending_verify_candidates.clear()
+            if latest_by_path:
+                await self._run_verify(session, security, list(latest_by_path.values()), model_override)
+                step = await run_turn(
+                    session=session,
+                    llm=self._llm,
+                    security=security,
+                    tool_ctx=ToolContext(
+                        security=security,
+                        session_id=session.session_id,
+                        skill_catalog=self._skill_catalog,
+                        rag_index_path=self._settings.resolved_rag_index_path(),
+                    ),
+                    max_turns=self._settings.max_turns,
+                    session_allow=session.session_allow,
+                    agent_prompt_factory=lambda agent: build_system_prompt(
+                        agent,
+                        self._skill_catalog,
+                        self._output_styles,
+                        session.output_style,
+                    ),
+                    model_selector=self._model_for_effort,
+                    model_override=model_override,
+                    thinking_budget_selector=self._thinking_budget_for_effort,
+                    event_callback=lambda event_type, payload: self._emit(session.session_id, event_type, payload),
+                    cache_engine=self._cache_engine,
+                    cache_metrics=self._cache_metrics,
+                )
+                response = _step_to_response(step)
         if isinstance(response, ChatToolCallsResponse):
             self._emit(
                 session.session_id,
@@ -1787,8 +1912,8 @@ class QueryEngine:
                 applied_result = result.result
                 if tool is not None and tool.enrich is not None and isinstance(applied_result, dict):
                     applied_result = tool.enrich(tool_args, applied_result)
-                if result.grant_session_allow and tool is not None and not tool.executes_process:
-                    session.session_allow.add(make_session_allow_grant(tool))
+                if result.grant_session_allow and tool is not None:
+                    session.session_allow.add(make_session_allow_grant(tool, tool_args))
                     logger.info(
                         "Session allow grant added session=%s tool=%s frame=%s",
                         session.session_id,
@@ -1865,8 +1990,10 @@ class QueryEngine:
         path = str(candidate["path"])
         frame = next((f for f in session.agent_stack if f.id == frame_id), None)
         if frame is None:
-            logger.warning("Verify skipped: frame missing session=%s frame=%s", session.session_id, frame_id)
-            return
+            frame = session.top_frame()
+            if frame is None:
+                logger.warning("Verify skipped: frame missing session=%s frame=%s", session.session_id, frame_id)
+                return
 
         retries = session.verify_retry_count.get(path, 0)
         if retries >= settings.verify_max_retries:
@@ -2168,18 +2295,69 @@ class QueryEngine:
         self._emit(session_id, "config_changed", {"output_style": output_style})
         logger.info("Session output style changed session=%s output_style=%s", session_id, output_style)
 
-    def compact(self, session_id: str, keep_recent: int = 12) -> dict[str, Any]:
-        """对指定 session 执行本地 micro/full compact，保留 pending 协议完整性。"""
+    def _needs_auto_compact(self, session: Session) -> bool:
+        """判断当前会话是否有任意帧的预估 token 数超过自动压缩阈值。
+
+        Args:
+            session: 当前会话（已追加本轮新消息/工具结果）。
+
+        Returns:
+            只要 `agent_stack` 中任意一帧超过 `auto_compact_token_threshold`
+            即返回 True；`compact()` 本身会对所有超过 `keep_recent` 消息数的
+            帧分别处理，这里只需判断"值不值得调用一次"。
+        """
+        threshold = self._settings.auto_compact_token_threshold
+        return any(estimate_message_tokens(frame.messages) > threshold for frame in session.agent_stack)
+
+    def compact(self, session_id: str, keep_recent: int = 12, triggered_by: str = "manual") -> dict[str, Any]:
+        """对指定 session 执行本地 micro/full compact，保留 pending 协议完整性。
+
+        Args:
+            session_id: 待压缩的会话 id。
+            keep_recent: 每帧保留的最近消息数（不含 system prompt）。
+            triggered_by: `"manual"`（`/compact` 命令）或 `"auto"`（§16.1 策略 A
+                的自动触发），写入 `compact_boundary` 事件 payload，仅用于
+                日志/观测区分来源，不影响压缩逻辑本身。
+        """
         session = self._store.get_or_create(session_id, self.available_tools)
-        logger.info("Compacting session session=%s keep_recent=%d", session_id, keep_recent)
+        logger.info(
+            "Compacting session session=%s keep_recent=%d triggered_by=%s", session_id, keep_recent, triggered_by
+        )
         compacted_frames = 0
         removed_messages = 0
+        truncated_messages = 0
         keep = max(6, keep_recent)
 
+        # 压缩本身是纯本地操作（无网络/子进程 I/O），耗时通常远低于一帧；这里仍
+        # 单独发一个"开始"事件（而不是只在结束时发 compact_boundary），是为了让
+        # 前端能渲染出一条独立的"正在压缩会话历史…"消息块——哪怕这条消息和随后
+        # 的完成事件几乎同时到达，压缩历史里也会留下"这一轮发生过压缩"的痕迹，
+        # 而不是只在日志里能看到。
+        self._emit(
+            session_id,
+            "compact_started",
+            {"keep_recent": keep, "triggered_by": triggered_by},
+        )
+
         for frame in session.agent_stack:
+            anchor = _pending_anchor_index(frame, session.pending_tool_call_ids)
+            # 超大单条消息的截断独立于"按消息数收拢"逐帧执行：不依赖
+            # `len(frame.messages) <= keep + 2` 的早退判断，否则消息数很少但单条
+            # 巨大的帧会被完全跳过（见 `_truncate_oversized_message` 文档）。排除
+            # index 0（system prompt）与最后一条（当前活跃/刚提交的消息，可能是
+            # 用户正在询问的内容，不应被静默改写）；待回传的 pending tool_call
+            # 之后的消息同样不动，与下方摘要逻辑的 `anchor` 边界保持一致。
+            scan_end = len(frame.messages) - 1
+            if anchor is not None:
+                scan_end = min(scan_end, anchor)
+            for index in range(1, scan_end):
+                replacement = _truncate_oversized_message(frame.messages[index])
+                if replacement is not None:
+                    frame.messages[index] = replacement
+                    truncated_messages += 1
+
             if len(frame.messages) <= keep + 2:
                 continue
-            anchor = _pending_anchor_index(frame, session.pending_tool_call_ids)
             default_start = max(1, len(frame.messages) - keep)
             keep_from = min(default_start, anchor) if anchor is not None else default_start
             if keep_from <= 1:
@@ -2207,21 +2385,27 @@ class QueryEngine:
             {
                 "compacted_frames": compacted_frames,
                 "removed_messages": removed_messages,
+                "truncated_messages": truncated_messages,
                 "keep_recent": keep,
                 "pending_preserved": session.pending_turn_id is not None,
+                "triggered_by": triggered_by,
             },
         )
         logger.info(
-            "Compacted session session=%s frames=%d removed_messages=%d pending_preserved=%s",
+            "Compacted session session=%s frames=%d removed_messages=%d truncated_messages=%d "
+            "pending_preserved=%s triggered_by=%s",
             session_id,
             compacted_frames,
             removed_messages,
+            truncated_messages,
             session.pending_turn_id is not None,
+            triggered_by,
         )
         return {
             "session_id": session_id,
             "compacted_frames": compacted_frames,
             "removed_messages": removed_messages,
+            "truncated_messages": truncated_messages,
             "last_event_seq": seq,
             "pending_turn_id": session.pending_turn_id,
         }

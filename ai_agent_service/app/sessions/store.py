@@ -68,6 +68,7 @@ class Session:
     delegate_groups: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_plan: dict[str, Any] | None = None
     verify_retry_count: dict[str, int] = field(default_factory=dict)
+    pending_verify_candidates: list[dict[str, Any]] = field(default_factory=list)
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
@@ -252,6 +253,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "delegate_groups": session.delegate_groups,
         "pending_plan": session.pending_plan,
         "verify_retry_count": session.verify_retry_count,
+        "pending_verify_candidates": session.pending_verify_candidates,
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
         "rag_context": session.rag_context,
@@ -295,15 +297,18 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         request_id_cache=data.get("request_id_cache", {}),
         pending_tool_calls=data.get("pending_tool_calls", {}),
         session_allow={
-            (str(item[0]), str(item[1]), str(item[2]))
+            (str(item[0]), str(item[1]), str(item[2]), str(item[3]) if len(item) >= 4 else "")
             for item in data.get("session_allow", [])
-            if isinstance(item, list) and len(item) == 3
+            if isinstance(item, list) and len(item) in {3, 4}
         },
         effort=str(data.get("effort", "standard")),
         output_style=str(data.get("output_style", "default")),
         delegate_groups=data.get("delegate_groups", {}),
         pending_plan=data.get("pending_plan"),
         verify_retry_count=data.get("verify_retry_count", {}),
+        pending_verify_candidates=[
+            item for item in data.get("pending_verify_candidates", []) if isinstance(item, dict)
+        ],
         history_event_counter=history_event_counter,
         history_events=history_events,
         rag_context=str(data.get("rag_context", "")),

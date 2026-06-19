@@ -8,6 +8,7 @@ const MarkdownRenderer = preload("res://addons/ai_agent/ui/markdown_renderer.gd"
 
 var theme_colors: Dictionary
 var editor_interface: EditorInterface
+var rich_text_setup: Callable
 
 
 # ─── 颜色辅助 ────────────────────────────────────────────────────────────────
@@ -257,6 +258,8 @@ func make_rich_text(text: String, color = null, marker_text: String = "") -> Ric
 	if marker_text != "":
 		bbcode = "[color=%s]%s[/color]  %s" % [_marker_color_tag(marker_text), marker_text, bbcode]
 	rich.append_text(bbcode)
+	if rich_text_setup.is_valid():
+		rich_text_setup.call(rich)
 	return rich
 
 

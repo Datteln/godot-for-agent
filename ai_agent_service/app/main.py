@@ -14,6 +14,7 @@ import os
 import secrets
 import sys
 from collections.abc import Callable, Sequence
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
@@ -26,6 +27,7 @@ from app.mcp.server import run_mcp_stdio
 from app.memory.store import MemoryStore
 from app.output_styles.catalog import OutputStyleCatalog
 from app.query.engine import QueryEngine
+from app.rag.build_manager import RagIndexBuildManager
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import security_settings_from_app
 from app.sessions.store import SessionStore
@@ -110,10 +112,53 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         recovery_store=recovery_store,
     )
 
+    rag_build_manager = RagIndexBuildManager(resolved_settings, security)
+    auto_build_task: asyncio.Task[None] | None = None
+
+    async def _run_auto_indexing() -> None:
+        try:
+            await rag_build_manager.build(incremental=True, reason="service_startup")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Initial automatic RAG index build failed; starting file watcher anyway")
+        await rag_build_manager.watch(
+            poll_interval_s=resolved_settings.rag_auto_watch_interval_s,
+            debounce_s=resolved_settings.rag_auto_watch_debounce_s,
+        )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        nonlocal auto_build_task
+        if resolved_settings.rag_auto_build_enabled:
+            logger.info("Scheduling automatic RAG index build")
+            auto_build_task = asyncio.create_task(
+                _run_auto_indexing(),
+                name="rag-auto-indexing",
+            )
+
+            def _report_auto_build(task: asyncio.Task[None]) -> None:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    logger.info("Automatic RAG index build cancelled")
+                except Exception:
+                    logger.exception("Automatic RAG index build failed")
+
+            auto_build_task.add_done_callback(_report_auto_build)
+        else:
+            logger.info("Automatic RAG index build disabled by configuration")
+        yield
+        if auto_build_task is not None and not auto_build_task.done():
+            auto_build_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await auto_build_task
+
     app = FastAPI(
         title="Godot AI Agent Service",
         version="0.1.0",
         dependencies=[Depends(_auth_dependency(resolved_token))],
+        lifespan=lifespan,
     )
     app.include_router(
         create_router(
@@ -127,8 +172,10 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
             skill_catalog=skill_catalog,
             output_style_catalog=output_style_catalog,
             memory_store=memory_store,
+            rag_build_manager=rag_build_manager,
         )
     )
+    app.state.rag_build_manager = rag_build_manager
     logger.info(
         "AI agent service app ready tools=%d session_store=%s",
         len(REGISTRY),

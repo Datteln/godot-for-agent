@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from fastapi import APIRouter
@@ -36,7 +35,7 @@ from app.llm.provider import LLMProvider
 from app.memory.store import MemoryStore
 from app.output_styles.catalog import OutputStyleCatalog
 from app.query.engine import QueryEngine
-from app.rag.factory import create_codebase_index
+from app.rag.build_manager import RagIndexBuildManager
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import SecuritySettings
 from app.skills.catalog import SkillCatalog
@@ -57,13 +56,17 @@ COMMANDS: list[CommandInfo] = [
             "properties": {
                 "include": {"type": "string", "default": "**/*"},
                 "max_files": {"type": "integer", "default": 4000},
+                "incremental": {"type": "boolean", "default": True},
             },
         },
     ),
     CommandInfo(
         name="compact",
         description="压缩指定 session 的早期上下文，保留 pending 与 agent_stack。",
-        args_schema={"type": "object", "properties": {"session_id": {"type": "string"}}},
+        args_schema={
+            "type": "object",
+            "properties": {"keep_recent": {"type": "integer", "default": 12}},
+        },
     ),
     CommandInfo(
         name="set_effort",
@@ -105,6 +108,7 @@ def create_router(
     skill_catalog: SkillCatalog,
     output_style_catalog: OutputStyleCatalog,
     memory_store: MemoryStore,
+    rag_build_manager: RagIndexBuildManager,
 ) -> APIRouter:
     """创建 HTTP 路由表。"""
     router = APIRouter()
@@ -243,21 +247,21 @@ def create_router(
             )
         if name == "rebuild_index":
             include = request.args.get("include", "**/*")
-            max_files = request.args.get("max_files", 4000)
+            max_files = _integer_argument(request.args.get("max_files", 4000))
             if not isinstance(include, str) or not include:
                 logger.warning("Command rebuild_index rejected: invalid include")
                 return CommandResponse(ok=False, text="include 必须是非空字符串")
-            if not isinstance(max_files, int) or max_files <= 0:
+            if max_files is None or max_files <= 0:
                 logger.warning("Command rebuild_index rejected: invalid max_files")
                 return CommandResponse(ok=False, text="max_files 必须是正整数")
             incremental = request.args.get("incremental", True)
             if not isinstance(incremental, bool):
                 return CommandResponse(ok=False, text="incremental 必须是布尔值")
-            result = await asyncio.to_thread(
-                create_codebase_index(settings, security).build,
-                include,
-                max_files,
-                incremental,
+            result = await rag_build_manager.build(
+                include=include,
+                max_files=max_files,
+                incremental=incremental,
+                reason="manual_command",
             )
             logger.info(
                 "Command rebuild_index completed files=%s chunks=%s truncated=%s",
@@ -274,10 +278,10 @@ def create_router(
             if request.session_id is None:
                 logger.warning("Command compact rejected: missing session_id")
                 return CommandResponse(ok=False, text="compact 需要 session_id")
-            keep_recent = request.args.get("keep_recent", 12)
-            if not isinstance(keep_recent, int):
+            keep_recent = _integer_argument(request.args.get("keep_recent", 12))
+            if keep_recent is None or keep_recent <= 0:
                 logger.warning("Command compact rejected: invalid keep_recent")
-                return CommandResponse(ok=False, text="keep_recent 必须是整数")
+                return CommandResponse(ok=False, text="keep_recent 必须是正整数")
             result = query_engine.compact(request.session_id, keep_recent=keep_recent)
             return CommandResponse(ok=True, text="compact 已完成", result=result)
         if name == "set_effort":
@@ -350,3 +354,14 @@ def create_router(
         return MemoryResponse(ok=False, text=f"未知 memory action：{request.action}")
 
     return router
+
+
+def _integer_argument(value: object) -> int | None:
+    """接受 JSON/Godot 将整数解码为浮点数的情况，同时拒绝布尔值和小数。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None

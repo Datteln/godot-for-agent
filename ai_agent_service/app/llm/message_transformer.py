@@ -22,6 +22,13 @@ from typing import Any
 # 生效）；这里在源头就裁剪到这个上限，不依赖端点"丢弃多余标记"的兜底行为。
 MAX_CACHE_BREAKPOINTS = 4
 
+# 历史分层的粒度（消息数）：老 tier 断点向下取整到该粒度的整数倍，使它只在
+# 每累积这么多条新消息时才整体前移一次，而不是像 recent tier 那样每轮都跟着
+# 消息总数右移。长对话因此被分成"几乎永久稳定的老段"（命中率高、创建成本只
+# 摊销一次）+ "尺寸恒定的活跃窗口"（每轮变化，但范围不随对话总长度增长），
+# 而不是单个随对话无限变长的前缀（§16.1 / 文档 3.10 衍生：tiered caching）。
+HISTORY_TIER_GRANULARITY = 20
+
 
 @dataclass(frozen=True)
 class CacheBreakpoint:
@@ -109,20 +116,49 @@ def _cap_breakpoints(breakpoints: list[CacheBreakpoint]) -> list[CacheBreakpoint
     return breakpoints[:MAX_CACHE_BREAKPOINTS]
 
 
+def _history_tier_breakpoints(system_end: int, stable_history_end: int) -> list[CacheBreakpoint]:
+    """规划历史部分的断点：短历史只给一个 recent 断点，长历史额外加一个老 tier。
+
+    老 tier 断点位置向下取整到 `HISTORY_TIER_GRANULARITY` 的整数倍——只要历史
+    还没跨过下一个粒度边界，这个位置在多轮对话里保持不变，对应的缓存段因此能
+    被持续命中而不是每轮都当作"新前缀"重新创建（§16.1 tiered caching）。
+
+    Args:
+        system_end: 前导 system 消息块的结束下标（见 `build_stable_prefix`）。
+        stable_history_end: recent tier 断点位置（`len(messages) - 2`）。
+
+    Returns:
+        历史部分的断点列表；按"老 tier 在前、recent 在后"排列，老 tier 不满足
+        条件（历史还不够长，或与 recent 重合）时只返回 recent 一个断点。
+    """
+    if stable_history_end <= system_end:
+        return []
+    breakpoints: list[CacheBreakpoint] = []
+    old_tier_end = (stable_history_end // HISTORY_TIER_GRANULARITY) * HISTORY_TIER_GRANULARITY
+    if system_end < old_tier_end < stable_history_end:
+        breakpoints.append(CacheBreakpoint(old_tier_end, None, "history_old_tier"))
+    breakpoints.append(CacheBreakpoint(stable_history_end, None, "stable_history"))
+    return breakpoints
+
+
 def build_stable_prefix(messages: list[dict[str, Any]]) -> StablePrefixPlan:
     """规划消息列表里值得标记缓存断点的位置（§16.1 多断点）。
 
-    断点来源有三类：
+    断点来源有四类：
     - **分层 system 层**：首条 system 消息若是 content-block 数组（L0 核心 /
       L2 项目上下文 / L3 RAG 等分层 prompt），为每个块末尾各放一个断点，使
       "L0"、"L0+L2"、"L0+L2+L3" 这些逐层加长的稳定前缀都能独立命中缓存；
     - **system 尾部**：若首条之后还有连续 system 消息（如压缩摘要），在最后一条
       前导 system 消息上补一个整体断点；
-    - **稳定历史**：除最新一条消息外的历史前缀末尾——多轮对话每轮只在末尾追加，
-      这段前缀下一轮会原样复用。
+    - **历史老 tier**：历史长度跨过 `HISTORY_TIER_GRANULARITY` 个粒度后出现，
+      位置只在跨粒度边界时才前移，多数轮次保持不变（见 `_history_tier_breakpoints`）；
+    - **稳定历史（recent tier）**：除最新一条消息外的历史前缀末尾——每轮都在
+      末尾追加新消息，这个断点因此每轮都跟着右移，覆盖范围则始终是"老 tier
+      之后的活跃窗口"，不随对话总长度增长。
 
     所有断点合并后按上限裁剪（见 `_cap_breakpoints`），最多 `MAX_CACHE_BREAKPOINTS`
-    个。
+    个；裁剪时系统层优先于历史层，历史老 tier 优先于 recent tier（最该保留的
+    排在最前）。
 
     Args:
         messages: 当前帧即将发给 `LLMProvider.chat()` 的完整消息列表。
@@ -152,9 +188,7 @@ def build_stable_prefix(messages: list[dict[str, Any]]) -> StablePrefixPlan:
         breakpoints.append(CacheBreakpoint(system_end, None, "system_tail"))
 
     if len(messages) >= 2:
-        stable_history_end = len(messages) - 2
-        if stable_history_end > system_end:
-            breakpoints.append(CacheBreakpoint(stable_history_end, None, "stable_history"))
+        breakpoints.extend(_history_tier_breakpoints(system_end, len(messages) - 2))
 
     breakpoints = _cap_breakpoints(breakpoints)
     stable_end = max((bp.message_index for bp in breakpoints), default=0)

@@ -135,6 +135,12 @@ class AppSettings(BaseSettings):
     rerank_model: str = Field(default="", description="空值表示跳过 cross-encoder 重排。")
     rerank_timeout_s: float = Field(default=2.0, ge=0.1, le=2.0)
     rag_query_router_enabled: bool = Field(default=True)
+    rag_auto_build_enabled: bool = Field(
+        default=True,
+        description="服务启动后是否在后台自动增量构建 RAG/EARS 全部索引。",
+    )
+    rag_auto_watch_interval_s: float = Field(default=1.0, ge=0.1, le=60.0)
+    rag_auto_watch_debounce_s: float = Field(default=0.75, ge=0.0, le=30.0)
     rag_token_budget: int = Field(default=1500, ge=128)
     graph_max_depth: int = Field(default=2, ge=0, le=8)
     graph_max_neighbors: int = Field(default=5, ge=1, le=100)
@@ -153,6 +159,24 @@ class AppSettings(BaseSettings):
         default=36,
         description="单次用户消息驱动的 agent 循环最大轮数（跨根帧与所有委派子帧的全局兜底上限；"
         "各帧自身的预算见 AgentDefinition.max_turns）。",
+    )
+
+    auto_compact_enabled: bool = Field(
+        default=True,
+        description="是否在驱动 LLM 前自动检查会话历史体积，超出阈值时自动执行一次本地压缩"
+        "（§16.1 策略 A）；为 False 时仅保留手动 /compact 命令。",
+    )
+    auto_compact_token_threshold: int = Field(
+        default=200_000,
+        ge=1000,
+        description="自动压缩的预估 token 阈值（按 estimate_message_tokens 粗估，非精确计费值）；"
+        "当前活跃帧的消息预估 token 数超过该值时，在本轮驱动 LLM 之前自动压缩一次，"
+        "为模型上下文窗口与延迟留出余量，而不是等到手动 /compact 或请求失败才处理。",
+    )
+    auto_compact_keep_recent: int = Field(
+        default=12,
+        ge=6,
+        description="自动压缩时保留的最近消息数，语义与 /compact 命令的 keep_recent 参数一致。",
     )
 
     verify_after_edit: bool = Field(
