@@ -316,7 +316,11 @@ def _delegate_child_frame(
     prompt = prompt_factory(child_agent) if prompt_factory is not None else child_agent.prompt
     child_agent = replace(child_agent, prompt=prompt)
     parent = _find_frame(session, parent_id)
+    history_anchor_frame_id = parent_id
     history_anchor_message_index = len(parent.messages) if parent is not None else None
+    if parent is not None and parent.history_anchor_frame_id is not None:
+        history_anchor_frame_id = parent.history_anchor_frame_id
+        history_anchor_message_index = parent.history_anchor_message_index
     return Frame(
         id=session.new_frame_id(),
         agent=child_agent,
@@ -328,7 +332,7 @@ def _delegate_child_frame(
         pending_delegate_call_id=call_id,
         pending_delegate_group_id=group_id,
         depth=depth,
-        history_anchor_frame_id=parent_id,
+        history_anchor_frame_id=history_anchor_frame_id,
         history_anchor_message_index=history_anchor_message_index,
     )
 

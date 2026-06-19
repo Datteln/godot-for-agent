@@ -10,16 +10,20 @@ from app.api.schemas import ChatRequest, SessionHistoryResponse
 from app.events.store import Event
 from app.llm.provider import _reasoning_tokens_from_usage
 from app.orchestrator.agent import (
+    _delegate_child_frame,
     _delta_callback,
     _estimate_stream_token_count,
     _resolve_request_model,
 )
 from app.query.engine import (
+    _assistant_history_blocks,
     _event_payload_for_log,
     _normalize_model_override,
     _structured_history_for_frame,
+    _structured_session_history,
     _tool_history_blocks,
 )
+from app.sessions.store import Session
 
 
 def _frame() -> Frame:
@@ -112,6 +116,117 @@ def test_reasoning_event_estimates_then_accepts_exact_token_count() -> None:
 
     callback("reasoning", "中文 reasoning text", 42)
     assert events[-1][1]["token_count"] == 42
+
+
+def test_tool_call_preface_is_not_rendered_as_a_workflow_message() -> None:
+    blocks = _assistant_history_blocks(
+        _frame(),
+        "UILayer created; now checking the final files.",
+        has_tool_calls=True,
+    )
+
+    assert blocks == []
+
+
+def test_nested_delegate_inherits_root_history_anchor() -> None:
+    root = _frame()
+    root.messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "", "tool_calls": []},
+    ]
+    session = Session(session_id="s1", agent_stack=[root])
+    child = _delegate_child_frame(
+        session=session,
+        parent_id=root.id,
+        call_id="delegate-1",
+        group_id=None,
+        args={"agent": "programming-agent", "task": "child task"},
+        depth=1,
+        prompt_factory=None,
+    )
+    assert child is not None
+    session.agent_stack.append(child)
+    grandchild = _delegate_child_frame(
+        session=session,
+        parent_id=child.id,
+        call_id="delegate-2",
+        group_id=None,
+        args={"agent": "programming-agent", "task": "grandchild task"},
+        depth=2,
+        prompt_factory=None,
+    )
+
+    assert grandchild is not None
+    assert grandchild.history_anchor_frame_id == root.id
+    assert grandchild.history_anchor_message_index == len(root.messages)
+
+
+def test_legacy_nested_delegate_events_are_reanchored_to_root_history() -> None:
+    root = _frame()
+    root.messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "inspect project"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "delegate-1",
+                    "function": {"name": "delegate_many", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "delegate-1",
+            "content": json.dumps(
+                {"results": [{"agent": "programming-agent", "summary": "done"}]}
+            ),
+        },
+        {"role": "assistant", "content": "final answer"},
+    ]
+    events = [
+        Event(
+            seq=1,
+            session_id="s1",
+            type="agent_reasoning_delta",
+            payload={
+                "frame_id": "f2",
+                "timeline_frame_id": root.id,
+                "timeline_message_index": 3,
+                "loop": 1,
+                "text": "child reasoning",
+            },
+        ),
+        Event(
+            seq=2,
+            session_id="s1",
+            type="server_tool_result",
+            payload={
+                "frame_id": "f3",
+                "timeline_frame_id": "f2",
+                "timeline_message_index": 2,
+                "tool": "read_file",
+                "result_summary": {
+                    "kind": "read",
+                    "path": "scripts/killzone.gd",
+                    "line_start": 1,
+                    "line_end": 31,
+                },
+            },
+        ),
+    ]
+
+    blocks = _structured_session_history([root], events)
+
+    assert [block.type for block in blocks] == [
+        "user",
+        "thought",
+        "log_read",
+        "delegate_results",
+        "log_text",
+    ]
 
 
 def test_runtime_state_history_preserves_node_tree() -> None:

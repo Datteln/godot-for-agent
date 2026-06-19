@@ -752,6 +752,8 @@ def _assistant_history_blocks(
     if not stripped:
         return []
     origin = _history_origin(frame)
+    if has_tool_calls and not stripped.startswith("Thought:"):
+        return []
     if not stripped.startswith("Thought:"):
         return [
             LogTextHistoryBlock(
@@ -1286,12 +1288,51 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
 
 
 def _structured_session_history(session_frames: list[Frame], events: list[Event]) -> list[SessionHistoryBlock]:
+    frame_aliases: dict[str, tuple[str, int | None]] = {}
+    for event in events:
+        frame_id = str(event.payload.get("frame_id", ""))
+        timeline_frame_id = str(event.payload.get("timeline_frame_id", ""))
+        if not frame_id or not timeline_frame_id or frame_id == timeline_frame_id:
+            continue
+        raw_index = event.payload.get("timeline_message_index")
+        try:
+            message_index = int(raw_index) if raw_index is not None else None
+        except (TypeError, ValueError):
+            message_index = None
+        frame_aliases.setdefault(frame_id, (timeline_frame_id, message_index))
+
+    normalized_events: list[Event] = []
+    for event in events:
+        timeline_frame_id = str(
+            event.payload.get("timeline_frame_id", event.payload.get("frame_id", ""))
+        )
+        message_index = event.payload.get("timeline_message_index")
+        seen_aliases: set[str] = set()
+        while timeline_frame_id in frame_aliases and timeline_frame_id not in seen_aliases:
+            seen_aliases.add(timeline_frame_id)
+            timeline_frame_id, alias_index = frame_aliases[timeline_frame_id]
+            if alias_index is not None:
+                message_index = alias_index
+        if timeline_frame_id != str(event.payload.get("timeline_frame_id", "")):
+            normalized_events.append(
+                replace(
+                    event,
+                    payload={
+                        **event.payload,
+                        "timeline_frame_id": timeline_frame_id,
+                        "timeline_message_index": message_index,
+                    },
+                )
+            )
+        else:
+            normalized_events.append(event)
+
     blocks: list[SessionHistoryBlock] = []
     claimed_event_ids: set[int] = set()
     for frame in session_frames:
         frame_events = [
             event
-            for event in events
+            for event in normalized_events
             if str(
                 event.payload.get(
                     "timeline_frame_id",
@@ -1302,7 +1343,7 @@ def _structured_session_history(session_frames: list[Frame], events: list[Event]
         ]
         claimed_event_ids.update(id(event) for event in frame_events)
         blocks.extend(_structured_history_for_frame(frame, frame_events))
-    for event in events:
+    for event in normalized_events:
         if id(event) in claimed_event_ids:
             continue
         blocks.extend(_event_history_blocks(event))

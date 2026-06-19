@@ -488,7 +488,7 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		return
 
 	_mark_current_stream_closed()
-	_finalize_stream_as_persistent()
+	_discard_stream_message()
 	# 模型这一轮已经决定调用工具，说明它的思考已经结束——必须在这里冻结计时器，
 	# 否则 _process() 会一直用 _reasoning_started_ms 刷新这条 "Thought for Xs"，
 	# 直到下一轮 reasoning_delta 到来才会被关闭，期间会一直跟着 Edit/确认框走。
@@ -1535,7 +1535,7 @@ func _on_reasoning_delta(event: Dictionary) -> void:
 			var toggle = finished.get("toggle")
 			if toggle is Button and is_instance_valid(toggle):
 				toggle.text = "✻  %s · %s tokens ✓" % [
-					str(finished.get("header", "Thought")), _format_token_count(token_count)
+					str(finished.get("base_header", "Thought")), _format_token_count(token_count)
 				]
 		FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta] IGNORED - key already closed", {
 			"key": key,
@@ -1629,13 +1629,17 @@ func _update_reasoning_entry() -> void:
 
 
 func _format_reasoning_header() -> String:
-	var elapsed := 0.0
-	if _reasoning_started_ms >= 0:
-		elapsed = maxf(0.01, (Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)
-	var header := "Thought for %.2fs" % elapsed
+	var header := _format_reasoning_base_header()
 	if _reasoning_token_count > 0:
 		header += " · %s tokens" % _format_token_count(_reasoning_token_count)
 	return header
+
+
+func _format_reasoning_base_header() -> String:
+	var elapsed := 0.0
+	if _reasoning_started_ms >= 0:
+		elapsed = maxf(0.01, (Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)
+	return "Thought for %.2fs" % elapsed
 
 
 func _format_token_count(count: int) -> String:
@@ -1678,7 +1682,7 @@ func _finish_reasoning_stream() -> void:
 		if _reasoning_key != "":
 			_finished_reasoning_headers[_reasoning_key] = {
 				"toggle": _reasoning_toggle,
-				"header": finished_header
+				"base_header": _format_reasoning_base_header()
 			}
 	_reasoning_key = ""
 	_reasoning_toggle = null
