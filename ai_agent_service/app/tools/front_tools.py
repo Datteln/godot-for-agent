@@ -437,6 +437,86 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="edit_map",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="map",
+            schema={
+                "name": "edit_map",
+                "description": (
+                    "Edit a 2D TileMapLayer/legacy TileMap or a 3D GridMap through Godot's native APIs. "
+                    "Use this tool instead of refusing a map edit or directly rewriting serialized tile/map data. "
+                    "Supports fill, erase, and overlap-safe region copy; all changes are previewed and undoable."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {
+                            "type": "string",
+                            "description": (
+                                "NodePath relative to the edited scene root. Omit to use the selected map node "
+                                "or the only compatible map node in the scene."
+                            ),
+                        },
+                        "map_layer": {
+                            "type": "integer",
+                            "description": "Layer index for a legacy TileMap; ignored by TileMapLayer and GridMap.",
+                        },
+                        "operations": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 128,
+                            "description": (
+                                "Ordered map operations. Coordinates use x/y for 2D and x/y/z for 3D. "
+                                "copy reads the complete source region before writing, so overlapping copies are safe."
+                            ),
+                            "items": _object_schema(
+                                {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["fill", "erase", "copy"],
+                                    },
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                    "width": {"type": "integer", "minimum": 1},
+                                    "height": {"type": "integer", "minimum": 1},
+                                    "depth": {"type": "integer", "minimum": 1},
+                                    "source_id": {
+                                        "type": "integer",
+                                        "description": "2D TileSet source id for fill.",
+                                    },
+                                    "atlas_x": {"type": "integer"},
+                                    "atlas_y": {"type": "integer"},
+                                    "alternative_tile": {"type": "integer"},
+                                    "item": {
+                                        "type": "integer",
+                                        "description": "3D MeshLibrary item id for fill.",
+                                    },
+                                    "orientation": {
+                                        "type": "integer",
+                                        "description": "3D GridMap orthogonal orientation index.",
+                                    },
+                                    "from_x": {"type": "integer"},
+                                    "from_y": {"type": "integer"},
+                                    "from_z": {"type": "integer"},
+                                    "to_x": {"type": "integer"},
+                                    "to_y": {"type": "integer"},
+                                    "to_z": {"type": "integer"},
+                                },
+                                ["action"],
+                            ),
+                        },
+                    },
+                    ["operations"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="fill_rect",
             domain="map",
             side="front",

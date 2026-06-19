@@ -56,6 +56,13 @@
     - [UndoRedo 集成](#undoredo-集成)
     - [恢复提示](#恢复提示)
     - [EditorSettings 完整参考](#editorsettings-完整参考)
+      - [服务连接](#服务连接)
+      - [会话 \& UI](#会话--ui)
+      - [LLM 配置](#llm-配置-1)
+      - [RAG \& Embedding](#rag--embedding-1)
+      - [资产理解](#资产理解-1)
+      - [日志 \& 事件](#日志--事件)
+      - [测试 \& Headless](#测试--headless)
   - [安全模型](#安全模型)
   - [开发自检](#开发自检)
   - [故障排查](#故障排查)
@@ -759,21 +766,95 @@ Project > Project Settings > Plugins > AI Agent
 
 ### EditorSettings 完整参考
 
-在 Godot 编辑器中通过 `Edit > Editor Settings` 配置：
+在 Godot 编辑器中通过 `Edit > Editor Settings > Ai Agent` 配置：
+
+#### 服务连接
 
 | EditorSettings key | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
+| `ai_agent/service_url` | string | `http://127.0.0.1:8765` | 服务地址 |
 | `ai_agent/auto_start_service` | bool | `false` | 是否由插件自动启动 Python 服务 |
 | `ai_agent/python_executable` | string | *(空=自动检测)* | Python 可执行文件路径 |
 | `ai_agent/service_module_dir` | string | *(空)* | `ai_agent_service` 目录的绝对路径 |
-| `ai_agent/service_url` | string | `http://127.0.0.1:8765` | 服务地址 |
+
+#### 会话 & UI
+
+| EditorSettings key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `ai_agent/session_id` | string | `default` | 当前会话 ID |
+| `ai_agent/ui_language` | string | `zh` | UI 语言（`zh` / `en`） |
 | `ai_agent/permission_mode` | string | `default` | 权限模式：`default` / `plan` / `auto_approve` / `read_only` |
+| `ai_agent/effort` | string | `standard` | Effort 档位：`quick` / `standard` / `deep` / `verify` / `advisor` |
+| `ai_agent/output_style` | string | `default` | OutputStyle 名称 |
+| `ai_agent/trusted_project_extensions` | bool | `false` | 是否信任项目扩展（允许项目级 Skill） |
+| `ai_agent/show_recovery_prompt` | bool | `true` | 是否显示崩溃恢复提示 |
+| `ai_agent/session_history_json` | string | *(空)* | 会话历史 JSON（内部缓存） |
+
+#### LLM 配置
+
+| EditorSettings key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `ai_agent/llm_base_url` | string | `https://api.openai.com/v1` | OpenAI 兼容 Chat Completions 端点 |
+| `ai_agent/llm_api_key` | string | *(空)* | 大模型 API key |
+| `ai_agent/llm_model` | string | `gpt-4o-mini` | 默认对话模型 |
+| `ai_agent/llm_quick_model` | string | *(空=用 llm_model)* | quick effort 模型 |
+| `ai_agent/llm_standard_model` | string | *(空=用 llm_model)* | standard effort 模型 |
+| `ai_agent/llm_deep_model` | string | *(空=用 llm_model)* | deep effort 模型 |
+| `ai_agent/llm_verify_model` | string | *(空=用 llm_model)* | verify effort 模型 |
+| `ai_agent/llm_advisor_model` | string | *(空=用 llm_model)* | advisor effort 模型 |
+| `ai_agent/llm_fallback_model` | string | *(空=不降级)* | 主模型不可用时的降级模型 |
+| `ai_agent/llm_request_timeout_s` | float | `60.0` | 单次 LLM 请求超时（秒） |
+
+#### RAG & Embedding
+
+| EditorSettings key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `ai_agent/embedding_provider` | string | `disabled` | Embedding 提供方：`disabled` / `openai` / `local` / `bge-m3` |
+| `ai_agent/embedding_model` | string | `text-embedding-3-small` | Embedding 模型名 |
+| `ai_agent/embedding_endpoint` | string | `https://api.openai.com/v1` | Embedding API 端点 |
+| `ai_agent/embedding_api_key` | string | *(空)* | Embedding API key |
+| `ai_agent/embedding_timeout_s` | float | `3.0` | Embedding 请求超时（秒） |
+| `ai_agent/embedding_retries` | int | `1` | Embedding 重试次数 |
+| `ai_agent/rerank_model` | string | *(空=跳过)* | 交叉编码器重排模型名 |
+| `ai_agent/rerank_timeout_s` | float | `2.0` | 重排请求超时（秒） |
+| `ai_agent/rag_query_router_enabled` | bool | `true` | 是否启用查询路由 |
+| `ai_agent/rag_token_budget` | int | `1500` | RAG 注入 prompt 的 token 预算 |
+| `ai_agent/graph_max_depth` | int | `2` | 图检索最大深度 |
+| `ai_agent/graph_max_neighbors` | int | `5` | 图检索每节点最大邻居数 |
+
+#### 资产理解
+
+| EditorSettings key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `ai_agent/asset_understanding_enabled` | bool | `false` | 是否启用资产理解（图片→描述） |
+| `ai_agent/asset_understanding_model` | string | *(空)* | 资产理解模型名 |
+| `ai_agent/asset_understanding_endpoint` | string | *(空)* | 资产理解 API 端点 |
+| `ai_agent/asset_understanding_api_key` | string | *(空)* | 资产理解 API key |
+| `ai_agent/asset_understanding_timeout_s` | float | `10.0` | 资产理解请求超时（秒） |
+| `ai_agent/asset_understanding_max_tokens` | int | `500` | 资产理解最大输出 token |
+
+#### 日志 & 事件
+
+| EditorSettings key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `ai_agent/log_level` | string | `info` | 日志等级：`debug` / `info` / `warning` / `error` |
+| `ai_agent/log_to_file` | bool | `true` | 是否写入日志文件 |
+| `ai_agent/log_file_path` | string | `res://logs/ai_agent_frontend.log` | 前端日志文件路径 |
+| `ai_agent/enable_event_stream` | bool | `true` | 是否启用事件流轮询 |
+| `ai_agent/event_poll_interval_sec` | float | `1.0` | 事件轮询间隔（秒） |
+| `ai_agent/enable_lsp_diagnostics` | bool | `true` | 是否启用 LSP 诊断采集 |
+
+#### 测试 & Headless
+
+| EditorSettings key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
 | `ai_agent/test_executable` | string | *(空)* | 项目测试 runner 可执行文件 |
 | `ai_agent/test_args` | string | *(空)* | 测试 runner 参数 |
 | `ai_agent/test_output_log` | string | *(空)* | 测试输出日志路径 |
 | `ai_agent/headless_executable` | string | *(空)* | M3 headless 自测 runner 可执行文件 |
 | `ai_agent/headless_args` | string | *(空)* | Headless runner 参数 |
 | `ai_agent/headless_output_log` | string | *(空)* | Headless 输出日志路径 |
+| `ai_agent/runner_timeout_ms` | int | `120000` | Runner 超时（毫秒） |
 
 <!-- 📸 在此处插入 EditorSettings 配置截图 -->
 <!-- ![EditorSettings](docs/images/editor-settings.png) -->

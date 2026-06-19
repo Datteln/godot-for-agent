@@ -197,7 +197,7 @@ func abort_batch() -> void:
 					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of node_property: node is no longer valid.")
 			"tile_cells":
 				var layer: Object = op["layer"]
-				if is_instance_valid(layer) and layer.has_method("set_cell"):
+				if is_instance_valid(layer) and (layer.has_method("set_cell") or layer.has_method("set_cell_item")):
 					_set_tile_cells(layer, op["before"])
 				else:
 					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of tile_cells: layer is no longer valid.")
@@ -311,15 +311,28 @@ func _rename_node(node: Node, new_name: String) -> void:
 
 
 func _set_tile_cells(layer: Node, cells: Array) -> void:
-	if layer == null or not layer.has_method("set_cell"):
+	if layer == null or (not layer.has_method("set_cell") and not layer.has_method("set_cell_item")):
 		return
 	for cell in cells:
 		if not (cell is Dictionary):
 			continue
-		layer.call(
-			"set_cell",
-			cell.get("coords", Vector2i.ZERO),
-			int(cell.get("source_id", -1)),
-			cell.get("atlas_coords", Vector2i(-1, -1)),
-			int(cell.get("alternative_tile", 0))
-		)
+		var coords = cell.get("coords", Vector3i.ZERO)
+		if layer.get_class() == "GridMap":
+			layer.call("set_cell_item", coords, int(cell.get("item", -1)), int(cell.get("orientation", 0)))
+		elif layer.get_class() == "TileMap":
+			layer.call(
+				"set_cell",
+				int(cell.get("map_layer", 0)),
+				Vector2i(coords.x, coords.y),
+				int(cell.get("source_id", -1)),
+				cell.get("atlas_coords", Vector2i(-1, -1)),
+				int(cell.get("alternative_tile", 0))
+			)
+		else:
+			layer.call(
+				"set_cell",
+				Vector2i(coords.x, coords.y),
+				int(cell.get("source_id", -1)),
+				cell.get("atlas_coords", Vector2i(-1, -1)),
+				int(cell.get("alternative_tile", 0))
+			)

@@ -68,6 +68,8 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = SceneTools.rename_node(input, editor_interface, undo_manager)
 		"describe_tilemap_selection":
 			result = MapTools.describe_selection(editor_interface)
+		"edit_map":
+			result = MapTools.edit_map(input, editor_interface, undo_manager)
 		"fill_rect":
 			result = MapTools.fill_rect(input, editor_interface, undo_manager)
 		"paint_from_image_grid":

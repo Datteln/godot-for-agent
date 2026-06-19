@@ -37,7 +37,7 @@ static func infer_render_kind(call: Dictionary) -> String:
 	match str(call.get("name", "")):
 		"propose_script_edit", "propose_tests", "apply_text_edit":
 			return "diff"
-		"fill_rect", "paint_from_image_grid":
+		"edit_map", "fill_rect", "paint_from_image_grid":
 			return "map"
 		"run_tests", "run_headless_self_test":
 			return "run"
@@ -115,6 +115,25 @@ static func diff_stats(call: Dictionary) -> Dictionary:
 static func _render_map_op(call: Dictionary) -> Control:
 	var input: Dictionary = call.get("input", {})
 	var lines: Array[String] = []
+	if input.has("operations"):
+		lines.append("Target: %s" % str(input.get("target_path", "selected/auto-detected map")))
+		var operations: Array = input.get("operations", [])
+		lines.append("Map operations: %d" % operations.size())
+		for index in range(mini(operations.size(), 12)):
+			var operation = operations[index]
+			if operation is Dictionary:
+				lines.append("%d. %s at (%s, %s, %s), size %sx%sx%s" % [
+					index + 1,
+					str(operation.get("action", "")),
+					str(operation.get("x", operation.get("to_x", 0))),
+					str(operation.get("y", operation.get("to_y", 0))),
+					str(operation.get("z", operation.get("to_z", 0))),
+					str(operation.get("width", 1)),
+					str(operation.get("height", 1)),
+					str(operation.get("depth", 1))
+				])
+		if operations.size() > 12:
+			lines.append("... %d more operation(s)" % (operations.size() - 12))
 	if input.has("x"):
 		lines.append("Area: (%s, %s) %sx%s" % [
 			str(input.get("x", 0)),
