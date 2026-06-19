@@ -128,6 +128,16 @@ def _resolve_model_for_effort(
     return model_selector(effort)
 
 
+def _resolve_request_model(
+    agent: AgentDefinition,
+    effort: EffortLevel,
+    model_selector: Callable[[EffortLevel], str | None] | None,
+    model_override: str | None,
+) -> str | None:
+    """以请求级覆盖为最高优先级解析本次调用的模型。"""
+    return model_override or _resolve_model_for_effort(agent, effort, model_selector)
+
+
 # effort 档位 -> 采样温度（§6.5）；`verify` 取 0 以追求确定性复核结果。
 EFFORT_TEMPERATURE: dict[EffortLevel, float] = {
     "quick": 0.2,
@@ -135,6 +145,16 @@ EFFORT_TEMPERATURE: dict[EffortLevel, float] = {
     "deep": 0.7,
     "verify": 0.0,
     "advisor": 0.3,
+}
+
+# effort 档位 -> thinking token 预算；verify 设为 0 关闭 thinking 以保证确定性；
+# -1 表示"不限预算"（沿用 enable_thinking:true 无 budget 的原有行为）。
+EFFORT_THINKING_BUDGET: dict[EffortLevel, int] = {
+    "quick": 1024,
+    "standard": 4096,
+    "deep": 16384,
+    "verify": 0,
+    "advisor": 2048,
 }
 
 
@@ -167,6 +187,26 @@ def _resolve_temperature(effort: EffortLevel) -> float:
         `EFFORT_TEMPERATURE` 中对应的采样温度。
     """
     return EFFORT_TEMPERATURE[effort]
+
+
+def resolve_thinking_budget(
+    effort: EffortLevel,
+    selector: Callable[[EffortLevel], int | None] | None = None,
+) -> int:
+    """把 effort 档位映射为 `LLMProvider.chat()` 的 `thinking_budget` 参数。
+
+    Args:
+        effort: 已解析的 effort 档位。
+        selector: 可选的外部覆盖函数（来自配置），返回 None 时 fallback 到内置默认值。
+
+    Returns:
+        thinking token 预算（>0 启用并限制，0 关闭，-1 不限预算）。
+    """
+    if selector is not None:
+        override = selector(effort)
+        if override is not None:
+            return override
+    return EFFORT_THINKING_BUDGET[effort]
 
 
 @dataclass(frozen=True)
@@ -971,7 +1011,7 @@ def _delta_callback(
     message_index: int,
     timeline_frame_id: str,
     timeline_message_index: int,
-) -> Callable[[str, str], None] | None:
+) -> Callable[[str, str, int | None], None] | None:
     """构造传给 `LLMProvider.chat` 的流式增量回调，转发为编排事件。
 
     Args:
@@ -989,7 +1029,7 @@ def _delta_callback(
 
     reasoning_started_at = time.monotonic()
 
-    def _on_delta(kind: str, text: str) -> None:
+    def _on_delta(kind: str, text: str, token_count: int | None) -> None:
         event_type = "agent_reasoning_delta" if kind == "reasoning" else "agent_text_delta"
         payload: dict[str, Any] = {
             "frame_id": frame_id,
@@ -1001,6 +1041,8 @@ def _delta_callback(
         }
         if kind == "reasoning":
             payload["elapsed_ms"] = max(int((time.monotonic() - reasoning_started_at) * 1000), 1)
+            if token_count is not None:
+                payload["token_count"] = token_count
         event_callback(event_type, payload)
 
     return _on_delta
@@ -1051,6 +1093,8 @@ async def run_turn(
     session_allow: set[SessionAllowGrant] | None = None,
     agent_prompt_factory: Callable[[AgentDefinition], str] | None = None,
     model_selector: Callable[[EffortLevel], str | None] | None = None,
+    model_override: str | None = None,
+    thinking_budget_selector: Callable[[EffortLevel], int | None] | None = None,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> StepResult:
     """驱动当前会话的活跃帧完成一轮（或多轮）编排循环。
@@ -1127,11 +1171,27 @@ async def run_turn(
                 },
             )
             effort = _resolve_effort(session, frame)
+            resolved_model = _resolve_request_model(
+                frame.agent,
+                effort,
+                model_selector,
+                model_override,
+            )
+            if event_callback is not None and resolved_model is not None:
+                event_callback(
+                    "agent_model_selected",
+                    {
+                        "frame_id": frame.id,
+                        "loop": loop_index + 1,
+                        "model": resolved_model,
+                    },
+                )
             turn = await llm.chat(
                 frame.messages,
                 visible_tools,
-                model=_resolve_model_for_effort(frame.agent, effort, model_selector),
+                model=resolved_model,
                 temperature=_resolve_temperature(effort),
+                thinking_budget=resolve_thinking_budget(effort, thinking_budget_selector),
                 on_delta=_delta_callback(
                     event_callback,
                     frame.id,

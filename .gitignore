@@ -404,3 +404,4 @@ ai_map_agent/
 .ai_agent_service/
 **/*.gd.uid
 **/ai_agent_service.egg-info/
+.godot/

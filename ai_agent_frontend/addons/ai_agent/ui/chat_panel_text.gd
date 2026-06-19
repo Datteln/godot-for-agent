@@ -55,7 +55,7 @@ const UI_TEXT := {
 		"tool_error_detail": "出错：%s",
 		"tool_unknown_error": "未知错误",
 		"rejected_turn_ended": "已拒绝本次工具调用，会话已结束，可以继续发送新消息。",
-		"history": "历史",
+		"history": "会话历史",
 		"history_empty": "无历史会话",
 		"switch_session_empty": "（无历史记录）"
 	},
@@ -112,7 +112,7 @@ const UI_TEXT := {
 		"tool_error_detail": "Error: %s",
 		"tool_unknown_error": "Unknown error",
 		"rejected_turn_ended": "Rejected this tool call. The turn has ended; you can send a new message.",
-		"history": "History",
+		"history": "Session history",
 		"history_empty": "No session history",
 		"switch_session_empty": "(no history)"
 	}

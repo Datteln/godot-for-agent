@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # 流式增量回调：`(kind, accumulated_text)`，`kind` 为 `"content"`（回复正文）
 # 或 `"reasoning"`（思考过程），`accumulated_text` 为截至当前的完整累积文本。
-DeltaCallback = Callable[[str, str], None]
+DeltaCallback = Callable[[str, str, int | None], None]
 
 # 降级回调：`(primary_model, fallback_model)`，主模型请求失败、即将用
 # `fallback_model` 重试时触发一次，供编排层把这次模型切换暴露为事件，
@@ -65,7 +65,19 @@ class AssistantTurn:
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str | None = None
     reasoning: str | None = None
+    reasoning_tokens: int | None = None
     model: str = ""
+
+
+def _reasoning_tokens_from_usage(usage: Any) -> int | None:
+    """从 OpenAI 兼容 usage 对象中提取真实 reasoning token 数。"""
+    if usage is None:
+        return None
+    details = getattr(usage, "completion_tokens_details", None)
+    value = getattr(details, "reasoning_tokens", None)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
 
 class LLMError(Exception):
@@ -91,6 +103,7 @@ class LLMProvider(Protocol):
         tools: list[dict[str, Any]],
         model: str | None = None,
         temperature: float | None = None,
+        thinking_budget: int = -1,
         on_delta: DeltaCallback | None = None,
         on_fallback: FallbackCallback | None = None,
     ) -> AssistantTurn:
@@ -103,8 +116,12 @@ class LLMProvider(Protocol):
             model: 本次请求使用的模型名；为 None 时使用 provider 的默认模型。
             temperature: 采样温度；为 None 时使用端点默认值（编排层通常按
                 `AgentDefinition.effort` 解析出具体值）。
-            on_delta: 流式增量回调，每次正文/思考过程有新增内容时被调用，
-                参数为 `(kind, accumulated_text)`；为 None 时不推送增量。
+            thinking_budget: 思考 token 预算。>0 时启用 extended thinking 并
+                限制上限；==0 时关闭 thinking（确定性优先）；==-1（默认）时
+                沿用 enable_thinking:true 不限预算的原有行为。
+            on_delta: 流式增量回调，参数为
+                `(kind, accumulated_text, token_count)`；精确 token 数仅在最终
+                usage 可用时传入，否则为 None。
             on_fallback: 降级回调，主模型失败、即将用 `fallback_model`
                 重试前触发一次；为 None 时不通知。
 
@@ -156,11 +173,10 @@ class OpenAICompatibleProvider:
         self._default_model = default_model
         self._fallback_model = fallback_model
         logger.info(
-            "Initialized OpenAI-compatible provider base_url=%s default_model=%s fallback_model=%s timeout_s=%s",
+            "Initialized OpenAI-compatible provider base_url=%s timeout_s=%s fallback_configured=%s",
             base_url,
-            default_model,
-            fallback_model,
             timeout_s,
+            fallback_model is not None,
         )
 
     @property
@@ -179,6 +195,7 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]],
         model: str | None = None,
         temperature: float | None = None,
+        thinking_budget: int = -1,
         on_delta: DeltaCallback | None = None,
         on_fallback: FallbackCallback | None = None,
     ) -> AssistantTurn:
@@ -192,6 +209,7 @@ class OpenAICompatibleProvider:
             tools: 当前 agent 可见工具的 OpenAI function schema 列表。
             model: 本次请求使用的模型名；为 None 时使用 `default_model`。
             temperature: 采样温度；为 None 时使用端点默认值。
+            thinking_budget: 思考 token 预算，参见 `LLMProvider.chat`。
             on_delta: 流式增量回调，参见 `LLMProvider.chat`。
             on_fallback: 降级回调，参见 `LLMProvider.chat`；在实际发起
                 降级请求前调用一次，便于编排层把这次模型切换暴露为事件。
@@ -204,24 +222,21 @@ class OpenAICompatibleProvider:
         """
         resolved_model = model or self._default_model
         try:
-            return await self._chat_once(messages, tools, resolved_model, temperature, on_delta)
+            return await self._chat_once(messages, tools, resolved_model, temperature, thinking_budget, on_delta)
         except LLMError as exc:
             if self._fallback_model is None or self._fallback_model == resolved_model:
                 logger.warning(
-                    "LLM chat failed without fallback model=%s status_code=%s",
-                    resolved_model,
+                    "LLM chat failed without fallback status_code=%s",
                     exc.status_code,
                 )
                 raise
             logger.warning(
-                "LLM chat failed; retrying fallback primary_model=%s fallback_model=%s status_code=%s",
-                resolved_model,
-                self._fallback_model,
+                "LLM chat failed; retrying configured fallback status_code=%s",
                 exc.status_code,
             )
             if on_fallback is not None:
                 on_fallback(resolved_model, self._fallback_model)
-            return await self._chat_once(messages, tools, self._fallback_model, temperature, on_delta)
+            return await self._chat_once(messages, tools, self._fallback_model, temperature, thinking_budget, on_delta)
 
     async def _chat_once(
         self,
@@ -229,6 +244,7 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]],
         model: str,
         temperature: float | None,
+        thinking_budget: int = -1,
         on_delta: DeltaCallback | None = None,
     ) -> AssistantTurn:
         """发起一次流式 `chat.completions.create` 请求并转换为 `AssistantTurn`。
@@ -238,6 +254,7 @@ class OpenAICompatibleProvider:
             tools: 当前 agent 可见工具的 OpenAI function schema 列表。
             model: 本次请求实际使用的模型名（已解析，非 None）。
             temperature: 采样温度；为 None 时使用端点默认值。
+            thinking_budget: 思考 token 预算，参见 `LLMProvider.chat`。
             on_delta: 流式增量回调，参见 `LLMProvider.chat`。
 
         Returns:
@@ -246,12 +263,19 @@ class OpenAICompatibleProvider:
         Raises:
             LLMError: 连接失败、超时或端点返回错误状态码时抛出。
         """
+        if thinking_budget > 0:
+            extra_body: dict[str, Any] | None = {"enable_thinking": True, "thinking_budget": thinking_budget}
+        elif thinking_budget == 0:
+            extra_body = None
+        else:
+            extra_body = {"enable_thinking": True}
+
         logger.info(
-            "LLM chat request model=%s messages=%d tools=%d temperature=%s",
-            model,
+            "LLM chat request messages=%d tools=%d temperature=%s thinking_budget=%s",
             len(messages),
             len(tools),
             temperature,
+            thinking_budget,
         )
         try:
             stream = await self._client.chat.completions.create(
@@ -260,14 +284,15 @@ class OpenAICompatibleProvider:
                 tools=tools or None,  # type: ignore[arg-type]
                 tool_choice="auto" if tools else None,
                 temperature=temperature,
-                extra_body={"enable_thinking": True},
+                extra_body=extra_body,
                 stream=True,
+                stream_options={"include_usage": True},
             )
         except (APIConnectionError, APITimeoutError) as exc:
-            logger.warning("LLM connection error model=%s error_type=%s", model, type(exc).__name__)
+            logger.warning("LLM connection error error_type=%s", type(exc).__name__)
             raise LLMError(f"无法连接大模型端点：{exc}") from exc
         except APIStatusError as exc:
-            logger.warning("LLM status error model=%s status_code=%s", model, exc.status_code)
+            logger.warning("LLM status error status_code=%s", exc.status_code)
             raise LLMError(
                 f"大模型端点返回错误（{exc.status_code}）：{exc.message}",
                 status_code=exc.status_code,
@@ -280,9 +305,13 @@ class OpenAICompatibleProvider:
         finish_reason: str | None = None
         last_content_emit = 0.0
         last_reasoning_emit = 0.0
+        reasoning_tokens: int | None = None
 
         try:
             async for chunk in stream:
+                chunk_reasoning_tokens = _reasoning_tokens_from_usage(getattr(chunk, "usage", None))
+                if chunk_reasoning_tokens is not None:
+                    reasoning_tokens = chunk_reasoning_tokens
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
@@ -298,14 +327,14 @@ class OpenAICompatibleProvider:
                     now = time.monotonic()
                     if on_delta is not None and now - last_content_emit >= _DELTA_MIN_INTERVAL_S:
                         last_content_emit = now
-                        on_delta("content", "".join(content_parts))
+                        on_delta("content", "".join(content_parts), None)
                 reasoning_piece = getattr(delta, "reasoning_content", None)
                 if reasoning_piece:
                     reasoning_parts.append(reasoning_piece)
                     now = time.monotonic()
                     if on_delta is not None and now - last_reasoning_emit >= _DELTA_MIN_INTERVAL_S:
                         last_reasoning_emit = now
-                        on_delta("reasoning", "".join(reasoning_parts))
+                        on_delta("reasoning", "".join(reasoning_parts), None)
                 for tool_call_delta in delta.tool_calls or []:
                     entry = tool_calls_acc.setdefault(
                         tool_call_delta.index,
@@ -321,10 +350,10 @@ class OpenAICompatibleProvider:
                         if tool_call_delta.function.arguments:
                             entry["function"]["arguments"] += tool_call_delta.function.arguments
         except (APIConnectionError, APITimeoutError) as exc:
-            logger.warning("LLM stream connection error model=%s error_type=%s", model, type(exc).__name__)
+            logger.warning("LLM stream connection error error_type=%s", type(exc).__name__)
             raise LLMError(f"大模型流式响应中断：{exc}") from exc
         except APIStatusError as exc:
-            logger.warning("LLM stream status error model=%s status_code=%s", model, exc.status_code)
+            logger.warning("LLM stream status error status_code=%s", exc.status_code)
             raise LLMError(
                 f"大模型端点返回错误（{exc.status_code}）：{exc.message}",
                 status_code=exc.status_code,
@@ -334,9 +363,9 @@ class OpenAICompatibleProvider:
         reasoning = "".join(reasoning_parts) or None
         if on_delta is not None:
             if content is not None:
-                on_delta("content", content)
+                on_delta("content", content, None)
             if reasoning is not None:
-                on_delta("reasoning", reasoning)
+                on_delta("reasoning", reasoning, reasoning_tokens)
 
         tool_calls = [
             ToolCallRequest(
@@ -364,8 +393,7 @@ class OpenAICompatibleProvider:
             ]
 
         logger.info(
-            "LLM chat response model=%s finish_reason=%s tool_calls=%d content_length=%d reasoning_length=%d",
-            model,
+            "LLM chat response finish_reason=%s tool_calls=%d content_length=%d reasoning_length=%d",
             finish_reason,
             len(tool_calls),
             len(content or ""),
@@ -377,5 +405,6 @@ class OpenAICompatibleProvider:
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             reasoning=reasoning,
+            reasoning_tokens=reasoning_tokens,
             model=model,
         )

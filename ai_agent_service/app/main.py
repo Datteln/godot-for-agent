@@ -72,12 +72,11 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
     resolved_token = token if token is not None else _token_from_env()
 
     logger.info(
-        "Creating AI agent service app project_root=%s permission_mode=%s trusted=%s auth_enabled=%s model=%s",
+        "Creating AI agent service app project_root=%s permission_mode=%s trusted=%s auth_enabled=%s",
         resolved_settings.project_root,
         resolved_settings.permission_mode,
         resolved_settings.trusted_project,
         resolved_token is not None,
-        resolved_settings.llm_model,
     )
 
     register_server_tools()

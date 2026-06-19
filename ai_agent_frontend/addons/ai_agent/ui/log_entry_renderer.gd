@@ -198,7 +198,9 @@ func split_log_entries(text: String) -> Array[String]:
 			_flush_log_entry(entries, current)
 			current.clear()
 			current.append(trimmed)
-		elif trimmed == "" and not current.is_empty() and is_log_action_start(str(current[0])):
+		elif trimmed == "" and not current.is_empty() \
+				and is_log_action_start(str(current[0])) \
+				and not is_workflow_summary_start(str(current[0])):
 			_flush_log_entry(entries, current)
 			current.clear()
 		else:
@@ -376,6 +378,21 @@ func append_history_text_entry(message_list: VBoxContainer, text: String, marker
 	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	content.add_theme_constant_override("separation", 2)
 	content.add_child(make_log_rich_text(text, null, "●" if marker else "", indent))
+	message_list.add_child(content)
+
+
+func append_history_code_entry(message_list: VBoxContainer, text: String, language: String, indent: bool) -> void:
+	var content := VBoxContainer.new()
+	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	content.add_theme_constant_override("separation", 2)
+	var rich := make_log_rich_text("", null, "", indent)
+	var highlighted: Array[String] = []
+	for line in text.split("\n"):
+		highlighted.append(MarkdownRenderer.highlight_code_line(str(line), language, theme_colors))
+	rich.append_text("[bgcolor=%s][code]%s[/code][/bgcolor]" % [
+		_theme_color_tag("code_bg"), "\n".join(highlighted)
+	])
+	content.add_child(rich)
 	message_list.add_child(content)
 
 

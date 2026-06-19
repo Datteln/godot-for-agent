@@ -60,6 +60,7 @@ from app.orchestrator.agent import (
     FinalResult,
     StepResult,
     ToolCallsResult,
+    resolve_thinking_budget,
     run_turn,
 )
 from app.output_styles.catalog import OutputStyleCatalog
@@ -75,6 +76,23 @@ from app.tools.server_tools.read_file import read_file_handler
 from app.verify.syntax_check import run_syntax_check
 
 logger = logging.getLogger(__name__)
+_MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
+
+
+def _normalize_model_override(model: str | None) -> str | None:
+    """清理请求级模型覆盖；空白值等同于未指定。"""
+    if model is None:
+        return None
+    normalized = model.strip()
+    return normalized or None
+
+
+def _event_payload_for_log(payload: dict[str, Any]) -> dict[str, Any]:
+    """隐藏事件日志中的模型名，不影响发送给 UI 的原始事件。"""
+    return {
+        key: "<redacted>" if key in _MODEL_LOG_FIELDS else value
+        for key, value in payload.items()
+    }
 
 
 def _response_from_dict(data: dict[str, Any]) -> ChatResponse:
@@ -236,6 +254,20 @@ _HISTORY_EDIT_TOOLS = frozenset(
     }
 )
 _HISTORY_GREP_TOOLS = frozenset({"grep_code", "search_codebase", "list_files"})
+# 前端工具（在 Godot 编辑器侧执行）不会返回纯文本内容，用短描述摘要替代 JSON 转储
+_HISTORY_FRONT_READ_TOOLS = frozenset(
+    {
+        "read_scene_tree",
+        "read_runtime_state",
+        "read_profiler_snapshot",
+        "read_debugger_errors",
+        "read_image_metadata",
+        "read_class_docs",
+        "describe_tilemap_selection",
+    }
+)
+_HISTORY_FRONT_SCENE_EDIT_TOOLS = frozenset({"add_node", "set_node_property"})
+_HISTORY_FRONT_RUN_TOOLS = frozenset({"run_tests", "run_headless_self_test"})
 _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
     {
         "agent_reasoning_delta",
@@ -326,6 +358,60 @@ def _truncate_text(text: str, max_chars: int) -> str:
     if len(text) > max_chars:
         return text[:max_chars] + "\n... (truncated)"
     return text
+
+
+def _front_result_lines(value: Any, *, indent: int = 0, max_items: int = 80) -> list[str]:
+    """把前端工具结果转为有界的 Markdown 列表，保留节点层级。"""
+    prefix = "  " * indent
+    if isinstance(value, dict):
+        lines: list[str] = []
+        for index, (key, item) in enumerate(value.items()):
+            if index >= max_items:
+                lines.append(f"{prefix}- ... (truncated)")
+                break
+            if isinstance(item, dict | list):
+                lines.append(f"{prefix}- {key}:")
+                lines.extend(_front_result_lines(item, indent=indent + 1, max_items=max_items))
+            else:
+                lines.append(f"{prefix}- {key}: {item}")
+        return lines
+    if isinstance(value, list):
+        lines = []
+        for index, item in enumerate(value):
+            if index >= max_items:
+                lines.append(f"{prefix}- ... (truncated)")
+                break
+            if isinstance(item, dict | list):
+                lines.append(f"{prefix}- item {index + 1}:")
+                lines.extend(_front_result_lines(item, indent=indent + 1, max_items=max_items))
+            else:
+                lines.append(f"{prefix}- {item}")
+        return lines
+    return [f"{prefix}- {value}"]
+
+
+def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str, Any]) -> str:
+    """为前端工具生成可读摘要，并保留返回的节点与状态。"""
+    title = name.replace("_", " ").capitalize()
+    if name == "read_class_docs":
+        cls = input_args.get("class_name", "")
+        title = f"Read class docs: {cls}" if cls else "Read class docs"
+    elif name == "add_node":
+        node_type = input_args.get("type", "")
+        node_name = input_args.get("name", "")
+        parent = input_args.get("parent_path", ".")
+        title = f"Add {node_type} '{node_name}' under '{parent}'"
+    elif name == "set_node_property":
+        path = input_args.get("path", "")
+        prop = input_args.get("property", "")
+        value = input_args.get("value", "")
+        title = f"Set {path}.{prop} = {value}"
+    elif name == "run_tests":
+        kind = input_args.get("kind", "")
+        title = f"Run tests ({kind})" if kind else "Run tests"
+    elif name == "run_headless_self_test":
+        title = "Run headless self-test"
+    return "\n".join([f"{title}:", *_front_result_lines(result)])
 
 
 def _display_tool_content(content: str) -> str:
@@ -786,6 +872,7 @@ def _tool_history_blocks(
                 path=path,
                 added=max(_count_lines(after_text) - _count_lines(before_text), 0),
                 removed=max(_count_lines(before_text) - _count_lines(after_text), 0),
+                after_text=after_text,
                 **origin,
             )
         ]
@@ -809,6 +896,14 @@ def _tool_history_blocks(
                 **origin,
             )
         ]
+
+    if name in _HISTORY_FRONT_READ_TOOLS:
+        summary = _front_tool_summary(name, input_args, inner)
+        return [LogTextHistoryBlock(text=summary, marker=True, **origin)]
+
+    if name in _HISTORY_FRONT_SCENE_EDIT_TOOLS or name in _HISTORY_FRONT_RUN_TOOLS:
+        summary = _front_tool_summary(name, input_args, inner)
+        return [LogTextHistoryBlock(text=summary, marker=True, **origin)]
 
     summary = _format_tool_result_summary(name, input_args, content).strip()
     return [LogTextHistoryBlock(text=summary, marker=True, **origin)] if summary else []
@@ -896,6 +991,9 @@ def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
         header = "Thought"
         if isinstance(elapsed_ms, int | float) and elapsed_ms > 0:
             header = f"Thought for {elapsed_ms / 1000:.2f}s"
+        token_count = payload.get("token_count")
+        if isinstance(token_count, int) and token_count > 0:
+            header += f" · {token_count:,} tokens"
         return [ThoughtHistoryBlock(header=header, detail=detail, **origin)]
     if event.type == "agent_text_delta":
         text = str(payload.get("text", "")).strip()
@@ -977,9 +1075,8 @@ def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
     if event.type == "server_tool_result":
         summary = payload.get("result_summary")
         if not isinstance(summary, dict):
-            if bool(payload.get("is_error", False)):
-                tool = str(payload.get("tool", "tool"))
-                return [ErrorHistoryBlock(text=f"{tool} failed", **origin)]
+            # Error detail is already rendered via the tool-role message block;
+            # emitting a duplicate ErrorHistoryBlock here causes double red boxes.
             return []
         kind = str(summary.get("kind", ""))
         if kind == "read":
@@ -1075,6 +1172,20 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
                 if reasoning_before_text
                 else None
             )
+            usage_events = [
+                event
+                for event in reasoning_events
+                if isinstance(event.payload.get("token_count"), int)
+            ]
+            if reasoning is not None and usage_events:
+                usage_event = max(usage_events, key=lambda event: event.seq)
+                reasoning = replace(
+                    reasoning,
+                    payload={
+                        **reasoning.payload,
+                        "token_count": usage_event.payload["token_count"],
+                    },
+                )
         else:
             reasoning = (
                 max(reasoning_events, key=lambda event: event.seq)
@@ -1123,6 +1234,17 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
                 legacy_stream_anchor += 1
             legacy_stream_key = key
             message_index = assistant_indexes[min(legacy_stream_anchor, len(assistant_indexes) - 1)]
+        # agent_text_delta events are streaming snapshots; when anchored to an
+        # assistant message that already contains the final text, skip them to
+        # avoid rendering the same content twice with mismatched indentation.
+        if (
+            event.type == "agent_text_delta"
+            and message_index is not None
+            and message_index < len(frame.messages)
+            and str(frame.messages[message_index].get("role", "")) == "assistant"
+            and str(frame.messages[message_index].get("content", "")).strip()
+        ):
+            continue
         if message_index is None:
             trailing.extend(blocks)
         else:
@@ -1298,6 +1420,7 @@ class QueryEngine:
         )
         return SessionHistoryResponse(
             session_id=session.session_id,
+            last_event_seq=self._events.last_seq(session_id) if self._events is not None else 0,
             pending_turn_id=session.pending_turn_id,
             items=items,
             blocks=blocks,
@@ -1376,6 +1499,8 @@ class QueryEngine:
             return ChatErrorResponse(text="user_message 与 tool_results 必须二选一")
 
         security = self._security_for_request(request)
+        model_override = _normalize_model_override(request.model)
+
         if request.effort is not None:
             session.effort = request.effort
             logger.info("Session effort overridden session=%s effort=%s", session.session_id, request.effort)
@@ -1414,7 +1539,7 @@ class QueryEngine:
                 logger.warning("Front tool result rejected session=%s reason=%s", session.session_id, result_error.text)
                 return result_error
             if verify_candidates:
-                await self._run_verify(session, security, verify_candidates)
+                await self._run_verify(session, security, verify_candidates, model_override)
         else:
             if session.pending_turn_id is not None:
                 logger.warning(
@@ -1455,6 +1580,8 @@ class QueryEngine:
                 session.output_style,
             ),
             model_selector=self._model_for_effort,
+            model_override=model_override,
+            thinking_budget_selector=self._thinking_budget_for_effort,
             event_callback=lambda event_type, payload: self._emit(session.session_id, event_type, payload),
         )
         response = _step_to_response(step)
@@ -1502,9 +1629,19 @@ class QueryEngine:
             "verify": self._settings.llm_verify_model,
             "advisor": self._settings.llm_advisor_model,
         }.get(effort)
-        if value is None or str(value).strip() == "":
-            return None
-        return str(value).strip()
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+        return self._settings.llm_model.strip() or None
+
+    def _thinking_budget_for_effort(self, effort: str) -> int | None:
+        """Return an optional thinking budget override for the current effort."""
+        return {
+            "quick": self._settings.llm_thinking_budget_quick,
+            "standard": self._settings.llm_thinking_budget_standard,
+            "deep": self._settings.llm_thinking_budget_deep,
+            "verify": self._settings.llm_thinking_budget_verify,
+            "advisor": self._settings.llm_thinking_budget_advisor,
+        }.get(effort)
 
     def _append_tool_results(
         self, session: Session, results: list[ToolResult]
@@ -1620,6 +1757,7 @@ class QueryEngine:
         session: Session,
         security: SecuritySettings,
         candidates: list[dict[str, Any]],
+        model_override: str | None = None,
     ) -> None:
         """对本轮所有命中校验条件的编辑结果依次跑 Verify 两阶段校验（§3.4）。
 
@@ -1629,13 +1767,14 @@ class QueryEngine:
             candidates: `_append_tool_results()` 收集的待校验候选列表。
         """
         for candidate in candidates:
-            await self._verify_one(session, security, candidate)
+            await self._verify_one(session, security, candidate, model_override)
 
     async def _verify_one(
         self,
         session: Session,
         security: SecuritySettings,
         candidate: dict[str, Any],
+        model_override: str | None = None,
     ) -> None:
         """对单个编辑结果跑 Phase 1 语法快检 + Phase 2 语义校验，并把结论写回对应帧。"""
         settings = self._settings
@@ -1732,7 +1871,13 @@ class QueryEngine:
                 "message_index": len(frame.messages),
             },
         )
-        result = await self._run_semantic_verify(security, tool_name, candidate.get("input", {}), path)
+        result = await self._run_semantic_verify(
+            security,
+            tool_name,
+            candidate.get("input", {}),
+            path,
+            model_override,
+        )
         self._emit(
             session.session_id,
             "verify_completed",
@@ -1779,6 +1924,7 @@ class QueryEngine:
         tool_name: str,
         tool_input: dict[str, Any],
         path: str,
+        model_override: str | None = None,
     ) -> VerifyResultDTO:
         """调用 LLM 对改动后的文件内容做语义/逻辑层面的校验（Phase 2，§3.5）。
 
@@ -1809,8 +1955,11 @@ class QueryEngine:
             turn = await self._llm.chat(
                 messages,
                 [],
-                model=self._model_for_effort(self._settings.verify_effort),
+                model=model_override or self._model_for_effort(self._settings.verify_effort),
                 temperature=EFFORT_TEMPERATURE.get(self._settings.verify_effort, 0.0),
+                thinking_budget=resolve_thinking_budget(
+                    self._settings.verify_effort, self._thinking_budget_for_effort
+                ),
             )
         except LLMError as exc:
             logger.warning("Verify semantic LLM call failed path=%s error=%s", path, exc)
@@ -1998,11 +2147,12 @@ class QueryEngine:
 
     def _emit(self, session_id: str, event_type: str, payload: dict[str, Any]) -> int:
         """记录内部事件；未配置事件存储时返回 0。"""
+        log_payload = _event_payload_for_log(payload)
         logger.debug(
             "Event emitted session=%s type=%s payload=%s",
             session_id,
             event_type,
-            json.dumps(payload, ensure_ascii=False, default=str),
+            json.dumps(log_payload, ensure_ascii=False, default=str),
         )
         if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
             session = self._store.get_or_create(session_id, self.available_tools)

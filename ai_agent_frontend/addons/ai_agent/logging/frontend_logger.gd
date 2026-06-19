@@ -18,6 +18,7 @@ const REDACTED_KEYS := {
 	"token": true
 }
 const MAX_DATA_CHARS := 4000
+const MAX_LOG_FILE_BYTES := 10 * 1024 * 1024
 
 
 static func debug(editor_interface: EditorInterface, component: String, message: String, data: Dictionary = {}) -> void:
@@ -83,6 +84,13 @@ static func _append_to_file(editor_interface: EditorInterface, line: String) -> 
 	var path := str(ConfigMigrations.get_value(editor_interface, "ai_agent/log_file_path")).strip_edges()
 	if path.is_empty():
 		return
+	path = _absolute_log_path(path)
+	var directory_path := path.get_base_dir()
+	var directory_error := DirAccess.make_dir_recursive_absolute(directory_path)
+	if directory_error != OK and directory_error != ERR_ALREADY_EXISTS:
+		push_warning("[AI Agent:Logger] Failed to create log directory: " + directory_path)
+		return
+	path = _available_log_path(path, line.to_utf8_buffer().size() + 1)
 	var file := FileAccess.open(path, FileAccess.READ_WRITE)
 	if file == null:
 		file = FileAccess.open(path, FileAccess.WRITE)
@@ -91,6 +99,41 @@ static func _append_to_file(editor_interface: EditorInterface, line: String) -> 
 		return
 	file.seek_end()
 	file.store_line(line)
+	file.close()
+
+
+static func _absolute_log_path(path: String) -> String:
+	if path.is_absolute_path():
+		return path
+	if path.begins_with("res://") or path.begins_with("user://"):
+		return ProjectSettings.globalize_path(path)
+	return ProjectSettings.globalize_path("res://" + path.trim_prefix("/"))
+
+
+static func _available_log_path(base_path: String, incoming_bytes: int) -> String:
+	var index := 0
+	while true:
+		var candidate := base_path if index == 0 else _rotated_log_path(base_path, index)
+		if not FileAccess.file_exists(candidate) or _file_size(candidate) + incoming_bytes <= MAX_LOG_FILE_BYTES:
+			return candidate
+		index += 1
+	return base_path
+
+
+static func _rotated_log_path(base_path: String, index: int) -> String:
+	var extension := base_path.get_extension()
+	if extension.is_empty():
+		return "%s.%d" % [base_path, index]
+	return "%s.%d.%s" % [base_path.trim_suffix("." + extension), index, extension]
+
+
+static func _file_size(path: String) -> int:
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		return 0
+	var size := file.get_length()
+	file.close()
+	return size
 
 
 static func _redact_dictionary(data: Dictionary) -> Dictionary:

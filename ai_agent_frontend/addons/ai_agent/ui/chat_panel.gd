@@ -65,6 +65,8 @@ var _history_popup: PopupMenu
 var _history_session_ids: Array = []
 var _effort_options: OptionButton
 var _style_options: OptionButton
+var _model_input: LineEdit
+var _active_model_name := ""
 
 var _state := AgentState.IDLE
 var _last_doctor_report: Dictionary = {}
@@ -89,15 +91,18 @@ var _reasoning_toggle: Button
 var _reasoning_detail_rich: RichTextLabel
 var _reasoning_text := ""
 var _reasoning_started_ms: int = -1
+var _reasoning_token_count: int = 0
 var _reasoning_text_dirty := false
 var _reasoning_last_render_ms := 0
 var _rendered_assistant_keys := {}
 var _live_response_keys := {}   # 仅追踪本轮实时响应，避免历史加载的指纹误判为重复
 var _closed_stream_keys := {}
 var _closed_reasoning_keys := {}   # 新增：专门追踪已关闭的 reasoning stream
+var _finished_reasoning_headers := {}
 var _theme_colors: Dictionary = {}
 var _auto_scroll := true
 var _suppress_scroll_check := false   # 程序滚动时抑制 value_changed 误判
+var _scroll_request_pending := false
 var _post_final_scroll_frames := 0   # final 响应后持续滚动到底部的剩余帧数
 var _post_delta_scroll_frames := 0   # 文本流刷新后持续滚动到底部的剩余帧数（避免每帧都强制滚动）
 var _empty_final_ignored_ms: int = -1   # 空 final 被忽略的时间戳，超时后强制结束 turn
@@ -240,6 +245,16 @@ func _build_ui() -> void:
 	toolbar.add_child(_effort_options)
 	_sync_effort_selection()
 
+	_model_input = LineEdit.new()
+	_model_input.custom_minimum_size = Vector2(160, 0)
+	_model_input.placeholder_text = str(
+		ConfigMigrations.get_value(editor_interface, "ai_agent/llm_model")
+	).strip_edges()
+	_active_model_name = _model_input.placeholder_text
+	_model_input.tooltip_text = "Model override (empty uses the configured default)"
+	_model_input.context_menu_enabled = true
+	toolbar.add_child(_model_input)
+
 	_style_options = OptionButton.new()
 	for style in ["default", "concise", "review"]:
 		_style_options.add_item(style)
@@ -290,7 +305,7 @@ func _build_ui() -> void:
 	bottom.add_child(_input)
 
 	_status = Label.new()
-	_status.text = _ui("idle")
+	_status.text = _status_text_for_state(AgentState.IDLE)
 	add_child(_status)
 
 
@@ -371,6 +386,8 @@ func _on_send() -> void:
 		})
 		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length()})
+	var requested_model = _request_model()
+	_active_model_name = str(requested_model) if requested_model != null else _model_input.placeholder_text
 	_auto_scroll = true
 	_force_scroll_once = true
 	_interrupted_locally = false
@@ -379,6 +396,7 @@ func _on_send() -> void:
 	_finish_reasoning_stream()
 	_closed_stream_keys.clear()
 	_closed_reasoning_keys.clear()   # 新增
+	_finished_reasoning_headers.clear()
 	_live_response_keys.clear()
 	_empty_final_ignored_ms = -1   # 重置空 final 超时计时器
 	_input.clear()
@@ -391,7 +409,7 @@ func _on_send() -> void:
 	_set_state(AgentState.WAITING_LLM)
 	if undo_manager != null:
 		undo_manager.begin_batch("AI: " + text.left(40))
-	_http_client.send_user_message(text, _collector.collect("any"))
+	_http_client.send_user_message(text, _collector.collect("any"), requested_model)
 
 
 func _on_response(response: Dictionary) -> void:
@@ -532,7 +550,7 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		_set_state(AgentState.WAITING_CONFIRM)
 	else:
 		_set_state(AgentState.WAITING_LLM)
-		_http_client.send_tool_results(results)
+		_http_client.send_tool_results(results, _request_model())
 
 
 func _on_decision(results: Array) -> void:
@@ -559,7 +577,7 @@ func _on_decision(results: Array) -> void:
 		_append_message("system", _ui("rejected_turn_ended"))
 		return
 	_set_state(AgentState.WAITING_LLM)
-	_http_client.send_tool_results(results)
+	_http_client.send_tool_results(results, _request_model())
 
 
 ## 移除文本中的 `<think>…</think>` XML 块及所有残余的 `</think>` 标签。
@@ -722,6 +740,7 @@ func _handle_session_history(response: Dictionary) -> void:
 	if state_store != null:
 		state_store.set_value("session_id", session_id)
 	var pending_turn_id = response.get("pending_turn_id")
+	_http_client.sync_event_cursor(int(response.get("last_event_seq", 0)))
 	if pending_turn_id != null:
 		_http_client.current_turn_id = str(pending_turn_id)
 		if state_store != null:
@@ -807,6 +826,11 @@ func _render_history_block(block: Dictionary) -> void:
 					int(block.get("removed", 0))
 				]
 			)
+			var edit_after_text := str(block.get("after_text", ""))
+			if edit_after_text != "":
+				var ext := str(block.get("path", "")).get_extension().to_lower()
+				var lang := "gdscript" if ext == "gd" else ("python" if ext == "py" else "")
+				_log_renderer.append_history_code_entry(_message_list, edit_after_text, lang, true)
 		"thought":
 			_log_renderer.append_history_thought_entry(
 				_message_list,
@@ -850,7 +874,8 @@ func _render_history_block(block: Dictionary) -> void:
 		"delegate_result":
 			_append_log_stream_message(
 				"Delegate result: %s\n%s" % [
-					str(block.get("agent", "")), str(block.get("summary", ""))
+					str(block.get("agent", "")),
+					str(block.get("summary", ""))
 				], null, true
 			)
 		"system_text":
@@ -1295,7 +1320,15 @@ func _handle_event(event: Dictionary) -> void:
 		if payload.has("text"):
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (via event stream)", {})
 			_handle_final(payload)
+	elif event_type == "agent_model_selected":
+		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+		_active_model_name = str(payload.get("model", "")).strip_edges()
+		_refresh_status_text()
 	else:
+		if event_type == "agent_model_fallback":
+			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+			_active_model_name = str(payload.get("fallback_model", "")).strip_edges()
+			_refresh_status_text()
 		var previous_state := _state
 		var is_compacting := event_type == "compact_boundary" and previous_state != AgentState.IDLE
 		if is_compacting:
@@ -1451,25 +1484,39 @@ func _clear_inline_confirmation() -> void:
 	_pending_silent_results.clear()
 
 
+func _request_model():
+	var model := _model_input.text.strip_edges()
+	return model if model != "" else null
+
+
+func _status_text_for_state(value: int) -> String:
+	var base := _ui("idle")
+	match value:
+		AgentState.WAITING_LLM:
+			base = _ui("waiting_model")
+		AgentState.WAITING_CONFIRM:
+			base = _ui("waiting_confirm")
+		AgentState.EXECUTING:
+			base = _ui("executing")
+		AgentState.COMPACTING:
+			base = _ui("compacting")
+	return "%s · %s" % [base, _active_model_name] if _active_model_name != "" else base
+
+
+func _refresh_status_text() -> void:
+	_status.text = _status_text_for_state(_state)
+	if state_store != null:
+		state_store.set_value("state", _status.text)
+
+
 func _set_state(value: int) -> void:
 	var previous_state := _state
 	_state = value
 	_send_btn.disabled = value != AgentState.IDLE
 	_stop_btn.disabled = value == AgentState.IDLE
 	_new_session_btn.disabled = value == AgentState.EXECUTING
-	match value:
-		AgentState.IDLE:
-			_status.text = _ui("idle")
-		AgentState.WAITING_LLM:
-			_status.text = _ui("waiting_model")
-		AgentState.WAITING_CONFIRM:
-			_status.text = _ui("waiting_confirm")
-		AgentState.EXECUTING:
-			_status.text = _ui("executing")
-		AgentState.COMPACTING:
-			_status.text = _ui("compacting")
-	if state_store != null:
-		state_store.set_value("state", _status.text)
+	_model_input.editable = value == AgentState.IDLE
+	_refresh_status_text()
 	if previous_state != value:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "State changed.", {
 			"from": previous_state,
@@ -1481,9 +1528,18 @@ func _set_state(value: int) -> void:
 func _on_reasoning_delta(event: Dictionary) -> void:
 	var payload: Dictionary = event.get("payload", {})
 	var key := _stream_event_key(payload)
+	var token_count := int(payload.get("token_count", 0))
 	if key != "" and _closed_reasoning_keys.has(key):
+		if token_count > 0 and _finished_reasoning_headers.has(key):
+			var finished: Dictionary = _finished_reasoning_headers[key]
+			var toggle = finished.get("toggle")
+			if toggle is Button and is_instance_valid(toggle):
+				toggle.text = "✻  %s · %s tokens ✓" % [
+					str(finished.get("header", "Thought")), _format_token_count(token_count)
+				]
 		FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta] IGNORED - key already closed", {
-			"key": key
+			"key": key,
+			"token_count": token_count
 		})
 		return
 	var text := str(payload.get("text", ""))
@@ -1492,6 +1548,8 @@ func _on_reasoning_delta(event: Dictionary) -> void:
 	})
 	_ensure_reasoning_entry(key)
 	_reasoning_text = text
+	if token_count > 0:
+		_reasoning_token_count = token_count
 	_update_reasoning_entry()
 
 
@@ -1574,7 +1632,16 @@ func _format_reasoning_header() -> String:
 	var elapsed := 0.0
 	if _reasoning_started_ms >= 0:
 		elapsed = maxf(0.01, (Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)
-	return "Thought for %.2fs" % elapsed
+	var header := "Thought for %.2fs" % elapsed
+	if _reasoning_token_count > 0:
+		header += " · %s tokens" % _format_token_count(_reasoning_token_count)
+	return header
+
+
+func _format_token_count(count: int) -> String:
+	if count < 1000:
+		return str(count)
+	return "%d,%03d" % [count / 1000, count % 1000]
 
 
 func _ensure_stream_message(key: String, indent := false) -> void:
@@ -1605,11 +1672,20 @@ func _finish_streaming() -> void:
 func _finish_reasoning_stream() -> void:
 	if _reasoning_text_dirty and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
 		_render_reasoning_entry()
+	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
+		var finished_header := _format_reasoning_header()
+		_reasoning_toggle.text = "✻  " + finished_header + " ✓"
+		if _reasoning_key != "":
+			_finished_reasoning_headers[_reasoning_key] = {
+				"toggle": _reasoning_toggle,
+				"header": finished_header
+			}
 	_reasoning_key = ""
 	_reasoning_toggle = null
 	_reasoning_detail_rich = null
 	_reasoning_text = ""
 	_reasoning_started_ms = -1
+	_reasoning_token_count = 0
 	_reasoning_text_dirty = false
 	_reasoning_last_render_ms = 0
 
@@ -1784,12 +1860,18 @@ func _clear_messages() -> void:
 	_live_response_keys.clear()
 	_closed_stream_keys.clear()
 	_closed_reasoning_keys.clear()   # 新增
+	_finished_reasoning_headers.clear()
 	for child in _message_list.get_children():
 		child.queue_free()
 
 
 func _scroll_to_bottom() -> void:
 	_trim_message_list()
+	if not _auto_scroll and not _force_scroll_once:
+		return
+	if _scroll_request_pending:
+		return
+	_scroll_request_pending = true
 	call_deferred("_scroll_to_bottom_deferred")
 
 
@@ -1823,6 +1905,7 @@ func _on_scroll_value_changed(value: float) -> void:
 
 
 func _scroll_to_bottom_deferred() -> void:
+	_scroll_request_pending = false
 	if _scroll == null:
 		return
 	if not _auto_scroll and not _force_scroll_once:

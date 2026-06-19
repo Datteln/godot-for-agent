@@ -46,6 +46,11 @@ class AppSettings(BaseSettings):
     llm_deep_model: str | None = Field(default=None, description="deep effort 模型；为空时使用 llm_model。")
     llm_verify_model: str | None = Field(default=None, description="verify effort 模型；为空时使用 llm_model。")
     llm_advisor_model: str | None = Field(default=None, description="advisor effort 模型；为空时使用 llm_model。")
+    llm_thinking_budget_quick: int | None = Field(default=None, description="quick effort 的 thinking token 预算；为空时使用内置默认值（1024）。")
+    llm_thinking_budget_standard: int | None = Field(default=None, description="standard effort 的 thinking token 预算；为空时使用内置默认值（4096）。")
+    llm_thinking_budget_deep: int | None = Field(default=None, description="deep effort 的 thinking token 预算；为空时使用内置默认值（16384）。")
+    llm_thinking_budget_verify: int | None = Field(default=None, description="verify effort 的 thinking token 预算；为空时使用内置默认值（0，关闭 thinking）。")
+    llm_thinking_budget_advisor: int | None = Field(default=None, description="advisor effort 的 thinking token 预算；为空时使用内置默认值（2048）。")
     llm_fallback_model: str | None = Field(
         default=None,
         description="主模型不可用时的降级模型名；为空表示不降级。",

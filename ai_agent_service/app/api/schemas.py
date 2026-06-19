@@ -107,6 +107,7 @@ class ChatRequest(BaseModel):
     permission_mode: PermissionMode | None = None
     effort: Effort | None = None
     output_style: str | None = None
+    model: str | None = None
     tool_results: list[ToolResult] | None = None
 
 
@@ -292,6 +293,7 @@ class LogEditHistoryBlock(HistoryBlockBase):
     path: str
     added: int = 0
     removed: int = 0
+    after_text: str = ""
 
 
 class ThoughtHistoryBlock(HistoryBlockBase):
@@ -392,6 +394,7 @@ class SessionHistoryResponse(BaseModel):
 
     ok: bool = True
     session_id: str
+    last_event_seq: int = 0
     pending_turn_id: str | None = None
     items: list[SessionHistoryItemDTO] = Field(default_factory=list)
     blocks: list[SessionHistoryBlock] = Field(default_factory=list)

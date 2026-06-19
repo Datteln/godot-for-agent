@@ -43,7 +43,7 @@ func _ready() -> void:
 	_event_timer.stop()
 
 
-func send_user_message(text: String, context: Dictionary) -> void:
+func send_user_message(text: String, context: Dictionary, model = null) -> void:
 	_suppress_events = false
 	_configure_event_timer()
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing user message.", {
@@ -58,13 +58,14 @@ func send_user_message(text: String, context: Dictionary) -> void:
 		"permission_mode": _setting("ai_agent/permission_mode"),
 		"effort": _setting("ai_agent/effort"),
 		"output_style": _setting("ai_agent/output_style"),
+		"model": model,
 		"engine_version": Engine.get_version_info().get("string", ""),
 		"language_hint": _language_hint()
 	}
 	_enqueue("POST", "/chat", payload)
 
 
-func send_tool_results(results: Array) -> void:
+func send_tool_results(results: Array, model = null) -> void:
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing tool results.", {"count": results.size()})
 	for item in results:
 		if item is Dictionary:
@@ -72,6 +73,7 @@ func send_tool_results(results: Array) -> void:
 	var payload := {
 		"session_id": _session_id(),
 		"request_id": _new_request_id(),
+		"model": model,
 		"tool_results": results
 	}
 	_enqueue("POST", "/chat", payload)
@@ -199,6 +201,10 @@ func fetch_recovery_pointer() -> void:
 func fetch_session_history(limit: int = 200) -> void:
 	var path := "/sessions/%s/history?limit=%d" % [_session_id().uri_encode(), limit]
 	_enqueue("GET", path, {})
+
+
+func sync_event_cursor(last_event_seq: int) -> void:
+	_last_event_seq = max(_last_event_seq, last_event_seq)
 
 
 ## 从恢复指针同步本地事件序号与挂起的 turn_id，供恢复提示"接受"分支调用。
