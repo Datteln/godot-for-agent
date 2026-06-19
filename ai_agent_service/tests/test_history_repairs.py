@@ -9,7 +9,11 @@ from app.agents.types import Frame
 from app.api.schemas import ChatRequest, SessionHistoryResponse
 from app.events.store import Event
 from app.llm.provider import _reasoning_tokens_from_usage
-from app.orchestrator.agent import _delta_callback, _resolve_request_model
+from app.orchestrator.agent import (
+    _delta_callback,
+    _estimate_stream_token_count,
+    _resolve_request_model,
+)
 from app.query.engine import (
     _event_payload_for_log,
     _normalize_model_override,
@@ -85,7 +89,13 @@ def test_reasoning_token_count_comes_from_usage() -> None:
     assert _reasoning_tokens_from_usage(None) is None
 
 
-def test_reasoning_event_omits_unknown_token_count() -> None:
+def test_stream_token_estimate_handles_english_and_cjk() -> None:
+    assert _estimate_stream_token_count("") == 0
+    assert _estimate_stream_token_count("abcdefgh") == 2
+    assert _estimate_stream_token_count("中文") == 2
+
+
+def test_reasoning_event_estimates_then_accepts_exact_token_count() -> None:
     events: list[tuple[str, dict[str, object]]] = []
     callback = _delta_callback(
         lambda event_type, payload: events.append((event_type, payload)),
@@ -98,7 +108,7 @@ def test_reasoning_event_omits_unknown_token_count() -> None:
     assert callback is not None
 
     callback("reasoning", "中文 reasoning text", None)
-    assert "token_count" not in events[-1][1]
+    assert events[-1][1]["token_count"] == _estimate_stream_token_count("中文 reasoning text")
 
     callback("reasoning", "中文 reasoning text", 42)
     assert events[-1][1]["token_count"] == 42

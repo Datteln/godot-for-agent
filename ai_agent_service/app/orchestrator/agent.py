@@ -1004,6 +1004,25 @@ def _history_timeline_payload(frame: Frame) -> dict[str, Any]:
     }
 
 
+def _estimate_stream_token_count(text: str) -> int:
+    """Estimate tokens for an accumulated stream without model-specific dependencies."""
+    if not text:
+        return 0
+    cjk_chars = 0
+    other_bytes = 0
+    for char in text:
+        codepoint = ord(char)
+        if (
+            0x3400 <= codepoint <= 0x4DBF
+            or 0x4E00 <= codepoint <= 0x9FFF
+            or 0xF900 <= codepoint <= 0xFAFF
+        ):
+            cjk_chars += 1
+        else:
+            other_bytes += len(char.encode("utf-8"))
+    return max(cjk_chars + (other_bytes + 3) // 4, 1)
+
+
 def _delta_callback(
     event_callback: Callable[[str, dict[str, Any]], None] | None,
     frame_id: str,
@@ -1041,8 +1060,9 @@ def _delta_callback(
         }
         if kind == "reasoning":
             payload["elapsed_ms"] = max(int((time.monotonic() - reasoning_started_at) * 1000), 1)
-            if token_count is not None:
-                payload["token_count"] = token_count
+            payload["token_count"] = (
+                token_count if token_count is not None else _estimate_stream_token_count(text)
+            )
         event_callback(event_type, payload)
 
     return _on_delta

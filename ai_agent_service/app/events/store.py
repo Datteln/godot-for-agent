@@ -82,7 +82,8 @@ class EventStore:
     def list_after(self, session_id: str, after: int = 0) -> list[Event]:
         """返回指定 seq 之后的事件。"""
         events = [event for event in self._events.get(session_id, []) if event.seq > after]
-        logger.debug("Events listed session=%s after=%d count=%d", session_id, after, len(events))
+        if events:
+            logger.debug("Events listed session=%s after=%d count=%d", session_id, after, len(events))
         return events
 
     def last_seq(self, session_id: str) -> int:
