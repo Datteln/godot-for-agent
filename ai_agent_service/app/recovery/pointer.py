@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.storage.atomic import atomic_write_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,8 +47,7 @@ class RecoveryPointerStore:
             project_hash=self._project_hash,
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(asdict(pointer), ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(self._path, asdict(pointer))
         logger.info(
             "Recovery pointer written session=%s pending_turn=%s last_event_seq=%d path=%s",
             session_id,
@@ -72,8 +73,27 @@ class RecoveryPointerStore:
         logger.debug("Recovery pointer read session=%s pending_turn=%s", pointer.session_id, pointer.pending_turn_id)
         return pointer
 
-    def clear(self) -> None:
-        """清理恢复指针。"""
-        if self._path.exists():
-            self._path.unlink()
-            logger.info("Recovery pointer cleared path=%s", self._path)
+    def clear(self, session_id: str | None = None) -> None:
+        """清理恢复指针。
+
+        指针是全局单文件，多会话共用。若 A 会话留有 pending 指针而 B 会话刚
+        完成（final）就无条件 `clear()`，会误删 A 的恢复状态（§14.3）。因此
+        当传入 `session_id` 时，只在磁盘上的指针确属该会话时才清除；不传则
+        保持旧行为（无条件清除）。
+
+        Args:
+            session_id: 仅当现有指针属于该会话时才清除；为 None 时无条件清除。
+        """
+        if not self._path.exists():
+            return
+        if session_id is not None:
+            existing = self.read()
+            if existing is not None and existing.session_id != session_id:
+                logger.debug(
+                    "Recovery pointer kept; belongs to session=%s not %s",
+                    existing.session_id,
+                    session_id,
+                )
+                return
+        self._path.unlink(missing_ok=True)
+        logger.info("Recovery pointer cleared path=%s session=%s", self._path, session_id)

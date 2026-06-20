@@ -4,12 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# 重试退避：基准 0.2s，指数增长并封顶 2s，叠加 ±50% 抖动，避免服务限流/短暂
+# 5xx 时连续立即重试反而加重故障（§P3 重试无退避）。
+_RETRY_BASE_DELAY_S = 0.2
+_RETRY_MAX_DELAY_S = 2.0
+
+
+def _retry_delay_s(attempt: int) -> float:
+    """第 `attempt`（从 0 起）次失败后的退避时长，含抖动。"""
+    capped = min(_RETRY_BASE_DELAY_S * (2 ** attempt), _RETRY_MAX_DELAY_S)
+    return capped * (0.5 + random.random())
 
 
 @dataclass(frozen=True)
@@ -104,6 +116,15 @@ class EmbeddingClient:
             except Exception as exc:  # optional enhancement must never break indexing
                 if attempt + 1 >= attempts:
                     logger.warning("Embedding unavailable; falling back to keyword retrieval: %s", exc)
+                else:
+                    delay = _retry_delay_s(attempt)
+                    logger.debug(
+                        "Embedding attempt %d failed; backing off %.3fs before retry: %s",
+                        attempt + 1,
+                        delay,
+                        exc,
+                    )
+                    time.sleep(delay)
         return []
 
     async def embed_async(self, texts: Sequence[str]) -> list[list[float]]:

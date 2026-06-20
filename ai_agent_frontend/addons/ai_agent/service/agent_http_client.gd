@@ -8,6 +8,18 @@ signal error_occurred(message: String)
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 
+## 后端偶发卡死（例如 RAG 文件监视器扫描超时、重排模型网络请求挂起）时，
+## 单条请求可能永远不触发 `request_completed`。队列是严格串行的（见
+## `_pump`），一旦卡住就会让诊断/扩展/命令/记忆等后续点击全部悄悄堆积、永
+## 不发出。这个看门狗超时保证即使后端没有响应，本地队列也能在有限时间内
+## 恢复，而不是永久冻住。
+##
+## `/chat` 本身可能合法地跑很久（deep effort、delegate_many 派给多个子 agent、
+## 工具执行……），不能套用和 `/doctor`、`/memory` 这类本该秒回的轻量端点一样
+## 的短超时，所以 `/chat` 用单独的、更宽松的超时设置。
+const DEFAULT_REQUEST_TIMEOUT_S := 30.0
+const DEFAULT_CHAT_REQUEST_TIMEOUT_S := 300.0
+
 var editor_interface: EditorInterface
 var service: Node
 var current_turn_id: String = ""
@@ -23,24 +35,61 @@ var _request_generation := 0
 var _last_event_seq := 0
 var _suppress_events := false
 var _event_timer: Timer
+var _request_timeout_timer: Timer
+var _timeout_generation := -1
 
 
 func _ready() -> void:
-	_http = HTTPRequest.new()
-	_http.name = "ChatHttp"
-	add_child(_http)
-	_http.request_completed.connect(_on_request_completed)
+	_create_chat_http()
 
-	_event_http = HTTPRequest.new()
-	_event_http.name = "EventHttp"
-	add_child(_event_http)
-	_event_http.request_completed.connect(_on_events_completed)
+	_create_event_http()
 
 	_event_timer = Timer.new()
 	_event_timer.one_shot = false
 	add_child(_event_timer)
 	_event_timer.timeout.connect(poll_events)
 	_event_timer.stop()
+
+	_request_timeout_timer = Timer.new()
+	_request_timeout_timer.one_shot = true
+	add_child(_request_timeout_timer)
+	_request_timeout_timer.timeout.connect(_on_request_timeout)
+
+
+func _create_chat_http() -> void:
+	_http = HTTPRequest.new()
+	_http.name = "ChatHttp"
+	add_child(_http)
+	_http.request_completed.connect(_on_request_completed)
+
+
+func _create_event_http() -> void:
+	_event_http = HTTPRequest.new()
+	_event_http.name = "EventHttp"
+	add_child(_event_http)
+	_event_http.request_completed.connect(_on_events_completed)
+
+
+func _replace_chat_http() -> void:
+	# A cancelled HTTPRequest may emit completion later. Destroying the node also
+	# destroys that signal source, so it cannot mutate a newer request's state.
+	if is_instance_valid(_http):
+		if _http.request_completed.is_connected(_on_request_completed):
+			_http.request_completed.disconnect(_on_request_completed)
+		if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+			_http.cancel_request()
+		_http.queue_free()
+	_create_chat_http()
+
+
+func _replace_event_http() -> void:
+	if is_instance_valid(_event_http):
+		if _event_http.request_completed.is_connected(_on_events_completed):
+			_event_http.request_completed.disconnect(_on_events_completed)
+		if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+			_event_http.cancel_request()
+		_event_http.queue_free()
+	_create_event_http()
 
 
 func send_user_message(text: String, context: Dictionary, model = null) -> void:
@@ -95,11 +144,10 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 	})
 	_request_generation += 1
 	_queue.clear()
-	if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		_http.cancel_request()
+	_replace_chat_http()
 	_busy = false
-	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		_event_http.cancel_request()
+	_request_timeout_timer.stop()
+	_replace_event_http()
 	current_turn_id = ""
 	_last_event_seq = 0
 	_suppress_events = false
@@ -114,15 +162,14 @@ func interrupt_current() -> void:
 	_request_generation += 1
 	_suppress_events = true
 	_queue.clear()
-	if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		_http.cancel_request()
+	_replace_chat_http()
 	# `cancel_request()` 不保证触发 `request_completed`（曾导致 `_busy` 卡死为
 	# true，后续所有请求——包括下面要发的 `/chat/interrupt` 和用户的下一条
 	# 消息——永远排在队列里发不出去）。这里不再等待那个信号，直接复位，
 	# 迟到的信号会被 `_on_request_completed` 的生成号检查丢弃。
 	_busy = false
-	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		_event_http.cancel_request()
+	_request_timeout_timer.stop()
+	_replace_event_http()
 	if _event_timer != null:
 		_event_timer.stop()
 	current_turn_id = ""
@@ -139,11 +186,10 @@ func switch_to_session(previous_session_id: String) -> void:
 	})
 	_request_generation += 1
 	_queue.clear()
-	if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		_http.cancel_request()
+	_replace_chat_http()
 	_busy = false
-	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		_event_http.cancel_request()
+	_request_timeout_timer.stop()
+	_replace_event_http()
 	current_turn_id = ""
 	_last_event_seq = 0
 	_suppress_events = false
@@ -268,6 +314,51 @@ func _pump() -> void:
 		})
 		error_occurred.emit("HTTP request failed: " + str(err))
 		_pump()
+	else:
+		_timeout_generation = _inflight_generation
+		_request_timeout_timer.start(_timeout_for_path(_inflight_path))
+
+
+func _timeout_for_path(path: String) -> float:
+	if path == "/chat":
+		var chat_value := float(_setting("ai_agent/chat_request_timeout_sec"))
+		return chat_value if chat_value > 0.0 else DEFAULT_CHAT_REQUEST_TIMEOUT_S
+	var value := float(_setting("ai_agent/request_timeout_sec"))
+	return value if value > 0.0 else DEFAULT_REQUEST_TIMEOUT_S
+
+
+func _on_request_timeout() -> void:
+	# 同样靠生成号识别"迟到的"超时回调：如果它不属于当前这一代请求，说明
+	# `_busy` 早被别的更新的请求（或一次显式 reset/interrupt）重新占用了，
+	# 这里绝不能再去碰它。
+	if not _busy or _timeout_generation != _request_generation:
+		return
+	var timed_out_path := _inflight_path
+	var timed_out_session_id := _inflight_session_id
+	FrontendLogger.error(editor_interface, "HTTP", "Request timed out; unblocking queue.", {
+		"path": timed_out_path,
+		"timeout_s": _timeout_for_path(timed_out_path),
+		"queue_size": _queue.size()
+	})
+	_request_generation += 1
+	_replace_chat_http()
+	_busy = false
+	var interrupt_enqueued := false
+	if timed_out_path == "/chat":
+		# 前端单方面放弃等待并不会让后端的 agent 循环停下来——它会继续跑完
+		# 这一轮工具调用，并持续通过独立的事件轮询通道往外推流，造成"状态栏
+		# 已经显示空闲，但某条 Thought 计时还在不停增长"的诡异现象。这里和
+		# 用户主动点"停止"一样，显式通知后端取消这个 session 仍在运行的请求，
+		# 并临时丢弃它后续迟到的事件，直到下一条用户消息重新开始一轮。
+		current_turn_id = ""
+		_suppress_events = true
+		_enqueue("POST", "/chat/interrupt", {
+			"session_id": timed_out_session_id if timed_out_session_id != "" else _session_id()
+		})
+		interrupt_enqueued = true
+	error_occurred.emit("HTTP request timed out: " + timed_out_path)
+	if not interrupt_enqueued:
+		_pump()
 
 
 func _on_request_completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
@@ -284,6 +375,7 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			"current_generation": _request_generation
 		})
 		return
+	_request_timeout_timer.stop()
 	_busy = false
 	var text := body.get_string_from_utf8()
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
@@ -294,6 +386,20 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			})
 			_pump()
 			return
+		# 后端对命令/记忆的参数错误改用 4xx + 结构化 body（含 ok/text）返回：HTTP
+		# 状态码语义正确，正文仍保留可读消息。这类"客户端错误"应按业务响应分发、
+		# 展示 text，而不是退化成一条 "HTTP 400" 传输错误。仅限传输成功 + 4xx +
+		# 含 ok 字段的字典；5xx、传输失败、非 JSON 仍按错误处理。
+		if result == HTTPRequest.RESULT_SUCCESS and code >= 400 and code < 500:
+			var structured: Variant = JSON.parse_string(text)
+			if structured is Dictionary and structured.has("ok"):
+				FrontendLogger.info(editor_interface, "HTTP", "Structured client-error response.", {
+					"code": code,
+					"path": _inflight_path
+				})
+				response_received.emit(structured)
+				_pump()
+				return
 		FrontendLogger.error(editor_interface, "HTTP", "HTTP request failed.", {
 			"code": code,
 			"result": result,
@@ -342,7 +448,11 @@ func _on_events_completed(result: int, code: int, _headers: PackedStringArray, b
 		return
 	var parsed := JSON.parse_string(body.get_string_from_utf8())
 	if parsed is Dictionary:
-		var events: Array = parsed.get("events", [])
+		var raw_events: Variant = parsed.get("events", [])
+		if not (raw_events is Array):
+			FrontendLogger.warn(editor_interface, "HTTP", "Ignored malformed events response.", {})
+			return
+		var events: Array = raw_events
 		if not events.is_empty():
 			FrontendLogger.debug(editor_interface, "HTTP", "Received events.", {"count": events.size()})
 		for event in events:

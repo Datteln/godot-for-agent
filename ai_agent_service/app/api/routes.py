@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response, status
 
 from app.api.schemas import (
     ChatEventDTO,
@@ -136,7 +136,7 @@ def create_router(
     @router.post("/reset", response_model=ResetResponse)
     async def reset(request: ResetRequest) -> ResetResponse:
         logger.info("HTTP /reset session=%s", request.session_id)
-        query_engine.reset(request.session_id)
+        await query_engine.reset(request.session_id)
         return ResetResponse(ok=True, session_id=request.session_id)
 
     @router.post("/chat/discard-pending", response_model=ChatResponse)
@@ -227,8 +227,15 @@ def create_router(
         return COMMANDS
 
     @router.post("/commands/{name}", response_model=CommandResponse)
-    async def run_command(name: str, request: CommandRequest) -> CommandResponse:
+    async def run_command(name: str, request: CommandRequest, response: Response) -> CommandResponse:
         logger.info("HTTP /commands/%s session=%s", name, request.session_id)
+
+        def _err(text: str, code: int = status.HTTP_400_BAD_REQUEST) -> CommandResponse:
+            # 命令参数错误/未知命令是协议层错误：保留结构化 body（ok/text）的同时
+            # 用恰当的 HTTP 状态码，让调用端无需解析正文即可区分"成功 vs 被拒绝"。
+            response.status_code = code
+            return CommandResponse(ok=False, text=text)
+
         if name == "doctor":
             response = run_doctor(
                 settings,
@@ -250,13 +257,13 @@ def create_router(
             max_files = _integer_argument(request.args.get("max_files", 4000))
             if not isinstance(include, str) or not include:
                 logger.warning("Command rebuild_index rejected: invalid include")
-                return CommandResponse(ok=False, text="include 必须是非空字符串")
+                return _err("include 必须是非空字符串")
             if max_files is None or max_files <= 0:
                 logger.warning("Command rebuild_index rejected: invalid max_files")
-                return CommandResponse(ok=False, text="max_files 必须是正整数")
+                return _err("max_files 必须是正整数")
             incremental = request.args.get("incremental", True)
             if not isinstance(incremental, bool):
-                return CommandResponse(ok=False, text="incremental 必须是布尔值")
+                return _err("incremental 必须是布尔值")
             result = await rag_build_manager.build(
                 include=include,
                 max_files=max_files,
@@ -277,32 +284,32 @@ def create_router(
         if name == "compact":
             if request.session_id is None:
                 logger.warning("Command compact rejected: missing session_id")
-                return CommandResponse(ok=False, text="compact 需要 session_id")
+                return _err("compact 需要 session_id")
             keep_recent = _integer_argument(request.args.get("keep_recent", 12))
             if keep_recent is None or keep_recent <= 0:
                 logger.warning("Command compact rejected: invalid keep_recent")
-                return CommandResponse(ok=False, text="keep_recent 必须是正整数")
-            result = query_engine.compact(request.session_id, keep_recent=keep_recent)
+                return _err("keep_recent 必须是正整数")
+            result = await query_engine.compact(request.session_id, keep_recent=keep_recent)
             return CommandResponse(ok=True, text="compact 已完成", result=result)
         if name == "set_effort":
             if request.session_id is None:
                 logger.warning("Command set_effort rejected: missing session_id")
-                return CommandResponse(ok=False, text="set_effort 需要 session_id")
+                return _err("set_effort 需要 session_id")
             effort = str(request.args.get("effort", "standard"))
             if effort not in {"quick", "standard", "deep", "verify", "advisor"}:
                 logger.warning("Command set_effort rejected: unknown effort=%s", effort)
-                return CommandResponse(ok=False, text=f"未知 effort：{effort}")
-            query_engine.set_effort(request.session_id, effort)
+                return _err(f"未知 effort：{effort}")
+            await query_engine.set_effort(request.session_id, effort)
             return CommandResponse(ok=True, text=f"effort 已设置为 {effort}")
         if name == "set_output_style":
             if request.session_id is None:
                 logger.warning("Command set_output_style rejected: missing session_id")
-                return CommandResponse(ok=False, text="set_output_style 需要 session_id")
+                return _err("set_output_style 需要 session_id")
             output_style = str(request.args.get("output_style", "default"))
             if output_style_catalog.get(output_style) is None:
                 logger.warning("Command set_output_style rejected: unknown output_style=%s", output_style)
-                return CommandResponse(ok=False, text=f"未知 OutputStyle：{output_style}")
-            query_engine.set_output_style(request.session_id, output_style)
+                return _err(f"未知 OutputStyle：{output_style}")
+            await query_engine.set_output_style(request.session_id, output_style)
             return CommandResponse(ok=True, text=f"OutputStyle 已设置为 {output_style}")
         if name == "refresh_extensions":
             skill_catalog.refresh()
@@ -310,7 +317,7 @@ def create_router(
             logger.info("Command refresh_extensions completed")
             return CommandResponse(ok=True, text="Skill 与 OutputStyle 已刷新")
         logger.warning("Command rejected: unknown name=%s", name)
-        return CommandResponse(ok=False, text=f"未知命令：{name}")
+        return _err(f"未知命令：{name}", status.HTTP_404_NOT_FOUND)
 
     @router.get("/memory", response_model=MemoryResponse)
     async def memory_list() -> MemoryResponse:
@@ -321,19 +328,24 @@ def create_router(
         )
 
     @router.post("/memory", response_model=MemoryResponse)
-    async def memory_update(request: MemoryRequest) -> MemoryResponse:
+    async def memory_update(request: MemoryRequest, response: Response) -> MemoryResponse:
         logger.info("HTTP /memory action=%s", request.action)
+
+        def _merr(text: str, code: int = status.HTTP_400_BAD_REQUEST) -> MemoryResponse:
+            response.status_code = code
+            return MemoryResponse(ok=False, text=text)
+
         if request.action == "list":
             return await memory_list()
         if request.action == "save":
             if request.text is None or not request.text.strip():
                 logger.warning("Memory save rejected: missing text")
-                return MemoryResponse(ok=False, text="save 需要非空 text")
+                return _merr("save 需要非空 text")
             try:
                 item = memory_store.save(request.text, tags=request.tags, scope=request.scope)
             except ValueError as exc:
                 logger.warning("Memory save rejected: %s", exc)
-                return MemoryResponse(ok=False, text=str(exc))
+                return _merr(str(exc))
             logger.info("Memory saved id=%s scope=%s tags=%d", item.id, item.scope, len(item.tags))
             return MemoryResponse(
                 text="memory saved",
@@ -342,16 +354,18 @@ def create_router(
         if request.action == "delete":
             if request.id is None:
                 logger.warning("Memory delete rejected: missing id")
-                return MemoryResponse(ok=False, text="delete 需要 id")
+                return _merr("delete 需要 id")
             deleted = memory_store.delete(request.id)
             logger.info("Memory delete requested id=%s deleted=%s", request.id, deleted)
-            return MemoryResponse(ok=deleted, text="memory deleted" if deleted else "memory not found")
+            if not deleted:
+                return _merr("memory not found", status.HTTP_404_NOT_FOUND)
+            return MemoryResponse(ok=True, text="memory deleted")
         if request.action == "clear":
             count = memory_store.clear()
             logger.info("Memory cleared count=%d", count)
             return MemoryResponse(text=f"cleared {count} memory item(s)")
         logger.warning("Memory action rejected: unknown action=%s", request.action)
-        return MemoryResponse(ok=False, text=f"未知 memory action：{request.action}")
+        return _merr(f"未知 memory action：{request.action}")
 
     return router
 

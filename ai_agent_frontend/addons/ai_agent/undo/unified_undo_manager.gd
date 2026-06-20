@@ -18,22 +18,30 @@ func begin_batch(description: String) -> void:
 	_active = true
 
 
-func record_file_write(path: String, before_text: String, after_text: String) -> void:
+func record_file_write(path: String, before_text: String, after_text: String) -> Error:
 	if not _active:
 		begin_batch("AI file changes")
-	_write_file_text(path, after_text)
+	# 必须先确认底层写入真的成功了，再把这次修改记入 undo batch。否则只读目录、
+	# 磁盘满、文件被占用时 `_write_file_text` 只会写一行日志就返回，上层却照样
+	# 报告 ok，模型会基于一个并不存在的改动继续工作（§工具写失败被当成 applied）。
+	var error := _write_file_text(path, after_text)
+	if error != OK:
+		return error
 	_ops.append({
 		"type": "file_write",
 		"path": path,
 		"before": before_text,
 		"after": after_text
 	})
+	return OK
 
 
-func record_binary_file_write(path: String, before_bytes: PackedByteArray, after_bytes: PackedByteArray, before_exists: bool) -> void:
+func record_binary_file_write(path: String, before_bytes: PackedByteArray, after_bytes: PackedByteArray, before_exists: bool) -> Error:
 	if not _active:
 		begin_batch("AI resource changes")
-	_write_file_bytes(path, after_bytes, true)
+	var error := _write_file_bytes(path, after_bytes, true)
+	if error != OK:
+		return error
 	_ops.append({
 		"type": "binary_file_write",
 		"path": path,
@@ -41,6 +49,7 @@ func record_binary_file_write(path: String, before_bytes: PackedByteArray, after
 		"after": after_bytes,
 		"before_exists": before_exists
 	})
+	return OK
 
 
 func record_node_added(parent: Node, node: Node, owner: Node) -> void:
@@ -346,33 +355,56 @@ func _clear() -> void:
 	_active = false
 
 
-func _write_file_text(path: String, text: String) -> void:
+func _write_file_text(path: String, text: String) -> Error:
 	var absolute := ProjectSettings.globalize_path(path)
 	var dir_path := absolute.get_base_dir()
-	DirAccess.make_dir_recursive_absolute(dir_path)
+	var dir_error := DirAccess.make_dir_recursive_absolute(dir_path)
+	if dir_error != OK and dir_error != ERR_ALREADY_EXISTS:
+		FrontendLogger.error(editor_interface, "UndoManager", "Failed to create directory.", {"path": path, "error": dir_error})
+		return dir_error
 	var file := FileAccess.open(absolute, FileAccess.WRITE)
 	if file == null:
-		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file.", {"path": path})
-		return
+		var open_error := FileAccess.get_open_error()
+		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file.", {"path": path, "error": open_error})
+		return open_error if open_error != OK else FAILED
 	file.store_string(text)
+	file.flush()
+	var write_error := file.get_error()
 	file.close()
+	if write_error != OK and write_error != ERR_FILE_EOF:
+		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file contents.", {"path": path, "error": write_error})
+		return write_error
 	if ResourceLoader.exists(path):
 		ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_REPLACE)
+	return OK
 
 
-func _write_file_bytes(path: String, bytes: PackedByteArray, exists: bool) -> void:
+func _write_file_bytes(path: String, bytes: PackedByteArray, exists: bool) -> Error:
 	var absolute := ProjectSettings.globalize_path(path)
 	if not exists:
 		if FileAccess.file_exists(absolute):
-			DirAccess.remove_absolute(absolute)
-		return
-	DirAccess.make_dir_recursive_absolute(absolute.get_base_dir())
+			var remove_error := DirAccess.remove_absolute(absolute)
+			if remove_error != OK:
+				FrontendLogger.error(editor_interface, "UndoManager", "Failed to remove file.", {"path": path, "error": remove_error})
+				return remove_error
+		return OK
+	var dir_error := DirAccess.make_dir_recursive_absolute(absolute.get_base_dir())
+	if dir_error != OK and dir_error != ERR_ALREADY_EXISTS:
+		FrontendLogger.error(editor_interface, "UndoManager", "Failed to create directory.", {"path": path, "error": dir_error})
+		return dir_error
 	var file := FileAccess.open(absolute, FileAccess.WRITE)
 	if file == null:
-		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file.", {"path": path})
-		return
+		var open_error := FileAccess.get_open_error()
+		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file.", {"path": path, "error": open_error})
+		return open_error if open_error != OK else FAILED
 	file.store_buffer(bytes)
+	file.flush()
+	var write_error := file.get_error()
 	file.close()
+	if write_error != OK and write_error != ERR_FILE_EOF:
+		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file contents.", {"path": path, "error": write_error})
+		return write_error
+	return OK
 
 
 func _add_node(parent: Node, node: Node, owner: Node) -> void:

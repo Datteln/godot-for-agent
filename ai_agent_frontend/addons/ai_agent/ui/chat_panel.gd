@@ -254,24 +254,9 @@ func _build_ui() -> void:
 	toolbar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	add_child(toolbar)
 
-	_send_btn = Button.new()
-	_send_btn.text = _ui("send")
-	toolbar.add_child(_send_btn)
-
-	_stop_btn = Button.new()
-	_stop_btn.text = _ui("stop")
-	_stop_btn.disabled = true
-	toolbar.add_child(_stop_btn)
-
 	_new_session_btn = Button.new()
 	_new_session_btn.text = _ui("new_session")
 	toolbar.add_child(_new_session_btn)
-
-	_effort_options = OptionButton.new()
-	for effort in ["quick", "standard", "deep", "verify", "advisor"]:
-		_effort_options.add_item(effort)
-	toolbar.add_child(_effort_options)
-	_sync_effort_selection()
 
 	_model_input = LineEdit.new()
 	_model_input.custom_minimum_size = Vector2(160, 0)
@@ -347,9 +332,32 @@ func _build_ui() -> void:
 	_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	bottom.add_child(_input)
 
+	var status_row := HBoxContainer.new()
+	status_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	add_child(status_row)
+
 	_status = Label.new()
 	_status.text = _status_text_for_state(AgentState.IDLE)
-	add_child(_status)
+	status_row.add_child(_status)
+
+	var status_spacer := Control.new()
+	status_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	status_row.add_child(status_spacer)
+
+	_effort_options = OptionButton.new()
+	for effort in ["quick", "standard", "deep", "verify", "advisor"]:
+		_effort_options.add_item(effort)
+	status_row.add_child(_effort_options)
+	_sync_effort_selection()
+
+	_send_btn = Button.new()
+	_send_btn.text = _ui("send")
+	status_row.add_child(_send_btn)
+
+	_stop_btn = Button.new()
+	_stop_btn.text = _ui("stop")
+	_stop_btn.disabled = true
+	status_row.add_child(_stop_btn)
 
 
 func _build_children() -> void:
@@ -747,7 +755,8 @@ func _on_response(response: Dictionary) -> void:
 
 	if response.has("exists"):
 		if response.get("exists", false):
-			var pointer: Dictionary = response.get("pointer", {})
+			var raw_pointer: Variant = response.get("pointer", {})
+			var pointer: Dictionary = raw_pointer if raw_pointer is Dictionary else {}
 			if bool(ConfigMigrations.get_value(editor_interface, "ai_agent/show_recovery_prompt")):
 				_recovery_prompt.show_pointer(pointer)
 		return
@@ -1082,7 +1091,11 @@ func _format_plain_value(title: String, value) -> String:
 
 
 func _handle_tool_calls(response: Dictionary) -> void:
-	var calls: Array = response.get("calls", [])
+	# 后端理应返回数组；但 HTTP 链路上的版本不匹配/截断/代理篡改都可能让 `calls`
+	# 变成 null 或对象。直接赋给强类型 `Array` 会在运行时崩溃并中断整条工具调用
+	# 回调，所以先判型兜底（§前端外部数据强类型赋值）。
+	var raw_calls: Variant = response.get("calls", [])
+	var calls: Array = raw_calls if raw_calls is Array else []
 	if _state == AgentState.WAITING_CONFIRM:
 		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring tool_calls while a previous batch is still pending confirmation.", {"count": calls.size()})
 		return
@@ -1321,8 +1334,10 @@ func _handle_session_history(response: Dictionary) -> void:
 			"state": _status.text
 		})
 		return
-	var items: Array = response.get("items", [])
-	var blocks: Array = response.get("blocks", [])
+	var raw_items: Variant = response.get("items", [])
+	var items: Array = raw_items if raw_items is Array else []
+	var raw_blocks: Variant = response.get("blocks", [])
+	var blocks: Array = raw_blocks if raw_blocks is Array else []
 	var session_id := str(response.get("session_id", ""))
 	# 响应 session_id 与当前不符说明是切换会话后迟到的过期响应，直接丢弃。
 	if session_id != "" and session_id != _current_session_id():
@@ -1618,7 +1633,8 @@ func _history_payload_has_plan_tasks(payload: Dictionary) -> bool:
 
 func _format_history_delegate_results(payload: Dictionary) -> String:
 	var lines := ["Delegate results:"]
-	var results: Array = payload.get("results", [])
+	var raw_results: Variant = payload.get("results", [])
+	var results: Array = raw_results if raw_results is Array else []
 	var limit = mini(results.size(), 8)
 	for index in range(limit):
 		var item = results[index]
@@ -1644,7 +1660,8 @@ func _format_history_delegate_summary(payload: Dictionary) -> String:
 
 func _format_history_plan_result(payload: Dictionary) -> String:
 	var lines := ["Plan created"]
-	var tasks: Array = payload.get("tasks", [])
+	var raw_tasks: Variant = payload.get("tasks", [])
+	var tasks: Array = raw_tasks if raw_tasks is Array else []
 	var limit = mini(tasks.size(), 8)
 	for index in range(limit):
 		var task = tasks[index]
@@ -2168,7 +2185,8 @@ func _set_state(value: int) -> void:
 
 
 func _on_reasoning_delta(event: Dictionary) -> void:
-	var payload: Dictionary = event.get("payload", {})
+	var raw_payload: Variant = event.get("payload", {})
+	var payload: Dictionary = raw_payload if raw_payload is Dictionary else {}
 	var key := _stream_event_key(payload)
 	var token_count := int(payload.get("token_count", 0))
 	if key != "" and _closed_reasoning_keys.has(key):
@@ -2196,7 +2214,8 @@ func _on_reasoning_delta(event: Dictionary) -> void:
 
 
 func _on_text_delta(event: Dictionary) -> void:
-	var payload: Dictionary = event.get("payload", {})
+	var raw_payload: Variant = event.get("payload", {})
+	var payload: Dictionary = raw_payload if raw_payload is Dictionary else {}
 	var text := str(payload.get("text", ""))
 	var key := _stream_event_key(payload)
 	if _should_ignore_stream_delta(key, text):

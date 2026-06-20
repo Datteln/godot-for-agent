@@ -45,9 +45,12 @@ async def read_file_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str,
 
     full_path = ctx.security.project_root / path
     logger.info("read_file start session=%s path=%s max_bytes=%d", ctx.session_id, path, max_bytes)
-    data = full_path.read_bytes()
-    truncated = len(data) > max_bytes
-    chunk = data[:max_bytes]
+    # 只读取上限 + 1 字节，避免把数 GB 的大文件整体读进内存导致瞬时内存暴涨/OOM；
+    # 多读 1 字节用于判断文件是否被截断，无需先 stat 再 read。
+    with full_path.open("rb") as stream:
+        chunk = stream.read(max_bytes + 1)
+    truncated = len(chunk) > max_bytes
+    chunk = chunk[:max_bytes]
     text = chunk.decode("utf-8", errors="replace")
     logger.info(
         "read_file success session=%s path=%s bytes_read=%d truncated=%s",

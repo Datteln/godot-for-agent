@@ -93,7 +93,7 @@ class CompactTriggeredByTests(unittest.TestCase):
             engine = _make_engine(tmp)
             session = engine._store.get_or_create("s1", engine.available_tools)
             session.agent_stack = [_frame_with_messages(20)]
-            result = engine.compact("s1")
+            result = engine._compact_locked("s1")
             self.assertIsInstance(result, dict)
             events = engine._events.list_after("s1", 0) if engine._events else []
             payload = next(e.payload for e in events if e.type == "compact_boundary")
@@ -104,7 +104,7 @@ class CompactTriggeredByTests(unittest.TestCase):
             engine = _make_engine(tmp)
             session = engine._store.get_or_create("s1", engine.available_tools)
             session.agent_stack = [_frame_with_messages(20)]
-            engine.compact("s1", triggered_by="auto")
+            engine._compact_locked("s1", triggered_by="auto")
             events = engine._events.list_after("s1", 0) if engine._events else []
             payload = next(e.payload for e in events if e.type == "compact_boundary")
             self.assertEqual(payload["triggered_by"], "auto")
@@ -116,7 +116,7 @@ class CompactTriggeredByTests(unittest.TestCase):
             engine = _make_engine(tmp)
             session = engine._store.get_or_create("s1", engine.available_tools)
             session.agent_stack = [_frame_with_messages(20)]
-            engine.compact("s1", triggered_by="auto")
+            engine._compact_locked("s1", triggered_by="auto")
             events = engine._events.list_after("s1", 0)
             types = [e.type for e in events if e.type in ("compact_started", "compact_boundary")]
             self.assertEqual(types, ["compact_started", "compact_boundary"])
@@ -146,7 +146,7 @@ class OversizedSingleMessageCompactionTests(unittest.TestCase):
             before = estimate_message_tokens(session.agent_stack[0].messages)
             self.assertTrue(engine._needs_auto_compact(session))
 
-            result = engine.compact("s1", triggered_by="auto")
+            result = engine._compact_locked("s1", triggered_by="auto")
 
             self.assertEqual(result["compacted_frames"], 0)  # too few messages for history-summary path
             self.assertGreater(result["truncated_messages"], 0)
@@ -157,8 +157,8 @@ class OversizedSingleMessageCompactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             engine = _make_engine(tmp)
             self._session_with_oversized_message(engine, oversized_at=2, total=6)
-            first = engine.compact("s1", triggered_by="auto")
-            second = engine.compact("s1", triggered_by="auto")
+            first = engine._compact_locked("s1", triggered_by="auto")
+            second = engine._compact_locked("s1", triggered_by="auto")
             self.assertGreater(first["truncated_messages"], 0)
             self.assertEqual(second["truncated_messages"], 0)  # already shrunk, idempotent
 
@@ -168,7 +168,7 @@ class OversizedSingleMessageCompactionTests(unittest.TestCase):
             session = self._session_with_oversized_message(engine, oversized_at=5, total=6)
             frame = session.agent_stack[0]
             original_last = frame.messages[-1]["content"]
-            engine.compact("s1", triggered_by="auto")
+            engine._compact_locked("s1", triggered_by="auto")
             self.assertEqual(frame.messages[-1]["content"], original_last)
 
 

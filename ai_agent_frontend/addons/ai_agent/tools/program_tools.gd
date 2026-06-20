@@ -71,7 +71,18 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 	if undo_manager == null:
 		return {"ok": false, "message": "undo manager is not available"}
 
-	undo_manager.record_file_write(path, before_text, after_text)
+	var write_error: Error = undo_manager.record_file_write(path, before_text, after_text)
+	if write_error != OK:
+		FrontendLogger.error(editor_interface, "ProgramTools", "Failed to write file.", {
+			"path": path,
+			"error": write_error,
+		})
+		return {
+			"ok": false,
+			"message": "failed to write file: %s" % error_string(write_error),
+			"error_code": "write_failed",
+			"path": path
+		}
 
 	var after_state := {}
 	if file_state_cache != null:
@@ -512,7 +523,7 @@ static func _run_system_command_launch(launch: Dictionary, timeout_ms: int) -> D
 	var start_ms := Time.get_ticks_msec()
 	while OS.is_process_running(pid):
 		if Time.get_ticks_msec() - start_ms > timeout_ms:
-			OS.kill(pid)
+			_kill_process_tree(pid)
 			return {"ok": false, "status": "timed_out", "pid": pid, "exit_code": null}
 		if tree != null:
 			await tree.create_timer(0.1).timeout
@@ -523,6 +534,28 @@ static func _run_system_command_launch(launch: Dictionary, timeout_ms: int) -> D
 		return {"ok": false, "status": "exit_code_missing", "pid": pid, "exit_code": null}
 	var code := int(exit_code)
 	return {"ok": code == 0, "status": "completed" if code == 0 else "failed", "pid": pid, "exit_code": code}
+
+
+## 终止整棵进程树，而不只是包装进程本身。
+##
+## 命令是通过 `powershell.exe`/`/bin/sh` 包装脚本启动的，真正的可执行文件是包装
+## 进程的子进程。`OS.kill(pid)` 只杀包装进程，会留下实际命令及其子进程成为孤儿，
+## 继续占用 CPU、端口和文件锁（§P2 子进程树未完整终止）。
+static func _kill_process_tree(pid: int) -> void:
+	if pid <= 0:
+		return
+	if OS.get_name() == "Windows":
+		# `/T` 连同整棵子树一起终止，`/F` 强制；这能可靠回收 powershell → 实际命令
+		# → 其孙进程的整条链。
+		var out: Array = []
+		OS.execute("taskkill", ["/F", "/T", "/PID", str(pid)], out, true)
+	else:
+		# 先杀直接子进程（包装 shell 启动的实际命令），再杀包装进程本身。
+		# 注：不依赖 setsid（macOS 默认无此命令），更深层的孙进程在多数运行器
+		# 场景里随父进程退出而被回收。
+		var out: Array = []
+		OS.execute("pkill", ["-TERM", "-P", str(pid)], out, true)
+		OS.kill(pid)
 
 
 static func _read_bounded_file(path: String, max_chars: int) -> String:
@@ -580,7 +613,7 @@ static func _run_process_with_timeout(executable: String, args: PackedStringArra
 	var start_ms := Time.get_ticks_msec()
 	while OS.is_process_running(pid):
 		if Time.get_ticks_msec() - start_ms > timeout_ms:
-			OS.kill(pid)
+			_kill_process_tree(pid)
 			_cleanup_runner_files(launch)
 			return {"ok": false, "status": "timed_out", "pid": pid, "exit_code": null}
 		if tree != null:

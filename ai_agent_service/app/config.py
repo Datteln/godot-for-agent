@@ -141,6 +141,12 @@ class AppSettings(BaseSettings):
     )
     rag_auto_watch_interval_s: float = Field(default=1.0, ge=0.1, le=60.0)
     rag_auto_watch_debounce_s: float = Field(default=0.75, ge=0.0, le=30.0)
+    rag_auto_watch_scan_timeout_s: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=120.0,
+        description="文件监视器扫描项目目录的超时；超时仅跳过本轮，不阻塞事件循环。",
+    )
     rag_token_budget: int = Field(default=1500, ge=128)
     graph_max_depth: int = Field(default=2, ge=0, le=8)
     graph_max_neighbors: int = Field(default=5, ge=1, le=100)

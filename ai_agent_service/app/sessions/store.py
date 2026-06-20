@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,7 @@ from typing import Any
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, Frame
 from app.permissions.engine import SessionAllowGrant
+from app.storage.atomic import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -260,8 +263,34 @@ def session_to_dict(session: Session) -> dict[str, Any]:
     }
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """把外部 JSON 值规整为 dict；非 dict（含 None）一律视作空 dict。"""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """把外部 JSON 值规整为 list；非 list（含 None）一律视作空 list。"""
+    return value if isinstance(value, list) else []
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """把外部 JSON 值规整为 int；非整数/None 回退为 `default`。"""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return default
+
+
 def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Session:
     """从持久化字典恢复 `Session`。
+
+    持久化文件可能是合法 JSON 但字段类型错误（例如 `{"items": null}`、
+    `pending_verify_candidates: null`）。这里对每个集合/字典字段先判型再使用，
+    避免对 None 做迭代/解包而抛出未捕获的 `TypeError`、进而让接口持续 500
+    （§14.2）。
 
     Args:
         data: `session_to_dict` 产出的字典。
@@ -269,7 +298,14 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
 
     Returns:
         恢复后的 `Session`。
+
+    Raises:
+        ValueError: 顶层不是对象，或缺少必需的 `session_id` 字段。
     """
+    if not isinstance(data, dict):
+        raise ValueError("session payload must be an object")
+    if not isinstance(data.get("session_id"), str) or not data["session_id"]:
+        raise ValueError("session payload missing string session_id")
     raw_history_events = data.get("history_events", [])
     history_events = (
         [event for event in raw_history_events if isinstance(event, dict)]
@@ -287,27 +323,34 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
     except (TypeError, ValueError):
         stored_event_counter = 0
     history_event_counter = max(stored_event_counter, restored_event_counter)
+    pending_plan = data.get("pending_plan")
     return Session(
-        session_id=data["session_id"],
-        agent_stack=[_frame_from_dict(f, available_tools) for f in data.get("agent_stack", [])],
+        session_id=str(data["session_id"]),
+        agent_stack=[
+            _frame_from_dict(f, available_tools)
+            for f in _as_list(data.get("agent_stack"))
+            if isinstance(f, dict)
+        ],
         pending_turn_id=data.get("pending_turn_id"),
-        pending_tool_call_ids=set(data.get("pending_tool_call_ids", [])),
-        turn_counter=data.get("turn_counter", 0),
-        frame_counter=data.get("frame_counter", 0),
-        request_id_cache=data.get("request_id_cache", {}),
-        pending_tool_calls=data.get("pending_tool_calls", {}),
+        pending_tool_call_ids={
+            str(item) for item in _as_list(data.get("pending_tool_call_ids"))
+        },
+        turn_counter=_as_int(data.get("turn_counter")),
+        frame_counter=_as_int(data.get("frame_counter")),
+        request_id_cache=_as_dict(data.get("request_id_cache")),
+        pending_tool_calls=_as_dict(data.get("pending_tool_calls")),
         session_allow={
             (str(item[0]), str(item[1]), str(item[2]), str(item[3]) if len(item) >= 4 else "")
-            for item in data.get("session_allow", [])
+            for item in _as_list(data.get("session_allow"))
             if isinstance(item, list) and len(item) in {3, 4}
         },
         effort=str(data.get("effort", "standard")),
         output_style=str(data.get("output_style", "default")),
-        delegate_groups=data.get("delegate_groups", {}),
-        pending_plan=data.get("pending_plan"),
-        verify_retry_count=data.get("verify_retry_count", {}),
+        delegate_groups=_as_dict(data.get("delegate_groups")),
+        pending_plan=pending_plan if isinstance(pending_plan, dict) else None,
+        verify_retry_count=_as_dict(data.get("verify_retry_count")),
         pending_verify_candidates=[
-            item for item in data.get("pending_verify_candidates", []) if isinstance(item, dict)
+            item for item in _as_list(data.get("pending_verify_candidates")) if isinstance(item, dict)
         ],
         history_event_counter=history_event_counter,
         history_events=history_events,
@@ -315,18 +358,29 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
     )
 
 
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
 def _safe_filename(session_id: str) -> str:
-    """把会话 id 转换为安全的文件名，避免路径穿越。
+    """把会话 id 转换为无碰撞的安全文件名，避免路径穿越与串读。
+
+    旧实现把 `session_id` 里的非法字符直接剔除，于是 `a/bc` 与 `ab/c`
+    会被清洗成同一个 `abc`，导致两个不同会话共用一个文件、互相覆盖/串读
+    （§14.2）。这里改为：先用白名单正则拒绝非法 id，再用 `session_id` 的
+    SHA-256 摘要作为文件名——摘要是单射且与原文一一对应，永不碰撞。
 
     Args:
         session_id: 客户端提供的会话 id。
 
     Returns:
-        仅包含字母数字、`-`、`_` 的文件名（不含扩展名）；若 `session_id`
-        不含任何合法字符，回退为 `"_"`。
+        `session_id` 的 SHA-256 十六进制摘要（不含扩展名）。
+
+    Raises:
+        ValueError: `session_id` 不满足白名单格式。
     """
-    safe = "".join(c for c in session_id if c.isalnum() or c in "-_")
-    return safe or "_"
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(f"invalid session_id: {session_id!r}")
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
 
 class SessionStore:
@@ -399,11 +453,7 @@ class SessionStore:
         """
         self._sessions[session.session_id] = session
         path = self._path_for(session.session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(session_to_dict(session), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        atomic_write_json(path, session_to_dict(session))
         logger.debug(
             "Session saved session=%s frames=%d pending=%s cache_entries=%d path=%s",
             session.session_id,
@@ -412,6 +462,21 @@ class SessionStore:
             len(session.request_id_cache),
             path,
         )
+
+    def replace_in_memory(self, session_id: str, session: Session) -> None:
+        """仅替换内存态会话，不触碰磁盘。
+
+        用于请求被取消时回滚到 turn 开始前的内存快照：此时本轮可能已向
+        `frame.messages` 追加了 assistant 的 tool_calls 却来不及写入对应的
+        tool result，若让这半截历史留在内存里，下一次请求发给 LLM 会因
+        "tool_call 无对应 tool result" 而协议报错（§agent.py 中断回滚）。
+        因为本轮尚未 `save()`，磁盘仍是旧版本，所以只需还原内存。
+
+        Args:
+            session_id: 会话 id。
+            session: 回滚目标快照。
+        """
+        self._sessions[session_id] = session
 
     def reset(self, session_id: str) -> None:
         """清空指定会话（内存与本地持久化文件）。
@@ -455,8 +520,18 @@ class SessionStore:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             session = session_from_dict(data, available_tools)
-            logger.debug("Session loaded from disk session=%s path=%s", session_id, path)
-            return session
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning("Session load failed session=%s path=%s error=%s", session_id, path, exc)
             return None
+        # 文件名是 session_id 的哈希；正常情况下不会串读，但仍校验磁盘中记录的
+        # session_id 与请求值一致，防止历史遗留文件或人为改名导致的串读。
+        if session.session_id != session_id:
+            logger.warning(
+                "Session id mismatch on load requested=%s stored=%s path=%s; treating as new",
+                session_id,
+                session.session_id,
+                path,
+            )
+            return None
+        logger.debug("Session loaded from disk session=%s path=%s", session_id, path)
+        return session

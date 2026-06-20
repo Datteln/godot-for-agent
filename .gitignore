@@ -70,6 +70,9 @@ tests/data/crypto/out*
 st[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]
 
 # Python development
+.env
+.env.*
+!.env.example
 .venv
 venv
 
@@ -404,5 +407,6 @@ ai_map_agent/
 .ai_agent_service/
 **/*.gd.uid
 **/ai_agent_service.egg-info/
+**/.coverage
 .godot/
 *.md

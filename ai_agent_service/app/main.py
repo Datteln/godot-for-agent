@@ -125,6 +125,7 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         await rag_build_manager.watch(
             poll_interval_s=resolved_settings.rag_auto_watch_interval_s,
             debounce_s=resolved_settings.rag_auto_watch_debounce_s,
+            scan_timeout_s=resolved_settings.rag_auto_watch_scan_timeout_s,
         )
 
     @asynccontextmanager

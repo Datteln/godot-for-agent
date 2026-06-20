@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.storage.atomic import atomic_write_json
+
 logger = logging.getLogger(__name__)
 
 MAX_MEMORY_TEXT_CHARS = 8000
@@ -37,9 +39,7 @@ class MemoryStore:
 
     def list(self) -> list[MemoryItem]:
         items: list[MemoryItem] = []
-        for entry in self._read().get("items", []):
-            if not isinstance(entry, dict):
-                continue
+        for entry in self._items():
             try:
                 items.append(MemoryItem(**entry))
             except TypeError:
@@ -59,16 +59,14 @@ class MemoryStore:
             if tag.strip()
         ][:MAX_MEMORY_TAGS]
         item = MemoryItem(id=str(uuid.uuid4()), text=stripped, tags=normalized_tags, scope=scope)
-        data = self._read()
-        items = [entry for entry in data.get("items", []) if isinstance(entry, dict)]
+        items = self._items()
         items.append(asdict(item))
         self._write({"items": items})
         logger.info("Memory item saved id=%s scope=%s tags=%d", item.id, item.scope, len(item.tags))
         return item
 
     def delete(self, item_id: str) -> bool:
-        data = self._read()
-        items = [entry for entry in data.get("items", []) if isinstance(entry, dict)]
+        items = self._items()
         kept = [entry for entry in items if entry.get("id") != item_id]
         self._write({"items": kept})
         deleted = len(kept) != len(items)
@@ -91,7 +89,20 @@ class MemoryStore:
             return {"items": []}
         return data if isinstance(data, dict) else {"items": []}
 
+    def _items(self) -> list[dict[str, Any]]:
+        """读取 `items` 列表，对非列表（含合法 JSON 但 `items: null`）兜底为空。
+
+        旧实现里 `_read().get("items", [])` 在文件内容为 `{"items": null}` 时
+        会返回 `None`，随后 `for entry in None` 触发未捕获的 `TypeError`，使
+        `/memory` 接口持续 500。这里统一判型，只保留 dict 元素。
+        """
+        raw = self._read().get("items")
+        if not isinstance(raw, list):
+            if raw is not None:
+                logger.warning("Invalid memory items type path=%s; treating as empty", self._path)
+            return []
+        return [entry for entry in raw if isinstance(entry, dict)]
+
     def _write(self, data: dict[str, Any]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(self._path, data)
         logger.debug("Memory store written path=%s items=%d", self._path, len(data.get("items", [])))

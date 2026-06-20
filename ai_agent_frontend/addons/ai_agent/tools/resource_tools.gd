@@ -213,7 +213,13 @@ static func create_shader_material(input: Dictionary, undo_manager: Node) -> Dic
 			shader_before_text = existing.get_as_text()
 			existing.close()
 	if undo_manager != null:
-		undo_manager.record_file_write(shader_path, shader_before_text, shader_code)
+		var shader_write_error: Error = undo_manager.record_file_write(shader_path, shader_before_text, shader_code)
+		if shader_write_error != OK:
+			return {
+				"ok": false,
+				"message": "failed to write shader file: %s (%s)" % [shader_path, error_string(shader_write_error)],
+				"error_code": "write_failed"
+			}
 	else:
 		DirAccess.make_dir_recursive_absolute(shader_absolute.get_base_dir())
 		var file := FileAccess.open(shader_absolute, FileAccess.WRITE)

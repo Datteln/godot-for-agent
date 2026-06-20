@@ -65,5 +65,82 @@ class CommandArgumentTests(unittest.TestCase):
                     self.assertTrue(response.json()["ok"], (name, response.json()))
 
 
+class CommandErrorStatusTests(unittest.TestCase):
+    """协议层错误应返回恰当的 HTTP 状态码，同时保留结构化 body（ok/text）。"""
+
+    def _client(self, root: Path) -> TestClient:
+        app = create_app(
+            AppSettings(project_root=root, rag_auto_build_enabled=False),
+            token="test-token",
+        )
+        return TestClient(app)
+
+    def test_unknown_command_returns_404(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._client(Path(tmp)) as client:
+                resp = client.post(
+                    "/commands/does_not_exist",
+                    headers={"Authorization": "Bearer test-token"},
+                    json={"session_id": "s1", "args": {}},
+                )
+                self.assertEqual(resp.status_code, 404)
+                self.assertFalse(resp.json()["ok"])
+                self.assertIn("未知命令", resp.json()["text"])
+
+    def test_invalid_effort_returns_400(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._client(Path(tmp)) as client:
+                resp = client.post(
+                    "/commands/set_effort",
+                    headers={"Authorization": "Bearer test-token"},
+                    json={"session_id": "s1", "args": {"effort": "bogus"}},
+                )
+                self.assertEqual(resp.status_code, 400)
+                self.assertFalse(resp.json()["ok"])
+
+    def test_compact_missing_session_returns_400(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._client(Path(tmp)) as client:
+                resp = client.post(
+                    "/commands/compact",
+                    headers={"Authorization": "Bearer test-token"},
+                    json={"args": {}},
+                )
+                self.assertEqual(resp.status_code, 400)
+
+    def test_memory_save_missing_text_returns_400(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._client(Path(tmp)) as client:
+                resp = client.post(
+                    "/memory",
+                    headers={"Authorization": "Bearer test-token"},
+                    json={"action": "save"},
+                )
+                self.assertEqual(resp.status_code, 400)
+                self.assertFalse(resp.json()["ok"])
+
+    def test_memory_delete_unknown_returns_404(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._client(Path(tmp)) as client:
+                resp = client.post(
+                    "/memory",
+                    headers={"Authorization": "Bearer test-token"},
+                    json={"action": "delete", "id": "nope"},
+                )
+                self.assertEqual(resp.status_code, 404)
+                self.assertFalse(resp.json()["ok"])
+
+    def test_successful_memory_save_still_200(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._client(Path(tmp)) as client:
+                resp = client.post(
+                    "/memory",
+                    headers={"Authorization": "Bearer test-token"},
+                    json={"action": "save", "text": "hello"},
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.assertTrue(resp.json()["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

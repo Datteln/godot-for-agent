@@ -21,6 +21,8 @@ const DEFAULTS := {
 	"ai_agent/llm_advisor_model": "",
 	"ai_agent/llm_fallback_model": "",
 	"ai_agent/llm_request_timeout_s": 60.0,
+	"ai_agent/request_timeout_sec": 30.0,
+	"ai_agent/chat_request_timeout_sec": 300.0,
 	"ai_agent/embedding_provider": "disabled",
 	"ai_agent/embedding_model": "text-embedding-3-small",
 	"ai_agent/embedding_endpoint": "https://api.openai.com/v1",
@@ -83,6 +85,14 @@ const PROPERTY_HINTS := {
 	"ai_agent/llm_request_timeout_s": {
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "1,600,1,suffix:s"
+	},
+	"ai_agent/request_timeout_sec": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,120,1,suffix:s"
+	},
+	"ai_agent/chat_request_timeout_sec": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,1800,1,suffix:s"
 	},
 	"ai_agent/embedding_provider": {
 		"hint": PROPERTY_HINT_ENUM,

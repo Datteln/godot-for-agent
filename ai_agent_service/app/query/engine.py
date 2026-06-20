@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from dataclasses import replace
@@ -1571,7 +1572,16 @@ class QueryEngine:
                     )
                     return _response_from_dict(session.request_id_cache[request.request_id])
 
-                response = await self._submit_locked(session, request)
+                # 取消保护快照：本轮可能在追加 assistant 的 tool_calls 后、写入对应
+                # tool result 之前被 interrupt 取消。若让这半截历史留在内存里，下一次
+                # 请求发给 OpenAI 兼容端点会因 tool_call 缺少 tool result 而 400。取消
+                # 时回滚到本轮开始前的内存快照（本轮尚未 save()，磁盘仍是旧版本）。
+                snapshot = copy.deepcopy(session)
+                try:
+                    response = await self._submit_locked(session, request)
+                except asyncio.CancelledError:
+                    self._store.replace_in_memory(request.session_id, snapshot)
+                    raise
 
                 if request.request_id is not None:
                     session.request_id_cache[request.request_id] = _response_to_dict(response)
@@ -1712,7 +1722,7 @@ class QueryEngine:
                 self._settings.auto_compact_token_threshold,
                 self._settings.auto_compact_keep_recent,
             )
-            self.compact(
+            self._compact_locked(
                 session.session_id,
                 keep_recent=self._settings.auto_compact_keep_recent,
                 triggered_by="auto",
@@ -2175,12 +2185,43 @@ class QueryEngine:
 
         return _parse_verify_response(turn.content or "")
 
-    def reset(self, session_id: str) -> None:
-        """清空指定会话。"""
-        self._store.reset(session_id)
-        if self._recovery is not None:
-            self._recovery.clear()
-        self._emit(session_id, "reset", {})
+    async def _cancel_active_tasks(self, session_id: str) -> bool:
+        """取消并等待该会话仍在运行的 `/chat` 任务，返回是否取消了任何任务。
+
+        会话生命周期操作（reset/interrupt）必须先把仍在 await LLM/工具的旧
+        turn 真正取消并 await 到它退出，否则旧 turn 之后的 `save(session)` 会
+        把已被重置/中断的会话重新写回，造成"会话复活"（§14.2）。排除当前
+        协程自身，避免自取消。
+        """
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for task in self._active_tasks.get(session_id, set())
+            if not task.done() and task is not current
+        }
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Cancelled task raised after cancel session=%s", session_id)
+        return bool(tasks)
+
+    async def reset(self, session_id: str) -> None:
+        """清空指定会话。
+
+        先取消该会话仍在运行的 `/chat` 任务并等待其退出，再在持锁状态下清空
+        会话；否则旧 turn 返回后的 `save()` 会把已重置的会话重新写回磁盘。
+        """
+        await self._cancel_active_tasks(session_id)
+        async with self._store.lock_for(session_id):
+            self._store.reset(session_id)
+            if self._recovery is not None:
+                self._recovery.clear(session_id)
+            self._emit(session_id, "reset", {})
         logger.info("Session reset through QueryEngine session=%s", session_id)
 
     async def interrupt(self, session_id: str) -> InterruptResponse:
@@ -2202,17 +2243,7 @@ class QueryEngine:
         interrupt 自己后面要拿的锁也会卡死。所以这里要把所有未完成的都
         取消掉。
         """
-        tasks = {task for task in self._active_tasks.get(session_id, set()) if not task.done()}
-        cancelled = bool(tasks)
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Interrupted task raised after cancel session=%s", session_id)
+        cancelled = await self._cancel_active_tasks(session_id)
 
         discarded = 0
         async with self._store.lock_for(session_id):
@@ -2233,7 +2264,7 @@ class QueryEngine:
                 session.clear_pending()
                 self._store.save(session)
                 if self._recovery is not None:
-                    self._recovery.clear()
+                    self._recovery.clear(session_id)
             elif had_pending_plan:
                 self._store.save(session)
 
@@ -2279,19 +2310,25 @@ class QueryEngine:
             logger.info("Pending tool calls discarded session=%s count=%d", session_id, discarded)
             return response
 
-    def set_effort(self, session_id: str, effort: str) -> None:
-        """Set session effort without starting a model turn."""
-        session = self._store.get_or_create(session_id, self.available_tools)
-        session.effort = effort
-        self._store.save(session)
+    async def set_effort(self, session_id: str, effort: str) -> None:
+        """Set session effort without starting a model turn.
+
+        持锁修改：否则会与正在 await LLM 的活跃 turn 抢同一个 Session，导致
+        配置在一轮中途被改、响应与上下文错配（§会话锁边界）。
+        """
+        async with self._store.lock_for(session_id):
+            session = self._store.get_or_create(session_id, self.available_tools)
+            session.effort = effort
+            self._store.save(session)
         self._emit(session_id, "config_changed", {"effort": effort})
         logger.info("Session effort changed session=%s effort=%s", session_id, effort)
 
-    def set_output_style(self, session_id: str, output_style: str) -> None:
+    async def set_output_style(self, session_id: str, output_style: str) -> None:
         """Set session output style without starting a model turn."""
-        session = self._store.get_or_create(session_id, self.available_tools)
-        session.output_style = output_style
-        self._store.save(session)
+        async with self._store.lock_for(session_id):
+            session = self._store.get_or_create(session_id, self.available_tools)
+            session.output_style = output_style
+            self._store.save(session)
         self._emit(session_id, "config_changed", {"output_style": output_style})
         logger.info("Session output style changed session=%s output_style=%s", session_id, output_style)
 
@@ -2309,8 +2346,13 @@ class QueryEngine:
         threshold = self._settings.auto_compact_token_threshold
         return any(estimate_message_tokens(frame.messages) > threshold for frame in session.agent_stack)
 
-    def compact(self, session_id: str, keep_recent: int = 12, triggered_by: str = "manual") -> dict[str, Any]:
+    async def compact(self, session_id: str, keep_recent: int = 12, triggered_by: str = "manual") -> dict[str, Any]:
         """对指定 session 执行本地 micro/full compact，保留 pending 协议完整性。
+
+        持锁入口：手动 `/compact` 命令经此处，先获取会话锁再压缩，避免与正在
+        await LLM 的活跃 turn 同时修改 `frame.messages`（§会话锁边界）。自动
+        压缩发生在已持锁的 `_submit_locked` 内，必须直接调用 `_compact_locked`，
+        否则同一协程再次获取非重入的 `asyncio.Lock` 会死锁。
 
         Args:
             session_id: 待压缩的会话 id。
@@ -2319,6 +2361,11 @@ class QueryEngine:
                 的自动触发），写入 `compact_boundary` 事件 payload，仅用于
                 日志/观测区分来源，不影响压缩逻辑本身。
         """
+        async with self._store.lock_for(session_id):
+            return self._compact_locked(session_id, keep_recent, triggered_by)
+
+    def _compact_locked(self, session_id: str, keep_recent: int = 12, triggered_by: str = "manual") -> dict[str, Any]:
+        """在已持有会话锁时执行压缩；不要在未持锁路径直接调用。"""
         session = self._store.get_or_create(session_id, self.available_tools)
         logger.info(
             "Compacting session session=%s keep_recent=%d triggered_by=%s", session_id, keep_recent, triggered_by
@@ -2459,5 +2506,5 @@ class QueryEngine:
                 last_seq,
             )
         elif isinstance(response, ChatFinalResponse):
-            self._recovery.clear()
+            self._recovery.clear(session.session_id)
             logger.debug("Recovery pointer cleared after final session=%s", session.session_id)
