@@ -203,6 +203,103 @@ class FrontendExternalTypingTests(unittest.TestCase):
         self.assertIn("var calls: Array = raw_calls if raw_calls is Array else []", source)
 
 
+class ReadFilePaginationTests(unittest.IsolatedAsyncioTestCase):
+    """`read_file` 按行分页（offset/limit），类似 Claude Code Read 工具的语义。"""
+
+    class _Ctx:
+        def __init__(self, root: Path) -> None:
+            from app.security.settings import SecuritySettings
+
+            self.security = SecuritySettings(project_root=root)
+            self.session_id = "s1"
+
+    async def test_default_reads_from_start_with_limit(self) -> None:
+        from app.tools.server_tools.read_file import read_file_handler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lines = [f"line{i}" for i in range(1, 11)]
+            (root / "f.txt").write_text("\n".join(lines), encoding="utf-8")
+            result = await read_file_handler({"path": "f.txt", "limit": 3}, self._Ctx(root))
+            self.assertEqual(result["content"], "line1\nline2\nline3")
+            self.assertEqual(result["offset"], 1)
+            self.assertTrue(result["has_more"])
+            self.assertTrue(result["truncated"])
+
+    async def test_offset_continues_from_requested_line(self) -> None:
+        from app.tools.server_tools.read_file import read_file_handler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lines = [f"line{i}" for i in range(1, 11)]
+            (root / "f.txt").write_text("\n".join(lines), encoding="utf-8")
+            result = await read_file_handler({"path": "f.txt", "offset": 8, "limit": 5}, self._Ctx(root))
+            self.assertEqual(result["content"], "line8\nline9\nline10")
+            self.assertFalse(result["has_more"])
+            self.assertFalse(result["truncated"])
+
+    async def test_reading_past_end_returns_empty_without_error(self) -> None:
+        from app.tools.server_tools.read_file import read_file_handler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "f.txt").write_text("only-line", encoding="utf-8")
+            result = await read_file_handler({"path": "f.txt", "offset": 50}, self._Ctx(root))
+            self.assertEqual(result["content"], "")
+            self.assertFalse(result["has_more"])
+
+
+class ApplyTextEditToolRegistrationTests(unittest.TestCase):
+    """`apply_text_edit` 必须作为真正的局部编辑工具注册，而不是 write_file 的死别名。"""
+
+    def test_registered_as_front_tool_with_old_new_string_params(self) -> None:
+        from app.tools.front_tools import register_front_tools
+        from app.tools.registry import REGISTRY
+
+        if "apply_text_edit" not in REGISTRY:
+            register_front_tools()
+        tool = REGISTRY["apply_text_edit"]
+        self.assertEqual(tool.side, "front")
+        props = tool.schema["parameters"]["properties"]
+        self.assertIn("old_string", props)
+        self.assertIn("new_string", props)
+        self.assertIn("path", props)
+
+    def test_programming_agent_grants_apply_text_edit(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        agent_def = (
+            repo / "ai_agent_service/app/agents/agent_defs/programming-agent.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("apply_text_edit", agent_def.split("---")[1])
+
+    def test_frontend_dispatches_apply_text_edit_to_local_edit_handler(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        source = (
+            repo / "ai_agent_frontend/addons/ai_agent/tools/program_tools.gd"
+        ).read_text(encoding="utf-8")
+        self.assertIn("static func apply_text_edit(", source)
+        executor = (
+            repo / "ai_agent_frontend/addons/ai_agent/tools/tool_executor.gd"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ProgramTools.apply_text_edit(", executor)
+        # write_file 的整文件覆盖别名组里不应该再混入 apply_text_edit。
+        self.assertNotIn(
+            '"write_file", "propose_script_edit", "propose_tests", "propose_content_file", "apply_text_edit"',
+            executor,
+        )
+
+    def test_frontend_requires_prior_read_before_local_edit(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        source = (
+            repo / "ai_agent_frontend/addons/ai_agent/tools/program_tools.gd"
+        ).read_text(encoding="utf-8")
+        self.assertIn("file_state_cache.has_state(path)", source)
+        cache_source = (
+            repo / "ai_agent_frontend/addons/ai_agent/context/file_state_cache.gd"
+        ).read_text(encoding="utf-8")
+        self.assertIn("func has_state(path: String) -> bool", cache_source)
+
+
 class GrepCodeTimeoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_pathological_pattern_aborts_instead_of_hanging(self) -> None:
         import app.tools.server_tools.grep_code as g

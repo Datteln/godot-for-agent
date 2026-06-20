@@ -84,9 +84,10 @@ var _effort_options: OptionButton
 var _style_options: OptionButton
 var _model_input: LineEdit
 var _active_model_name := ""
+var _context_token_limit := 0
 ## 最近一次 cache_hit 事件的常驻状态栏摘要；与聊天记录里的滚动提示是两套
 ## 独立展示——这条不随对话滚走，方便随时确认当前缓存命中情况。
-var _last_cache_status := ""
+var _last_context_usage_status := ""
 ## `compact_started` 到达时记录下当时的状态，供 `compact_boundary` 到达时还原；
 ## 压缩前后状态对应"这一轮原本在干什么"（等待模型/执行工具等），不是固定回到 IDLE。
 var _state_before_compact := AgentState.IDLE
@@ -1352,6 +1353,10 @@ func _handle_session_history(response: Dictionary) -> void:
 		"structured": response.has("blocks")
 	})
 	_clear_messages()
+	_update_context_usage_status(
+		int(response.get("context_used_tokens", 0)),
+		int(response.get("context_token_limit", 0))
+	)
 	if state_store != null:
 		state_store.set_value("session_id", session_id)
 	var pending_turn_id = response.get("pending_turn_id")
@@ -1760,7 +1765,7 @@ func _on_reset() -> void:
 	_http_client.reset_session()
 	if state_store != null:
 		state_store.reset()
-	_last_cache_status = ""
+	_update_context_usage_status(0, _context_token_limit)
 	_set_state(AgentState.IDLE)
 
 
@@ -1803,7 +1808,7 @@ func _on_new_session() -> void:
 		state_store.reset()
 		state_store.set_value("session_id", session_id)
 	_clear_messages()
-	_last_cache_status = ""
+	_update_context_usage_status(0, _context_token_limit)
 	_set_state(AgentState.IDLE)
 	_append_message("system", _ui("new_session_started") % session_id)
 
@@ -1975,10 +1980,12 @@ func _handle_event(event: Dictionary) -> void:
 			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 			_active_model_name = str(payload.get("fallback_model", "")).strip_edges()
 			_refresh_status_text()
-		if event_type == "cache_hit":
-			var cache_payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-			_last_cache_status = EventFormatter.format_cache_status_indicator(cache_payload, _ui_table())
-			_refresh_status_text()
+		if event_type == "context_usage":
+			var usage_payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+			_update_context_usage_status(
+				int(usage_payload.get("used_tokens", 0)),
+				int(usage_payload.get("token_limit", 0))
+			)
 		# `compact_started`/`compact_boundary` 总是成对到达（见后端 `compact()`），
 		# 中间跨越的才是压缩真正发生的窗口；据此让状态栏在这段时间显示"正在压缩"，
 		# 结束后还原成压缩前原本的状态（等待模型/执行工具等），而不是固定回到 IDLE。
@@ -2156,8 +2163,8 @@ func _status_text_for_state(value: int) -> String:
 	var parts: Array[String] = [base]
 	if _active_model_name != "":
 		parts.append(_active_model_name)
-	if _last_cache_status != "":
-		parts.append(_last_cache_status)
+	if _last_context_usage_status != "":
+		parts.append(_last_context_usage_status)
 	return " · ".join(parts)
 
 
@@ -2165,6 +2172,19 @@ func _refresh_status_text() -> void:
 	_status.text = _status_text_for_state(_state)
 	if state_store != null:
 		state_store.set_value("state", _status.text)
+
+
+func _update_context_usage_status(used_tokens: int, token_limit: int) -> void:
+	if token_limit > 0:
+		_context_token_limit = token_limit
+	if _context_token_limit <= 0:
+		_last_context_usage_status = ""
+	else:
+		_last_context_usage_status = EventFormatter.format_context_usage_indicator({
+			"used_tokens": maxi(used_tokens, 0),
+			"token_limit": _context_token_limit
+		}, _ui_table())
+	_refresh_status_text()
 
 
 func _set_state(value: int) -> void:
@@ -2689,7 +2709,7 @@ func _switch_to_session(session_id: String) -> void:
 		state_store.reset()
 		state_store.set_value("session_id", session_id)
 	_clear_messages()
-	_last_cache_status = ""
+	_update_context_usage_status(0, _context_token_limit)
 	_set_state(AgentState.IDLE)
 	_http_client.fetch_session_history()
 	_save_session_to_history(session_id)

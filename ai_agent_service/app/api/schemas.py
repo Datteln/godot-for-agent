@@ -404,6 +404,8 @@ class SessionHistoryResponse(BaseModel):
     session_id: str
     last_event_seq: int = 0
     pending_turn_id: str | None = None
+    context_used_tokens: int = 0
+    context_token_limit: int = 0
     items: list[SessionHistoryItemDTO] = Field(default_factory=list)
     blocks: list[SessionHistoryBlock] = Field(default_factory=list)
 

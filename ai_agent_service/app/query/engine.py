@@ -297,6 +297,7 @@ _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
         "verify_completed",
         "delegate_start",
         "server_tool_result",
+        "context_usage",
     }
 )
 
@@ -538,8 +539,19 @@ def _format_tool_result_summary(name: str, input_args: dict[str, Any], content: 
 
     if name in _HISTORY_READ_TOOLS:
         path = str(inner.get("path", input_args.get("path", "<unknown>")))
+        offset = int(inner.get("offset", 1) or 1)
         line_count = _count_lines(str(inner.get("content", "")))
-        return f"Read {path} (lines 1-{line_count})"
+        line_end = offset + line_count - 1
+        return f"Read {path} (lines {offset}-{max(line_end, offset)})"
+
+    if name == "apply_text_edit":
+        path = str(inner.get("path", input_args.get("path", "<unknown>")))
+        old_string = str(input_args.get("old_string", ""))
+        new_string = str(input_args.get("new_string", ""))
+        replaced = int(inner.get("replaced_count", 1) or 1)
+        added = _count_lines(new_string) * replaced
+        removed = _count_lines(old_string) * replaced
+        return f"Edit {path}\n+{added} -{removed} lines"
 
     if name in _HISTORY_EDIT_TOOLS:
         path = str(inner.get("path", input_args.get("path", input_args.get("target_path", "<unknown>"))))
@@ -923,8 +935,24 @@ def _tool_history_blocks(
 
     if name in _HISTORY_READ_TOOLS:
         path = str(inner.get("path", input_args.get("path", "<unknown>")))
+        offset = int(inner.get("offset", 1) or 1)
         line_count = max(_count_lines(str(inner.get("content", ""))), 1)
-        return [LogReadHistoryBlock(path=path, line_end=line_count, **origin)]
+        return [LogReadHistoryBlock(path=path, line_start=offset, line_end=offset + line_count - 1, **origin)]
+
+    if name == "apply_text_edit":
+        path = str(inner.get("path", input_args.get("path", "<unknown>")))
+        old_string = str(input_args.get("old_string", ""))
+        new_string = str(input_args.get("new_string", ""))
+        replaced = int(inner.get("replaced_count", 1) or 1)
+        return [
+            LogEditHistoryBlock(
+                path=path,
+                added=_count_lines(new_string) * replaced,
+                removed=_count_lines(old_string) * replaced,
+                after_text=new_string,
+                **origin,
+            )
+        ]
 
     if name in _HISTORY_EDIT_TOOLS:
         path = str(inner.get("path", input_args.get("path", input_args.get("target_path", "<unknown>"))))
@@ -1442,6 +1470,20 @@ def _persisted_history_events(session: Session) -> list[Event]:
     return events
 
 
+def _history_context_used_tokens(session: Session, events: list[Event]) -> int:
+    """Return the latest exact provider usage, falling back to a local estimate."""
+    for event in reversed(events):
+        if event.type != "context_usage":
+            continue
+        try:
+            used = int(event.payload.get("used_tokens", -1))
+        except (TypeError, ValueError):
+            continue
+        if used >= 0:
+            return used
+    return max((estimate_message_tokens(frame.messages) for frame in session.agent_stack), default=0)
+
+
 def _pending_anchor_index(frame: Frame, pending_ids: set[str]) -> int | None:
     """找到包含 pending tool_call 的 assistant 消息位置。"""
     if not pending_ids:
@@ -1536,6 +1578,8 @@ class QueryEngine:
             session_id=session.session_id,
             last_event_seq=self._events.last_seq(session_id) if self._events is not None else 0,
             pending_turn_id=session.pending_turn_id,
+            context_used_tokens=_history_context_used_tokens(session, events),
+            context_token_limit=self._settings.auto_compact_token_threshold,
             items=items,
             blocks=blocks,
         )
@@ -1759,6 +1803,7 @@ class QueryEngine:
             event_callback=emit_turn_event,
             cache_engine=self._cache_engine,
             cache_metrics=self._cache_metrics,
+            context_token_limit=self._settings.auto_compact_token_threshold,
         )
         response = _step_to_response(step)
         if isinstance(response, ChatFinalResponse) and session.pending_verify_candidates:
@@ -1799,6 +1844,7 @@ class QueryEngine:
                     event_callback=lambda event_type, payload: self._emit(session.session_id, event_type, payload),
                     cache_engine=self._cache_engine,
                     cache_metrics=self._cache_metrics,
+                    context_token_limit=self._settings.auto_compact_token_threshold,
                 )
                 response = _step_to_response(step)
         if isinstance(response, ChatToolCallsResponse):
@@ -2151,7 +2197,7 @@ class QueryEngine:
         """
         try:
             file_payload = await read_file_handler(
-                {"path": path},
+                {"path": path, "limit": 20000},
                 ToolContext(security=security, session_id="verify"),
             )
         except (OSError, ValueError) as exc:

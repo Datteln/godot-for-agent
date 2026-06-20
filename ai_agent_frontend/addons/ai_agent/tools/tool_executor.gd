@@ -41,8 +41,10 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = ClassDBReader.get_class_info(str(input.get("class_name", input.get("name", ""))))
 		"read_file", "read_script":
 			result = ProgramTools.read_file(input, file_state_cache)
-		"write_file", "propose_script_edit", "propose_tests", "propose_content_file", "apply_text_edit":
+		"write_file", "propose_script_edit", "propose_tests", "propose_content_file":
 			result = ProgramTools.write_file(input, undo_manager, file_state_cache, editor_interface)
+		"apply_text_edit":
+			result = ProgramTools.apply_text_edit(input, undo_manager, file_state_cache, editor_interface)
 		"read_debugger_errors":
 			result = _read_debugger_errors(input)
 		"read_profiler_snapshot":

@@ -65,6 +65,8 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 	match str(event.get("type", "")):
 		"agent_step", "agent_tool_calls", "tool_calls", "final", "tool_results_received":
 			return ""
+		"context_usage":
+			return ""
 		"delegate_start":
 			return ui_text.get("event_delegate", "Task(%s)") % _format_delegate_args(payload)
 		"cache_hit":
@@ -258,17 +260,24 @@ static func _format_cache_hit_event(payload: Dictionary, ui_text: Dictionary) ->
 ## 滚走）。最近一次命中的 cached/total tokens 与命中率，用于 chat_panel 底部
 ## 状态行常驻展示，不需要用户翻回聊天记录确认当前缓存情况。
 ## cached <= 0 时返回空串（尚无命中或本轮未走缓存），调用方据此清空指示器。
-static func format_cache_status_indicator(payload: Dictionary, ui_text: Dictionary) -> String:
-	var cached := int(payload.get("cached_tokens", 0))
-	if cached <= 0:
+static func format_context_usage_indicator(payload: Dictionary, ui_text: Dictionary) -> String:
+	var used := int(payload.get("used_tokens", 0))
+	var limit := int(payload.get("token_limit", 0))
+	if used < 0 or limit <= 0:
 		return ""
-	var total := int(payload.get("total_input_tokens", 0))
-	var ratio := (float(cached) / float(total) * 100.0) if total > 0 else 0.0
-	return ui_text.get("status_cache_indicator", "cache %s%% (%s/%s)") % [
-		String.num(ratio, 1),
-		_format_thousands(cached),
-		_format_thousands(total)
+	return ui_text.get("status_context_usage", "cache %s/%s") % [
+		_format_compact_tokens(used),
+		_format_compact_tokens(limit)
 	]
+
+
+static func _format_compact_tokens(value: int) -> String:
+	if value < 1000:
+		return str(value)
+	var compact := float(value) / 1000.0
+	if value % 1000 == 0:
+		return "%dk" % int(compact)
+	return "%.1fk" % compact
 
 
 ## 把整数格式化为带千分位逗号的字符串（如 3840 -> "3,840"）。
@@ -319,8 +328,15 @@ static func format_tool_result_detail(name: String, input: Dictionary, status: S
 		return ui_text.get("tool_error_detail", "Error: %s") % message
 	match name:
 		"read_file", "read_script":
-			return ui_text.get("tool_read_lines", "Read %s lines") % count_lines(str(inner.get("content", "")))
-		"write_file", "propose_script_edit", "apply_text_edit", "propose_tests", "propose_content_file":
+			var read_lines := count_lines(str(inner.get("content", "")))
+			if inner.has("has_more") and bool(inner.get("has_more", false)):
+				return "%s (more available)" % (ui_text.get("tool_read_lines", "Read %s lines") % read_lines)
+			return ui_text.get("tool_read_lines", "Read %s lines") % read_lines
+		"apply_text_edit":
+			var edited_path := str(inner.get("path", input.get("path", "")))
+			var replaced_count := int(inner.get("replaced_count", 1))
+			return "Edited `%s` (%d replacement(s))" % [edited_path, replaced_count]
+		"write_file", "propose_script_edit", "propose_tests", "propose_content_file":
 			var after_text := str(input.get("content", input.get("after_text", "")))
 			var path := str(inner.get("path", input.get("path", input.get("target_path", ""))))
 			return ui_text.get("tool_wrote_lines", "Wrote `%s` (%s lines)") % [path, count_lines(after_text)]
@@ -374,8 +390,18 @@ static func format_log_tool_result(name: String, input: Dictionary, result: Dict
 		"read_file", "read_script":
 			var read_path := str(inner.get("path", input.get("path", "<unknown>")))
 			var content := str(inner.get("content", ""))
-			return "Read %s (lines 1-%d)" % [read_path, count_lines(content)]
-		"write_file", "propose_script_edit", "apply_text_edit", "propose_tests", "propose_content_file":
+			var read_offset := int(inner.get("offset", 1))
+			var read_end := read_offset + count_lines(content) - 1
+			return "Read %s (lines %d-%d)" % [read_path, read_offset, max(read_end, read_offset)]
+		"apply_text_edit":
+			var edit_target := str(inner.get("path", input.get("path", "<unknown>")))
+			var old_string := str(input.get("old_string", ""))
+			var new_string := str(input.get("new_string", ""))
+			var replaced := int(inner.get("replaced_count", 1))
+			var edit_added := count_lines(new_string) * replaced
+			var edit_removed := count_lines(old_string) * replaced
+			return "Edit %s\n+%d -%d lines" % [edit_target, edit_added, edit_removed]
+		"write_file", "propose_script_edit", "propose_tests", "propose_content_file":
 			var edit_path := str(inner.get("path", input.get("path", input.get("target_path", "<unknown>"))))
 			var after_text := str(input.get("content", input.get("after_text", "")))
 			var before_text := str(input.get("before_text", input.get("before", "")))

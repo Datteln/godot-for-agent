@@ -47,15 +47,37 @@ static func infer_render_kind(call: Dictionary) -> String:
 			return "json"
 
 
-static func _render_diff(call: Dictionary, theme_colors: Dictionary) -> Control:
-	var input: Dictionary = call.get("input", {})
+## apply_text_edit 的工具调用只带 old_string/new_string，没有完整的 after 内容；
+## 预览/统计都需要按真实的替换逻辑现算一遍 after_text，确保展示结果和实际落地一致。
+static func _resolve_diff_texts(input: Dictionary) -> Dictionary:
 	var path := PathUtils.to_res_path(str(input.get("path", input.get("target_path", ""))))
-	var after_text := str(input.get("content", input.get("after_text", input.get("after", ""))))
 	var before_text := str(input.get("before_text", input.get("before", "")))
 	if before_text == "" and path != "":
 		var absolute := ProjectSettings.globalize_path(path)
 		if FileAccess.file_exists(absolute):
 			before_text = FileAccess.get_file_as_string(absolute)
+
+	var after_text: String
+	if input.has("old_string"):
+		var old_string := str(input.get("old_string", ""))
+		var new_string := str(input.get("new_string", ""))
+		var replace_all := bool(input.get("replace_all", false))
+		if replace_all:
+			after_text = before_text.replace(old_string, new_string)
+		else:
+			var idx := before_text.find(old_string)
+			after_text = before_text if idx == -1 else (before_text.substr(0, idx) + new_string + before_text.substr(idx + old_string.length()))
+	else:
+		after_text = str(input.get("content", input.get("after_text", input.get("after", ""))))
+	return {"path": path, "before_text": before_text, "after_text": after_text}
+
+
+static func _render_diff(call: Dictionary, theme_colors: Dictionary) -> Control:
+	var input: Dictionary = call.get("input", {})
+	var texts := _resolve_diff_texts(input)
+	var path: String = texts["path"]
+	var before_text: String = texts["before_text"]
+	var after_text: String = texts["after_text"]
 
 	var view := RichTextLabel.new()
 	view.bbcode_enabled = true
@@ -94,13 +116,9 @@ static func _render_diff(call: Dictionary, theme_colors: Dictionary) -> Control:
 ## 执行后磁盘上的文件已经变成 after_text，再读就读不到真正的 before 了。
 static func diff_stats(call: Dictionary) -> Dictionary:
 	var input: Dictionary = call.get("input", {})
-	var path := PathUtils.to_res_path(str(input.get("path", input.get("target_path", ""))))
-	var after_text := str(input.get("content", input.get("after_text", input.get("after", ""))))
-	var before_text := str(input.get("before_text", input.get("before", "")))
-	if before_text == "" and path != "":
-		var absolute := ProjectSettings.globalize_path(path)
-		if FileAccess.file_exists(absolute):
-			before_text = FileAccess.get_file_as_string(absolute)
+	var texts := _resolve_diff_texts(input)
+	var before_text: String = texts["before_text"]
+	var after_text: String = texts["after_text"]
 	var added := 0
 	var removed := 0
 	for line in _lcs_diff(before_text, after_text):

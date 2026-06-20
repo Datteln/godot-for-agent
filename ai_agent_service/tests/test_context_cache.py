@@ -32,7 +32,7 @@ from app.llm.message_transformer import (
     inject_cache_breakpoints,
 )
 from app.llm.provider import _cache_tokens_from_usage, _max_token_count
-from app.orchestrator.agent import _emit_cache_hit_event, _record_cache_metrics
+from app.orchestrator.agent import _emit_cache_hit_event, _emit_context_usage_event, _record_cache_metrics
 from app.prompt.builder import LayeredPrompt, build_layered_system_prompt
 from app.prompt.project_context import build_project_context
 from app.prompt.rag_context import build_rag_context
@@ -526,6 +526,21 @@ class EmitCacheHitEventTests(unittest.TestCase):
         ):
             _emit_cache_hit_event(callback, frame, 1, turn)
         self.assertEqual(events, [])
+
+
+class EmitContextUsageEventTests(unittest.TestCase):
+    def test_emits_used_tokens_and_configured_limit(self) -> None:
+        events: list[tuple[str, dict[str, Any]]] = []
+        callback = lambda event_type, payload: events.append((event_type, payload))
+        frame = SimpleNamespace(id="frame-1")
+        turn = SimpleNamespace(total_input_tokens=60_237)
+
+        _emit_context_usage_event(callback, frame, 2, turn, 200_000)
+
+        event_type, payload = events[0]
+        self.assertEqual(event_type, "context_usage")
+        self.assertEqual(payload["used_tokens"], 60_237)
+        self.assertEqual(payload["token_limit"], 200_000)
 
 
 class RecordCacheMetricsTests(unittest.TestCase):

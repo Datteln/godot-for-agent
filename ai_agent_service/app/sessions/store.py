@@ -24,7 +24,7 @@ from app.storage.atomic import atomic_write_json
 logger = logging.getLogger(__name__)
 
 _MAX_HISTORY_EVENTS = 500
-_COALESCED_HISTORY_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta"}
+_COALESCED_HISTORY_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta", "context_usage"}
 
 
 @dataclass

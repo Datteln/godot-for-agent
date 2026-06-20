@@ -18,6 +18,7 @@ from app.orchestrator.agent import (
 from app.query.engine import (
     _assistant_history_blocks,
     _event_payload_for_log,
+    _history_context_used_tokens,
     _normalize_model_override,
     _structured_history_for_frame,
     _structured_session_history,
@@ -46,6 +47,20 @@ def test_session_history_exposes_event_cursor() -> None:
     response = SessionHistoryResponse(session_id="s1", last_event_seq=42)
 
     assert response.last_event_seq == 42
+
+
+def test_history_context_usage_restores_latest_exact_value() -> None:
+    session = Session(session_id="s1", agent_stack=[_frame()])
+    events = [
+        Event(
+            seq=7,
+            session_id="s1",
+            type="context_usage",
+            payload={"used_tokens": 60_237, "token_limit": 200_000},
+        )
+    ]
+
+    assert _history_context_used_tokens(session, events) == 60_237
 
 
 def test_request_model_selector_is_temporary_and_trims_input() -> None:

@@ -947,11 +947,13 @@ def _event_result_summary(tool_name: str, result: Any, is_error: bool) -> dict[s
         if not isinstance(content, str):
             return None
         preview = content[:EVENT_TEXT_PREVIEW_CHARS]
+        offset = result.get("offset", 1)
+        line_start = offset if isinstance(offset, int) and offset > 0 else 1
         return {
             "kind": "read",
             "path": str(result.get("path", "")),
-            "line_start": 1,
-            "line_end": max(1, len(content.splitlines())),
+            "line_start": line_start,
+            "line_end": max(line_start, line_start + len(content.splitlines()) - 1),
             "content": preview,
             "truncated": bool(result.get("truncated", False)) or len(content) > len(preview),
         }
@@ -1142,6 +1144,28 @@ def _emit_cache_hit_event(
     )
 
 
+def _emit_context_usage_event(
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+    frame: Frame,
+    loop: int,
+    turn: AssistantTurn,
+    token_limit: int | None,
+) -> None:
+    """Emit current prompt usage against the configured context limit."""
+    used = turn.total_input_tokens
+    if event_callback is None or used is None or used < 0 or token_limit is None or token_limit <= 0:
+        return
+    event_callback(
+        "context_usage",
+        {
+            "frame_id": frame.id,
+            "loop": loop,
+            "used_tokens": used,
+            "token_limit": token_limit,
+        },
+    )
+
+
 def _fallback_callback(
     event_callback: Callable[[str, dict[str, Any]], None] | None,
     frame_id: str,
@@ -1192,6 +1216,7 @@ async def run_turn(
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
     cache_engine: CacheDecisionEngine | None = None,
     cache_metrics: CacheMetricsCollector | None = None,
+    context_token_limit: int | None = None,
 ) -> StepResult:
     """驱动当前会话的活跃帧完成一轮（或多轮）编排循环。
 
@@ -1325,6 +1350,7 @@ async def run_turn(
 
         frame.messages.append(turn.raw_message)
         _record_cache_metrics(cache_metrics, cache_decision, turn)
+        _emit_context_usage_event(event_callback, frame, loop_index + 1, turn, context_token_limit)
         _emit_cache_hit_event(event_callback, frame, loop_index + 1, turn)
 
         if not turn.tool_calls:

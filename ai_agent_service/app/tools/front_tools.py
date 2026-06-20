@@ -253,6 +253,46 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="apply_text_edit",
+            domain="program",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="diff",
+            path_args=["path"],
+            schema={
+                "name": "apply_text_edit",
+                "description": (
+                    "Apply a precise find-and-replace edit to an existing text file, instead of rewriting "
+                    "the whole file with propose_script_edit. `old_string` must be copied verbatim from a "
+                    "previous read_file/read_script result for this exact path (calling this before ever "
+                    "reading the file is rejected). old_string must match exactly once unless replace_all "
+                    "is set; if it matches zero or multiple times, include more surrounding context instead."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "path": {"type": "string", "description": "Relative file path."},
+                        "old_string": {
+                            "type": "string",
+                            "description": "Exact text to find, copied verbatim from a prior read.",
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Replacement text.",
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace every occurrence instead of requiring a unique match. Defaults to false.",
+                        },
+                    },
+                    ["path", "old_string", "new_string"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="read_debugger_errors",
             domain="program",
             side="front",

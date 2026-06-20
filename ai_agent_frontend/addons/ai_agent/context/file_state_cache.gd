@@ -14,6 +14,13 @@ func get_state(path: String) -> Dictionary:
 	return _states.get(path, {})
 
 
+## 是否曾经为该路径做过任意一次快照（read_file/write_file 都会打快照）。
+## 用于强制"先 read 再 apply_text_edit"——没有任何已知状态时拒绝局部编辑，
+## 避免模型凭空猜测 old_string 改出一个它从未真正看过的文件。
+func has_state(path: String) -> bool:
+	return _states.has(path)
+
+
 ## 只比较内容哈希，不比较 mtime：哈希相同就意味着字节内容完全没变，写入不会
 ## 覆盖任何人的修改，这种情况下没有"过期"可言。之前还要求 mtime 也相同，结果是
 ## 即使内容字节不差，只要文件系统/索引/同步进程之类的东西把 mtime 碰了一下

@@ -10,6 +10,12 @@ const MAX_SYSTEM_COMMAND_CHARS := 100000
 const MAX_SYSTEM_COMMAND_OUTPUT_CHARS := 200000
 const GIT_COMMAND_TIMEOUT_MS := 15000
 
+# 单次扫描最多读取的行数（与服务端 read_file.py 的分页语义保持一致），
+# 避免超大文件一次性把整份内容拼进字符串数组。
+const MAX_READ_SCAN_LINES := 200000
+const DEFAULT_READ_LIMIT_LINES := 2000
+const MAX_READ_LIMIT_LINES := 20000
+
 
 static func read_file(input: Dictionary, file_state_cache: Node = null) -> Dictionary:
 	var path := PathUtils.to_res_path(str(input.get("path", "")))
@@ -17,16 +23,182 @@ static func read_file(input: Dictionary, file_state_cache: Node = null) -> Dicti
 		return {"ok": false, "message": "path is required"}
 	if not PathUtils.is_read_allowed(path):
 		return {"ok": false, "message": "reading this path is not allowed: " + path, "error_code": "read_denied"}
-	if not FileAccess.file_exists(ProjectSettings.globalize_path(path)):
+	var absolute := ProjectSettings.globalize_path(path)
+	if not FileAccess.file_exists(absolute):
 		return {"ok": false, "message": "file does not exist", "path": path}
-	var content := FileAccess.get_file_as_string(ProjectSettings.globalize_path(path))
+
+	var offset := int(input.get("offset", 1))
+	if offset < 1:
+		offset = 1
+	var limit := int(input.get("limit", DEFAULT_READ_LIMIT_LINES))
+	if limit < 1:
+		limit = DEFAULT_READ_LIMIT_LINES
+	limit = min(limit, MAX_READ_LIMIT_LINES)
+
+	var file := FileAccess.open(absolute, FileAccess.READ)
+	if file == null:
+		return {
+			"ok": false,
+			"message": "failed to open file: %s" % error_string(FileAccess.get_open_error()),
+			"error_code": "open_failed",
+			"path": path
+		}
+
+	# 逐行流式读取，而不是把整份文件一次性读进内存再切片：超大文件也只在
+	# 扫描上限内消耗内存，offset/limit 之外的内容对本次调用不可见。
+	var lines: Array[String] = []
+	var line_no := 0
+	var scan_truncated := false
+	var has_more := false
+	while file.get_position() < file.get_length():
+		var line := file.get_line()
+		line_no += 1
+		if line_no > MAX_READ_SCAN_LINES:
+			scan_truncated = true
+			break
+		if line_no < offset:
+			continue
+		if lines.size() >= limit:
+			has_more = true
+			continue
+		lines.append(line)
+	file.close()
+
+	var content := "\n".join(lines)
 	if file_state_cache != null:
 		file_state_cache.snapshot(path, true)
 	return {
 		"ok": true,
 		"path": path,
-		"content": content
+		"content": content,
+		"offset": offset,
+		"limit": limit,
+		"lines_returned": lines.size(),
+		"total_lines_scanned": line_no,
+		"has_more": has_more,
+		"scan_truncated": scan_truncated,
+		"truncated": has_more or scan_truncated
 	}
+
+
+static func apply_text_edit(input: Dictionary, undo_manager: Node, file_state_cache: Node, editor_interface: EditorInterface = null) -> Dictionary:
+	var path := PathUtils.to_res_path(str(input.get("path", "")))
+	var old_string := str(input.get("old_string", ""))
+	var new_string := str(input.get("new_string", ""))
+	var replace_all := bool(input.get("replace_all", false))
+	if path == "":
+		return {"ok": false, "message": "path is required"}
+	if old_string == "":
+		return {"ok": false, "message": "old_string must not be empty", "error_code": "invalid_old_string"}
+	if not PathUtils.is_write_allowed(path):
+		FrontendLogger.warn(editor_interface, "ProgramTools", "Blocked edit outside allowed paths.", {"path": path})
+		return {"ok": false, "message": "writing to this path is not allowed: " + path, "error_code": "write_denied"}
+
+	# 必须先有一次 read_file/write_file 留下的快照才允许局部编辑，否则模型可能
+	# 凭空构造一个从未真正读过的 old_string，把"猜测性编辑"伪装成精确匹配。
+	if file_state_cache == null or not file_state_cache.has_state(path):
+		return {
+			"ok": false,
+			"message": "must read_file before apply_text_edit: " + path,
+			"error_code": "not_read",
+			"path": path
+		}
+
+	var absolute := ProjectSettings.globalize_path(path)
+	if not FileAccess.file_exists(absolute):
+		return {"ok": false, "message": "file does not exist", "path": path, "error_code": "not_found"}
+
+	if file_state_cache.is_stale(path):
+		var current_content := FileAccess.get_file_as_string(absolute)
+		if current_content.length() > MAX_STALE_CONTENT_CHARS:
+			current_content = current_content.left(MAX_STALE_CONTENT_CHARS) + "\n\n... (content truncated)"
+		file_state_cache.snapshot(path, true)
+		FrontendLogger.warn(editor_interface, "ProgramTools", "Rejected edit of stale file.", {"path": path})
+		return {
+			"ok": false,
+			"message": (
+				"file changed on disk since it was last read: " + path
+				+ ". The up-to-date content is included as `current_content` below — "
+				+ "use it directly to construct your next edit instead of calling read_file again."
+			),
+			"error_code": "file_stale",
+			"path": path,
+			"current_content": current_content
+		}
+
+	var before_text := FileAccess.get_file_as_string(absolute)
+	var match_count := _count_occurrences(before_text, old_string)
+	if match_count == 0:
+		return {
+			"ok": false,
+			"message": "old_string not found in file: " + path,
+			"error_code": "old_string_not_found",
+			"path": path
+		}
+	if match_count > 1 and not replace_all:
+		return {
+			"ok": false,
+			"message": "old_string matches %d times; pass replace_all=true or include more surrounding context to make old_string unique" % match_count,
+			"error_code": "ambiguous_match",
+			"match_count": match_count,
+			"path": path
+		}
+
+	var after_text: String
+	if replace_all:
+		after_text = before_text.replace(old_string, new_string)
+	else:
+		var idx := before_text.find(old_string)
+		after_text = before_text.substr(0, idx) + new_string + before_text.substr(idx + old_string.length())
+
+	if undo_manager == null:
+		return {"ok": false, "message": "undo manager is not available"}
+
+	var write_error: Error = undo_manager.record_file_write(path, before_text, after_text)
+	if write_error != OK:
+		FrontendLogger.error(editor_interface, "ProgramTools", "Failed to apply text edit.", {
+			"path": path,
+			"error": write_error,
+		})
+		return {
+			"ok": false,
+			"message": "failed to write file: %s" % error_string(write_error),
+			"error_code": "write_failed",
+			"path": path
+		}
+
+	var after_state := {}
+	if file_state_cache != null:
+		after_state = file_state_cache.snapshot(path, true)
+
+	FrontendLogger.info(editor_interface, "ProgramTools", "Applied text edit.", {
+		"path": path,
+		"match_count": match_count,
+		"replace_all": replace_all,
+	})
+	return {
+		"ok": true,
+		"path": path,
+		"replaced_count": match_count if replace_all else 1,
+		"before_hash": before_text.sha256_text(),
+		"after_hash": after_state.get("hash", after_text.sha256_text()),
+		"mtime_ns": after_state.get("mtime_ns", 0),
+		"known_full_read": true
+	}
+
+
+static func _count_occurrences(haystack: String, needle: String) -> int:
+	if needle == "":
+		return 0
+	var count := 0
+	var pos := 0
+	while true:
+		var idx := haystack.find(needle, pos)
+		if idx == -1:
+			break
+		count += 1
+		pos = idx + needle.length()
+	return count
 
 
 static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: Node, editor_interface: EditorInterface = null) -> Dictionary:
