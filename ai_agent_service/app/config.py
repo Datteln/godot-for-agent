@@ -68,6 +68,14 @@ class AppSettings(BaseSettings):
         default_factory=lambda: Path("logs"),
         description="日志文件存储目录，相对路径相对于 project_root。",
     )
+    managed_process: bool = Field(
+        default=False,
+        description=(
+            "是否由 Godot 插件通过 `OS.execute_with_pipe` 启动并持有 stdio 管道。"
+            "该管道目前没有被消费方读取，写满后会让控制台 handler 的下一次写入"
+            "永久阻塞、冻住整个事件循环；此时禁用控制台日志，只保留文件日志。"
+        ),
+    )
 
     project_root: Path = Field(
         default_factory=Path.cwd,
@@ -156,6 +164,7 @@ class AppSettings(BaseSettings):
     asset_understanding_api_key: SecretStr = Field(default=SecretStr(""))
     asset_understanding_timeout_s: float = Field(default=10.0, ge=0.1)
     asset_understanding_max_tokens: int = Field(default=500, ge=1)
+    asset_understanding_concurrency: int = Field(default=3, ge=1, le=16)
     output_styles_dir: Path = Field(
         default_factory=lambda: Path(".ai_agent") / "output_styles",
         description="项目级 OutputStyle 目录；未信任工程默认不启用项目级样式。",

@@ -51,6 +51,7 @@ app/query/__init__.py
 app/query/engine.py
 app/rag/__init__.py
 app/rag/asset_llm_client.py
+app/rag/build_manager.py
 app/rag/embedding_client.py
 app/rag/embedding_index.py
 app/rag/factory.py
@@ -77,6 +78,8 @@ app/sessions/store.py
 app/skills/__init__.py
 app/skills/catalog.py
 app/skills/types.py
+app/storage/__init__.py
+app/storage/atomic.py
 app/tools/__init__.py
 app/tools/context.py
 app/tools/front_tools.py
@@ -90,7 +93,16 @@ app/tools/server_tools/search_codebase.py
 app/tools/server_tools/search_tools.py
 app/verify/__init__.py
 app/verify/syntax_check.py
+tests/test_auto_compact.py
+tests/test_commands.py
 tests/test_context_cache.py
+tests/test_deferred_godot_tools.py
 tests/test_ears.py
+tests/test_execute_gd_script_tool.py
+tests/test_extended_godot_tools.py
 tests/test_history_blocks.py
 tests/test_history_repairs.py
+tests/test_map_tool.py
+tests/test_runtime_hardening.py
+tests/test_scene_mutation_tools.py
+tests/test_system_command_tool.py

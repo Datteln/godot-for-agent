@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import mimetypes
 import re
 import time
 from collections import Counter
@@ -16,7 +17,7 @@ from app.rag.models import GraphEdge, GraphNode, SearchResult
 
 logger = logging.getLogger(__name__)
 
-_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".bmp"}
+_DESCRIPTION_PIPELINE_VERSION = 2
 _AUDIO = {".wav", ".mp3", ".ogg", ".flac"}
 _RESOURCE = {".tscn", ".tres", ".res", ".anim"}
 _TEXT = {".gd", ".cs", ".json", ".cfg", ".md", ".txt", ".ini", ".gdshader", ".import"}
@@ -28,8 +29,10 @@ def _token_counts(text: str) -> Counter[str]:
 
 
 def classify_asset(path: Path | str) -> str:
-    suffix = Path(path).suffix.lower()
-    if suffix in _IMAGE:
+    asset_path = Path(path)
+    suffix = asset_path.suffix.lower()
+    mime = mimetypes.guess_type(asset_path.name)[0]
+    if mime is not None and mime.startswith("image/"):
         return "image"
     if suffix in _AUDIO:
         return "audio"
@@ -71,18 +74,32 @@ class AssetIndex:
             for ref in _REF.findall(text):
                 usage.setdefault(ref, []).append(rel_scene)
         self.assets = {key: value for key, value in self.assets.items() if key in asset_files}
+        pending: list[tuple[str, Path, int, int, str]] = []
         for rel, file in list(asset_files.items())[:max_files]:
             stat = file.stat()
             old = self.assets.get(rel)
-            if old and incremental and old.get("mtime_ns") == stat.st_mtime_ns and old.get("size_bytes") == stat.st_size:
+            if (
+                old
+                and incremental
+                and old.get("mtime_ns") == stat.st_mtime_ns
+                and old.get("size_bytes") == stat.st_size
+                and old.get("description_pipeline_version") == _DESCRIPTION_PIPELINE_VERSION
+            ):
                 old["used_by"] = sorted(usage.get(rel, []))
                 continue
             type_hint = classify_asset(file)
-            description = self.llm_client.describe(file, type_hint)
+            pending.append((rel, file, stat.st_size, stat.st_mtime_ns, type_hint))
+        descriptions = self.llm_client.describe_many(
+            [(file, type_hint) for _, file, _, _, type_hint in pending]
+        )
+        for (rel, file, size_bytes, mtime_ns, type_hint), description in zip(
+            pending, descriptions, strict=True
+        ):
             self.assets[rel] = {
                 "asset": rel, "extension": file.suffix.lower(), "type_hint": type_hint,
-                "used_by": sorted(usage.get(rel, [])), "size_bytes": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns, "description": description,
+                "used_by": sorted(usage.get(rel, [])), "size_bytes": size_bytes,
+                "mtime_ns": mtime_ns, "description": description,
+                "description_pipeline_version": _DESCRIPTION_PIPELINE_VERSION,
             }
         self._rebuild_graph()
         self._save()

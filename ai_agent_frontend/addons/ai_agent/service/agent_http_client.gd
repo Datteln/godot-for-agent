@@ -320,7 +320,11 @@ func _pump() -> void:
 
 
 func _timeout_for_path(path: String) -> float:
-	if path == "/chat":
+	# `rebuild_index` 扫描全项目文件并逐块调用 embedding（可能还有 asset
+	# 理解模型），耗时量级和 `/chat` 一样，不是 `/doctor`、`/memory` 这类该
+	# 秒回的轻量端点。套用和它们一样的默认 30s 超时，只会让正常的大项目重建
+	# 索引在后端还在跑的时候就被前端误判成"卡住"。
+	if path == "/chat" or path == "/commands/rebuild_index":
 		var chat_value := float(_setting("ai_agent/chat_request_timeout_sec"))
 		return chat_value if chat_value > 0.0 else DEFAULT_CHAT_REQUEST_TIMEOUT_S
 	var value := float(_setting("ai_agent/request_timeout_sec"))

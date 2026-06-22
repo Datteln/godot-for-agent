@@ -1422,20 +1422,18 @@ def _structured_session_history(session_frames: list[Frame], events: list[Event]
         else:
             normalized_events.append(event)
 
+    # 按 timeline_frame_id 建一次索引，避免对每个 frame 都重新扫描全部
+    # events（原实现是 O(frames * events)，长会话/大量 delegate_many 子
+    # agent frame 叠加大事件日志时会让 session_history 卡到几十秒）。
+    events_by_frame: dict[str, list[Event]] = {}
+    for event in normalized_events:
+        key = str(event.payload.get("timeline_frame_id", event.payload.get("frame_id", "")))
+        events_by_frame.setdefault(key, []).append(event)
+
     blocks: list[SessionHistoryBlock] = []
     claimed_event_ids: set[int] = set()
     for frame in session_frames:
-        frame_events = [
-            event
-            for event in normalized_events
-            if str(
-                event.payload.get(
-                    "timeline_frame_id",
-                    event.payload.get("frame_id", ""),
-                )
-            )
-            == frame.id
-        ]
+        frame_events = events_by_frame.get(frame.id, [])
         claimed_event_ids.update(id(event) for event in frame_events)
         blocks.extend(_structured_history_for_frame(frame, frame_events))
     for event in normalized_events:
@@ -1555,20 +1553,32 @@ class QueryEngine:
         events = _persisted_history_events(session)
         if not events and self._events is not None:
             events = self._events.list_after(session_id, 0)
-        blocks = _structured_session_history(session.agent_stack, events)
+        # 下面的逐 frame/event 转换是 O(frames + events) 的纯 Python 工作；长期
+        # 使用的会话（大量 delegate_many 子 agent frame + 持续累积的事件日志）
+        # 不加界会让这一步随历史总量无限增长，最终触发前端 30s 看门狗超时、把
+        # 本来该串行复用的请求队列卡死。既然最终只展示最近 `limit` 条，这里先
+        # 把输入收窄到最近窗口再转换，而不是转换全量历史后再丢弃大半。
+        if limit > 0:
+            recent_frames = session.agent_stack[-limit:]
+            recent_events = events[-(limit * 8) :] if len(events) > limit * 8 else events
+        else:
+            recent_frames = session.agent_stack
+            recent_events = events
+        blocks = _structured_session_history(recent_frames, recent_events)
         items: list[SessionHistoryItemDTO] = []
-        for frame in session.agent_stack:
+        for frame in recent_frames:
             items.extend(_history_items_for_frame(frame))
         seen = {_history_text_fingerprint(item.text) for item in items}
-        if events:
-            items.extend(_history_items_for_events(events, seen))
+        if recent_events:
+            items.extend(_history_items_for_events(recent_events, seen))
         if limit > 0 and len(items) > limit:
             items = items[-limit:]
         if limit > 0 and len(blocks) > limit:
             blocks = blocks[-limit:]
         logger.info(
-            "Session history requested session=%s frames=%d items=%d blocks=%d pending=%s",
+            "Session history requested session=%s frames=%d/%d items=%d blocks=%d pending=%s",
             session_id,
+            len(recent_frames),
             len(session.agent_stack),
             len(items),
             len(blocks),

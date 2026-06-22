@@ -56,12 +56,17 @@ class _SafeRotatingFileHandler(RotatingFileHandler):
         self.stream = self._open()
 
 
-def configure_logging(level: str, log_dir: Path | None = None) -> None:
+def configure_logging(level: str, log_dir: Path | None = None, console: bool = True) -> None:
     """配置进程级日志输出，同时写入控制台与文件（若指定 log_dir）。
 
     Args:
         level: 日志等级字符串。
         log_dir: 日志文件存储目录；为 None 时仅输出到控制台。
+        console: 是否附加控制台 handler。Godot 插件通过 `OS.execute_with_pipe`
+            启动本进程时，stdout/stderr 管道没有消费方在读取；管道写满后
+            控制台 handler 的下一次写入会永久阻塞、冻住整个事件循环（所有
+            HTTP 请求都会因此卡死)。这种受管进程必须传 `console=False`，
+            只依赖文件日志。
     """
     normalized = normalize_log_level(level)
     root = logging.getLogger()
@@ -74,10 +79,11 @@ def configure_logging(level: str, log_dir: Path | None = None) -> None:
     formatter = logging.Formatter(_DEFAULT_FORMAT)
 
     # 控制台输出
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(normalized)
-    console_handler.setFormatter(formatter)
-    root.addHandler(console_handler)
+    if console:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(normalized)
+        console_handler.setFormatter(formatter)
+        root.addHandler(console_handler)
 
     # 文件输出（带 Windows 安全轮转）
     if log_dir is not None:

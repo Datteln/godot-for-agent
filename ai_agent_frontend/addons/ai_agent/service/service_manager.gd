@@ -32,7 +32,8 @@ const RAG_ENV_SETTINGS := {
 	"AI_AGENT_ASSET_UNDERSTANDING_ENDPOINT": "ai_agent/asset_understanding_endpoint",
 	"AI_AGENT_ASSET_UNDERSTANDING_API_KEY": "ai_agent/asset_understanding_api_key",
 	"AI_AGENT_ASSET_UNDERSTANDING_TIMEOUT_S": "ai_agent/asset_understanding_timeout_s",
-	"AI_AGENT_ASSET_UNDERSTANDING_MAX_TOKENS": "ai_agent/asset_understanding_max_tokens"
+	"AI_AGENT_ASSET_UNDERSTANDING_MAX_TOKENS": "ai_agent/asset_understanding_max_tokens",
+	"AI_AGENT_ASSET_UNDERSTANDING_CONCURRENCY": "ai_agent/asset_understanding_concurrency"
 }
 
 var editor_interface: EditorInterface
@@ -118,6 +119,13 @@ func _start_python_service() -> void:
 	var old_llm_fallback_model := OS.get_environment("AI_AGENT_LLM_FALLBACK_MODEL")
 	var old_llm_timeout := OS.get_environment("AI_AGENT_LLM_REQUEST_TIMEOUT_S")
 	var old_rag_environment := _capture_environment(RAG_ENV_SETTINGS.keys())
+	var old_managed_process := OS.get_environment("AI_AGENT_MANAGED_PROCESS")
+	# 子进程的 stdout/stderr 由 `execute_with_pipe()` 的 stdio 管道持有，本插件
+	# 只用它给子进程写入 token，从不读取输出。管道写满后子进程下一次写日志会
+	# 永久阻塞、冻住它的事件循环，导致所有 HTTP 请求（包括 /chat/interrupt、
+	# /doctor）都卡死。告诉后端它是被管理的子进程，让它跳过控制台 handler，
+	# 只写文件日志。
+	OS.set_environment("AI_AGENT_MANAGED_PROCESS", "1")
 	OS.set_environment("AI_AGENT_PROJECT_ROOT", ProjectSettings.globalize_path("res://"))
 	OS.set_environment("AI_AGENT_PORT", _port_from_url(base_url))
 	OS.set_environment("PYTHONPATH", module_dir + _path_separator() + old_pythonpath)
@@ -131,6 +139,7 @@ func _start_python_service() -> void:
 		"base_url": base_url
 	})
 	var pipe := OS.execute_with_pipe(python, args)
+	OS.set_environment("AI_AGENT_MANAGED_PROCESS", old_managed_process)
 	OS.set_environment("AI_AGENT_PROJECT_ROOT", old_project_root)
 	OS.set_environment("AI_AGENT_PORT", old_port)
 	OS.set_environment("PYTHONPATH", old_pythonpath)

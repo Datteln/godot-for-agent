@@ -40,6 +40,7 @@ def create_codebase_index(settings: AppSettings, security: SecuritySettings) -> 
         api_key=settings.asset_understanding_api_key.get_secret_value(),
         timeout_s=settings.asset_understanding_timeout_s,
         max_tokens=settings.asset_understanding_max_tokens,
+        concurrency=settings.asset_understanding_concurrency,
     ))
     return CodebaseIndex(
         security,

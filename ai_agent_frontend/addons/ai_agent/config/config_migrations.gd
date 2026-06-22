@@ -44,6 +44,7 @@ const DEFAULTS := {
 	"ai_agent/asset_understanding_api_key": "",
 	"ai_agent/asset_understanding_timeout_s": 10.0,
 	"ai_agent/asset_understanding_max_tokens": 500,
+	"ai_agent/asset_understanding_concurrency": 3,
 	"ai_agent/log_level": "info",
 	"ai_agent/log_to_file": true,
 	"ai_agent/log_file_path": "res://logs/ai_agent_frontend.log",
@@ -137,6 +138,10 @@ const PROPERTY_HINTS := {
 	"ai_agent/asset_understanding_max_tokens": {
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "1,4096,1,suffix:tokens"
+	},
+	"ai_agent/asset_understanding_concurrency": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,16,1"
 	},
 	"ai_agent/log_level": {
 		"hint": PROPERTY_HINT_ENUM,

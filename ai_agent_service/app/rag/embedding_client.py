@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 # 5xx 时连续立即重试反而加重故障（§P3 重试无退避）。
 _RETRY_BASE_DELAY_S = 0.2
 _RETRY_MAX_DELAY_S = 2.0
+_OPENAI_MAX_BATCH_SIZE = 10
 
 
 def _retry_delay_s(attempt: int) -> float:
@@ -50,6 +51,33 @@ class EmbeddingClient:
     def available(self) -> bool:
         return self._encoder is not None or self.config.provider.lower() in {"openai", "local", "bge-m3"}
 
+    def _embed_openai(self, texts: Sequence[str]) -> list[list[float]]:
+        """按兼容接口上限分批请求 Embedding，并保持输入输出顺序一致。"""
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=self.config.api_key,
+            base_url=self.config.endpoint,
+            timeout=self.config.timeout_s,
+        )
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), _OPENAI_MAX_BATCH_SIZE):
+            batch = list(texts[start : start + _OPENAI_MAX_BATCH_SIZE])
+            response = client.embeddings.create(model=self.config.model, input=batch)
+            ordered = sorted(response.data, key=lambda item: item.index)
+            if len(ordered) != len(batch):
+                raise ValueError(
+                    f"Embedding 返回数量不匹配: requested={len(batch)} received={len(ordered)}"
+                )
+            vectors.extend([list(item.embedding) for item in ordered])
+            logger.debug(
+                "Embedding batch complete model=%s batch_start=%d batch_size=%d",
+                self.config.model,
+                start,
+                len(batch),
+            )
+        return vectors
+
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts or not self.available:
             logger.debug(
@@ -76,15 +104,7 @@ class EmbeddingClient:
                     return vectors
                 provider = self.config.provider.lower()
                 if provider == "openai":
-                    from openai import OpenAI
-
-                    client = OpenAI(
-                        api_key=self.config.api_key,
-                        base_url=self.config.endpoint,
-                        timeout=self.config.timeout_s,
-                    )
-                    response = client.embeddings.create(model=self.config.model, input=list(texts))
-                    vectors = [list(item.embedding) for item in response.data]
+                    vectors = self._embed_openai(texts)
                     logger.debug(
                         "Embedding request complete provider=openai model=%s texts=%d dimensions=%d "
                         "attempt=%d elapsed_ms=%.3f",
@@ -128,9 +148,15 @@ class EmbeddingClient:
         return []
 
     async def embed_async(self, texts: Sequence[str]) -> list[list[float]]:
+        """在线程池执行 Embedding，并按实际批次数计算整体超时。"""
+        attempts = max(1, min(self.config.retries + 1, 3))
+        batch_count = 1
+        if self._encoder is None and self.config.provider.lower() == "openai":
+            batch_count = max(1, (len(texts) + _OPENAI_MAX_BATCH_SIZE - 1) // _OPENAI_MAX_BATCH_SIZE)
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self.embed, texts), timeout=self.config.timeout_s * max(1, self.config.retries + 1)
+                asyncio.to_thread(self.embed, texts),
+                timeout=self.config.timeout_s * attempts * batch_count,
             )
         except (TimeoutError, asyncio.TimeoutError):
             logger.warning("Embedding timed out; falling back to keyword retrieval")
