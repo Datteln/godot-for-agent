@@ -110,6 +110,9 @@ class ChatRequest(BaseModel):
     output_style: str | None = None
     model: str | None = None
     tool_results: list[ToolResult] | None = None
+    compact_summary_use_llm: bool | None = None
+    """本轮自动压缩是否用 LLM 语义压缩摘要：None 时沿用服务端
+    `compact_summary_use_llm` 配置，True/False 时仅对本次请求覆盖该配置。"""
 
 
 class FrontToolCallDTO(BaseModel):

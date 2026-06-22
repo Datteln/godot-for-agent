@@ -208,7 +208,8 @@ def compute_rag_fingerprint(rag_index_path: Path | None, query: str = "") -> str
     if isinstance(file_states, dict) and file_states:
         state = "\n".join(
             f"{path}:{value.get('size', 0)}:{value.get('mtime_ns', 0)}"
-            for path, value in sorted(file_states.items()) if isinstance(value, dict)
+            for path, value in sorted(file_states.items())
+            if isinstance(value, dict)
         )
     else:
         # Legacy indexes still use content rather than coarse filesystem metadata.
@@ -262,6 +263,7 @@ def build_cache_key(
     tool_schema_version: str,
     repo_fingerprint: str,
     project_id: str = "",
+    compact_digest: str = "",
     rag_fingerprint: str = "",
     scene_graph_version: str = "none",
     asset_graph_version: str = "none",
@@ -273,13 +275,22 @@ def build_cache_key(
         tool_schema_version: 当前可见工具 schema 的哈希。
         repo_fingerprint: 当前工程根目录的状态指纹。
         project_id: 工程标识（见 `compute_project_id`）。
+        compact_digest: 当前帧压缩快照的内容指纹；未压缩时为空。
         rag_fingerprint: RAG 索引指纹（见 `compute_rag_fingerprint`）。
 
     Returns:
         各维度拼接后的 sha256 摘要；不会出现在发给 LLM 端点的请求体里。
     """
     material = ":".join(
-        [system_core_hash, tool_schema_version, repo_fingerprint, project_id,
-         scene_graph_version, asset_graph_version, rag_fingerprint]
+        [
+            system_core_hash,
+            tool_schema_version,
+            repo_fingerprint,
+            project_id,
+            compact_digest,
+            scene_graph_version,
+            asset_graph_version,
+            rag_fingerprint,
+        ]
     )
     return hashlib.sha256(material.encode()).hexdigest()

@@ -89,6 +89,35 @@ def resolve_effective_tools(agent: AgentDefinition, available_tools: set[str]) -
 
 
 @dataclass
+class CompactSnapshot:
+    """保存单个 Agent 帧的持久化会话压缩快照。
+
+    Attributes:
+        revision: 当前帧单调递增的压缩版本。
+        digest: 规范化摘要文本的 SHA-256 指纹。
+        summary: 不含 system content-block 包装的压缩摘要正文。
+        created_at: UTC ISO-8601 创建时间。
+        source_message_count: 本次摘要合并的旧消息数量。
+        removed_message_count: 本次从活跃历史移除的消息数量。
+        keep_recent: 压缩后保留的最近消息数量。
+        estimated_tokens_before: 压缩前的预估 token 数。
+        estimated_tokens_after: 压缩后的预估 token 数。
+        triggered_by: 压缩来源，通常为 ``manual`` 或 ``auto``。
+    """
+
+    revision: int
+    digest: str
+    summary: str
+    created_at: str
+    source_message_count: int
+    removed_message_count: int
+    keep_recent: int
+    estimated_tokens_before: int
+    estimated_tokens_after: int
+    triggered_by: Literal["manual", "auto"]
+
+
+@dataclass
 class Frame:
     """Agent 帧：会话内 `agent_stack` 的一个元素（§6.2 / 详设 A §2.2）。
 
@@ -105,6 +134,7 @@ class Frame:
         depth: 帧深度，根帧为 0，供 `MAX_DEPTH` 防御性约束使用（M2+）。
         active_deferred_tools: 本帧通过 `search_tools` 激活的 deferred 工具名；
             只在本帧内生效，不提升权限、不跨 agent 继承。
+        compact_snapshot: 当前帧最近一次有效压缩的持久化快照；未压缩时为 None。
     """
 
     id: str
@@ -118,3 +148,4 @@ class Frame:
     active_deferred_tools: set[str] = field(default_factory=set)
     history_anchor_frame_id: str | None = None
     history_anchor_message_index: int | None = None
+    compact_snapshot: CompactSnapshot | None = None

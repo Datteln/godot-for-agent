@@ -21,6 +21,8 @@ const DEFAULTS := {
 	"ai_agent/llm_advisor_model": "",
 	"ai_agent/llm_fallback_model": "",
 	"ai_agent/llm_request_timeout_s": 60.0,
+	"ai_agent/compact_summary_use_llm": "default",
+	"ai_agent/compact_summary_model": "",
 	"ai_agent/request_timeout_sec": 30.0,
 	"ai_agent/chat_request_timeout_sec": 300.0,
 	"ai_agent/embedding_provider": "disabled",
@@ -78,6 +80,10 @@ const PROPERTY_HINTS := {
 	"ai_agent/effort": {
 		"hint": PROPERTY_HINT_ENUM,
 		"hint_string": "quick,standard,deep,verify,advisor"
+	},
+	"ai_agent/compact_summary_use_llm": {
+		"hint": PROPERTY_HINT_ENUM,
+		"hint_string": "default,on,off"
 	},
 	"ai_agent/llm_api_key": {
 		"hint": PROPERTY_HINT_PASSWORD,

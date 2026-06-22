@@ -65,7 +65,14 @@ COMMANDS: list[CommandInfo] = [
         description="压缩指定 session 的早期上下文，保留 pending 与 agent_stack。",
         args_schema={
             "type": "object",
-            "properties": {"keep_recent": {"type": "integer", "default": 12}},
+            "properties": {
+                "keep_recent": {"type": "integer", "default": 12},
+                "use_llm": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "本次压缩摘要是否调用 LLM 语义压缩；省略时沿用服务端配置。",
+                },
+            },
         },
     ),
     CommandInfo(
@@ -289,7 +296,10 @@ def create_router(
             if keep_recent is None or keep_recent <= 0:
                 logger.warning("Command compact rejected: invalid keep_recent")
                 return _err("keep_recent 必须是正整数")
-            result = await query_engine.compact(request.session_id, keep_recent=keep_recent)
+            use_llm = _bool_argument(request.args.get("use_llm"))
+            result = await query_engine.compact(
+                request.session_id, keep_recent=keep_recent, use_llm=use_llm
+            )
             return CommandResponse(ok=True, text="compact 已完成", result=result)
         if name == "set_effort":
             if request.session_id is None:
@@ -378,4 +388,24 @@ def _integer_argument(value: object) -> int | None:
         return value
     if isinstance(value, float) and value.is_integer():
         return int(value)
+    return None
+
+
+def _bool_argument(value: object) -> bool | None:
+    """把命令参数解析为可选布尔值：缺省/无法识别时返回 None（表示沿用配置）。
+
+    兼容前端可能传入的真布尔、整数 0/1 与字符串（如 ``"true"``/``"false"``）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
     return None

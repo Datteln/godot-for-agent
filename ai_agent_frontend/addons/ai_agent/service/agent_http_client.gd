@@ -109,7 +109,8 @@ func send_user_message(text: String, context: Dictionary, model = null) -> void:
 		"output_style": _setting("ai_agent/output_style"),
 		"model": model,
 		"engine_version": Engine.get_version_info().get("string", ""),
-		"language_hint": _language_hint()
+		"language_hint": _language_hint(),
+		"compact_summary_use_llm": _compact_summary_use_llm_override()
 	}
 	_enqueue("POST", "/chat", payload)
 
@@ -123,9 +124,22 @@ func send_tool_results(results: Array, model = null) -> void:
 		"session_id": _session_id(),
 		"request_id": _new_request_id(),
 		"model": model,
-		"tool_results": results
+		"tool_results": results,
+		"compact_summary_use_llm": _compact_summary_use_llm_override()
 	}
 	_enqueue("POST", "/chat", payload)
+
+
+func _compact_summary_use_llm_override() -> Variant:
+	# 三态配置项映射为 ChatRequest.compact_summary_use_llm 的 None/True/False：
+	# "default" 时传 null，沿用服务端 `compact_summary_use_llm` 配置。
+	match str(_setting("ai_agent/compact_summary_use_llm")):
+		"on":
+			return true
+		"off":
+			return false
+		_:
+			return null
 
 
 func reset_session() -> void:

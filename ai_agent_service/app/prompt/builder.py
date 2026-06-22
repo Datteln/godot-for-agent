@@ -39,24 +39,14 @@ def build_system_prompt(
     if output_style_catalog is not None:
         style = output_style_catalog.get(output_style_id)
         if style is not None and style.enabled:
-            parts.append(
-                "当前 OutputStyle "
-                + style.qualified_name
-                + ":\n"
-                + style.body
-            )
+            parts.append("当前 OutputStyle " + style.qualified_name + ":\n" + style.body)
 
     if skill_catalog is not None:
         preloaded: list[str] = []
         for name in agent.skills:
             skill = skill_catalog.get(name)
             if skill is not None and skill.enabled:
-                preloaded.append(
-                    "预加载 Skill "
-                    + skill.qualified_name
-                    + ":\n"
-                    + skill.body
-                )
+                preloaded.append("预加载 Skill " + skill.qualified_name + ":\n" + skill.body)
         if preloaded:
             parts.append("\n\n".join(preloaded))
 
@@ -91,6 +81,8 @@ class LayeredPrompt:
             本帧存活期间几乎不变，缓存收益最高。
         project_context: L2 项目上下文层——repo 摘要/工程文档，跨会话稳定，
             支撑项目级缓存复用；为空时不产出该层。
+        compact_context: 持久化的会话压缩快照，位于项目上下文之后、动态 RAG
+            之前，使压缩后的历史成为可版本化的稳定缓存前缀。
         rag_context: L3 临时上下文层——RAG 检索结果/当前文件等，最易变；为空时
             不产出该层（当前实现默认为空，检索仍走工具，但该层与其独立缓存
             边界已就位）。
@@ -102,11 +94,22 @@ class LayeredPrompt:
     core: str
     project_context: str = ""
     structure_context: str = ""
+    compact_context: str = ""
     rag_context: str = ""
 
     def layers(self) -> list[str]:
-        """返回非空层的有序列表（L0 -> L2 -> L3）。"""
-        return [layer for layer in (self.core, self.project_context, self.structure_context, self.rag_context) if layer.strip()]
+        """返回非空层的有序列表（核心 -> 项目 -> 压缩快照 -> RAG）。"""
+        return [
+            layer
+            for layer in (
+                self.core,
+                self.project_context,
+                self.structure_context,
+                self.compact_context,
+                self.rag_context,
+            )
+            if layer.strip()
+        ]
 
     def to_text(self) -> str:
         """把各层拼成单一字符串（供 `agent.prompt` 等需要纯文本的场景）。"""
@@ -128,6 +131,7 @@ def build_layered_system_prompt(
     output_style_id: str | None = None,
     project_context: str = "",
     structure_context: str = "",
+    compact_context: str = "",
     rag_context: str = "",
 ) -> LayeredPrompt:
     """构造分层 system prompt：L0 复用 `build_system_prompt`，再叠加 L2/L3。
@@ -138,10 +142,17 @@ def build_layered_system_prompt(
         output_style_catalog: OutputStyle 目录索引。
         output_style_id: 当前会话选定的 OutputStyle。
         project_context: L2 项目上下文文本；为空时不产出该层。
+        compact_context: 当前帧的持久化压缩摘要；为空时不产出该层。
         rag_context: L3 临时上下文文本；为空时不产出该层。
 
     Returns:
         分层 prompt；`to_content_blocks()` 用于写入 system 消息以启用多断点缓存。
     """
     core = build_system_prompt(agent, skill_catalog, output_style_catalog, output_style_id)
-    return LayeredPrompt(core=core, project_context=project_context.strip(), structure_context=structure_context.strip(), rag_context=rag_context.strip())
+    return LayeredPrompt(
+        core=core,
+        project_context=project_context.strip(),
+        structure_context=structure_context.strip(),
+        compact_context=compact_context.strip(),
+        rag_context=rag_context.strip(),
+    )

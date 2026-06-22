@@ -12,13 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 from dataclasses import replace
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Literal
 
 from app.agents.bundled import get_agent
-from app.agents.types import Frame
+from app.agents.types import CompactSnapshot, Frame
 from app.api.schemas import (
     ChatErrorResponse,
     ChatFinalResponse,
@@ -99,8 +101,7 @@ def _normalize_model_override(model: str | None) -> str | None:
 def _event_payload_for_log(payload: dict[str, Any]) -> dict[str, Any]:
     """隐藏事件日志中的模型名，不影响发送给 UI 的原始事件。"""
     return {
-        key: "<redacted>" if key in _MODEL_LOG_FIELDS else value
-        for key, value in payload.items()
+        key: "<redacted>" if key in _MODEL_LOG_FIELDS else value for key, value in payload.items()
     }
 
 
@@ -233,7 +234,7 @@ def _brief_message(message: dict[str, Any]) -> str:
                 if isinstance(function, dict):
                     names.append(str(function.get("name", "unknown")))
         return f"assistant 调用了工具：{', '.join(names) if names else 'unknown'}"
-    content = str(message.get("content", ""))
+    content = flatten_message_text(message.get("content"))
     compact = " ".join(content.split())
     if len(compact) > 360:
         compact = compact[:360] + "..."
@@ -258,6 +259,7 @@ _HISTORY_PREVIEW_LIMIT = 2000
 # 足够小，保证截断后的消息再次估算时必然低于阈值（幂等，不会被重复截断）。
 _OVERSIZED_MESSAGE_TOKEN_THRESHOLD = 4000
 _OVERSIZED_MESSAGE_TRUNCATE_CHARS = 3000
+_COMPACT_SUMMARY_MAX_CHARS = 12_000
 
 # 与 chat_panel.gd 中 `_TOOL_DISPLAY_NAMES`/`_format_log_tool_result` 的分组保持一致，
 # 使会话历史里的工具结果摘要能复用前端既有的 "Read"/"Edit"/"Grep" 工作流分组渲染。
@@ -361,7 +363,9 @@ def _format_delegate_group_history_summary(content: dict[str, Any]) -> str:
 
 def _looks_like_delegate_result(content: dict[str, Any]) -> bool:
     """判断工具结果是否是单个 `delegate` 子任务摘要。"""
-    return "summary" in content and set(content.keys()).issubset({"summary", "agent", "frame_id", "error"})
+    return "summary" in content and set(content.keys()).issubset(
+        {"summary", "agent", "frame_id", "error"}
+    )
 
 
 def _format_delegate_history_summary(content: dict[str, Any]) -> str:
@@ -554,7 +558,9 @@ def _format_tool_result_summary(name: str, input_args: dict[str, Any], content: 
         return f"Edit {path}\n+{added} -{removed} lines"
 
     if name in _HISTORY_EDIT_TOOLS:
-        path = str(inner.get("path", input_args.get("path", input_args.get("target_path", "<unknown>"))))
+        path = str(
+            inner.get("path", input_args.get("path", input_args.get("target_path", "<unknown>")))
+        )
         after_text = str(input_args.get("content", input_args.get("after_text", "")))
         before_text = str(input_args.get("before_text", input_args.get("before", "")))
         added = max(_count_lines(after_text) - _count_lines(before_text), 0)
@@ -562,21 +568,38 @@ def _format_tool_result_summary(name: str, input_args: dict[str, Any], content: 
         return f"Edit {path}\n+{added} -{removed} lines"
 
     if name in _HISTORY_GREP_TOOLS:
-        pattern = str(input_args.get("pattern", input_args.get("query", input_args.get("include", ""))))
+        pattern = str(
+            input_args.get("pattern", input_args.get("query", input_args.get("include", "")))
+        )
         escaped_pattern = pattern.replace('"', '\\"')
         return f'Grep "{escaped_pattern}" (in project)'
 
     return _display_tool_content(content)
 
 
-def _history_items_for_frame(frame: Frame, *, include_system_prompt: bool = False) -> list[SessionHistoryItemDTO]:
+def _history_items_for_frame(
+    frame: Frame, *, include_system_prompt: bool = False
+) -> list[SessionHistoryItemDTO]:
     """Convert stored LLM messages into chat-panel friendly history items."""
     items: list[SessionHistoryItemDTO] = []
+    if not include_system_prompt and frame.compact_snapshot is not None:
+        items.append(
+            SessionHistoryItemDTO(
+                role="system",
+                text=frame.compact_snapshot.summary,
+                frame_id=frame.id,
+                agent=frame.agent.name,
+            )
+        )
     tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
     for index, message in enumerate(frame.messages):
         role = str(message.get("role", "system"))
         content = message.get("content", "")
-        text = "" if content is None else str(content)
+        text = (
+            ""
+            if content is None
+            else flatten_message_text(content) if isinstance(content, list) else str(content)
+        )
 
         if role == "system":
             if index == 0 and not include_system_prompt:
@@ -584,7 +607,9 @@ def _history_items_for_frame(frame: Frame, *, include_system_prompt: bool = Fals
             if not text.strip():
                 continue
             items.append(
-                SessionHistoryItemDTO(role="system", text=text, frame_id=frame.id, agent=frame.agent.name)
+                SessionHistoryItemDTO(
+                    role="system", text=text, frame_id=frame.id, agent=frame.agent.name
+                )
             )
             continue
 
@@ -592,14 +617,18 @@ def _history_items_for_frame(frame: Frame, *, include_system_prompt: bool = Fals
             text = _display_user_content(text)
             if text.strip():
                 items.append(
-                    SessionHistoryItemDTO(role="user", text=text, frame_id=frame.id, agent=frame.agent.name)
+                    SessionHistoryItemDTO(
+                        role="user", text=text, frame_id=frame.id, agent=frame.agent.name
+                    )
                 )
             continue
 
         if role == "assistant":
             if text.strip():
                 items.append(
-                    SessionHistoryItemDTO(role="assistant", text=text, frame_id=frame.id, agent=frame.agent.name)
+                    SessionHistoryItemDTO(
+                        role="assistant", text=text, frame_id=frame.id, agent=frame.agent.name
+                    )
                 )
             tool_calls = message.get("tool_calls", [])
             if isinstance(tool_calls, list) and tool_calls:
@@ -641,7 +670,11 @@ def _history_items_for_frame(frame: Frame, *, include_system_prompt: bool = Fals
             continue
 
         if text.strip():
-            items.append(SessionHistoryItemDTO(role="system", text=text, frame_id=frame.id, agent=frame.agent.name))
+            items.append(
+                SessionHistoryItemDTO(
+                    role="system", text=text, frame_id=frame.id, agent=frame.agent.name
+                )
+            )
     return items
 
 
@@ -738,15 +771,25 @@ def _history_item_for_event(event: Event) -> SessionHistoryItemDTO | None:
     payload = event.payload
     match event.type:
         case "plan_created":
-            return SessionHistoryItemDTO(role="system", text=_format_plan_created_history_event(payload))
+            return SessionHistoryItemDTO(
+                role="system", text=_format_plan_created_history_event(payload)
+            )
         case "plan_step_started":
-            return SessionHistoryItemDTO(role="system", text=_format_plan_step_started_history_event(payload))
+            return SessionHistoryItemDTO(
+                role="system", text=_format_plan_step_started_history_event(payload)
+            )
         case "plan_step_completed":
-            return SessionHistoryItemDTO(role="system", text=_format_plan_step_completed_history_event(payload))
+            return SessionHistoryItemDTO(
+                role="system", text=_format_plan_step_completed_history_event(payload)
+            )
         case "verify_started":
-            return SessionHistoryItemDTO(role="system", text=_format_verify_started_history_event(payload))
+            return SessionHistoryItemDTO(
+                role="system", text=_format_verify_started_history_event(payload)
+            )
         case "verify_completed":
-            return SessionHistoryItemDTO(role="system", text=_format_verify_completed_history_event(payload))
+            return SessionHistoryItemDTO(
+                role="system", text=_format_verify_completed_history_event(payload)
+            )
         case _:
             return None
 
@@ -883,7 +926,9 @@ def _tool_history_blocks(
     origin = _history_origin(frame)
     if payload.get("status") == "rejected":
         return [ErrorHistoryBlock(text=f"{name}: rejected", **origin)]
-    error_message = inner.get("error", inner.get("message") if payload.get("status") == "error" else None)
+    error_message = inner.get(
+        "error", inner.get("message") if payload.get("status") == "error" else None
+    )
     if isinstance(error_message, str):
         return [ErrorHistoryBlock(text=f"{name}: {error_message}", **origin)]
 
@@ -937,7 +982,11 @@ def _tool_history_blocks(
         path = str(inner.get("path", input_args.get("path", "<unknown>")))
         offset = int(inner.get("offset", 1) or 1)
         line_count = max(_count_lines(str(inner.get("content", ""))), 1)
-        return [LogReadHistoryBlock(path=path, line_start=offset, line_end=offset + line_count - 1, **origin)]
+        return [
+            LogReadHistoryBlock(
+                path=path, line_start=offset, line_end=offset + line_count - 1, **origin
+            )
+        ]
 
     if name == "apply_text_edit":
         path = str(inner.get("path", input_args.get("path", "<unknown>")))
@@ -955,7 +1004,9 @@ def _tool_history_blocks(
         ]
 
     if name in _HISTORY_EDIT_TOOLS:
-        path = str(inner.get("path", input_args.get("path", input_args.get("target_path", "<unknown>"))))
+        path = str(
+            inner.get("path", input_args.get("path", input_args.get("target_path", "<unknown>")))
+        )
         after_text = str(input_args.get("content", input_args.get("after_text", "")))
         before_text = str(input_args.get("before_text", input_args.get("before", "")))
         return [
@@ -970,7 +1021,9 @@ def _tool_history_blocks(
 
     if name in _HISTORY_GREP_TOOLS:
         matches = _grep_matches(inner)
-        pattern = str(input_args.get("pattern", input_args.get("query", input_args.get("include", ""))))
+        pattern = str(
+            input_args.get("pattern", input_args.get("query", input_args.get("include", "")))
+        )
         include = str(input_args.get("include", input_args.get("path", "project"))) or "project"
         raw_count = inner.get("match_count", inner.get("count", len(matches)))
         try:
@@ -1197,9 +1250,7 @@ def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
                         GrepMatchDTO(
                             path=str(match.get("path", "")),
                             line=(
-                                int(match["line"])
-                                if match.get("line") not in (None, "")
-                                else None
+                                int(match["line"]) if match.get("line") not in (None, "") else None
                             ),
                             text=str(match.get("text", "")),
                         )
@@ -1221,7 +1272,9 @@ def _block_fingerprint(block: SessionHistoryBlock) -> str:
 def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[SessionHistoryBlock]:
     """Interleave frame messages with events anchored to their upcoming message index."""
     assistant_indexes = [
-        index for index, message in enumerate(frame.messages) if str(message.get("role", "")) == "assistant"
+        index
+        for index, message in enumerate(frame.messages)
+        if str(message.get("role", "")) == "assistant"
     ]
     anchored: dict[int, list[SessionHistoryBlock]] = {}
     trailing: list[SessionHistoryBlock] = []
@@ -1248,9 +1301,7 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
             group_key,
             {"reasoning": [], "text": []},
         )
-        group_events = group[
-            "reasoning" if event.type == "agent_reasoning_delta" else "text"
-        ]
+        group_events = group["reasoning" if event.type == "agent_reasoning_delta" else "text"]
         assert isinstance(group_events, list)
         group_events.append(event)
 
@@ -1261,9 +1312,7 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
         assert isinstance(text_events, list)
         text = max(text_events, key=lambda event: event.seq) if text_events else None
         if text is not None:
-            reasoning_before_text = [
-                event for event in reasoning_events if event.seq < text.seq
-            ]
+            reasoning_before_text = [event for event in reasoning_events if event.seq < text.seq]
             reasoning = (
                 max(reasoning_before_text, key=lambda event: event.seq)
                 if reasoning_before_text
@@ -1285,9 +1334,7 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
                 )
         else:
             reasoning = (
-                max(reasoning_events, key=lambda event: event.seq)
-                if reasoning_events
-                else None
+                max(reasoning_events, key=lambda event: event.seq) if reasoning_events else None
             )
         selected = [event for event in (reasoning, text) if event is not None]
         first_seq = min((event.seq for event in selected), default=2**31 - 1)
@@ -1382,7 +1429,9 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
     return result
 
 
-def _structured_session_history(session_frames: list[Frame], events: list[Event]) -> list[SessionHistoryBlock]:
+def _structured_session_history(
+    session_frames: list[Frame], events: list[Event]
+) -> list[SessionHistoryBlock]:
     frame_aliases: dict[str, tuple[str, int | None]] = {}
     for event in events:
         frame_id = str(event.payload.get("frame_id", ""))
@@ -1479,7 +1528,9 @@ def _history_context_used_tokens(session: Session, events: list[Event]) -> int:
             continue
         if used >= 0:
             return used
-    return max((estimate_message_tokens(frame.messages) for frame in session.agent_stack), default=0)
+    return max(
+        (estimate_message_tokens(frame.messages) for frame in session.agent_stack), default=0
+    )
 
 
 def _pending_anchor_index(frame: Frame, pending_ids: set[str]) -> int | None:
@@ -1494,6 +1545,91 @@ def _pending_anchor_index(frame: Frame, pending_ids: set[str]) -> int | None:
             if isinstance(call, dict) and str(call.get("id", "")) in pending_ids:
                 return index
     return None
+
+
+_COMPACT_SUMMARY_HEADER = "[compact_summary]"
+_COMPACT_SUMMARY_GUIDANCE = "以下是较早上下文的本地摘要；写文件或执行高风险操作前仍需重新读取事实。"
+
+
+def _previous_summary_body(previous: CompactSnapshot | None) -> str:
+    """取出旧快照摘要正文，剥掉 [compact_summary] 标记头与引导语，供合并时复用。"""
+    if previous is None or not previous.summary.strip():
+        return ""
+    body = previous.summary.strip()
+    if body.startswith(_COMPACT_SUMMARY_HEADER):
+        body = body[len(_COMPACT_SUMMARY_HEADER) :].lstrip()
+    if body.startswith(_COMPACT_SUMMARY_GUIDANCE):
+        body = body[len(_COMPACT_SUMMARY_GUIDANCE) :].lstrip()
+    return body
+
+
+def _mechanical_summary_body(
+    previous: CompactSnapshot | None, messages: list[dict[str, Any]]
+) -> str:
+    """机械拼接摘要正文：旧摘要正文 + 本次移除消息的逐条预览。
+
+    作为 LLM 语义压缩的确定性回退（LLM 未启用、失败或返回空时使用），也用作
+    喂给 LLM 的结构化源文本。
+    """
+    lines: list[str] = []
+    previous_body = _previous_summary_body(previous)
+    if previous_body:
+        lines.extend(["较早压缩快照：", previous_body])
+    if messages:
+        if lines:
+            lines.append("")
+        lines.append("本次收拢的消息：")
+        lines.extend(f"- {_brief_message(message)}" for message in messages)
+    return "\n".join(lines)
+
+
+def _wrap_compact_summary(body: str) -> str:
+    """给摘要正文套上 [compact_summary] 标记头与引导语，并按上限截断为最终持久化文本。
+
+    标记头是 system content-block 识别压缩层、预留缓存断点的依据（见
+    `message_transformer.build_stable_prefix`），无论摘要来自 LLM 还是机械拼接都必须存在。
+    """
+    summary = "\n".join([_COMPACT_SUMMARY_HEADER, _COMPACT_SUMMARY_GUIDANCE, "", body.strip()])
+    if len(summary) <= _COMPACT_SUMMARY_MAX_CHARS:
+        return summary
+    return summary[:_COMPACT_SUMMARY_MAX_CHARS] + "\n... (compact summary truncated)"
+
+
+def _compact_summary_text(previous: CompactSnapshot | None, messages: list[dict[str, Any]]) -> str:
+    """确定性的机械压缩摘要（零额外 LLM 调用）；LLM 语义压缩失败时的回退路径。"""
+    return _wrap_compact_summary(_mechanical_summary_body(previous, messages))
+
+
+def _compact_digest(summary: str) -> str:
+    """计算压缩摘要规范化文本的 SHA-256 指纹。"""
+    normalized = "\n".join(line.rstrip() for line in summary.strip().splitlines())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _inject_compact_snapshot(frame: Frame, *, has_rag_context: bool) -> None:
+    """把持久化压缩快照写入首条 system 消息的独立 content block。"""
+    if frame.compact_snapshot is None or not frame.messages:
+        return
+    system_message = frame.messages[0]
+    if system_message.get("role") != "system":
+        return
+    content = system_message.get("content", "")
+    blocks = (
+        [dict(block) if isinstance(block, dict) else block for block in content]
+        if isinstance(content, list)
+        else [{"type": "text", "text": str(content)}]
+    )
+    blocks = [
+        block
+        for block in blocks
+        if not (
+            isinstance(block, dict) and str(block.get("text", "")).startswith("[compact_summary]")
+        )
+    ]
+    compact_block = {"type": "text", "text": frame.compact_snapshot.summary}
+    insert_at = len(blocks) - 1 if has_rag_context and blocks else len(blocks)
+    blocks.insert(insert_at, compact_block)
+    system_message["content"] = blocks
 
 
 class QueryEngine:
@@ -1618,7 +1754,10 @@ class QueryEngine:
                     len(request.tool_results or []),
                 )
 
-                if request.request_id is not None and request.request_id in session.request_id_cache:
+                if (
+                    request.request_id is not None
+                    and request.request_id in session.request_id_cache
+                ):
                     logger.info(
                         "Chat idempotency hit session=%s request_id=%s",
                         request.session_id,
@@ -1680,7 +1819,9 @@ class QueryEngine:
 
         if request.effort is not None:
             session.effort = request.effort
-            logger.info("Session effort overridden session=%s effort=%s", session.session_id, request.effort)
+            logger.info(
+                "Session effort overridden session=%s effort=%s", session.session_id, request.effort
+            )
         if request.output_style is not None:
             session.output_style = request.output_style
             logger.info(
@@ -1707,9 +1848,11 @@ class QueryEngine:
             dynamic_context=session.rag_context,
             query=request.user_message or "",
         )
+        root_snapshot = session.agent_stack[0].compact_snapshot if session.agent_stack else None
         layered_prompt = LayeredPrompt(
             core=cache_context.stable_prefix,
             structure_context=cache_context.structure_context,
+            compact_context=root_snapshot.summary if root_snapshot is not None else "",
             rag_context=cache_context.dynamic_context,
         )
         # `agent.prompt` 保留拼平后的纯文本（供委派子帧继承等需要字符串的场景）；
@@ -1730,16 +1873,26 @@ class QueryEngine:
             )
 
         if has_results:
-            self._emit(session.session_id, "tool_results_received", {"count": len(request.tool_results or [])})
+            self._emit(
+                session.session_id,
+                "tool_results_received",
+                {"count": len(request.tool_results or [])},
+            )
             logger.info(
                 "Appending front tool results session=%s count=%d pending_turn=%s",
                 session.session_id,
                 len(request.tool_results or []),
                 session.pending_turn_id,
             )
-            result_error, verify_candidates = self._append_tool_results(session, request.tool_results or [])
+            result_error, verify_candidates = self._append_tool_results(
+                session, request.tool_results or []
+            )
             if result_error is not None:
-                logger.warning("Front tool result rejected session=%s reason=%s", session.session_id, result_error.text)
+                logger.warning(
+                    "Front tool result rejected session=%s reason=%s",
+                    session.session_id,
+                    result_error.text,
+                )
                 return result_error
             if verify_candidates:
                 session.pending_verify_candidates.extend(verify_candidates)
@@ -1753,11 +1906,16 @@ class QueryEngine:
                 return ChatErrorResponse(text="当前会话仍有待回传的工具结果，不能开始新的用户消息")
             frame = session.top_frame()
             if frame is None:
-                logger.error("User message rejected because session has no active frame session=%s", session.session_id)
+                logger.error(
+                    "User message rejected because session has no active frame session=%s",
+                    session.session_id,
+                )
                 return ChatErrorResponse(text="会话没有活跃的 agent 帧")
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
             session.pending_verify_candidates.clear()
-            self._emit(session.session_id, "user_submitted", {"has_context": request.context is not None})
+            self._emit(
+                session.session_id, "user_submitted", {"has_context": request.context is not None}
+            )
             logger.info(
                 "User turn appended session=%s has_context=%s language_hint=%s",
                 session.session_id,
@@ -1776,16 +1934,20 @@ class QueryEngine:
                 self._settings.auto_compact_token_threshold,
                 self._settings.auto_compact_keep_recent,
             )
-            self._compact_locked(
+            await self._compact_locked(
                 session.session_id,
                 keep_recent=self._settings.auto_compact_keep_recent,
                 triggered_by="auto",
+                use_llm=request.compact_summary_use_llm,
             )
 
         defer_verification_until_final = bool(session.pending_verify_candidates)
 
         def emit_turn_event(event_type: str, payload: dict[str, Any]) -> None:
-            if defer_verification_until_final and event_type in {"agent_text_delta", "agent_reasoning_delta"}:
+            if defer_verification_until_final and event_type in {
+                "agent_text_delta",
+                "agent_reasoning_delta",
+            }:
                 return
             self._emit(session.session_id, event_type, payload)
 
@@ -1829,7 +1991,9 @@ class QueryEngine:
                     latest_by_path[path] = candidate
             session.pending_verify_candidates.clear()
             if latest_by_path:
-                await self._run_verify(session, security, list(latest_by_path.values()), model_override)
+                await self._run_verify(
+                    session, security, list(latest_by_path.values()), model_override
+                )
                 step = await run_turn(
                     session=session,
                     llm=self._llm,
@@ -1851,7 +2015,9 @@ class QueryEngine:
                     model_selector=self._model_for_effort,
                     model_override=model_override,
                     thinking_budget_selector=self._thinking_budget_for_effort,
-                    event_callback=lambda event_type, payload: self._emit(session.session_id, event_type, payload),
+                    event_callback=lambda event_type, payload: self._emit(
+                        session.session_id, event_type, payload
+                    ),
                     cache_engine=self._cache_engine,
                     cache_metrics=self._cache_metrics,
                     context_token_limit=self._settings.auto_compact_token_threshold,
@@ -1878,7 +2044,9 @@ class QueryEngine:
             )
         else:
             self._emit(session.session_id, "error", {"text": response.text})
-            logger.warning("Chat produced error response session=%s text=%s", session.session_id, response.text)
+            logger.warning(
+                "Chat produced error response session=%s text=%s", session.session_id, response.text
+            )
         return response
 
     def _security_for_request(self, request: ChatRequest) -> SecuritySettings:
@@ -1944,7 +2112,9 @@ class QueryEngine:
                 actual,
             )
             return (
-                ChatErrorResponse(text=f"tool_results 与 pending 工具调用不匹配：expected={expected}; actual={actual}"),
+                ChatErrorResponse(
+                    text=f"tool_results 与 pending 工具调用不匹配：expected={expected}; actual={actual}"
+                ),
                 [],
             )
         if any(result.turn_id != session.pending_turn_id for result in results):
@@ -1976,7 +2146,11 @@ class QueryEngine:
             payload: Any
             if result.status == "applied":
                 applied_result = result.result
-                if tool is not None and tool.enrich is not None and isinstance(applied_result, dict):
+                if (
+                    tool is not None
+                    and tool.enrich is not None
+                    and isinstance(applied_result, dict)
+                ):
                     applied_result = tool.enrich(tool_args, applied_result)
                 if result.grant_session_allow and tool is not None:
                     session.session_allow.add(make_session_allow_grant(tool, tool_args))
@@ -1992,7 +2166,10 @@ class QueryEngine:
                     "artifact_refs": result.artifact_refs,
                     "grant_session_allow": result.grant_session_allow,
                 }
-                if self._settings.verify_after_edit and tool_name in self._settings.verify_trigger_tools:
+                if (
+                    self._settings.verify_after_edit
+                    and tool_name in self._settings.verify_trigger_tools
+                ):
                     path = tool_args.get("path") or tool_args.get("target_path")
                     if isinstance(path, str) and path:
                         verify_candidates.append(
@@ -2058,7 +2235,11 @@ class QueryEngine:
         if frame is None:
             frame = session.top_frame()
             if frame is None:
-                logger.warning("Verify skipped: frame missing session=%s frame=%s", session.session_id, frame_id)
+                logger.warning(
+                    "Verify skipped: frame missing session=%s frame=%s",
+                    session.session_id,
+                    frame_id,
+                )
                 return
 
         retries = session.verify_retry_count.get(path, 0)
@@ -2314,7 +2495,9 @@ class QueryEngine:
                     if frame is None:
                         continue
                     frame.messages.append(
-                        _tool_message(tool_use_id, "用户中断了当前请求，该工具调用结果未回传。", is_error=True)
+                        _tool_message(
+                            tool_use_id, "用户中断了当前请求，该工具调用结果未回传。", is_error=True
+                        )
                     )
                     discarded += 1
                 session.clear_pending()
@@ -2324,7 +2507,9 @@ class QueryEngine:
             elif had_pending_plan:
                 self._store.save(session)
 
-        self._emit(session_id, "turn_interrupted", {"cancelled": cancelled, "pending_discarded": discarded})
+        self._emit(
+            session_id, "turn_interrupted", {"cancelled": cancelled, "pending_discarded": discarded}
+        )
         last_seq = self._events.last_seq(session_id) if self._events is not None else 0
         logger.info(
             "Turn interrupted session=%s cancelled=%s pending_discarded=%d last_seq=%d",
@@ -2360,7 +2545,9 @@ class QueryEngine:
 
             session.clear_pending()
             self._store.save(session)
-            response = ChatFinalResponse(text=f"已放弃 {discarded} 个待回传的工具调用，可以继续发送新消息。")
+            response = ChatFinalResponse(
+                text=f"已放弃 {discarded} 个待回传的工具调用，可以继续发送新消息。"
+            )
             self._record_recovery(session, response)
             self._emit(session_id, "pending_discarded", {"count": discarded})
             logger.info("Pending tool calls discarded session=%s count=%d", session_id, discarded)
@@ -2386,7 +2573,9 @@ class QueryEngine:
             session.output_style = output_style
             self._store.save(session)
         self._emit(session_id, "config_changed", {"output_style": output_style})
-        logger.info("Session output style changed session=%s output_style=%s", session_id, output_style)
+        logger.info(
+            "Session output style changed session=%s output_style=%s", session_id, output_style
+        )
 
     def _needs_auto_compact(self, session: Session) -> bool:
         """判断当前会话是否有任意帧的预估 token 数超过自动压缩阈值。
@@ -2400,9 +2589,17 @@ class QueryEngine:
             帧分别处理，这里只需判断"值不值得调用一次"。
         """
         threshold = self._settings.auto_compact_token_threshold
-        return any(estimate_message_tokens(frame.messages) > threshold for frame in session.agent_stack)
+        return any(
+            estimate_message_tokens(frame.messages) > threshold for frame in session.agent_stack
+        )
 
-    async def compact(self, session_id: str, keep_recent: int = 12, triggered_by: str = "manual") -> dict[str, Any]:
+    async def compact(
+        self,
+        session_id: str,
+        keep_recent: int = 12,
+        triggered_by: str = "manual",
+        use_llm: bool | None = None,
+    ) -> dict[str, Any]:
         """对指定 session 执行本地 micro/full compact，保留 pending 协议完整性。
 
         持锁入口：手动 `/compact` 命令经此处，先获取会话锁再压缩，避免与正在
@@ -2416,20 +2613,99 @@ class QueryEngine:
             triggered_by: `"manual"`（`/compact` 命令）或 `"auto"`（§16.1 策略 A
                 的自动触发），写入 `compact_boundary` 事件 payload，仅用于
                 日志/观测区分来源，不影响压缩逻辑本身。
+            use_llm: 本次压缩是否用 LLM 语义压缩摘要的 per-request 覆盖；None 时
+                沿用服务端 `compact_summary_use_llm` 配置。
         """
         async with self._store.lock_for(session_id):
-            return self._compact_locked(session_id, keep_recent, triggered_by)
+            return await self._compact_locked(session_id, keep_recent, triggered_by, use_llm)
 
-    def _compact_locked(self, session_id: str, keep_recent: int = 12, triggered_by: str = "manual") -> dict[str, Any]:
+    async def _build_compact_summary(
+        self,
+        previous: CompactSnapshot | None,
+        old_messages: list[dict[str, Any]],
+        *,
+        use_llm: bool,
+    ) -> str:
+        """生成最终压缩摘要：优先 LLM 语义压缩，未启用/失败/空时回退确定性机械拼接。"""
+        if use_llm and old_messages:
+            body = await self._summarize_via_llm(previous, old_messages)
+            if body:
+                return _wrap_compact_summary(body)
+        return _compact_summary_text(previous, old_messages)
+
+    async def _summarize_via_llm(
+        self, previous: CompactSnapshot | None, old_messages: list[dict[str, Any]]
+    ) -> str | None:
+        """调用 LLM 把旧摘要与本次移除消息综合成单一连贯摘要正文；失败返回 None。
+
+        采用 ``temperature=0`` 与 ``thinking_budget=0``，尽量让同一输入得到稳定输出，
+        从而稳定 `compact_digest`、减少远端缓存版本抖动（§9/§10）。任何 `LLMError`
+        或空响应都被吞掉并返回 None，由调用方回退到机械摘要——压缩绝不因摘要失败
+        而中断本轮请求（§12：失败不得停留在半压缩状态）。
+        """
+        source = _mechanical_summary_body(previous, old_messages)
+        if not source.strip():
+            return None
+        instructions = (
+            "你是会话历史压缩器。请把下面这段较早的对话上下文压缩成简洁、忠实的中文摘要，"
+            "保留关键决策、结论、涉及的文件路径与符号、以及尚未完成的事项；不要编造，不要补充原文没有的信息。"
+            "若其中已包含『较早压缩快照』，请把它与新内容融合成单一连贯摘要，不要罗列多份摘要。"
+            "只输出摘要正文，不要添加任何前后缀或标记。"
+        )
+        model = self._settings.compact_summary_model or self._model_for_effort("quick")
+        try:
+            turn = await self._llm.chat(
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": source},
+                ],
+                tools=[],
+                model=model,
+                temperature=0.0,
+                thinking_budget=0,
+            )
+        except LLMError as exc:
+            logger.warning("Compact LLM summarize failed, falling back to mechanical: %s", exc)
+            return None
+        text = (turn.content or "").strip()
+        if not text:
+            logger.warning(
+                "Compact LLM summarize returned empty content, falling back to mechanical"
+            )
+            return None
+        return text
+
+    async def _compact_locked(
+        self,
+        session_id: str,
+        keep_recent: int = 12,
+        triggered_by: str = "manual",
+        use_llm: bool | None = None,
+    ) -> dict[str, Any]:
         """在已持有会话锁时执行压缩；不要在未持锁路径直接调用。"""
         session = self._store.get_or_create(session_id, self.available_tools)
+        trigger: Literal["manual", "auto"] = "auto" if triggered_by == "auto" else "manual"
+        summary_use_llm = (
+            self._settings.compact_summary_use_llm if use_llm is None else use_llm
+        )
         logger.info(
-            "Compacting session session=%s keep_recent=%d triggered_by=%s", session_id, keep_recent, triggered_by
+            "Compacting session session=%s keep_recent=%d triggered_by=%s",
+            session_id,
+            keep_recent,
+            trigger,
         )
         compacted_frames = 0
         removed_messages = 0
         truncated_messages = 0
         keep = max(6, keep_recent)
+        modified_frame_ids: list[str] = []
+        snapshot_payloads: list[dict[str, Any]] = []
+        estimated_tokens_before = 0
+        estimated_tokens_after = 0
+        backups = [
+            (frame, copy.deepcopy(frame.messages), copy.deepcopy(frame.compact_snapshot))
+            for frame in session.agent_stack
+        ]
 
         # 压缩本身是纯本地操作（无网络/子进程 I/O），耗时通常远低于一帧；这里仍
         # 单独发一个"开始"事件（而不是只在结束时发 compact_boundary），是为了让
@@ -2439,10 +2715,17 @@ class QueryEngine:
         self._emit(
             session_id,
             "compact_started",
-            {"keep_recent": keep, "triggered_by": triggered_by},
+            {
+                "keep_recent": keep,
+                "triggered_by": trigger,
+                "frame_ids": [frame.id for frame in session.agent_stack],
+            },
         )
 
         for frame in session.agent_stack:
+            frame_tokens_before = estimate_message_tokens(frame.messages)
+            estimated_tokens_before += frame_tokens_before
+            frame_changed = False
             anchor = _pending_anchor_index(frame, session.pending_tool_call_ids)
             # 超大单条消息的截断独立于"按消息数收拢"逐帧执行：不依赖
             # `len(frame.messages) <= keep + 2` 的早退判断，否则消息数很少但单条
@@ -2458,30 +2741,97 @@ class QueryEngine:
                 if replacement is not None:
                     frame.messages[index] = replacement
                     truncated_messages += 1
+                    frame_changed = True
 
-            if len(frame.messages) <= keep + 2:
+            if len(frame.messages) <= keep + 1:
+                estimated_tokens_after += estimate_message_tokens(frame.messages)
+                if frame_changed:
+                    modified_frame_ids.append(frame.id)
                 continue
             default_start = max(1, len(frame.messages) - keep)
             keep_from = min(default_start, anchor) if anchor is not None else default_start
             if keep_from <= 1:
+                estimated_tokens_after += estimate_message_tokens(frame.messages)
+                if frame_changed:
+                    modified_frame_ids.append(frame.id)
                 continue
 
             old_messages = frame.messages[1:keep_from]
-            summary_lines = [_brief_message(message) for message in old_messages]
-            summary = (
-                "[compact_summary]\n"
-                "以下是较早上下文的本地摘要；写文件或执行高风险操作前仍需重新读取事实。\n"
-                + "\n".join(f"- {line}" for line in summary_lines)
+            # 自动压缩防抖（§10）：本次可收拢的旧消息太少时（pending 锚点过早、或
+            # 近期消息独占体积），生成新快照只会徒增一个 compact_digest 版本、让
+            # 远端缓存反复失效，token 却几乎降不下来。auto 触发下跳过该帧、不翻新
+            # 快照；手动 /compact 是用户显式意图，不受此门槛限制。
+            if (
+                trigger == "auto"
+                and len(old_messages) < self._settings.auto_compact_min_new_messages
+            ):
+                estimated_tokens_after += estimate_message_tokens(frame.messages)
+                if frame_changed:
+                    modified_frame_ids.append(frame.id)
+                continue
+            previous = frame.compact_snapshot
+            summary = await self._build_compact_summary(
+                previous, old_messages, use_llm=summary_use_llm
             )
-            frame.messages = [
-                frame.messages[0],
-                {"role": "system", "content": summary},
-                *frame.messages[keep_from:],
-            ]
+            digest = _compact_digest(summary)
+            revision = (
+                previous.revision
+                if previous is not None and previous.digest == digest
+                else previous.revision + 1 if previous is not None else 1
+            )
+            frame.messages = [frame.messages[0], *frame.messages[keep_from:]]
+            snapshot = CompactSnapshot(
+                revision=revision,
+                digest=digest,
+                summary=summary,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                source_message_count=(previous.source_message_count if previous is not None else 0)
+                + len(old_messages),
+                removed_message_count=len(old_messages),
+                keep_recent=keep,
+                estimated_tokens_before=frame_tokens_before,
+                estimated_tokens_after=0,
+                triggered_by=trigger,
+            )
+            frame.compact_snapshot = snapshot
+            _inject_compact_snapshot(
+                frame,
+                has_rag_context=(
+                    frame is session.agent_stack[0] and bool(session.rag_context.strip())
+                ),
+            )
+            frame_tokens_after = estimate_message_tokens(frame.messages)
+            snapshot = replace(
+                snapshot,
+                estimated_tokens_after=frame_tokens_after,
+            )
+            frame.compact_snapshot = snapshot
+            estimated_tokens_after += frame_tokens_after
+            frame_changed = True
             compacted_frames += 1
             removed_messages += len(old_messages)
+            modified_frame_ids.append(frame.id)
+            snapshot_payloads.append(
+                {
+                    "frame_id": frame.id,
+                    "revision": revision,
+                    "digest": digest,
+                    "source_message_count": snapshot.source_message_count,
+                    "removed_message_count": len(old_messages),
+                    "estimated_tokens_before": frame_tokens_before,
+                    "estimated_tokens_after": frame_tokens_after,
+                }
+            )
 
-        self._store.save(session)
+        try:
+            self._store.save(session)
+        except Exception:
+            for frame, messages, backup_snapshot in backups:
+                frame.messages = messages
+                frame.compact_snapshot = backup_snapshot
+            raise
+        if modified_frame_ids:
+            self._cache_engine.invalidate(session_id, modified_frame_ids)
         seq = self._emit(
             session_id,
             "compact_boundary",
@@ -2491,7 +2841,10 @@ class QueryEngine:
                 "truncated_messages": truncated_messages,
                 "keep_recent": keep,
                 "pending_preserved": session.pending_turn_id is not None,
-                "triggered_by": triggered_by,
+                "triggered_by": trigger,
+                "estimated_tokens_before": estimated_tokens_before,
+                "estimated_tokens_after": estimated_tokens_after,
+                "snapshots": snapshot_payloads,
             },
         )
         logger.info(
@@ -2502,13 +2855,16 @@ class QueryEngine:
             removed_messages,
             truncated_messages,
             session.pending_turn_id is not None,
-            triggered_by,
+            trigger,
         )
         return {
             "session_id": session_id,
             "compacted_frames": compacted_frames,
             "removed_messages": removed_messages,
             "truncated_messages": truncated_messages,
+            "estimated_tokens_before": estimated_tokens_before,
+            "estimated_tokens_after": estimated_tokens_after,
+            "snapshots": snapshot_payloads,
             "last_event_seq": seq,
             "pending_turn_id": session.pending_turn_id,
         }

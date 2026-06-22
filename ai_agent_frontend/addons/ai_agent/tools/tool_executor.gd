@@ -5,6 +5,7 @@ const AgentDTO = preload("res://addons/ai_agent/dto/agent_dto.gd")
 const ClassDBReader = preload("res://addons/ai_agent/context/classdb_reader.gd")
 const FileStateCache = preload("res://addons/ai_agent/context/file_state_cache.gd")
 const DiagnosticsCollector = preload("res://addons/ai_agent/context/diagnostics_collector.gd")
+const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 const ProgramTools = preload("res://addons/ai_agent/tools/program_tools.gd")
 const SceneTools = preload("res://addons/ai_agent/tools/scene_tools.gd")
 const MapTools = preload("res://addons/ai_agent/tools/map_tools.gd")
@@ -21,6 +22,24 @@ func _ready() -> void:
 	if file_state_cache == null:
 		file_state_cache = FileStateCache.new()
 		add_child(file_state_cache)
+
+
+## 记录服务端 read_file/read_script 已成功读取的文件，让后续前端编辑共享同一份读取状态。
+func remember_server_file_read(path: String) -> bool:
+	var normalized_path := PathUtils.to_res_path(path)
+	if normalized_path == "" or not PathUtils.is_read_allowed(normalized_path):
+		return false
+	var absolute := ProjectSettings.globalize_path(normalized_path)
+	if not FileAccess.file_exists(absolute):
+		return false
+	if file_state_cache == null:
+		file_state_cache = FileStateCache.new()
+		add_child(file_state_cache)
+	file_state_cache.snapshot(normalized_path, true)
+	FrontendLogger.debug(editor_interface, "ToolExecutor", "Remembered server file read.", {
+		"path": normalized_path,
+	})
+	return true
 
 
 ## 执行单个前端工具调用。部分工具（如 run_tests）内部使用 await 轮询子进程，

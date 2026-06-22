@@ -14,10 +14,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from app.agents.bundled import get_agent
-from app.agents.types import AgentDefinition, Frame
+from app.agents.types import AgentDefinition, CompactSnapshot, Frame
 from app.permissions.engine import SessionAllowGrant
 from app.storage.atomic import atomic_write_json
 
@@ -201,6 +201,22 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
         "active_deferred_tools": sorted(frame.active_deferred_tools),
         "history_anchor_frame_id": frame.history_anchor_frame_id,
         "history_anchor_message_index": frame.history_anchor_message_index,
+        "compact_snapshot": (
+            {
+                "revision": frame.compact_snapshot.revision,
+                "digest": frame.compact_snapshot.digest,
+                "summary": frame.compact_snapshot.summary,
+                "created_at": frame.compact_snapshot.created_at,
+                "source_message_count": frame.compact_snapshot.source_message_count,
+                "removed_message_count": frame.compact_snapshot.removed_message_count,
+                "keep_recent": frame.compact_snapshot.keep_recent,
+                "estimated_tokens_before": frame.compact_snapshot.estimated_tokens_before,
+                "estimated_tokens_after": frame.compact_snapshot.estimated_tokens_after,
+                "triggered_by": frame.compact_snapshot.triggered_by,
+            }
+            if frame.compact_snapshot is not None
+            else None
+        ),
     }
 
 
@@ -217,6 +233,24 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
     """
     agent = get_agent(data["agent_name"], available_tools)
     status = data.get("status", "running")
+    raw_snapshot = data.get("compact_snapshot")
+    compact_snapshot: CompactSnapshot | None = None
+    if isinstance(raw_snapshot, dict):
+        triggered_by: Literal["manual", "auto"] = (
+            "auto" if raw_snapshot.get("triggered_by") == "auto" else "manual"
+        )
+        compact_snapshot = CompactSnapshot(
+            revision=_as_int(raw_snapshot.get("revision"), 1),
+            digest=str(raw_snapshot.get("digest", "")),
+            summary=str(raw_snapshot.get("summary", "")),
+            created_at=str(raw_snapshot.get("created_at", "")),
+            source_message_count=_as_int(raw_snapshot.get("source_message_count")),
+            removed_message_count=_as_int(raw_snapshot.get("removed_message_count")),
+            keep_recent=_as_int(raw_snapshot.get("keep_recent"), 12),
+            estimated_tokens_before=_as_int(raw_snapshot.get("estimated_tokens_before")),
+            estimated_tokens_after=_as_int(raw_snapshot.get("estimated_tokens_after")),
+            triggered_by=triggered_by,
+        )
     return Frame(
         id=data["id"],
         agent=agent,
@@ -229,6 +263,7 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
         active_deferred_tools=set(data.get("active_deferred_tools", [])),
         history_anchor_frame_id=data.get("history_anchor_frame_id"),
         history_anchor_message_index=data.get("history_anchor_message_index"),
+        compact_snapshot=compact_snapshot,
     )
 
 
@@ -332,9 +367,7 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
             if isinstance(f, dict)
         ],
         pending_turn_id=data.get("pending_turn_id"),
-        pending_tool_call_ids={
-            str(item) for item in _as_list(data.get("pending_tool_call_ids"))
-        },
+        pending_tool_call_ids={str(item) for item in _as_list(data.get("pending_tool_call_ids"))},
         turn_counter=_as_int(data.get("turn_counter")),
         frame_counter=_as_int(data.get("frame_counter")),
         request_id_cache=_as_dict(data.get("request_id_cache")),
@@ -350,7 +383,9 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         pending_plan=pending_plan if isinstance(pending_plan, dict) else None,
         verify_retry_count=_as_dict(data.get("verify_retry_count")),
         pending_verify_candidates=[
-            item for item in _as_list(data.get("pending_verify_candidates")) if isinstance(item, dict)
+            item
+            for item in _as_list(data.get("pending_verify_candidates"))
+            if isinstance(item, dict)
         ],
         history_event_counter=history_event_counter,
         history_events=history_events,
@@ -429,7 +464,9 @@ class SessionStore:
         """
         existing = self._sessions.get(session_id)
         if existing is not None:
-            logger.debug("Session cache hit session=%s frames=%d", session_id, len(existing.agent_stack))
+            logger.debug(
+                "Session cache hit session=%s frames=%d", session_id, len(existing.agent_stack)
+            )
             return existing
         restored = self._load(session_id, available_tools)
         session = restored if restored is not None else Session(session_id=session_id)

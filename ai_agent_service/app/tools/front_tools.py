@@ -472,13 +472,19 @@ def register_front_tools() -> None:
                 "description": (
                     "Run a project-relative .gd file directly with the editor's own Godot executable "
                     "(headless --script) and return its stdout/stderr and exit code. Use this to execute "
-                    "one-off GDScript utility/generator scripts, not to launch the game itself."
+                    "one-off GDScript utility/generator scripts, not to launch the game itself. The entry "
+                    "script must directly extend SceneTree or MainLoop; EditorScript and Node scripts are "
+                    "rejected before launch. Godot ERROR/SCRIPT ERROR output is treated as failure even if "
+                    "the process exits with code 0."
                 ),
                 "parameters": _object_schema(
                     {
                         "path": {
                             "type": "string",
-                            "description": "Project-relative .gd file path, for example tools/generate_map.gd.",
+                            "description": (
+                                "Project-relative .gd entry script, for example tools/generate_map.gd. "
+                                "It must directly extend SceneTree or MainLoop, never EditorScript."
+                            ),
                         },
                         "args": {
                             "type": "array",

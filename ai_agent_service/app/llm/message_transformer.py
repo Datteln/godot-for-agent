@@ -113,7 +113,19 @@ def _cap_breakpoints(breakpoints: list[CacheBreakpoint]) -> list[CacheBreakpoint
     最后（覆盖范围最大但每轮都在变长）；超出上限时优先丢弃靠后的，确保最稳定的
     层一定被缓存。
     """
-    return breakpoints[:MAX_CACHE_BREAKPOINTS]
+    if len(breakpoints) <= MAX_CACHE_BREAKPOINTS:
+        return breakpoints
+    compact = next((bp for bp in breakpoints if bp.segment == "compact_snapshot"), None)
+    capped = breakpoints[:MAX_CACHE_BREAKPOINTS]
+    if compact is not None and compact not in capped:
+        capped[-1] = compact
+        capped.sort(
+            key=lambda bp: (
+                bp.message_index,
+                bp.block_index if bp.block_index is not None else -1,
+            )
+        )
+    return capped
 
 
 def _history_tier_breakpoints(system_end: int, stable_history_end: int) -> list[CacheBreakpoint]:
@@ -179,8 +191,14 @@ def build_stable_prefix(messages: list[dict[str, Any]]) -> StablePrefixPlan:
     breakpoints: list[CacheBreakpoint] = []
     first_content = messages[0].get("content")
     if isinstance(first_content, list) and first_content:
-        for block_index in range(len(first_content)):
-            breakpoints.append(CacheBreakpoint(0, block_index, f"system_layer_{block_index}"))
+        for block_index, block in enumerate(first_content):
+            text = block.get("text", "") if isinstance(block, dict) else ""
+            segment = (
+                "compact_snapshot"
+                if str(text).startswith("[compact_summary]")
+                else f"system_layer_{block_index}"
+            )
+            breakpoints.append(CacheBreakpoint(0, block_index, segment))
     else:
         breakpoints.append(CacheBreakpoint(0, None, "system_core"))
 
@@ -220,7 +238,9 @@ def inject_cache_breakpoints(
     Returns:
         标记好缓存断点的消息列表副本；没有任何断点可标记时原样返回 `messages`。
     """
-    valid = [bp for bp in breakpoints if 0 <= bp.message_index < len(messages)][:MAX_CACHE_BREAKPOINTS]
+    valid = [bp for bp in breakpoints if 0 <= bp.message_index < len(messages)][
+        :MAX_CACHE_BREAKPOINTS
+    ]
     if not valid:
         return messages
 

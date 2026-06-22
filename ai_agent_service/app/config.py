@@ -193,6 +193,24 @@ class AppSettings(BaseSettings):
         ge=6,
         description="自动压缩时保留的最近消息数，语义与 /compact 命令的 keep_recent 参数一致。",
     )
+    auto_compact_min_new_messages: int = Field(
+        default=8,
+        ge=1,
+        description="自动压缩的防抖门槛：某帧自上次快照以来本次实际可收拢的旧消息数低于该值时，"
+        "跳过该帧、不生成新快照——避免 pending 工具调用锚点过早或近期消息独占体积时，"
+        "每轮都翻一个新的 compact_digest 版本、让远端缓存反复失效（§10）。手动 /compact 不受此门槛限制。",
+    )
+    compact_summary_use_llm: bool = Field(
+        default=True,
+        description="压缩摘要是否调用 LLM 做语义压缩（§5『综合旧摘要+新移除消息』）；为 True 时在压缩"
+        "路径里额外发起一次模型请求把旧摘要与本次移除消息融合成连贯摘要，失败或返回空时自动回退到"
+        "确定性的机械拼接摘要；为 False 时始终使用机械拼接。",
+    )
+    compact_summary_model: str | None = Field(
+        default=None,
+        description="压缩摘要 LLM 调用使用的模型名；为空时回退到 quick effort 对应的模型"
+        "（即 llm_quick_model，再为空则使用 llm_model）。",
+    )
 
     verify_after_edit: bool = Field(
         default=True,

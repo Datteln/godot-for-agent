@@ -418,6 +418,9 @@ static func execute_gd_script(input: Dictionary, editor_interface: EditorInterfa
 			"message": "script file not found: " + res_path,
 			"error_code": "script_not_found"
 		}
+	var base_error := _validate_headless_script_base(res_path)
+	if not base_error.is_empty():
+		return base_error
 
 	var script_args := PackedStringArray()
 	var raw_args = input.get("args", [])
@@ -447,6 +450,9 @@ static func execute_gd_script(input: Dictionary, editor_interface: EditorInterfa
 	var ok := bool(run_result.get("ok", false))
 	var status := str(run_result.get("status", "failed"))
 	var exit_code = run_result.get("exit_code", null)
+	if ok and _has_godot_error(output):
+		ok = false
+		status = "godot_error"
 	var result := {
 		"ok": ok,
 		"status": status,
@@ -461,6 +467,51 @@ static func execute_gd_script(input: Dictionary, editor_interface: EditorInterfa
 		result["error_code"] = status
 		result["message"] = _describe_system_command_failure(status, exit_code, output)
 	return result
+
+
+## 校验 `--script` 入口的直接基类，避免把只能由编辑器实例化的 EditorScript 交给主循环。
+static func _validate_headless_script_base(res_path: String) -> Dictionary:
+	var source := FileAccess.get_file_as_string(res_path)
+	for raw_line in source.split("\n"):
+		var line := str(raw_line).strip_edges()
+		if line == "" or line.begins_with("#") or line.begins_with("@"):
+			continue
+		if not line.begins_with("extends "):
+			break
+		var base_type := line.trim_prefix("extends ").split("#", false, 1)[0].strip_edges()
+		if base_type == "SceneTree" or base_type == "MainLoop":
+			return {}
+		return {
+			"ok": false,
+			"message": (
+				"execute_gd_script runs Godot with --headless --script; "
+				+ res_path + " extends " + base_type
+				+ ", but the entry script must directly extend SceneTree or MainLoop. "
+				+ "EditorScript can only run inside the editor."
+			),
+			"error_code": "invalid_script_base",
+			"path": res_path,
+			"base_type": base_type,
+		}
+	return {
+		"ok": false,
+		"message": (
+			"execute_gd_script runs Godot with --headless --script; "
+			+ res_path + " must declare `extends SceneTree` or `extends MainLoop`."
+		),
+		"error_code": "invalid_script_base",
+		"path": res_path,
+		"base_type": "",
+	}
+
+
+## Godot 某些运行时错误不会产生非零退出码，因此还要检查标准错误输出中的错误行。
+static func _has_godot_error(output: String) -> bool:
+	for raw_line in output.split("\n"):
+		var line := str(raw_line).strip_edges()
+		if line.begins_with("ERROR:") or line.begins_with("SCRIPT ERROR:"):
+			return true
+	return false
 
 
 ## git_status/git_diff 用固定的可执行文件名与参数数组直接拼起子进程，不经过用户输入
@@ -576,6 +627,9 @@ static func _describe_system_command_failure(status: String, exit_code, output: 
 			return "command timed out"
 		"exit_code_missing":
 			return "command did not report an exit code (process may have been killed)"
+		"godot_error":
+			var base := "Godot reported an ERROR even though the process exited with code %s" % str(exit_code)
+			return base if tail == "" else "%s: %s" % [base, tail]
 		_:
 			var base := "command exited with code %s" % str(exit_code)
 			return base if tail == "" else "%s: %s" % [base, tail]

@@ -18,7 +18,8 @@ can_delegate: false
 - 小范围、局部的修改优先用 `apply_text_edit`（精确的查找替换，`old_string` 必须原样取自刚读到的内容，且在文件里唯一，否则会被拒绝并提示加更多上下文或传 `replace_all`）；只有新建文件、整文件重写或改动跨越文件大部分内容时才用 `propose_script_edit` 提交完整替换内容。
 - `apply_text_edit` 要求此前对同一路径调用过 `read_file`，否则会被拒绝——不要在没读过文件的情况下编造 `old_string`。
 - 生成测试可用 `propose_tests`；优先使用 `run_tests` 的已配置 kind，需要构建、版本控制或其他终端操作时可使用 `run_system_command`，后者每次都必须由用户确认。
-- 需要直接跑某个一次性 GDScript 工具/生成器脚本时用 `execute_gd_script`，它用编辑器自身的 Godot 以 `--headless --script` 方式执行该 .gd 文件并返回 stdout/stderr 与退出码；同样每次都必须由用户确认，且只能用于工具脚本，不要用它来启动游戏本体。
+- 需要直接跑某个一次性 GDScript 工具/生成器脚本时用 `execute_gd_script`，它用编辑器自身的 Godot 以 `--headless --script` 方式执行该 .gd 文件并返回 stdout/stderr 与退出码；入口脚本必须直接 `extends SceneTree` 或 `extends MainLoop`，禁止使用只能由编辑器实例化的 `EditorScript` 或普通 `Node`；同样每次都必须由用户确认，且只能用于工具脚本，不要用它来启动游戏本体。
+- 一次性脚本实例化 `PackedScene` 后，只给实例根节点设置 owner，禁止递归改写实例内部节点的 owner，也不要重复连接实例场景已经持久化的信号；否则保存父场景时会把实例内部节点和连接展开为冗余覆盖。
 - AI 试玩/自测只能用 `run_headless_self_test`，读取结果日志后再给修复建议或代码修改。
 - 想看仓库当前改动状态用只读的 `git_status`/`git_diff`，不需要每次确认；真正的提交/推送等改动性 git 操作仍走 `run_system_command`。
 - 触发导出前先用 `list_export_presets` 看有哪些预设，再用 `export_project` 实际导出；导出依赖本机已装好对应平台的导出模板，耗时可能很长，每次都必须由用户确认。

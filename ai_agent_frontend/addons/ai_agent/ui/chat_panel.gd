@@ -1962,6 +1962,8 @@ func _drain_event_queue() -> void:
 
 func _handle_event(event: Dictionary) -> void:
 	var event_type := str(event.get("type", ""))
+	if event_type == "server_tool_result":
+		_remember_server_file_read(event)
 	if event_type == "agent_reasoning_delta":
 		_on_reasoning_delta(event)
 	elif event_type == "agent_text_delta":
@@ -2003,6 +2005,28 @@ func _handle_event(event: Dictionary) -> void:
 			_append_message("system", description)
 		if event_type == "compact_boundary" and _state == AgentState.COMPACTING:
 			_set_state(_state_before_compact)
+
+
+func _remember_server_file_read(event: Dictionary) -> void:
+	var payload_value = event.get("payload", {})
+	if not payload_value is Dictionary:
+		return
+	var payload: Dictionary = payload_value
+	if bool(payload.get("is_error", false)):
+		return
+	var tool_name := str(payload.get("tool", ""))
+	if tool_name != "read_file" and tool_name != "read_script":
+		return
+	var result_summary_value = payload.get("result_summary", {})
+	var path := ""
+	if result_summary_value is Dictionary:
+		path = str(result_summary_value.get("path", ""))
+	if path == "":
+		var args_value = payload.get("args", {})
+		if args_value is Dictionary:
+			path = str(args_value.get("path", ""))
+	if path != "" and _tool_executor != null:
+		_tool_executor.remember_server_file_read(path)
 
 
 func _on_extensions() -> void:

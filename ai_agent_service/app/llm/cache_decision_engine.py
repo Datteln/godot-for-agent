@@ -113,6 +113,7 @@ class CacheDecisionEngine:
         tools: list[dict[str, Any]],
         project_root: Path,
         rag_index_path: Path | None = None,
+        compact_digest: str = "",
     ) -> CacheDecision:
         """为一次 `LLMProvider.chat()` 调用产出缓存决策。
 
@@ -124,6 +125,7 @@ class CacheDecisionEngine:
             tools: 当前帧可见的工具 schema 列表。
             project_root: 当前安全边界的工程根目录，用于计算 repo 指纹/project_id。
             rag_index_path: 本地 RAG 索引路径，用于计算 rag_fingerprint。
+            compact_digest: 当前帧持久化压缩快照的内容指纹；未压缩时为空。
 
         Returns:
             本次请求的 `CacheDecision`；前缀过短（连隐式缓存下限都不到）时直接
@@ -150,6 +152,7 @@ class CacheDecisionEngine:
             tool_schema_version=tool_schema_version,
             repo_fingerprint=repo_fingerprint,
             project_id=project_id,
+            compact_digest=compact_digest,
             rag_fingerprint=rag_fingerprint,
             scene_graph_version=scene_graph_version,
             asset_graph_version=asset_graph_version,
@@ -192,3 +195,19 @@ class CacheDecisionEngine:
             tool_schema_version=tool_schema_version,
             estimated_tokens=tokens,
         )
+
+    def invalidate(self, session_id: str, frame_ids: list[str] | None = None) -> None:
+        """使会话帧的本地缓存稳定性记录失效。
+
+        Args:
+            session_id: 需要失效的会话 id。
+            frame_ids: 指定帧 id；为 None 时失效该会话的全部已跟踪帧。
+        """
+        selected = set(frame_ids) if frame_ids is not None else None
+        stale_keys = [
+            key
+            for key in self._last_cache_key
+            if key[0] == session_id and (selected is None or key[1] in selected)
+        ]
+        for key in stale_keys:
+            del self._last_cache_key[key]
