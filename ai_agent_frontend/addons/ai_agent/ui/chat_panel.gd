@@ -1471,9 +1471,9 @@ func _render_history_block(block: Dictionary) -> void:
 	var block_type := str(block.get("type", ""))
 	match block_type:
 		"user":
-			_append_message("user", str(block.get("text", "")))
+			_render_message_block("user", str(block.get("text", "")))
 		"error":
-			_append_message("error", str(block.get("text", "")))
+			_render_message_block("error", str(block.get("text", "")))
 		"log_text":
 			_log_renderer.append_history_text_entry(
 				_message_list,
@@ -1555,14 +1555,12 @@ func _render_history_block(block: Dictionary) -> void:
 			)
 		"event":
 			var payload: Dictionary = block.get("payload", {}) if block.get("payload", {}) is Dictionary else {}
-			var description := EventFormatter.describe_event({
+			_render_event_description({
 				"type": str(block.get("event_type", "")),
 				"payload": payload
-			}, _ui_table())
-			if description != "":
-				_append_message("system", description)
+			})
 		"system_text":
-			_append_message("system", str(block.get("text", "")))
+			_render_message_block("system", str(block.get("text", "")))
 
 
 func _history_agent_suffix(block: Dictionary) -> String:
@@ -2055,15 +2053,14 @@ func _handle_event(event: Dictionary) -> void:
 		if event_type == "compact_started" and _state != AgentState.IDLE:
 			_state_before_compact = _state
 			_set_state(AgentState.COMPACTING)
-		var description := EventFormatter.describe_event(event, _ui_table())
-		if description != "":
+		var rendered_description := _render_event_description(event)
+		if rendered_description != "":
 			FrontendLogger.debug(editor_interface, "ChatPanel", "-> rendered", {
 				"type": event_type,
-				"description_len": description.length()
+				"description_len": rendered_description.length()
 			})
 			if _MILESTONE_EVENT_TYPES.has(event_type):
 				_force_scroll_once = true
-			_append_message("system", description)
 		if event_type == "compact_boundary" and _state == AgentState.COMPACTING:
 			_set_state(_state_before_compact)
 
@@ -2489,6 +2486,17 @@ func _finalize_stream_as_persistent() -> void:
 		_indent_current_text = false
 		_rendered_assistant_keys[_message_fingerprint(text)] = true
 	_finish_streaming()
+
+
+func _render_message_block(role: String, text: String, color = null) -> void:
+	_append_message(role, text, color)
+
+
+func _render_event_description(event: Dictionary) -> String:
+	var description := EventFormatter.describe_event(event, _ui_table())
+	if description != "":
+		_render_message_block("system", description)
+	return description
 
 
 func _append_message(role: String, text: String, color = null) -> void:

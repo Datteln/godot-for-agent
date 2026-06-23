@@ -40,7 +40,6 @@ from app.api.schemas import (
     LogGrepHistoryBlock,
     LogReadHistoryBlock,
     LogTextHistoryBlock,
-    NodeTreeHistoryBlock,
     PlanCreatedHistoryBlock,
     PlanStepDTO,
     SessionHistoryBlock,
@@ -284,6 +283,7 @@ _HISTORY_FRONT_READ_TOOLS = frozenset(
         "read_runtime_state",
         "read_profiler_snapshot",
         "read_debugger_errors",
+        "capture_viewport_screenshot",
         "read_image_metadata",
         "read_class_docs",
         "describe_tilemap_selection",
@@ -497,6 +497,47 @@ def _front_result_lines(value: Any, *, indent: int = 0, max_items: int = 80) -> 
 def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str, Any]) -> str:
     """为前端工具生成可读摘要，并保留返回的节点与状态。"""
     title = name.replace("_", " ").capitalize()
+    if name == "read_scene_tree":
+        node_name = str(result.get("name", result.get("path", "Scene"))).strip()
+        node_type = str(result.get("type", "Node")).strip()
+        children = result.get("children", [])
+        child_count = len(children) if isinstance(children, list) else 0
+        suffix = f": {node_name} ({node_type})" if node_name else ""
+        return f"Read scene tree{suffix}\n{child_count} top-level child node(s)"
+    if name == "read_runtime_state":
+        edited_scene = result.get("edited_scene", {})
+        scene_name = (
+            str(edited_scene.get("name", edited_scene.get("path", "Scene"))).strip()
+            if isinstance(edited_scene, dict)
+            else "Scene"
+        )
+        selected = result.get("selected_nodes", [])
+        selected_count = len(selected) if isinstance(selected, list) else 0
+        return f"Read runtime state: {scene_name}\n{selected_count} selected node(s)"
+    if name == "read_image_metadata":
+        path = str(result.get("path", input_args.get("path", ""))).strip()
+        width = result.get("width")
+        height = result.get("height")
+        colors = result.get("dominant_colors", [])
+        color_values = [
+            str(item.get("hex", "")).strip()
+            for item in colors
+            if isinstance(item, dict) and str(item.get("hex", "")).strip()
+        ][:5]
+        lines = [f"Read image metadata: {path}" if path else "Read image metadata"]
+        if width is not None and height is not None:
+            lines.append(f"{width}x{height}")
+        if color_values:
+            lines.append("Dominant colors: " + ", ".join(color_values))
+        return "\n".join(lines)
+    if name == "capture_viewport_screenshot":
+        path = str(result.get("path", result.get("absolute_path", ""))).strip()
+        width = result.get("width")
+        height = result.get("height")
+        lines = [f"Capture viewport screenshot: {path}" if path else "Capture viewport screenshot"]
+        if width is not None and height is not None:
+            lines.append(f"{width}x{height}")
+        return "\n".join(lines)
     if name == "read_class_docs":
         cls = input_args.get("class_name", "")
         title = f"Read class docs: {cls}" if cls else "Read class docs"
@@ -514,6 +555,14 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         scene_path = input_args.get("scene_path", "")
         parent = input_args.get("parent_path", ".")
         title = f"Instance {scene_path} under '{parent}'"
+        path = str(result.get("path", "")).strip()
+        position = result.get("position", {})
+        lines = [title]
+        if path:
+            lines.append(f"Done: `{path}`")
+        if isinstance(position, dict) and ("x" in position or "y" in position):
+            lines.append(f"Position: ({position.get('x', '?')}, {position.get('y', '?')})")
+        return "\n".join(lines)
     elif name == "duplicate_node":
         path = input_args.get("path", "")
         title = f"Duplicate node {path}"
@@ -1086,6 +1135,9 @@ def _tool_history_blocks(
             )
         ]
 
+    if name == "search_tools":
+        return []
+
     if name in _HISTORY_READ_TOOLS:
         path = str(inner.get("path", input_args.get("path", "<unknown>")))
         offset = int(inner.get("offset", 1) or 1)
@@ -1148,12 +1200,6 @@ def _tool_history_blocks(
                 **origin,
             )
         ]
-
-    if name in {"read_scene_tree", "read_runtime_state"}:
-        raw_tree = inner.get("edited_scene", inner)
-        tree = raw_tree if isinstance(raw_tree, dict) else {}
-        title = "Runtime scene tree" if name == "read_runtime_state" else "Scene tree"
-        return [NodeTreeHistoryBlock(title=title, tree=tree, **origin)]
 
     if name in _HISTORY_FRONT_READ_TOOLS:
         summary = _front_tool_summary(name, input_args, inner)
