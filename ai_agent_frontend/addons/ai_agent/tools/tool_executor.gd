@@ -88,6 +88,8 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = SceneTools.read_scene_tree(editor_interface)
 		"read_runtime_state":
 			result = SceneTools.read_runtime_state(input, editor_interface)
+		"validate_scene_state":
+			result = SceneTools.validate_scene_state(input, editor_interface)
 		"add_node":
 			result = SceneTools.add_node(input, editor_interface, undo_manager)
 		"set_node_property":
@@ -123,7 +125,7 @@ func execute(tool_call: Dictionary) -> Dictionary:
 		"capture_viewport_screenshot":
 			result = await SceneTools.capture_viewport_screenshot(input, editor_interface)
 		"open_scene":
-			result = SceneTools.open_scene(input, editor_interface)
+			result = await SceneTools.open_scene(input, editor_interface)
 		"list_groups":
 			result = SceneTools.list_groups(editor_interface)
 		"get_current_scene_path":

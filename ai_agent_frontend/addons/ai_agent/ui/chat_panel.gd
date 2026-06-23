@@ -476,6 +476,7 @@ func _on_send() -> void:
 	_live_response_keys.clear()
 	_empty_final_ignored_ms = -1   # 重置空 final 超时计时器
 	_input.text = ""
+	_update_input_height()
 	var referenced_paths: Array = _referenced_files.keys()
 	_referenced_files.clear()
 	_selection_signature = ""
@@ -513,6 +514,7 @@ func _try_run_slash_command(text: String) -> bool:
 			return true
 		args = parsed
 	_input.text = ""
+	_update_input_height()
 	_auto_scroll = true
 	_force_scroll_once = true
 	_append_message("user", text)
@@ -612,6 +614,7 @@ func _on_file_reference_selected(index: int) -> void:
 	if at_index >= 0:
 		_input.text = text.left(at_index) + "@" + path + " " + text.substr(caret)
 		_input.set_caret_column(at_index + path.length() + 2)
+		_update_input_height()
 	_referenced_files[path] = true
 	_dismissed_context.erase("file:" + path)
 	_selection_signature = ""
@@ -736,6 +739,7 @@ func _on_message_context_action(id: int) -> void:
 				var caret := _input.get_caret_column()
 				_input.text = _input.text.left(caret) + pasted + _input.text.substr(caret)
 				_input.set_caret_column(caret + pasted.length())
+				_update_input_height()
 				_input.grab_focus()
 		2:
 			if _message_context_source != null and is_instance_valid(_message_context_source):
@@ -1549,6 +1553,14 @@ func _render_history_block(block: Dictionary) -> void:
 					str(block.get("summary", ""))
 				], null, true
 			)
+		"event":
+			var payload: Dictionary = block.get("payload", {}) if block.get("payload", {}) is Dictionary else {}
+			var description := EventFormatter.describe_event({
+				"type": str(block.get("event_type", "")),
+				"payload": payload
+			}, _ui_table())
+			if description != "":
+				_append_message("system", description)
 		"system_text":
 			_append_message("system", str(block.get("text", "")))
 

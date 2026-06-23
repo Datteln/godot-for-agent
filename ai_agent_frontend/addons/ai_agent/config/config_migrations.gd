@@ -25,6 +25,7 @@ const DEFAULTS := {
 	"ai_agent/compact_summary_model": "",
 	"ai_agent/request_timeout_sec": 30.0,
 	"ai_agent/chat_request_timeout_sec": 300.0,
+	"ai_agent/chat_request_hard_cap_sec": 1800.0,
 	"ai_agent/embedding_provider": "disabled",
 	"ai_agent/embedding_model": "text-embedding-3-small",
 	"ai_agent/embedding_endpoint": "https://api.openai.com/v1",
@@ -100,6 +101,10 @@ const PROPERTY_HINTS := {
 	"ai_agent/chat_request_timeout_sec": {
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "1,1800,1,suffix:s"
+	},
+	"ai_agent/chat_request_hard_cap_sec": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "60,7200,10,suffix:s"
 	},
 	"ai_agent/embedding_provider": {
 		"hint": PROPERTY_HINT_ENUM,

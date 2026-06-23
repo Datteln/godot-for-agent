@@ -17,6 +17,7 @@ import json
 import logging
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from app.agents.bundled import get_agent
@@ -31,6 +32,7 @@ from app.api.schemas import (
     DelegateResultHistoryBlock,
     DelegateResultsHistoryBlock,
     ErrorHistoryBlock,
+    EventHistoryBlock,
     FrontToolCallDTO,
     GrepMatchDTO,
     InterruptResponse,
@@ -76,6 +78,7 @@ from app.prompt.builder import LayeredPrompt, build_system_prompt
 from app.prompt.context_builder import ContextBuilder
 from app.prompt.project_context import build_project_context
 from app.prompt.rag_context import build_rag_context
+from app.rag.asset_llm_client import AssetLLMClient, AssetLLMConfig
 from app.rag.factory import create_codebase_index
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import SecuritySettings, security_settings_from_app
@@ -284,22 +287,76 @@ _HISTORY_FRONT_READ_TOOLS = frozenset(
         "read_image_metadata",
         "read_class_docs",
         "describe_tilemap_selection",
+        "validate_scene_state",
     }
 )
-_HISTORY_FRONT_SCENE_EDIT_TOOLS = frozenset({"add_node", "set_node_property"})
-_HISTORY_FRONT_RUN_TOOLS = frozenset({"run_tests", "run_headless_self_test", "run_system_command"})
+_HISTORY_FRONT_SCENE_EDIT_TOOLS = frozenset(
+    {
+        "add_node",
+        "set_node_property",
+        "delete_node",
+        "reparent_node",
+        "rename_node",
+        "open_scene",
+        "instance_scene",
+        "duplicate_node",
+        "connect_signal",
+        "disconnect_signal",
+        "add_to_group",
+        "remove_from_group",
+        "save_scene",
+        "bake_navigation_mesh",
+        "create_animation_track",
+    }
+)
+_HISTORY_FRONT_RUN_TOOLS = frozenset(
+    {
+        "run_tests",
+        "run_headless_self_test",
+        "run_system_command",
+        "execute_gd_script",
+        "export_project",
+    }
+)
 _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
     {
         "agent_reasoning_delta",
         "agent_text_delta",
+        "agent_model_fallback",
+        "cache_hit",
+        "compact_boundary",
+        "compact_started",
+        "config_changed",
         "plan_created",
         "plan_step_started",
         "plan_step_completed",
         "verify_started",
         "verify_completed",
         "delegate_start",
+        "error",
+        "pending_discarded",
+        "reset",
+        "server_tool_start",
         "server_tool_result",
         "context_usage",
+        "turn_interrupted",
+        "user_submitted",
+    }
+)
+
+_GENERIC_HISTORY_EVENT_TYPES = frozenset(
+    {
+        "agent_model_fallback",
+        "cache_hit",
+        "compact_boundary",
+        "compact_started",
+        "config_changed",
+        "error",
+        "pending_discarded",
+        "reset",
+        "server_tool_start",
+        "turn_interrupted",
+        "user_submitted",
     }
 )
 
@@ -453,6 +510,57 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         prop = input_args.get("property", "")
         value = input_args.get("value", "")
         title = f"Set {path}.{prop} = {value}"
+    elif name == "instance_scene":
+        scene_path = input_args.get("scene_path", "")
+        parent = input_args.get("parent_path", ".")
+        title = f"Instance {scene_path} under '{parent}'"
+    elif name == "duplicate_node":
+        path = input_args.get("path", "")
+        title = f"Duplicate node {path}"
+    elif name == "open_scene":
+        path = input_args.get("path", "")
+        title = f"Open scene {path}"
+    elif name == "save_scene":
+        title = "Save current scene"
+    elif name == "delete_node":
+        path = input_args.get("path", "")
+        title = f"Delete node {path}"
+    elif name == "reparent_node":
+        path = input_args.get("path", "")
+        new_parent = input_args.get("new_parent_path", "")
+        title = f"Reparent {path} under '{new_parent}'"
+    elif name == "rename_node":
+        path = input_args.get("path", "")
+        new_name = input_args.get("name", "")
+        title = f"Rename {path} to '{new_name}'"
+    elif name == "connect_signal":
+        path = input_args.get("path", "")
+        signal = input_args.get("signal", "")
+        target = input_args.get("target_path", "")
+        method = input_args.get("method", "")
+        title = f"Connect {path}.{signal} -> {target}.{method}"
+    elif name == "disconnect_signal":
+        path = input_args.get("path", "")
+        signal = input_args.get("signal", "")
+        target = input_args.get("target_path", "")
+        method = input_args.get("method", "")
+        title = f"Disconnect {path}.{signal} -> {target}.{method}"
+    elif name == "add_to_group":
+        path = input_args.get("path", "")
+        group = input_args.get("group", "")
+        title = f"Add {path} to group '{group}'"
+    elif name == "remove_from_group":
+        path = input_args.get("path", "")
+        group = input_args.get("group", "")
+        title = f"Remove {path} from group '{group}'"
+    elif name == "bake_navigation_mesh":
+        path = input_args.get("path", "")
+        title = f"Bake navigation mesh for {path}"
+    elif name == "create_animation_track":
+        player = input_args.get("player_path", "")
+        animation = input_args.get("animation", "")
+        track_path = input_args.get("track_path", "")
+        title = f"Set animation track {animation}@{player} ({track_path})"
     elif name == "run_tests":
         kind = input_args.get("kind", "")
         title = f"Run tests ({kind})" if kind else "Run tests"
@@ -1133,6 +1241,8 @@ def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
     frame_id = str(payload.get("frame_id", "")) or None
     agent = str(payload.get("agent", "")) or None
     origin = {"frame_id": frame_id, "agent": agent}
+    if event.type in _GENERIC_HISTORY_EVENT_TYPES:
+        return [EventHistoryBlock(event_type=event.type, payload=payload, **origin)]
     if event.type == "agent_reasoning_delta":
         detail = str(payload.get("text", "")).strip()
         if not detail:
@@ -1225,9 +1335,7 @@ def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
     if event.type == "server_tool_result":
         summary = payload.get("result_summary")
         if not isinstance(summary, dict):
-            # Error detail is already rendered via the tool-role message block;
-            # emitting a duplicate ErrorHistoryBlock here causes double red boxes.
-            return []
+            return [EventHistoryBlock(event_type=event.type, payload=payload, **origin)]
         kind = str(summary.get("kind", ""))
         if kind == "read":
             return [
@@ -1261,6 +1369,7 @@ def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
                     **origin,
                 )
             ]
+        return [EventHistoryBlock(event_type=event.type, payload=payload, **origin)]
     return []
 
 
@@ -1884,8 +1993,8 @@ class QueryEngine:
                 len(request.tool_results or []),
                 session.pending_turn_id,
             )
-            result_error, verify_candidates = self._append_tool_results(
-                session, request.tool_results or []
+            result_error, verify_candidates = await self._append_tool_results(
+                session, request.tool_results or [], security
             )
             if result_error is not None:
                 logger.warning(
@@ -2083,8 +2192,83 @@ class QueryEngine:
             "advisor": self._settings.llm_thinking_budget_advisor,
         }.get(effort)
 
-    def _append_tool_results(
-        self, session: Session, results: list[ToolResult]
+    async def _enrich_front_image_result(
+        self, tool_name: str, result: dict[str, Any], security: SecuritySettings
+    ) -> dict[str, Any]:
+        """为前端读图类工具结果补充多模态语义描述。"""
+        if tool_name not in {"read_image_metadata", "capture_viewport_screenshot"}:
+            return result
+        enriched = dict(result)
+        client = AssetLLMClient(
+            AssetLLMConfig(
+                enabled=self._settings.asset_understanding_enabled,
+                model=self._settings.asset_understanding_model,
+                endpoint=self._settings.asset_understanding_endpoint,
+                api_key=self._settings.asset_understanding_api_key.get_secret_value(),
+                timeout_s=self._settings.asset_understanding_timeout_s,
+                max_tokens=self._settings.asset_understanding_max_tokens,
+                concurrency=1,
+            )
+        )
+        semantic: dict[str, Any] = {
+            "enabled": client.available,
+            "model": self._settings.asset_understanding_model,
+        }
+        if not client.available:
+            semantic["skipped"] = "asset_understanding_not_configured"
+            enriched["semantic"] = semantic
+            return enriched
+        image_path = self._resolve_front_image_path(enriched, security)
+        if image_path is None:
+            semantic["skipped"] = "image_path_not_readable_by_service"
+            enriched["semantic"] = semantic
+            return enriched
+        description = await asyncio.to_thread(client.describe, image_path, "image")
+        semantic["source_path"] = str(image_path)
+        semantic["description"] = description
+        enriched["semantic"] = semantic
+        if description:
+            enriched["semantic_description"] = description
+        return enriched
+
+    def _resolve_front_image_path(
+        self, result: dict[str, Any], security: SecuritySettings
+    ) -> Path | None:
+        """把前端返回的 res/user 路径解析为服务端可读的本地图片路径。"""
+        raw_path = str(result.get("path", "")).strip()
+        if raw_path.startswith("res://"):
+            rel = raw_path.removeprefix("res://").lstrip("/\\")
+            return self._resolve_project_image_path(security.project_root / rel, security)
+        if raw_path and not raw_path.startswith("user://") and not Path(raw_path).is_absolute():
+            return self._resolve_project_image_path(security.project_root / raw_path, security)
+        absolute = str(result.get("absolute_path", "")).strip()
+        if raw_path.startswith("user://") and absolute:
+            return self._resolve_existing_image_path(Path(absolute))
+        return None
+
+    def _resolve_project_image_path(
+        self, candidate: Path, security: SecuritySettings
+    ) -> Path | None:
+        """确认项目内图片路径没有越过安全根目录且真实存在。"""
+        try:
+            resolved_root = security.project_root.resolve()
+            resolved_candidate = candidate.resolve()
+            resolved_candidate.relative_to(resolved_root)
+        except (OSError, ValueError):
+            return None
+        return self._resolve_existing_image_path(resolved_candidate)
+
+    def _resolve_existing_image_path(self, candidate: Path) -> Path | None:
+        """确认图片候选路径存在且是普通文件。"""
+        try:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        except OSError:
+            return None
+        return None
+
+    async def _append_tool_results(
+        self, session: Session, results: list[ToolResult], security: SecuritySettings
     ) -> tuple[ChatErrorResponse | None, list[dict[str, Any]]]:
         """校验并把前端工具结果追加到对应 agent 帧。
 
@@ -2152,6 +2336,10 @@ class QueryEngine:
                     and isinstance(applied_result, dict)
                 ):
                     applied_result = tool.enrich(tool_args, applied_result)
+                if isinstance(applied_result, dict):
+                    applied_result = await self._enrich_front_image_result(
+                        tool_name, applied_result, security
+                    )
                 if result.grant_session_allow and tool is not None:
                     session.session_allow.add(make_session_allow_grant(tool, tool_args))
                     logger.info(

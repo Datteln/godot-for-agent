@@ -373,6 +373,12 @@ class DelegateResultHistoryBlock(HistoryBlockBase):
     summary: str = ""
 
 
+class EventHistoryBlock(HistoryBlockBase):
+    type: Literal["event"] = "event"
+    event_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class SystemTextHistoryBlock(HistoryBlockBase):
     type: Literal["system_text"] = "system_text"
     text: str
@@ -395,6 +401,7 @@ SessionHistoryBlock = Annotated[
     | VerifyFailedHistoryBlock
     | DelegateResultsHistoryBlock
     | DelegateResultHistoryBlock
+    | EventHistoryBlock
     | SystemTextHistoryBlock,
     Field(discriminator="type"),
 ]

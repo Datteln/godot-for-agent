@@ -49,6 +49,160 @@ static func _node_position_payload(node: Node) -> Dictionary:
 	return {}
 
 
+static func _coerce_property_value(current_value: Variant, raw_value: Variant) -> Dictionary:
+	var current_type := typeof(current_value)
+	var accepts_resource_ref := current_type == TYPE_NIL or current_type == TYPE_OBJECT
+	if accepts_resource_ref and raw_value is Dictionary and raw_value.has("_resource_path"):
+		var ref_path := PathUtils.to_res_path(str(raw_value.get("_resource_path", "")))
+		if ref_path == "" or not PathUtils.is_read_allowed(ref_path) or not FileAccess.file_exists(ref_path):
+			return {"ok": false, "message": "resource reference is not readable: " + ref_path, "error_code": "invalid_resource_reference"}
+		var loaded = load(ref_path)
+		if not (loaded is Resource):
+			return {"ok": false, "message": "resource reference is not a Resource: " + ref_path, "error_code": "invalid_resource_reference"}
+		return {"ok": true, "value": loaded}
+	if current_value is Vector2:
+		return _coerce_vector2(raw_value)
+	if current_value is Vector2i:
+		var vector2_result := _coerce_vector2(raw_value)
+		if not bool(vector2_result.get("ok", false)):
+			return vector2_result
+		var vector2: Vector2 = vector2_result["value"]
+		return {"ok": true, "value": Vector2i(roundi(vector2.x), roundi(vector2.y))}
+	if current_value is Vector3:
+		return _coerce_vector3(raw_value)
+	if current_value is Vector3i:
+		var vector3_result := _coerce_vector3(raw_value)
+		if not bool(vector3_result.get("ok", false)):
+			return vector3_result
+		var vector3: Vector3 = vector3_result["value"]
+		return {"ok": true, "value": Vector3i(roundi(vector3.x), roundi(vector3.y), roundi(vector3.z))}
+	if current_value is Color:
+		return _coerce_color(raw_value)
+	if current_value is NodePath:
+		return {"ok": true, "value": NodePath(str(raw_value))}
+	if current_value is StringName:
+		return {"ok": true, "value": StringName(str(raw_value))}
+	match typeof(current_value):
+		TYPE_INT:
+			return {"ok": true, "value": int(raw_value)}
+		TYPE_FLOAT:
+			return {"ok": true, "value": float(raw_value)}
+		TYPE_BOOL:
+			return {"ok": true, "value": bool(raw_value)}
+		TYPE_STRING:
+			return {"ok": true, "value": str(raw_value)}
+	return {"ok": true, "value": raw_value}
+
+
+static func _coerce_vector2(value: Variant) -> Dictionary:
+	if value is Dictionary:
+		if not _has_numeric_components(value, ["x", "y"]):
+			return {"ok": false, "message": "Vector2 value must include numeric x/y fields", "error_code": "invalid_vector"}
+		return {"ok": true, "value": Vector2(float(value["x"]), float(value["y"]))}
+	if value is Array and value.size() >= 2:
+		if typeof(value[0]) in [TYPE_INT, TYPE_FLOAT] and typeof(value[1]) in [TYPE_INT, TYPE_FLOAT]:
+			return {"ok": true, "value": Vector2(float(value[0]), float(value[1]))}
+	return {"ok": false, "message": "Vector2 value must be an object {x,y} or array [x,y]", "error_code": "invalid_vector"}
+
+
+static func _coerce_vector3(value: Variant) -> Dictionary:
+	if value is Dictionary:
+		if not _has_numeric_components(value, ["x", "y"]):
+			return {"ok": false, "message": "Vector3 value must include numeric x/y fields", "error_code": "invalid_vector"}
+		var z_value = value.get("z", 0.0)
+		if typeof(z_value) not in [TYPE_INT, TYPE_FLOAT]:
+			return {"ok": false, "message": "Vector3.z must be a number", "error_code": "invalid_vector"}
+		return {"ok": true, "value": Vector3(float(value["x"]), float(value["y"]), float(z_value))}
+	if value is Array and value.size() >= 3:
+		if typeof(value[0]) in [TYPE_INT, TYPE_FLOAT] and typeof(value[1]) in [TYPE_INT, TYPE_FLOAT] and typeof(value[2]) in [TYPE_INT, TYPE_FLOAT]:
+			return {"ok": true, "value": Vector3(float(value[0]), float(value[1]), float(value[2]))}
+	return {"ok": false, "message": "Vector3 value must be an object {x,y,z} or array [x,y,z]", "error_code": "invalid_vector"}
+
+
+static func _coerce_color(value: Variant) -> Dictionary:
+	if value is Dictionary:
+		if not _has_numeric_components(value, ["r", "g", "b"]):
+			return {"ok": false, "message": "Color value must include numeric r/g/b fields", "error_code": "invalid_color"}
+		var a_value = value.get("a", 1.0)
+		if typeof(a_value) not in [TYPE_INT, TYPE_FLOAT]:
+			return {"ok": false, "message": "Color.a must be a number", "error_code": "invalid_color"}
+		return {"ok": true, "value": Color(float(value["r"]), float(value["g"]), float(value["b"]), float(a_value))}
+	return {"ok": false, "message": "Color value must be an object {r,g,b,a?}", "error_code": "invalid_color"}
+
+
+static func _has_numeric_components(value: Dictionary, components: Array) -> bool:
+	for component in components:
+		if not value.has(component) or typeof(value[component]) not in [TYPE_INT, TYPE_FLOAT]:
+			return false
+	return true
+
+
+static func _json_safe_value(value: Variant) -> Variant:
+	if value is Vector2:
+		return {"x": value.x, "y": value.y}
+	if value is Vector2i:
+		return {"x": value.x, "y": value.y}
+	if value is Vector3:
+		return {"x": value.x, "y": value.y, "z": value.z}
+	if value is Vector3i:
+		return {"x": value.x, "y": value.y, "z": value.z}
+	if value is Color:
+		return {"r": value.r, "g": value.g, "b": value.b, "a": value.a}
+	if value is Resource:
+		return {"_type": "Resource", "class": value.get_class(), "path": str(value.resource_path)}
+	if value is Object:
+		return {"_type": "Object", "class": value.get_class()}
+	if value is Array:
+		var out: Array = []
+		for item in value:
+			out.append(_json_safe_value(item))
+		return out
+	if value is Dictionary:
+		var out_dict := {}
+		for key in value.keys():
+			out_dict[str(key)] = _json_safe_value(value[key])
+		return out_dict
+	return value
+
+
+static func _variant_matches(actual: Variant, expected: Variant, tolerance: float) -> bool:
+	var coerced := _coerce_property_value(actual, expected)
+	if bool(coerced.get("ok", false)):
+		expected = coerced["value"]
+	if actual is Resource and expected is Dictionary and expected.has("_resource_path"):
+		return str(actual.resource_path) == PathUtils.to_res_path(str(expected.get("_resource_path", "")))
+	if actual is Vector2 and expected is Vector2:
+		return actual.distance_to(expected) <= tolerance
+	if actual is Vector2i and expected is Vector2i:
+		return actual == expected
+	if actual is Vector3 and expected is Vector3:
+		return actual.distance_to(expected) <= tolerance
+	if actual is Vector3i and expected is Vector3i:
+		return actual == expected
+	if actual is Color and expected is Color:
+		return (
+			abs(actual.r - expected.r) <= tolerance
+			and abs(actual.g - expected.g) <= tolerance
+			and abs(actual.b - expected.b) <= tolerance
+			and abs(actual.a - expected.a) <= tolerance
+		)
+	if typeof(actual) in [TYPE_INT, TYPE_FLOAT] and typeof(expected) in [TYPE_INT, TYPE_FLOAT]:
+		return abs(float(actual) - float(expected)) <= tolerance
+	if actual is Array and expected is Array:
+		if actual.size() != expected.size():
+			return false
+		for index in range(actual.size()):
+			if not _variant_matches(actual[index], expected[index], tolerance):
+				return false
+		return true
+	if actual is Dictionary and expected is Dictionary:
+		for key in expected.keys():
+			if not actual.has(key) or not _variant_matches(actual[key], expected[key], tolerance):
+				return false
+		return true
+	return actual == expected
+
+
 static func read_scene_tree(editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {}
@@ -83,6 +237,112 @@ static func read_runtime_state(input: Dictionary, editor_interface: EditorInterf
 				"process_mode": int(node.process_mode)
 			})
 	return result
+
+
+static func validate_scene_state(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var root := editor_interface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "message": "No edited scene root", "error_code": "no_scene_root"}
+	var raw_checks = input.get("checks", [])
+	if not (raw_checks is Array) or raw_checks.is_empty():
+		return {"ok": false, "message": "checks must be a non-empty array", "error_code": "invalid_checks"}
+	var tolerance := max(0.0, float(input.get("tolerance", 0.001)))
+	var results: Array = []
+	var failed := 0
+	for index in range(raw_checks.size()):
+		var raw_check = raw_checks[index]
+		var result := _validate_scene_check(root, raw_check, index, tolerance)
+		results.append(result)
+		if not bool(result.get("ok", false)):
+			failed += 1
+	return {
+		"ok": failed == 0,
+		"passed": raw_checks.size() - failed,
+		"failed": failed,
+		"results": results,
+	}
+
+
+static func _validate_scene_check(root: Node, raw_check: Variant, index: int, tolerance: float) -> Dictionary:
+	if not (raw_check is Dictionary):
+		return {"ok": false, "index": index, "message": "check must be an object", "error_code": "invalid_check"}
+	var check: Dictionary = raw_check
+	var path := str(check.get("path", ""))
+	var expect_exists := bool(check.get("exists", true))
+	var node := root if path in [".", "", str(root.get_path())] else root.get_node_or_null(NodePath(path))
+	var failures: Array = []
+	var details := {
+		"index": index,
+		"path": path if path != "" else ".",
+		"exists": node != null,
+	}
+	if node == null:
+		if expect_exists:
+			failures.append("node not found")
+		details["failures"] = failures
+		details["ok"] = failures.is_empty()
+		return details
+	if not expect_exists:
+		failures.append("node exists but expected missing")
+	details["actual_path"] = _relative_path(root, node)
+	details["type"] = node.get_class()
+
+	var expected_type := str(check.get("type", "")).strip_edges()
+	if expected_type != "" and not node.is_class(expected_type):
+		failures.append("type expected %s but got %s" % [expected_type, node.get_class()])
+
+	var properties = check.get("properties", {})
+	var property_details := {}
+	if properties is Dictionary:
+		for property in properties.keys():
+			var property_name := str(property)
+			var actual = node.get(property_name)
+			var expected = properties[property]
+			property_details[property_name] = _json_safe_value(actual)
+			if not _variant_matches(actual, expected, tolerance):
+				failures.append("property %s expected %s but got %s" % [property_name, JSON.stringify(_json_safe_value(expected)), JSON.stringify(_json_safe_value(actual))])
+	details["properties"] = property_details
+
+	var groups = check.get("groups", [])
+	if groups is Array:
+		for group in groups:
+			if not node.is_in_group(str(group)):
+				failures.append("missing group %s" % str(group))
+	var absent_groups = check.get("not_groups", [])
+	if absent_groups is Array:
+		for group in absent_groups:
+			if node.is_in_group(str(group)):
+				failures.append("unexpected group %s" % str(group))
+
+	var signals = check.get("signals", [])
+	var signal_details: Array = []
+	if signals is Array:
+		for signal_check in signals:
+			if not (signal_check is Dictionary):
+				failures.append("signal check must be an object")
+				continue
+			var signal_name := str(signal_check.get("signal", ""))
+			var target_path := str(signal_check.get("target_path", path))
+			var method_name := str(signal_check.get("method", ""))
+			var expect_connected := bool(signal_check.get("connected", true))
+			var target := root if target_path in [".", "", str(root.get_path())] else root.get_node_or_null(NodePath(target_path))
+			var connected := false
+			if target != null and signal_name != "" and method_name != "" and node.has_signal(signal_name):
+				connected = node.is_connected(signal_name, Callable(target, method_name))
+			signal_details.append({
+				"signal": signal_name,
+				"target_path": target_path,
+				"method": method_name,
+				"connected": connected,
+			})
+			if connected != expect_connected:
+				failures.append("signal %s -> %s.%s connected=%s expected %s" % [signal_name, target_path, method_name, connected, expect_connected])
+	details["signals"] = signal_details
+	details["failures"] = failures
+	details["ok"] = failures.is_empty()
+	return details
 
 
 static func add_node(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
@@ -129,12 +389,15 @@ static func set_node_property(input: Dictionary, editor_interface: EditorInterfa
 		return {"ok": false, "message": "Node not found"}
 	var property := str(input.get("property", ""))
 	var before = node.get(property)
-	var after = input.get("value")
+	var coerced := _coerce_property_value(before, input.get("value"))
+	if not bool(coerced.get("ok", false)):
+		return coerced
+	var after = coerced["value"]
 	if undo_manager != null:
 		undo_manager.record_node_property(node, property, before, after)
 	else:
 		node.set(property, after)
-	return {"ok": true, "path": _relative_path(root, node), "property": property}
+	return {"ok": true, "path": _relative_path(root, node), "property": property, "before": _json_safe_value(before), "after": _json_safe_value(after)}
 
 
 static func delete_node(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
@@ -246,7 +509,7 @@ static func instance_scene(input: Dictionary, editor_interface: EditorInterface,
 	if not position_error.is_empty():
 		return position_error
 	parent.add_child(node)
-	_set_owner_recursive(node, root)
+	node.owner = root
 	if undo_manager != null:
 		undo_manager.record_node_added(parent, node, root)
 	return {
@@ -280,7 +543,10 @@ static func duplicate_node(input: Dictionary, editor_interface: EditorInterface,
 	if not position_error.is_empty():
 		return position_error
 	parent.add_child(clone)
-	_set_owner_recursive(clone, root)
+	if str(clone.scene_file_path) == "":
+		_set_owner_preserving_scene_instances(clone, root)
+	else:
+		clone.owner = root
 	if undo_manager != null:
 		undo_manager.record_node_added(parent, clone, root)
 	return {
@@ -546,6 +812,8 @@ static func save_scene(editor_interface: EditorInterface) -> Dictionary:
 	var root := editor_interface.get_edited_scene_root()
 	if root == null:
 		return {"ok": false, "message": "No edited scene root"}
+	if str(root.scene_file_path).strip_edges() == "":
+		return {"ok": false, "message": "Current scene has no file path; save it in the editor first, then run save_scene again.", "error_code": "scene_path_required"}
 	var err := editor_interface.save_scene()
 	if err != OK:
 		return {"ok": false, "message": "Failed to save scene (error %d)" % err, "error_code": "save_failed"}
@@ -603,14 +871,16 @@ static func capture_viewport_screenshot(input: Dictionary, editor_interface: Edi
 	var err := image.save_png(absolute)
 	if err != OK:
 		return {"ok": false, "message": "Failed to save screenshot (error %d)" % err, "error_code": "save_failed"}
-	return {"ok": true, "path": output_path, "width": image.get_width(), "height": image.get_height()}
+	return {"ok": true, "path": output_path, "absolute_path": absolute, "width": image.get_width(), "height": image.get_height()}
 
 
-static func _set_owner_recursive(node: Node, owner: Node) -> void:
+static func _set_owner_preserving_scene_instances(node: Node, owner: Node) -> void:
 	node.owner = owner
 	for child in node.get_children():
 		if child is Node:
-			_set_owner_recursive(child, owner)
+			child.owner = owner
+			if str(child.scene_file_path) == "":
+				_set_owner_preserving_scene_instances(child, owner)
 
 
 ## 切换编辑器当前打开/编辑的场景。会丢弃目标场景之外的未保存编辑器内编辑状态，
@@ -628,6 +898,10 @@ static func open_scene(input: Dictionary, editor_interface: EditorInterface) -> 
 	if not FileAccess.file_exists(path):
 		return {"ok": false, "message": "scene file not found: " + path, "error_code": "scene_not_found"}
 	editor_interface.open_scene_from_path(path)
+	var tree := editor_interface.get_base_control().get_tree()
+	if tree != null:
+		await tree.process_frame
+		await tree.process_frame
 	var root := editor_interface.get_edited_scene_root()
 	if root == null or str(root.scene_file_path) != path:
 		return {"ok": false, "message": "failed to open scene: " + path, "error_code": "open_failed"}

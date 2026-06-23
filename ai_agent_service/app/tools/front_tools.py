@@ -618,12 +618,22 @@ def register_front_tools() -> None:
             render_kind="list",
             schema={
                 "name": "set_node_property",
-                "description": "Set a property on a node in the currently edited scene.",
+                "description": (
+                    "Set a property on a node in the currently edited scene. The frontend coerces common "
+                    "Godot Variant types from JSON: Vector2/Vector2i use {x,y} or [x,y], Vector3/Vector3i "
+                    "use {x,y,z} or [x,y,z], Color uses {r,g,b,a?}, NodePath/StringName use strings, and "
+                    "Resource references use {'_resource_path': 'res://...'}."
+                ),
                 "parameters": _object_schema(
                     {
                         "path": {"type": "string", "description": "NodePath to the node."},
                         "property": {"type": "string", "description": "Property name."},
-                        "value": {"description": "JSON value to assign."},
+                        "value": {
+                            "description": (
+                                "JSON value to assign. For position/global_position/scale-like properties, "
+                                "pass {x,y} for 2D nodes or {x,y,z} for 3D nodes instead of a raw string."
+                            )
+                        },
                     },
                     ["path", "property", "value"],
                 ),
@@ -911,6 +921,91 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="validate_scene_state",
+            domain="scene",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "validate_scene_state",
+                "description": (
+                    "Validate the currently edited scene against explicit expectations without modifying it. "
+                    "Use after scene-editing tools to verify nodes exist or are absent, node types match, "
+                    "properties have expected values, groups are present/absent, and signal connections are "
+                    "present/absent. Property values use the same JSON coercion as set_node_property: "
+                    "{x,y} for Vector2, {x,y,z} for Vector3, {r,g,b,a?} for Color, and "
+                    "{'_resource_path': 'res://...'} for Resource references."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "tolerance": {
+                            "type": "number",
+                            "description": "Numeric tolerance for float, Vector2, Vector3, and Color comparisons. Defaults to 0.001.",
+                        },
+                        "checks": {
+                            "type": "array",
+                            "description": "Scene assertions to evaluate against the current edited scene root.",
+                            "items": _object_schema(
+                                {
+                                    "path": {
+                                        "type": "string",
+                                        "description": "NodePath relative to the edited scene root, or '.' for the root.",
+                                    },
+                                    "exists": {
+                                        "type": "boolean",
+                                        "description": "Whether the node should exist. Defaults to true.",
+                                    },
+                                    "type": {
+                                        "type": "string",
+                                        "description": "Optional Godot class/type expectation, e.g. Node2D, Area2D, Node3D.",
+                                    },
+                                    "properties": {
+                                        "type": "object",
+                                        "description": "Optional property expectations keyed by property name, e.g. {'position': {'x': 10, 'y': 20}}.",
+                                    },
+                                    "groups": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Groups the node must belong to.",
+                                    },
+                                    "not_groups": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Groups the node must not belong to.",
+                                    },
+                                    "signals": {
+                                        "type": "array",
+                                        "description": "Signal connection expectations for this source node.",
+                                        "items": _object_schema(
+                                            {
+                                                "signal": {"type": "string", "description": "Signal name on the source node."},
+                                                "target_path": {
+                                                    "type": "string",
+                                                    "description": "Target NodePath relative to the scene root. Defaults to the source path.",
+                                                },
+                                                "method": {"type": "string", "description": "Target method name."},
+                                                "connected": {
+                                                    "type": "boolean",
+                                                    "description": "Whether the connection should exist. Defaults to true.",
+                                                },
+                                            },
+                                            ["signal", "method"],
+                                        ),
+                                    },
+                                },
+                                ["path"],
+                            ),
+                        },
+                    },
+                    ["checks"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="list_groups",
             domain="scene",
             side="front",
@@ -981,6 +1076,7 @@ def register_front_tools() -> None:
             domain="scene",
             side="front",
             reads_project=True,
+            uses_network=True,
             is_read_only=True,
             write_path_args=["output_path"],
             render_kind="json",
@@ -988,7 +1084,9 @@ def register_front_tools() -> None:
                 "name": "capture_viewport_screenshot",
                 "description": (
                     "Capture the editor's current 2D or 3D viewport as a PNG so the model can see the actual "
-                    "result of a map/UI/animation change instead of only reading scene data."
+                    "result of a map/UI/animation change instead of only reading scene data. When asset "
+                    "understanding is configured, the service also sends the screenshot through the multimodal "
+                    "asset-understanding model after applying the shared image compression/format conversion."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1435,13 +1533,18 @@ def register_front_tools() -> None:
             domain="resource",
             side="front",
             reads_project=True,
+            uses_network=True,
             is_read_only=True,
             is_concurrency_safe=True,
             render_kind="json",
             path_args=["path"],
             schema={
                 "name": "read_image_metadata",
-                "description": "Read image size, format and sampled dominant colors from a project asset.",
+                "description": (
+                    "Read image size, format and sampled dominant colors from a project asset. When asset "
+                    "understanding is configured, the service also sends the image through the multimodal "
+                    "asset-understanding model after applying the shared image compression/format conversion."
+                ),
                 "parameters": _object_schema(
                     {
                         "path": {"type": "string", "description": "Relative or res:// image path."},

@@ -19,6 +19,12 @@ const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd
 ## 的短超时，所以 `/chat` 用单独的、更宽松的超时设置。
 const DEFAULT_REQUEST_TIMEOUT_S := 30.0
 const DEFAULT_CHAT_REQUEST_TIMEOUT_S := 300.0
+## 上面那个超时现在按"空闲"语义续期（见 `_on_events_completed`）：只要
+## `/chat/events` 轮询还能拿到新事件（流式文本、delegate、工具调用……），
+## 就说明后端没卡死，超时计时器会被重置而不是任由它在固定总时长后到期。
+## 这个硬上限是兜底：哪怕事件一直在零星地来、后端实际已经死循环/卡死，
+## 单条 `/chat` 请求也不会无限续期下去。
+const DEFAULT_CHAT_REQUEST_HARD_CAP_S := 1800.0
 
 var editor_interface: EditorInterface
 var service: Node
@@ -37,6 +43,7 @@ var _suppress_events := false
 var _event_timer: Timer
 var _request_timeout_timer: Timer
 var _timeout_generation := -1
+var _inflight_started_at_msec := 0
 
 
 func _ready() -> void:
@@ -330,6 +337,7 @@ func _pump() -> void:
 		_pump()
 	else:
 		_timeout_generation = _inflight_generation
+		_inflight_started_at_msec = Time.get_ticks_msec()
 		_request_timeout_timer.start(_timeout_for_path(_inflight_path))
 
 
@@ -343,6 +351,36 @@ func _timeout_for_path(path: String) -> float:
 		return chat_value if chat_value > 0.0 else DEFAULT_CHAT_REQUEST_TIMEOUT_S
 	var value := float(_setting("ai_agent/request_timeout_sec"))
 	return value if value > 0.0 else DEFAULT_REQUEST_TIMEOUT_S
+
+
+func _hard_cap_for_path(path: String) -> float:
+	if path != "/chat" and path != "/commands/rebuild_index":
+		return 0.0
+	var cap := float(_setting("ai_agent/chat_request_hard_cap_sec"))
+	return cap if cap > 0.0 else DEFAULT_CHAT_REQUEST_HARD_CAP_S
+
+
+## 收到新事件说明这条仍在跑的 `/chat`（或 `rebuild_index`）请求后端没有
+## 卡死，把"固定总时长"超时改写成"距离上一次有进展多久"的空闲超时——
+## 真正耗时的长任务（深度 effort、delegate_many、多轮工具调用）只要还在
+## 持续产生事件就不会被误判超时；`_hard_cap_for_path` 兜底真正卡死的场景。
+func _maybe_extend_request_timeout() -> void:
+	if not _busy or _timeout_generation != _request_generation:
+		return
+	if _inflight_session_id != _session_id():
+		return
+	var hard_cap := _hard_cap_for_path(_inflight_path)
+	if hard_cap <= 0.0:
+		return
+	var elapsed_s := float(Time.get_ticks_msec() - _inflight_started_at_msec) / 1000.0
+	if elapsed_s >= hard_cap:
+		return
+	FrontendLogger.debug(editor_interface, "HTTP", "Extending in-flight request timeout on new events.", {
+		"path": _inflight_path,
+		"elapsed_s": elapsed_s,
+		"hard_cap_s": hard_cap
+	})
+	_request_timeout_timer.start(_timeout_for_path(_inflight_path))
 
 
 func _on_request_timeout() -> void:
@@ -473,6 +511,7 @@ func _on_events_completed(result: int, code: int, _headers: PackedStringArray, b
 		var events: Array = raw_events
 		if not events.is_empty():
 			FrontendLogger.debug(editor_interface, "HTTP", "Received events.", {"count": events.size()})
+			_maybe_extend_request_timeout()
 		for event in events:
 			if event is Dictionary:
 				_last_event_seq = max(_last_event_seq, int(event.get("seq", _last_event_seq)))

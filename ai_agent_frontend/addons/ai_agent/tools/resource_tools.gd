@@ -52,6 +52,7 @@ static func read_image_metadata(input: Dictionary) -> Dictionary:
 	return {
 		"ok": true,
 		"path": path,
+		"absolute_path": ProjectSettings.globalize_path(path),
 		"width": image.get_width(),
 		"height": image.get_height(),
 		"format": image.get_format(),
