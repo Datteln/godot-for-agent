@@ -27,6 +27,8 @@ const MAX_MESSAGE_LIST_CHILDREN := 240
 const MAX_LIVE_RENDER_CHARS := 60000
 const MAX_MESSAGE_RENDER_CHARS := 90000
 const MAX_REASONING_RENDER_CHARS := 30000
+const INPUT_MIN_HEIGHT := 60
+const INPUT_MAX_HEIGHT := 240
 ## Plan/Verify 的展示性事件：通常没有活跃 LLM 文本流陪同到达，需要强制滚动一次，
 ## 否则容易在 ScrollContainer 重新计算高度期间被误判为"用户已上滑"而停止跟随。
 const _MILESTONE_EVENT_TYPES := {
@@ -53,7 +55,7 @@ var _log_renderer: LogEntryRenderer
 
 var _scroll: ScrollContainer
 var _message_list: VBoxContainer
-var _input: LineEdit
+var _input: TextEdit
 var _context_bar: HFlowContainer
 var _file_suggestions_panel: PanelContainer
 var _file_suggestions: ItemList
@@ -327,9 +329,11 @@ func _build_ui() -> void:
 	bottom.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	add_child(bottom)
 
-	_input = LineEdit.new()
+	_input = TextEdit.new()
 	_input.placeholder_text = _ui("input_placeholder")
-	_input.context_menu_enabled = true
+	_input.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	_input.scroll_fit_content_height = false
+	_input.custom_minimum_size = Vector2(0, INPUT_MIN_HEIGHT)
 	_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	bottom.add_child(_input)
 
@@ -401,8 +405,8 @@ func _connect_signals() -> void:
 	_send_btn.pressed.connect(_on_send)
 	_stop_btn.pressed.connect(_on_interrupt)
 	_new_session_btn.pressed.connect(_on_new_session)
-	_input.text_submitted.connect(func(_text: String): _on_send())
-	_input.text_changed.connect(_on_input_text_changed)
+	_input.gui_input.connect(_on_input_gui_input)
+	_input.text_changed.connect(func(): _on_input_text_changed(_input.text))
 	_effort_options.item_selected.connect(_on_effort_selected)
 	_style_options.item_selected.connect(_on_style_selected)
 	_doctor_btn.pressed.connect(func(): _http_client.fetch_doctor())
@@ -471,7 +475,7 @@ func _on_send() -> void:
 	_finished_reasoning_headers.clear()
 	_live_response_keys.clear()
 	_empty_final_ignored_ms = -1   # 重置空 final 超时计时器
-	_input.clear()
+	_input.text = ""
 	var referenced_paths: Array = _referenced_files.keys()
 	_referenced_files.clear()
 	_selection_signature = ""
@@ -508,7 +512,7 @@ func _try_run_slash_command(text: String) -> bool:
 			})
 			return true
 		args = parsed
-	_input.clear()
+	_input.text = ""
 	_auto_scroll = true
 	_force_scroll_once = true
 	_append_message("user", text)
@@ -522,10 +526,55 @@ func _try_run_slash_command(text: String) -> bool:
 	return true
 
 
+## Enter 发送消息；Ctrl+Enter 换行。
+## Shift+Enter 在 Godot 的 TextEdit 里默认不会插入换行（默认的 ui_text_newline
+## 动作要求精确匹配无修饰键，Shift+Enter 不命中任何内置动作，相当于无反应），
+## 所以换行改用 Ctrl+Enter，并手动在光标处插入 "\n"。
+## 注意：`gui_input` 信号在控件自身处理事件之前发出，是专门留给外部拦截用的；
+## 因此这里只能对"要拦截"的 Enter 组合调用 accept_event()，其余按键必须原样
+## 放行，否则会截断 TextEdit 自己插入字符/处理粘贴等内部逻辑（§全部输入被吞没）。
+func _on_input_gui_input(event: InputEvent) -> void:
+	if not (event is InputEventKey):
+		return
+	var key_event := event as InputEventKey
+	if not key_event.pressed or key_event.echo:
+		return
+	if key_event.keycode != KEY_ENTER and key_event.keycode != KEY_KP_ENTER:
+		return
+	if key_event.ctrl_pressed or key_event.meta_pressed:
+		_input.accept_event()
+		_input.insert_text_at_caret("\n")
+		return
+	if key_event.shift_pressed or key_event.alt_pressed:
+		return
+	if DisplayServer.ime_get_text() != "":
+		# 输入法正在合成候选（例如中文全角标点确认），这个 Enter 是输入法上屏键，
+		# 不能拦截成"发送"，否则候选文本会丢字或被错误提交。
+		return
+	_input.accept_event()
+	_on_send()
+
+
+## 根据当前行数（含自动换行产生的视觉行）动态调整输入框高度，
+## 在 INPUT_MIN_HEIGHT 与 INPUT_MAX_HEIGHT 之间撑大，超出上限后由 TextEdit 自带滚动条接管。
+func _update_input_height() -> void:
+	if _input == null or not is_instance_valid(_input):
+		return
+	var line_height := _input.get_line_height()
+	if line_height <= 0:
+		return
+	var visual_lines := 0
+	for line_index in range(_input.get_line_count()):
+		visual_lines += _input.get_line_wrap_count(line_index) + 1
+	var content_height := visual_lines * line_height + 16
+	_input.custom_minimum_size.y = clampi(content_height, INPUT_MIN_HEIGHT, INPUT_MAX_HEIGHT)
+
+
 func _on_input_text_changed(text: String) -> void:
+	_update_input_height()
 	if _file_suggestions == null:
 		return
-	var caret := _input.caret_column
+	var caret := _input.get_caret_column()
 	var before_caret := text.left(caret)
 	var at_index := before_caret.rfind("@")
 	if at_index < 0 or (at_index > 0 and not before_caret.substr(at_index - 1, 1) in [" ", "\t", "\n"]):
@@ -557,12 +606,12 @@ func _on_file_reference_selected(index: int) -> void:
 	if index < 0 or index >= _file_popup_paths.size():
 		return
 	var path := _file_popup_paths[index]
-	var caret := _input.caret_column
+	var caret := _input.get_caret_column()
 	var text := _input.text
 	var at_index := text.left(caret).rfind("@")
 	if at_index >= 0:
 		_input.text = text.left(at_index) + "@" + path + " " + text.substr(caret)
-		_input.caret_column = at_index + path.length() + 2
+		_input.set_caret_column(at_index + path.length() + 2)
 	_referenced_files[path] = true
 	_dismissed_context.erase("file:" + path)
 	_selection_signature = ""
@@ -684,9 +733,9 @@ func _on_message_context_action(id: int) -> void:
 		1:
 			var pasted := DisplayServer.clipboard_get()
 			if pasted != "":
-				var caret := _input.caret_column
+				var caret := _input.get_caret_column()
 				_input.text = _input.text.left(caret) + pasted + _input.text.substr(caret)
-				_input.caret_column = caret + pasted.length()
+				_input.set_caret_column(caret + pasted.length())
 				_input.grab_focus()
 		2:
 			if _message_context_source != null and is_instance_valid(_message_context_source):

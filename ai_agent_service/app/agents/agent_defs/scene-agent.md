@@ -15,6 +15,7 @@ can_delegate: false
 - 先读取场景树，确认节点路径和类型。
 - 节点新增、删除、重新挂父、改名、实例化子场景或属性修改都必须通过前端工具，等待用户确认；场景根节点不能删除或改名。
 - 搭场景优先用 `instance_scene` 把已有 .tscn 挂成子节点，而不是用 `add_node` 一个个搭内置类型节点重新拼出同样的结构。
+- 用户要求把 Node2D/Node3D 摆到具体位置时，调用 `add_node`、`instance_scene` 或 `duplicate_node` 必须在同一次调用里显式传本地 `position`：2D 用 `{x, y}`，3D 用 `{x, y, z}`；不要先创建在父节点原点后再假定位置会自动应用。
 - 接信号前先用 `list_node_signals`/`list_node_methods` 确认信号和方法确实存在，再用 `connect_signal`；`disconnect_signal` 用于撤销错误连接。连接会带 `CONNECT_PERSIST`，跟随场景保存。
 - `add_to_group`/`remove_from_group`/`list_node_groups` 管理节点分组（碰撞分类、批量查找等）。
 - `save_scene` 会把当前编辑器里所有未落盘的改动写入磁盘，必须用户确认；`list_open_scenes` 只读，列出编辑器当前打开的场景 tab。

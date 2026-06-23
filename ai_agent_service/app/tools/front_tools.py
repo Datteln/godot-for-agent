@@ -582,7 +582,7 @@ def register_front_tools() -> None:
             render_kind="list",
             schema={
                 "name": "add_node",
-                "description": "Add a node under a parent in the currently edited scene.",
+                "description": "Add a node under a parent in the currently edited scene, with an optional local 2D/3D position.",
                 "parameters": _object_schema(
                     {
                         "parent_path": {
@@ -591,6 +591,17 @@ def register_front_tools() -> None:
                         },
                         "type": {"type": "string", "description": "Node class to instantiate."},
                         "name": {"type": "string", "description": "New node name."},
+                        "position": {
+                            "type": "object",
+                            "description": "Optional local position relative to the parent: x/y for Node2D, x/y/z for Node3D (z defaults to 0).",
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                                "z": {"type": "number"},
+                            },
+                            "required": ["x", "y"],
+                            "additionalProperties": False,
+                        },
                     },
                     ["type", "name"],
                 ),
@@ -695,7 +706,7 @@ def register_front_tools() -> None:
             read_path_args=["scene_path"],
             schema={
                 "name": "instance_scene",
-                "description": "Instantiate a .tscn/.scn file as a new child node in the currently edited scene.",
+                "description": "Instantiate a .tscn/.scn file as a new child node, with an optional local 2D/3D position.",
                 "parameters": _object_schema(
                     {
                         "parent_path": {
@@ -704,6 +715,17 @@ def register_front_tools() -> None:
                         },
                         "scene_path": {"type": "string", "description": "Relative .tscn/.scn path to instantiate."},
                         "name": {"type": "string", "description": "Optional name override for the new instance root."},
+                        "position": {
+                            "type": "object",
+                            "description": "Optional local position relative to the parent: x/y for a Node2D root, x/y/z for a Node3D root (z defaults to 0).",
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                                "z": {"type": "number"},
+                            },
+                            "required": ["x", "y"],
+                            "additionalProperties": False,
+                        },
                     },
                     ["scene_path"],
                 ),
@@ -720,11 +742,22 @@ def register_front_tools() -> None:
             render_kind="list",
             schema={
                 "name": "duplicate_node",
-                "description": "Duplicate a node and its children within the currently edited scene.",
+                "description": "Duplicate a node and its children, optionally overriding the duplicate's local 2D/3D position.",
                 "parameters": _object_schema(
                     {
                         "path": {"type": "string", "description": "NodePath to duplicate, relative to the scene root."},
                         "name": {"type": "string", "description": "Optional name override for the duplicate."},
+                        "position": {
+                            "type": "object",
+                            "description": "Optional local position relative to the parent: x/y for Node2D, x/y/z for Node3D (z defaults to 0).",
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                                "z": {"type": "number"},
+                            },
+                            "required": ["x", "y"],
+                            "additionalProperties": False,
+                        },
                     },
                     ["path"],
                 ),

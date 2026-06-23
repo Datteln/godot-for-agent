@@ -12,6 +12,43 @@ static func _relative_path(root: Node, node: Node) -> String:
 	return str(root.get_path_to(node))
 
 
+## 将工具协议中的本地坐标转换成 Godot 的 Vector2/Vector3，并拒绝不支持空间坐标的节点。
+static func _apply_optional_position(node: Node, input: Dictionary) -> Dictionary:
+	if not input.has("position"):
+		return {}
+	var position_value = input.get("position")
+	if not position_value is Dictionary:
+		return {"ok": false, "message": "position must be an object with numeric x/y[/z] fields", "error_code": "invalid_position"}
+	var position: Dictionary = position_value
+	for component in ["x", "y"]:
+		if not position.has(component) or typeof(position[component]) not in [TYPE_INT, TYPE_FLOAT]:
+			return {"ok": false, "message": "position.%s must be a number" % component, "error_code": "invalid_position"}
+	if node is Node2D:
+		(node as Node2D).position = Vector2(float(position["x"]), float(position["y"]))
+		return {}
+	if node is Node3D:
+		var z_value = position.get("z", 0.0)
+		if typeof(z_value) not in [TYPE_INT, TYPE_FLOAT]:
+			return {"ok": false, "message": "position.z must be a number", "error_code": "invalid_position"}
+		(node as Node3D).position = Vector3(float(position["x"]), float(position["y"]), float(z_value))
+		return {}
+	return {
+		"ok": false,
+		"message": "position is only supported for Node2D or Node3D roots; got " + node.get_class(),
+		"error_code": "position_unsupported",
+	}
+
+
+static func _node_position_payload(node: Node) -> Dictionary:
+	if node is Node2D:
+		var position_2d := (node as Node2D).position
+		return {"x": position_2d.x, "y": position_2d.y}
+	if node is Node3D:
+		var position_3d := (node as Node3D).position
+		return {"x": position_3d.x, "y": position_3d.y, "z": position_3d.z}
+	return {}
+
+
 static func read_scene_tree(editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {}
@@ -66,11 +103,19 @@ static func add_node(input: Dictionary, editor_interface: EditorInterface, undo_
 		return {"ok": false, "message": "Cannot instantiate node type: " + type_name}
 	var node: Node = instance
 	node.name = str(input.get("name", type_name))
+	var position_error := _apply_optional_position(node, input)
+	if not position_error.is_empty():
+		return position_error
 	parent.add_child(node)
 	node.owner = root
 	if undo_manager != null:
 		undo_manager.record_node_added(parent, node, root)
-	return {"ok": true, "path": _relative_path(root, node), "type": type_name}
+	return {
+		"ok": true,
+		"path": _relative_path(root, node),
+		"type": type_name,
+		"position": _node_position_payload(node),
+	}
 
 
 static func set_node_property(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
@@ -197,11 +242,19 @@ static func instance_scene(input: Dictionary, editor_interface: EditorInterface,
 	var node: Node = instance
 	if input.has("name"):
 		node.name = str(input.get("name"))
+	var position_error := _apply_optional_position(node, input)
+	if not position_error.is_empty():
+		return position_error
 	parent.add_child(node)
 	_set_owner_recursive(node, root)
 	if undo_manager != null:
 		undo_manager.record_node_added(parent, node, root)
-	return {"ok": true, "path": _relative_path(root, node), "scene_path": scene_path}
+	return {
+		"ok": true,
+		"path": _relative_path(root, node),
+		"scene_path": scene_path,
+		"position": _node_position_payload(node),
+	}
 
 
 static func duplicate_node(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
@@ -223,11 +276,18 @@ static func duplicate_node(input: Dictionary, editor_interface: EditorInterface,
 		return {"ok": false, "message": "Failed to duplicate node: " + path, "error_code": "duplicate_failed"}
 	if input.has("name"):
 		clone.name = str(input.get("name"))
+	var position_error := _apply_optional_position(clone, input)
+	if not position_error.is_empty():
+		return position_error
 	parent.add_child(clone)
 	_set_owner_recursive(clone, root)
 	if undo_manager != null:
 		undo_manager.record_node_added(parent, clone, root)
-	return {"ok": true, "path": _relative_path(root, clone)}
+	return {
+		"ok": true,
+		"path": _relative_path(root, clone),
+		"position": _node_position_payload(clone),
+	}
 
 
 static func connect_signal(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
