@@ -318,6 +318,9 @@ _HISTORY_FRONT_RUN_TOOLS = frozenset(
         "export_project",
     }
 )
+_HISTORY_FRONT_TOOLS = (
+    _HISTORY_FRONT_READ_TOOLS | _HISTORY_FRONT_SCENE_EDIT_TOOLS | _HISTORY_FRONT_RUN_TOOLS
+)
 _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
     {
         "agent_reasoning_delta",
@@ -494,6 +497,37 @@ def _front_result_lines(value: Any, *, indent: int = 0, max_items: int = 80) -> 
     return [f"{prefix}- {value}"]
 
 
+def _front_tool_error_message(result: dict[str, Any]) -> str:
+    """提取前端工具结果中的错误摘要。"""
+    if result.get("ok") is not False:
+        return ""
+    for key in ("message", "error", "error_code"):
+        value = result.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return "Unknown error"
+
+
+def _unknown_tool_result_summary(payload: dict[str, Any], inner: dict[str, Any]) -> str:
+    """为缺少 tool call 元数据的旧历史结果生成保守摘要。"""
+    status = str(payload.get("status", "")).strip()
+    for key in ("message", "error", "error_code"):
+        value = inner.get(key, payload.get(key))
+        if status in {"error", "rejected"} and value not in (None, ""):
+            return f"Tool {status}: {value}"
+    path = str(inner.get("path", "")).strip()
+    root_name = str(inner.get("root_name", "")).strip()
+    root_type = str(inner.get("root_type", "")).strip()
+    lines = ["Tool result"]
+    if status:
+        lines[0] = f"Tool {status}"
+    if path:
+        lines.append(f"Done: `{path}`")
+    if root_name or root_type:
+        lines.append(f"Root: {root_name} ({root_type})".strip())
+    return "\n".join(lines)
+
+
 def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str, Any]) -> str:
     """为前端工具生成可读摘要，并保留返回的节点与状态。"""
     title = name.replace("_", " ").capitalize()
@@ -546,6 +580,14 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         node_name = input_args.get("name", "")
         parent = input_args.get("parent_path", ".")
         title = f"Add {node_type} '{node_name}' under '{parent}'"
+        error = _front_tool_error_message(result)
+        if error:
+            return f"{title}\nError: {error}"
+        path = str(result.get("path", "")).strip()
+        lines = [title]
+        if path:
+            lines.append(f"Done: `{path}`")
+        return "\n".join(lines)
     elif name == "set_node_property":
         path = input_args.get("path", "")
         prop = input_args.get("property", "")
@@ -555,6 +597,9 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         scene_path = input_args.get("scene_path", "")
         parent = input_args.get("parent_path", ".")
         title = f"Instance {scene_path} under '{parent}'"
+        error = _front_tool_error_message(result)
+        if error:
+            return f"{title}\nError: {error}"
         path = str(result.get("path", "")).strip()
         position = result.get("position", {})
         lines = [title]
@@ -569,6 +614,18 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
     elif name == "open_scene":
         path = input_args.get("path", "")
         title = f"Open scene {path}"
+        error = _front_tool_error_message(result)
+        if error:
+            return f"{title}\nError: {error}"
+        opened_path = str(result.get("path", path)).strip()
+        root_name = str(result.get("root_name", "")).strip()
+        root_type = str(result.get("root_type", "")).strip()
+        lines = [title]
+        if opened_path:
+            lines.append(f"Done: `{opened_path}`")
+        if root_name or root_type:
+            lines.append(f"Root: {root_name} ({root_type})".strip())
+        return "\n".join(lines)
     elif name == "save_scene":
         title = "Save current scene"
     elif name == "delete_node":
@@ -630,6 +687,9 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         if output:
             lines.extend(["```", _truncate_text(output, 4000), "```"])
         return "\n".join(lines)
+    error = _front_tool_error_message(result)
+    if error:
+        return f"{title}\nError: {error}"
     return "\n".join([f"{title}:", *_front_result_lines(result)])
 
 
@@ -1081,6 +1141,16 @@ def _tool_history_blocks(
     nested_result = payload.get("result")
     inner = nested_result if isinstance(nested_result, dict) else payload
     origin = _history_origin(frame)
+    if name == "":
+        summary = _unknown_tool_result_summary(payload, inner).strip()
+        if str(payload.get("status", "")) in {"error", "rejected"}:
+            return [ErrorHistoryBlock(text=summary, **origin)] if summary else []
+        return [LogTextHistoryBlock(text=summary, marker=True, **origin)] if summary else []
+    if name in _HISTORY_FRONT_TOOLS and (
+        payload.get("status") in {"rejected", "error"} or inner.get("ok") is False
+    ):
+        summary = _front_tool_summary(name, input_args, inner).strip()
+        return [ErrorHistoryBlock(text=summary, **origin)] if summary else []
     if payload.get("status") == "rejected":
         return [ErrorHistoryBlock(text=f"{name}: rejected", **origin)]
     error_message = inner.get(
@@ -1241,6 +1311,7 @@ def _message_history_blocks(
     tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]],
     *,
     is_initial_system: bool,
+    message_index: int,
     include_thought_summary: bool = True,
 ) -> list[SessionHistoryBlock]:
     role = str(message.get("role", "system"))
@@ -1248,6 +1319,8 @@ def _message_history_blocks(
     text = "" if raw_content is None else str(raw_content)
     origin = _history_origin(frame)
     if role == "user":
+        if frame.parent_id is not None and message_index == 1:
+            return []
         displayed = _display_user_content(text).strip()
         return [UserHistoryBlock(text=displayed, **origin)] if displayed else []
     if role == "assistant":
@@ -1570,6 +1643,7 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
             message,
             tool_calls_by_id,
             is_initial_system=index == 0,
+            message_index=index,
             include_thought_summary=not has_reasoning_event,
         )
         for block in message_blocks:

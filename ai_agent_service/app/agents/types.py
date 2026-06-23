@@ -32,7 +32,12 @@ class AgentDefinition:
         effort: 任务档位（§6.5），决定 `run_turn` 传给 `LLMProvider.chat()`
             的 `temperature`（见 `orchestrator/agent.py::EFFORT_TEMPERATURE`）。
             根帧可被 `Session.effort` 覆盖，委派子帧始终使用各自的声明值。
-        max_turns: 单次循环允许的最大轮数。
+        max_turns: 单次循环允许的最大轮数；不属于 `edit_map_max_turns` 覆盖范围的
+            轮次（即本轮 tool_calls 不是单一 `edit_map` 调用）都计入这个预算。
+        edit_map_max_turns: 单次循环中允许调用 `edit_map` 的轮数上限，与
+            `max_turns` 分开计算；为 `None` 时 `edit_map` 调用同样计入
+            `max_turns`（向后兼容旧行为）。用于地图编辑类 agent 把大范围地形
+            拆成多批 `edit_map` 调用时，不被其余规划/校验轮次挤占预算。
         can_delegate: 是否拥有 `delegate` 编排能力；仅 coordinator 可为 True，
             且需要 `delegate` 工具与子 agent 注册表均已就位（M2+）。
         hooks: 声明式 Hook；当前支持 `on_start`——帧创建时追加到
@@ -51,6 +56,7 @@ class AgentDefinition:
     model: str | None = "inherit"
     effort: EffortLevel = "standard"
     max_turns: int = 12
+    edit_map_max_turns: int | None = None
     can_delegate: bool = False
     hooks: dict[str, str] | None = None
     effective_tools: list[str] = field(default_factory=list)

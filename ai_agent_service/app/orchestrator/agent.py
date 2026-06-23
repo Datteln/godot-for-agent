@@ -547,6 +547,50 @@ def _finish_frame(
     return None
 
 
+def _handle_frame_turns_exhausted(
+    session: Session,
+    frame: Frame,
+    limit_label: str,
+    limit: int,
+    prompt_factory: Callable[[AgentDefinition], str] | None,
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> ErrorResult | None:
+    """某个轮次预算（总轮数/edit_map 轮数/常规轮数）耗尽时的统一收尾。
+
+    根帧耗尽时整轮直接报错终止；子帧耗尽时用 `_finish_frame` 收尾并把控制权
+    交还父帧，让父 agent 据此判断是否要重新拆分任务。
+
+    Returns:
+        根帧耗尽时返回 `ErrorResult`（调用方应立即 `return`）；子帧耗尽时返回
+        `None`（`_finish_frame` 已处理收尾，调用方应 `continue` 外层循环）。
+    """
+    if len(session.agent_stack) <= 1:
+        logger.warning(
+            "Agent run_turn reached root frame turns limit session=%s agent=%s limit=%s=%d",
+            session.session_id,
+            frame.agent.name,
+            limit_label,
+            limit,
+        )
+        return ErrorResult(text="已达到本轮最大循环次数，请精简任务或拆分请求后重试")
+    logger.warning(
+        "Delegate frame reached its turns limit session=%s frame=%s agent=%s limit=%s=%d",
+        session.session_id,
+        frame.id,
+        frame.agent.name,
+        limit_label,
+        limit,
+    )
+    _finish_frame(
+        session,
+        f"子 agent「{frame.agent.name}」已达到自身{limit_label}上限（{limit}），"
+        "任务未完成，已强制收尾。以上为已执行步骤记录，请据此判断是否需要重新拆分任务或继续委派。",
+        prompt_factory,
+        event_callback,
+    )
+    return None
+
+
 def _load_tool_args(
     call_id: str, arguments: str
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -1279,7 +1323,9 @@ async def run_turn(
         或 `ErrorResult`（LLM 调用失败/达到轮数上限）。
     """
     logger.info("Agent run_turn start session=%s max_turns=%d", session.session_id, max_turns)
-    frame_turns: dict[str, int] = {}  # frame_id -> 本次 run_turn 调用内该帧已消耗轮数
+    frame_turns: dict[str, int] = {}  # frame_id -> 本次 run_turn 调用内该帧已消耗的总轮数
+    # frame_id -> 其中单独计入 edit_map_max_turns 预算的轮数（tool_calls 仅含 edit_map 时）
+    frame_edit_map_turns: dict[str, int] = {}
     for loop_index in range(max_turns):
         frame = session.top_frame()
         if frame is None:
@@ -1287,29 +1333,15 @@ async def run_turn(
             return ErrorResult(text="会话没有活跃的 agent 帧")
 
         used = frame_turns.get(frame.id, 0)
-        if used >= frame.agent.max_turns:
-            if len(session.agent_stack) <= 1:
-                logger.warning(
-                    "Agent run_turn reached root frame max turns session=%s agent=%s max_turns=%d",
-                    session.session_id,
-                    frame.agent.name,
-                    frame.agent.max_turns,
-                )
-                return ErrorResult(text="已达到本轮最大循环次数，请精简任务或拆分请求后重试")
-            logger.warning(
-                "Delegate frame reached its max turns session=%s frame=%s agent=%s max_turns=%d",
-                session.session_id,
-                frame.id,
-                frame.agent.name,
-                frame.agent.max_turns,
+        # 这里只做一个宽松的总量护栏（max_turns + edit_map_max_turns），防止帧无限循环；
+        # 哪个预算先耗尽由下面 tool_calls 揭晓后的精确分类检查负责。
+        total_budget = frame.agent.max_turns + (frame.agent.edit_map_max_turns or 0)
+        if used >= total_budget:
+            result = _handle_frame_turns_exhausted(
+                session, frame, "总轮数", total_budget, agent_prompt_factory, event_callback
             )
-            _finish_frame(
-                session,
-                f"子 agent「{frame.agent.name}」已达到自身最大循环次数（{frame.agent.max_turns}），"
-                "任务未完成，已强制收尾。以上为已执行步骤记录，请据此判断是否需要重新拆分任务或继续委派。",
-                agent_prompt_factory,
-                event_callback,
-            )
+            if result is not None:
+                return result
             continue
 
         frame_turns[frame.id] = used + 1
@@ -1417,12 +1449,13 @@ async def run_turn(
                 return result
             continue  # 子帧已结束，继续驱动父帧
 
+        tool_names = [call.name for call in turn.tool_calls]
         logger.info(
             "Agent requested tools session=%s frame=%s agent=%s names=%s",
             session.session_id,
             frame.id,
             frame.agent.name,
-            [call.name for call in turn.tool_calls],
+            tool_names,
         )
         _emit_orchestration_event(
             event_callback,
@@ -1430,9 +1463,42 @@ async def run_turn(
             {
                 "frame_id": frame.id,
                 "agent": frame.agent.name,
-                "tools": [call.name for call in turn.tool_calls],
+                "tools": tool_names,
             },
         )
+
+        # edit_map 调用按 edit_map_max_turns 单独计算预算，不挤占该 agent 处理其他
+        # 工具（read_scene_tree/截图/规划等）的常规 max_turns 配额；反之亦然。
+        is_edit_map_turn = bool(tool_names) and all(name == "edit_map" for name in tool_names)
+        if is_edit_map_turn and frame.agent.edit_map_max_turns is not None:
+            edit_map_used = frame_edit_map_turns.get(frame.id, 0) + 1
+            frame_edit_map_turns[frame.id] = edit_map_used
+            if edit_map_used > frame.agent.edit_map_max_turns:
+                result = _handle_frame_turns_exhausted(
+                    session,
+                    frame,
+                    "edit_map 调用次数",
+                    frame.agent.edit_map_max_turns,
+                    agent_prompt_factory,
+                    event_callback,
+                )
+                if result is not None:
+                    return result
+                continue
+        else:
+            general_used = frame_turns.get(frame.id, 0) - frame_edit_map_turns.get(frame.id, 0)
+            if general_used > frame.agent.max_turns:
+                result = _handle_frame_turns_exhausted(
+                    session,
+                    frame,
+                    "常规轮数",
+                    frame.agent.max_turns,
+                    agent_prompt_factory,
+                    event_callback,
+                )
+                if result is not None:
+                    return result
+                continue
 
         permission_ctx = PermissionContext(
             security=security,

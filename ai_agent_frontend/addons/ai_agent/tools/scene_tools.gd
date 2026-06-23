@@ -32,9 +32,16 @@ static func _apply_optional_position(node: Node, input: Dictionary) -> Dictionar
 			return {"ok": false, "message": "position.z must be a number", "error_code": "invalid_position"}
 		(node as Node3D).position = Vector3(float(position["x"]), float(position["y"]), float(z_value))
 		return {}
+	if node is Control:
+		(node as Control).position = Vector2(float(position["x"]), float(position["y"]))
+		return {}
 	return {
 		"ok": false,
-		"message": "position is only supported for Node2D or Node3D roots; got " + node.get_class(),
+		"message": (
+			"%s has no spatial position property; omit \"position\" here. If you need to place it, " +
+			"use set_node_property afterwards with a property this class actually supports (e.g. " +
+			"\"offset\" on a 2D collision shape, or a custom transform property)."
+		) % node.get_class(),
 		"error_code": "position_unsupported",
 	}
 
@@ -46,6 +53,9 @@ static func _node_position_payload(node: Node) -> Dictionary:
 	if node is Node3D:
 		var position_3d := (node as Node3D).position
 		return {"x": position_3d.x, "y": position_3d.y, "z": position_3d.z}
+	if node is Control:
+		var position_control := (node as Control).position
+		return {"x": position_control.x, "y": position_control.y}
 	return {}
 
 
@@ -102,7 +112,14 @@ static func _coerce_vector2(value: Variant) -> Dictionary:
 	if value is Array and value.size() >= 2:
 		if typeof(value[0]) in [TYPE_INT, TYPE_FLOAT] and typeof(value[1]) in [TYPE_INT, TYPE_FLOAT]:
 			return {"ok": true, "value": Vector2(float(value[0]), float(value[1]))}
-	return {"ok": false, "message": "Vector2 value must be an object {x,y} or array [x,y]", "error_code": "invalid_vector"}
+	return {
+		"ok": false,
+		"message": (
+			"Vector2 value must be an object {x,y} or array [x,y], not a JSON-encoded string. " +
+			"You passed %s; use a real object/array instead, e.g. {\"x\": 1400, \"y\": -60} or [1400, -60]."
+		) % JSON.stringify(value),
+		"error_code": "invalid_vector",
+	}
 
 
 static func _coerce_vector3(value: Variant) -> Dictionary:
@@ -116,7 +133,14 @@ static func _coerce_vector3(value: Variant) -> Dictionary:
 	if value is Array and value.size() >= 3:
 		if typeof(value[0]) in [TYPE_INT, TYPE_FLOAT] and typeof(value[1]) in [TYPE_INT, TYPE_FLOAT] and typeof(value[2]) in [TYPE_INT, TYPE_FLOAT]:
 			return {"ok": true, "value": Vector3(float(value[0]), float(value[1]), float(value[2]))}
-	return {"ok": false, "message": "Vector3 value must be an object {x,y,z} or array [x,y,z]", "error_code": "invalid_vector"}
+	return {
+		"ok": false,
+		"message": (
+			"Vector3 value must be an object {x,y,z} or array [x,y,z], not a JSON-encoded string. " +
+			"You passed %s; use a real object/array instead, e.g. {\"x\": 1, \"y\": 2, \"z\": 0} or [1, 2, 0]."
+		) % JSON.stringify(value),
+		"error_code": "invalid_vector",
+	}
 
 
 static func _coerce_color(value: Variant) -> Dictionary:
@@ -127,7 +151,15 @@ static func _coerce_color(value: Variant) -> Dictionary:
 		if typeof(a_value) not in [TYPE_INT, TYPE_FLOAT]:
 			return {"ok": false, "message": "Color.a must be a number", "error_code": "invalid_color"}
 		return {"ok": true, "value": Color(float(value["r"]), float(value["g"]), float(value["b"]), float(a_value))}
-	return {"ok": false, "message": "Color value must be an object {r,g,b,a?}", "error_code": "invalid_color"}
+	return {
+		"ok": false,
+		"message": (
+			"Color value must be an object {r,g,b,a?} with components in 0..1, not a hex string or " +
+			"JSON-encoded string. You passed %s; use a real object instead, e.g. " +
+			"{\"r\": 1.0, \"g\": 0.0, \"b\": 0.0, \"a\": 1.0}."
+		) % JSON.stringify(value),
+		"error_code": "invalid_color",
+	}
 
 
 static func _has_numeric_components(value: Dictionary, components: Array) -> bool:

@@ -4,6 +4,7 @@ extends RefCounted
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 
 const MAX_EDITED_CELLS := 100000
+const MAX_DESCRIBED_CELLS := 400
 
 
 static func describe_selection(editor_interface: EditorInterface) -> Dictionary:

@@ -41,6 +41,16 @@ const _MILESTONE_EVENT_TYPES := {
 	"compact_started": true,
 	"compact_boundary": true,
 }
+const _REASONING_BOUNDARY_EVENT_TYPES := {
+	"delegate_start": true,
+	"server_tool_start": true,
+	"server_tool_result": true,
+	"plan_created": true,
+	"plan_step_started": true,
+	"plan_step_completed": true,
+	"verify_started": true,
+	"verify_completed": true,
+}
 
 var editor_interface: EditorInterface
 var service: Node
@@ -2053,14 +2063,22 @@ func _handle_event(event: Dictionary) -> void:
 		if event_type == "compact_started" and _state != AgentState.IDLE:
 			_state_before_compact = _state
 			_set_state(AgentState.COMPACTING)
+		if _REASONING_BOUNDARY_EVENT_TYPES.has(event_type):
+			_mark_reasoning_stream_closed()
+			_finish_reasoning_stream()
+		var force_milestone_scroll := _MILESTONE_EVENT_TYPES.has(event_type)
+		if force_milestone_scroll:
+			_force_scroll_once = true
 		var rendered_description := _render_event_description(event)
 		if rendered_description != "":
 			FrontendLogger.debug(editor_interface, "ChatPanel", "-> rendered", {
 				"type": event_type,
 				"description_len": rendered_description.length()
 			})
-			if _MILESTONE_EVENT_TYPES.has(event_type):
+			if force_milestone_scroll:
 				_force_scroll_once = true
+				_scroll_to_bottom()
+				_post_final_scroll_frames = max(_post_final_scroll_frames, 5)
 		if event_type == "compact_boundary" and _state == AgentState.COMPACTING:
 			_set_state(_state_before_compact)
 
