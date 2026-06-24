@@ -153,7 +153,24 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	elif dimension == 2 and "tile_set" in target and target.tile_set != null:
 		var tile_size: Vector2i = target.tile_set.tile_size
 		result["tile_size"] = {"x": tile_size.x, "y": tile_size.y}
+	if target.get_class() == "TileMap":
+		result["layers"] = _describe_tilemap_layers(target)
 	return result
+
+
+## 一个 legacy TileMap 节点可能同时挂多个图层（比如 "Background"/"Mid"），
+## 各图层互相独立、互不遮挡判定；不能假设 map_layer=0 就是承载碰撞的前景层。
+## 调用方应该看这份列表自己选对 map_layer，而不是不传 map_layer 时悄悄默认成 0。
+static func _describe_tilemap_layers(target: Node) -> Array:
+	var layers: Array = []
+	var count: int = target.get_layers_count()
+	for layer_index in range(count):
+		layers.append({
+			"index": layer_index,
+			"name": str(target.get_layer_name(layer_index)),
+			"enabled": bool(target.is_layer_enabled(layer_index)),
+		})
+	return layers
 
 
 ## 把 `_read_map_cell` 里的 Vector2i/Vector3i 折算成 JSON 可序列化的 `{x,y[,z]}`。

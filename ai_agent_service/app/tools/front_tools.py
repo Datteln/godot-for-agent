@@ -1365,7 +1365,11 @@ def register_front_tools() -> None:
                     "TileMap or 3D GridMap, plus the map node's own local position and tile_size/cell_size. "
                     "Use this before extending or blending with existing terrain/background so new content "
                     "reuses the real source_id/atlas_coords already in use, and before computing world "
-                    "coordinates for nodes placed relative to the map, instead of guessing constants."
+                    "coordinates for nodes placed relative to the map, instead of guessing constants. "
+                    "For a legacy TileMap, the response also includes a `layers` array (index/name/enabled) "
+                    "listing every layer the node actually has — check it and pick the right map_layer "
+                    "explicitly; do not assume map_layer 0 is the visible/collidable foreground layer, many "
+                    "templates put a non-collidable background/decoration layer at index 0."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1378,7 +1382,11 @@ def register_front_tools() -> None:
                         },
                         "map_layer": {
                             "type": "integer",
-                            "description": "Layer index for a legacy TileMap; ignored by TileMapLayer and GridMap.",
+                            "description": (
+                                "Layer index for a legacy TileMap; ignored by TileMapLayer and GridMap. Defaults "
+                                "to 0 if omitted, which is not necessarily the foreground/collidable layer — "
+                                "check the `layers` field in a prior response before assuming."
+                            ),
                         },
                         "x": {"type": "integer"},
                         "y": {"type": "integer"},
@@ -1406,7 +1414,10 @@ def register_front_tools() -> None:
                 "description": (
                     "Edit a 2D TileMapLayer/legacy TileMap or a 3D GridMap through Godot's native APIs. "
                     "Use this tool instead of refusing a map edit or directly rewriting serialized tile/map data. "
-                    "Supports fill, erase, and overlap-safe region copy; all changes are previewed and undoable."
+                    "Supports fill, erase, and overlap-safe region copy; all changes are previewed and undoable. "
+                    "For a legacy TileMap with multiple layers, call describe_map_region first to see the real "
+                    "`layers` list and confirm which index is the visible/collidable foreground layer before "
+                    "picking map_layer — do not assume index 0 is the right one."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1419,7 +1430,11 @@ def register_front_tools() -> None:
                         },
                         "map_layer": {
                             "type": "integer",
-                            "description": "Layer index for a legacy TileMap; ignored by TileMapLayer and GridMap.",
+                            "description": (
+                                "Layer index for a legacy TileMap; ignored by TileMapLayer and GridMap. Defaults "
+                                "to 0 if omitted — confirm this is the intended layer via describe_map_region's "
+                                "`layers` field first, since index 0 is not always the foreground/collidable layer."
+                            ),
                         },
                         "operations": {
                             "type": "array",

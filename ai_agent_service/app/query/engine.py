@@ -18,10 +18,10 @@ import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from app.agents.bundled import get_agent
-from app.agents.types import CompactSnapshot, Frame
+from app.agents.types import AgentDefinition, CompactSnapshot, Frame
 from app.api.schemas import (
     ChatErrorResponse,
     ChatFinalResponse,
@@ -2065,6 +2065,7 @@ class QueryEngine:
         if request.user_message is not None:
             session.rag_context = await self._retrieve_rag_context(security, request.user_message)
 
+        project_context = build_project_context(security.project_root)
         coordinator = get_agent("coordinator", self.available_tools)
         cache_context = ContextBuilder().build(
             stable_prefix=build_system_prompt(
@@ -2073,7 +2074,7 @@ class QueryEngine:
                 self._output_styles,
                 session.output_style,
             ),
-            structure_context=build_project_context(security.project_root),
+            structure_context=project_context,
             dynamic_context=session.rag_context,
             query=request.user_message or "",
         )
@@ -2180,6 +2181,32 @@ class QueryEngine:
                 return
             self._emit(session.session_id, event_type, payload)
 
+        async def build_child_agent_prompt(agent: AgentDefinition, task: str) -> str:
+            """为委派子 agent 构造按任务检索的分层 system prompt。"""
+            task_rag_context = await self._retrieve_rag_context(security, task)
+            child_context = ContextBuilder().build(
+                stable_prefix=build_system_prompt(
+                    agent,
+                    self._skill_catalog,
+                    self._output_styles,
+                    session.output_style,
+                ),
+                structure_context=project_context,
+                dynamic_context=task_rag_context,
+                query=task,
+            )
+            return cast(
+                str,
+                LayeredPrompt(
+                    core=child_context.stable_prefix,
+                    structure_context=child_context.structure_context,
+                    rag_context=child_context.dynamic_context,
+                ).to_text(),
+            )
+
+        def emit_verify_turn_event(event_type: str, payload: dict[str, Any]) -> None:
+            self._emit(session.session_id, event_type, payload)
+
         step = await run_turn(
             session=session,
             llm=self._llm,
@@ -2192,12 +2219,7 @@ class QueryEngine:
             ),
             max_turns=self._settings.max_turns,
             session_allow=session.session_allow,
-            agent_prompt_factory=lambda agent: build_system_prompt(
-                agent,
-                self._skill_catalog,
-                self._output_styles,
-                session.output_style,
-            ),
+            agent_prompt_factory=build_child_agent_prompt,
             model_selector=self._model_for_effort,
             model_override=model_override,
             thinking_budget_selector=self._thinking_budget_for_effort,
@@ -2235,18 +2257,11 @@ class QueryEngine:
                     ),
                     max_turns=self._settings.max_turns,
                     session_allow=session.session_allow,
-                    agent_prompt_factory=lambda agent: build_system_prompt(
-                        agent,
-                        self._skill_catalog,
-                        self._output_styles,
-                        session.output_style,
-                    ),
+                    agent_prompt_factory=build_child_agent_prompt,
                     model_selector=self._model_for_effort,
                     model_override=model_override,
                     thinking_budget_selector=self._thinking_budget_for_effort,
-                    event_callback=lambda event_type, payload: self._emit(
-                        session.session_id, event_type, payload
-                    ),
+                    event_callback=emit_verify_turn_event,
                     cache_engine=self._cache_engine,
                     cache_metrics=self._cache_metrics,
                     context_token_limit=self._settings.auto_compact_token_threshold,

@@ -15,6 +15,7 @@ can_delegate: false
 规则：
 - 用户要求编辑 2D 或 3D 地图时，不要因为 `.tscn` 中存在压缩/二进制式瓦片数据而拒绝。先读取场景结构，然后调用 `edit_map`，让 Godot 原生 API 修改 TileMapLayer、旧 TileMap 或 GridMap；不要直接改写序列化地图数据。
 - 优先给 `edit_map` 传明确的 `target_path`。扩建已有地形时优先使用 `copy` 复制现有区域；新绘制时使用上下文里的 tile_catalog 或 MeshLibrary item id。
+- 目标是 legacy TileMap（不是 TileMapLayer/GridMap）时，第一次对它调用 `describe_map_region` 后必须看返回的 `layers` 字段（每层的 `index`/`name`/`enabled`），明确哪一层才是玩家真正看到、能站上去的前景/碰撞层——**不要默认 `map_layer=0` 就是这一层**，很多模板把不带碰撞的背景渐变/装饰放在第0层，真正的地面在另一层（例如名字像 "Mid"/"Foreground"/"Ground" 的层）。如果不确定，对每一层各读一小块样本数据比对，或者去 `read_class_docs`/场景里找 TileSet 里哪些瓦片定义了 `physics_layer` 碰撞形状，碰撞瓦片所在的那层才是该编辑的目标层。后续所有 `describe_map_region`/`edit_map` 调用都必须显式传这个确认过的 `map_layer`，不要省略让它隐式回退成0。
 - 扩建/延伸已有地形或背景图层前，必须先用 `describe_map_region` 查询边界附近若干现有列/行实际放的是哪个 `source_id`/`atlas_coords`（或 3D 的 `item`/`orientation`），新内容按原样复制延伸这个真实模式（结合 `copy` 操作）；不要只凭 tile_catalog 里"有哪些瓦片可用"自己发明一套新的搭配去拼背景或地形，否则会和原图风格/色调对不上。
 - 编辑前可以先调用一次 `capture_viewport_screenshot` 截图作视觉参考；但编辑器视口当前滚动到哪由用户决定，模型不能控制镜头对准目标区域，截图不保证拍到要编辑的边界区域，只能当辅助参考，瓦片/背景到底该怎么接必须以 `describe_map_region` 读到的真实数据为准。
 - `edit_map` 的每次修改都需要用户预览确认并支持 Undo/Redo；大范围改动应拆成可检查的操作。

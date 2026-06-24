@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -144,35 +145,38 @@ def test_tool_call_preface_is_not_rendered_as_a_workflow_message() -> None:
 
 
 def test_nested_delegate_inherits_root_history_anchor() -> None:
-    root = _frame()
-    root.messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "task"},
-        {"role": "assistant", "content": "", "tool_calls": []},
-    ]
-    session = Session(session_id="s1", agent_stack=[root])
-    child = _delegate_child_frame(
-        session=session,
-        parent_id=root.id,
-        call_id="delegate-1",
-        group_id=None,
-        args={"agent": "programming-agent", "task": "child task"},
-        depth=1,
-        prompt_factory=None,
-    )
-    assert child is not None
-    session.agent_stack.append(child)
-    grandchild = _delegate_child_frame(
-        session=session,
-        parent_id=child.id,
-        call_id="delegate-2",
-        group_id=None,
-        args={"agent": "programming-agent", "task": "grandchild task"},
-        depth=2,
-        prompt_factory=None,
-    )
+    async def scenario() -> tuple[Frame, Frame]:
+        root = _frame()
+        root.messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "", "tool_calls": []},
+        ]
+        session = Session(session_id="s1", agent_stack=[root])
+        child = await _delegate_child_frame(
+            session=session,
+            parent_id=root.id,
+            call_id="delegate-1",
+            group_id=None,
+            args={"agent": "programming-agent", "task": "child task"},
+            depth=1,
+            prompt_factory=None,
+        )
+        assert child is not None
+        session.agent_stack.append(child)
+        grandchild = await _delegate_child_frame(
+            session=session,
+            parent_id=child.id,
+            call_id="delegate-2",
+            group_id=None,
+            args={"agent": "programming-agent", "task": "grandchild task"},
+            depth=2,
+            prompt_factory=None,
+        )
+        assert grandchild is not None
+        return root, grandchild
 
-    assert grandchild is not None
+    root, grandchild = asyncio.run(scenario())
     assert grandchild.history_anchor_frame_id == root.id
     assert grandchild.history_anchor_message_index == len(root.messages)
 

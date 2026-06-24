@@ -92,6 +92,15 @@ def test_coordinator_plan_for_map_steps_stays_high_level() -> None:
     assert "你没有 `describe_map_region` 工具" in agent.prompt
 
 
+def test_coordinator_routes_map_analysis_steps_to_map_agent_not_programming_agent() -> None:
+    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "coordinator.md"
+    agent = load_agent_file(path)
+
+    assert "都必须交给 `map-agent`" in agent.prompt
+    assert "即便这一步只是分析或验证" in agent.prompt
+    assert "不要把这类步骤分给 `programming-agent` 或 `advisor`" in agent.prompt
+
+
 def test_map_agent_batches_follow_read_plan_edit_verify_loop() -> None:
     path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
     agent = load_agent_file(path)
@@ -100,3 +109,33 @@ def test_map_agent_batches_follow_read_plan_edit_verify_loop() -> None:
     assert "预期 `cells` 数量" in agent.prompt
     assert "不必每批重读" in agent.prompt
     assert "更新这一块的计划" in agent.prompt
+
+
+def test_describe_map_region_schema_warns_about_legacy_tilemap_layers() -> None:
+    previous = REGISTRY.copy()
+    try:
+        REGISTRY.clear()
+        register_front_tools()
+        describe_tool = REGISTRY["describe_map_region"]
+        edit_tool = REGISTRY["edit_map"]
+
+        assert "`layers` array" in describe_tool.schema["description"]
+        assert "do not assume map_layer 0" in describe_tool.schema["description"]
+        map_layer_doc = describe_tool.schema["parameters"]["properties"]["map_layer"]["description"]
+        assert "Defaults" in map_layer_doc and "layers" in map_layer_doc
+
+        assert "describe_map_region first" in edit_tool.schema["description"]
+        edit_map_layer_doc = edit_tool.schema["parameters"]["properties"]["map_layer"]["description"]
+        assert "not always the foreground/collidable layer" in edit_map_layer_doc
+    finally:
+        REGISTRY.clear()
+        REGISTRY.update(previous)
+
+
+def test_map_agent_must_check_real_layers_before_picking_map_layer() -> None:
+    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
+    agent = load_agent_file(path)
+
+    assert "`layers` 字段" in agent.prompt
+    assert "不要默认 `map_layer=0`" in agent.prompt
+    assert "physics_layer" in agent.prompt

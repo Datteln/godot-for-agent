@@ -22,7 +22,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
 
@@ -42,6 +42,8 @@ EVENT_TEXT_PREVIEW_CHARS = 24_000
 EVENT_MATCH_PREVIEW_ITEMS = 20
 
 logger = logging.getLogger(__name__)
+
+AgentPromptFactory = Callable[[AgentDefinition, str], Awaitable[str]]
 
 
 @dataclass(frozen=True)
@@ -296,7 +298,7 @@ def _find_frame(session: Session, frame_id: str) -> Frame | None:
     return None
 
 
-def _delegate_child_frame(
+async def _delegate_child_frame(
     *,
     session: Session,
     parent_id: str,
@@ -304,7 +306,7 @@ def _delegate_child_frame(
     group_id: str | None,
     args: dict[str, Any],
     depth: int,
-    prompt_factory: Callable[[AgentDefinition], str] | None,
+    prompt_factory: AgentPromptFactory | None,
 ) -> Frame | None:
     """根据委派参数创建一个子 agent 帧。"""
     agent_name = args.get("agent")
@@ -317,7 +319,12 @@ def _delegate_child_frame(
         child_agent = get_agent(agent_name, set(REGISTRY))
     except KeyError:
         return None
-    prompt = prompt_factory(child_agent) if prompt_factory is not None else child_agent.prompt
+    task_text = task.strip()
+    prompt = (
+        await prompt_factory(child_agent, task_text)
+        if prompt_factory is not None
+        else child_agent.prompt
+    )
     child_agent = replace(child_agent, prompt=prompt)
     parent = _find_frame(session, parent_id)
     history_anchor_frame_id = parent_id
@@ -330,7 +337,7 @@ def _delegate_child_frame(
         agent=child_agent,
         messages=[
             {"role": "system", "content": child_agent.prompt},
-            {"role": "user", "content": task.strip()},
+            {"role": "user", "content": task_text},
         ],
         parent_id=parent_id,
         pending_delegate_call_id=call_id,
@@ -416,11 +423,11 @@ def _plan_step_completed(
     )
 
 
-def _continue_delegate_group(
+async def _continue_delegate_group(
     session: Session,
     done: Frame,
     text: str,
-    prompt_factory: Callable[[AgentDefinition], str] | None,
+    prompt_factory: AgentPromptFactory | None,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> None:
     """记录一个 `delegate_many` 子任务结果，并按需启动下一个子任务。"""
@@ -455,7 +462,7 @@ def _continue_delegate_group(
                 }
             )
             continue
-        child = _delegate_child_frame(
+        child = await _delegate_child_frame(
             session=session,
             parent_id=str(group["parent_frame_id"]),
             call_id=None,
@@ -501,10 +508,10 @@ def _continue_delegate_group(
     session.delegate_groups.pop(done.pending_delegate_group_id, None)
 
 
-def _finish_frame(
+async def _finish_frame(
     session: Session,
     text: str,
-    prompt_factory: Callable[[AgentDefinition], str] | None = None,
+    prompt_factory: AgentPromptFactory | None = None,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> FinalResult | None:
     """处理当前帧产出最终文本（无 `tool_calls`）的情况（§13.1）。
@@ -537,7 +544,7 @@ def _finish_frame(
         len(text),
     )
     if done.pending_delegate_group_id is not None:
-        _continue_delegate_group(session, done, text, prompt_factory, event_callback)
+        await _continue_delegate_group(session, done, text, prompt_factory, event_callback)
         return None
     parent = session.top_frame()
     assert parent is not None
@@ -547,12 +554,12 @@ def _finish_frame(
     return None
 
 
-def _handle_frame_turns_exhausted(
+async def _handle_frame_turns_exhausted(
     session: Session,
     frame: Frame,
     limit_label: str,
     limit: int,
-    prompt_factory: Callable[[AgentDefinition], str] | None,
+    prompt_factory: AgentPromptFactory | None,
     event_callback: Callable[[str, dict[str, Any]], None] | None,
 ) -> ErrorResult | None:
     """某个轮次预算（总轮数/edit_map 轮数/常规轮数）耗尽时的统一收尾。
@@ -581,7 +588,7 @@ def _handle_frame_turns_exhausted(
         limit_label,
         limit,
     )
-    _finish_frame(
+    await _finish_frame(
         session,
         f"子 agent「{frame.agent.name}」已达到自身{limit_label}上限（{limit}），"
         "任务未完成，已强制收尾。以上为已执行步骤记录，请据此判断是否需要重新拆分任务或继续委派。",
@@ -801,13 +808,13 @@ def _handle_create_plan(
     )
 
 
-def _start_delegate_frame(
+async def _start_delegate_frame(
     *,
     session: Session,
     frame: Frame,
     call_id: str,
     args: dict[str, Any],
-    prompt_factory: Callable[[AgentDefinition], str] | None,
+    prompt_factory: AgentPromptFactory | None,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> bool:
     """创建子 agent 帧并压栈，成功时返回 True。"""
@@ -851,7 +858,7 @@ def _start_delegate_frame(
         )
         return False
 
-    child = _delegate_child_frame(
+    child = await _delegate_child_frame(
         session=session,
         parent_id=frame.id,
         call_id=call_id,
@@ -882,13 +889,13 @@ def _start_delegate_frame(
     return True
 
 
-def _start_delegate_group(
+async def _start_delegate_group(
     *,
     session: Session,
     frame: Frame,
     call_id: str,
     args: dict[str, Any],
-    prompt_factory: Callable[[AgentDefinition], str] | None,
+    prompt_factory: AgentPromptFactory | None,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> bool:
     """启动 `delegate_many` 顺序子任务组。"""
@@ -944,7 +951,7 @@ def _start_delegate_group(
         "results": [],
         "depth": frame.depth + 1,
     }
-    child = _delegate_child_frame(
+    child = await _delegate_child_frame(
         session=session,
         parent_id=frame.id,
         call_id=None,
@@ -1296,7 +1303,7 @@ async def run_turn(
     tool_ctx: ToolContext,
     max_turns: int,
     session_allow: set[SessionAllowGrant] | None = None,
-    agent_prompt_factory: Callable[[AgentDefinition], str] | None = None,
+    agent_prompt_factory: AgentPromptFactory | None = None,
     model_selector: Callable[[EffortLevel], str | None] | None = None,
     model_override: str | None = None,
     thinking_budget_selector: Callable[[EffortLevel], int | None] | None = None,
@@ -1337,7 +1344,7 @@ async def run_turn(
         # 哪个预算先耗尽由下面 tool_calls 揭晓后的精确分类检查负责。
         total_budget = frame.agent.max_turns + (frame.agent.edit_map_max_turns or 0)
         if used >= total_budget:
-            result = _handle_frame_turns_exhausted(
+            result = await _handle_frame_turns_exhausted(
                 session, frame, "总轮数", total_budget, agent_prompt_factory, event_callback
             )
             if result is not None:
@@ -1439,14 +1446,14 @@ async def run_turn(
         _emit_cache_hit_event(event_callback, frame, loop_index + 1, turn)
 
         if not turn.tool_calls:
-            result = _finish_frame(
+            finish_result = await _finish_frame(
                 session, turn.content or "", agent_prompt_factory, event_callback
             )
-            if result is not None:
+            if finish_result is not None:
                 logger.info(
                     "Agent run_turn final session=%s loop=%d", session.session_id, loop_index + 1
                 )
-                return result
+                return finish_result
             continue  # 子帧已结束，继续驱动父帧
 
         tool_names = [call.name for call in turn.tool_calls]
@@ -1474,7 +1481,7 @@ async def run_turn(
             edit_map_used = frame_edit_map_turns.get(frame.id, 0) + 1
             frame_edit_map_turns[frame.id] = edit_map_used
             if edit_map_used > frame.agent.edit_map_max_turns:
-                result = _handle_frame_turns_exhausted(
+                result = await _handle_frame_turns_exhausted(
                     session,
                     frame,
                     "edit_map 调用次数",
@@ -1488,7 +1495,7 @@ async def run_turn(
         else:
             general_used = frame_turns.get(frame.id, 0) - frame_edit_map_turns.get(frame.id, 0)
             if general_used > frame.agent.max_turns:
-                result = _handle_frame_turns_exhausted(
+                result = await _handle_frame_turns_exhausted(
                     session,
                     frame,
                     "常规轮数",
@@ -1562,7 +1569,7 @@ async def run_turn(
                 },
             )
             if call.name == "delegate_many":
-                _start_delegate_group(
+                await _start_delegate_group(
                     session=session,
                     frame=frame,
                     call_id=call.id,
@@ -1571,7 +1578,7 @@ async def run_turn(
                     event_callback=event_callback,
                 )
             else:
-                _start_delegate_frame(
+                await _start_delegate_frame(
                     session=session,
                     frame=frame,
                     call_id=call.id,
