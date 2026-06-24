@@ -98,6 +98,75 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 	}
 
 
+## 只读地查询一小块现有地图区域的真实瓦片/网格数据，外加地图节点自身的坐标系数。
+## 用于在扩建/延伸地形前先弄清楚现有内容到底长什么样、世界坐标怎么换算，而不是
+## 靠 tile_catalog 里"有哪些瓦片可用"自己瞎拼，或者假设 origin/tile_size 是常量。
+static func describe_map_region(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var map_layer := int(input.get("map_layer", 0))
+	var origin := Vector3i(
+		int(input.get("x", 0)),
+		int(input.get("y", 0)),
+		int(input.get("z", 0)) if dimension == 3 else 0
+	)
+	var width := max(1, int(input.get("width", 1)))
+	var height := max(1, int(input.get("height", 1)))
+	var depth := max(1, int(input.get("depth", 1))) if dimension == 3 else 1
+	if width * height * depth > MAX_DESCRIBED_CELLS:
+		return {
+			"ok": false,
+			"message": "requested region exceeds the %d-cell read limit; query a smaller region" % MAX_DESCRIBED_CELLS,
+			"error_code": "region_too_large",
+		}
+
+	var cells: Array = []
+	for z_offset in range(depth):
+		for y_offset in range(height):
+			for x_offset in range(width):
+				var coords := origin + Vector3i(x_offset, y_offset, z_offset)
+				cells.append(_describe_safe_cell(_read_map_cell(target, coords, dimension, map_layer), dimension))
+
+	var result := {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"type": target.get_class(),
+		"dimension": dimension,
+		"map_layer": map_layer if target.get_class() == "TileMap" else null,
+		"cells": cells,
+	}
+	if target is Node2D:
+		var position_2d := (target as Node2D).position
+		result["node_position"] = {"x": position_2d.x, "y": position_2d.y}
+	elif target is Node3D:
+		var position_3d := (target as Node3D).position
+		result["node_position"] = {"x": position_3d.x, "y": position_3d.y, "z": position_3d.z}
+	if dimension == 3 and "cell_size" in target:
+		var cell_size: Vector3 = target.cell_size
+		result["cell_size"] = {"x": cell_size.x, "y": cell_size.y, "z": cell_size.z}
+	elif dimension == 2 and "tile_set" in target and target.tile_set != null:
+		var tile_size: Vector2i = target.tile_set.tile_size
+		result["tile_size"] = {"x": tile_size.x, "y": tile_size.y}
+	return result
+
+
+## 把 `_read_map_cell` 里的 Vector2i/Vector3i 折算成 JSON 可序列化的 `{x,y[,z]}`。
+static func _describe_safe_cell(cell: Dictionary, dimension: int) -> Dictionary:
+	var safe := cell.duplicate()
+	var coords: Vector3i = safe.get("coords", Vector3i.ZERO)
+	safe["coords"] = {"x": coords.x, "y": coords.y, "z": coords.z} if dimension == 3 else {"x": coords.x, "y": coords.y}
+	if safe.has("atlas_coords"):
+		var atlas: Vector2i = safe["atlas_coords"]
+		safe["atlas_coords"] = {"x": atlas.x, "y": atlas.y}
+	return safe
+
+
 static func _resolve_map_target(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	var root := editor_interface.get_edited_scene_root()
 	if root == null:

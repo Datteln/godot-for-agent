@@ -1352,6 +1352,48 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="describe_map_region",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            render_kind="json",
+            schema={
+                "name": "describe_map_region",
+                "description": (
+                    "Read the actual tiles/cells already placed in a small region of a 2D TileMapLayer/legacy "
+                    "TileMap or 3D GridMap, plus the map node's own local position and tile_size/cell_size. "
+                    "Use this before extending or blending with existing terrain/background so new content "
+                    "reuses the real source_id/atlas_coords already in use, and before computing world "
+                    "coordinates for nodes placed relative to the map, instead of guessing constants."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {
+                            "type": "string",
+                            "description": (
+                                "NodePath relative to the edited scene root. Omit to use the selected map node "
+                                "or the only compatible map node in the scene."
+                            ),
+                        },
+                        "map_layer": {
+                            "type": "integer",
+                            "description": "Layer index for a legacy TileMap; ignored by TileMapLayer and GridMap.",
+                        },
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                    },
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="edit_map",
             domain="map",
             side="front",

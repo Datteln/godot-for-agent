@@ -152,6 +152,8 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = ProjectTools.list_export_presets()
 		"describe_tilemap_selection":
 			result = MapTools.describe_selection(editor_interface)
+		"describe_map_region":
+			result = MapTools.describe_map_region(input, editor_interface)
 		"edit_map":
 			result = MapTools.edit_map(input, editor_interface, undo_manager)
 		"fill_rect":
