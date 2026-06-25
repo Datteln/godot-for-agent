@@ -89,7 +89,8 @@ def test_coordinator_plan_for_map_steps_stays_high_level() -> None:
     agent = load_agent_file(path)
 
     assert "不要写具体的 atlas 坐标" in agent.prompt
-    assert "你没有 `describe_map_region` 工具" in agent.prompt
+    assert "高层计划不该预填底层瓦片值" in agent.prompt
+    assert "你没有 `describe_map_region` 工具" not in agent.prompt
 
 
 def test_coordinator_routes_map_analysis_steps_to_map_agent_not_programming_agent() -> None:

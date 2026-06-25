@@ -1342,6 +1342,7 @@ def register_front_tools() -> None:
             side="front",
             reads_project=True,
             is_read_only=True,
+            is_concurrency_safe=True,
             render_kind="json",
             schema={
                 "name": "describe_tilemap_selection",
@@ -1352,11 +1353,85 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="describe_map_context",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "describe_map_context",
+                "description": (
+                    "Read the current scene's editable map context before planning a 2D/3D map task: "
+                    "TileMapLayer/legacy TileMap/GridMap nodes, TileSet/MeshLibrary references, "
+                    "resource_registry.json status, and spatial_index.json summary. Use this as the "
+                    "project-recognition step before resolving natural-language resources or choosing "
+                    "a target map node."
+                ),
+                "parameters": _object_schema({}),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="plan_map_layout",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "plan_map_layout",
+                "description": (
+                    "Parse a natural-language 2D/3D map request into a structured MapIntent and generate a "
+                    "read-only layout plan: standard layer needs, zones, anchors, required semantic resources, "
+                    "missing registry keys, draft edit_map operations, and validation steps. Use before large "
+                    "generate/edit/decorate tasks; it never edits the scene."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "prompt": {
+                            "type": "string",
+                            "description": "User's map-editing request in natural language.",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["auto", "2d", "3d"],
+                            "description": "Optional mode override; defaults to auto.",
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "Optional task override such as generate, erase, replace, decorate.",
+                        },
+                        "theme": {"type": "string"},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "density": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                        },
+                        "seed": {"type": "integer"},
+                        "noise": {"type": "boolean"},
+                    },
+                    ["prompt"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="describe_map_region",
             domain="map",
             side="front",
             reads_project=True,
             is_read_only=True,
+            is_concurrency_safe=True,
             render_kind="json",
             schema={
                 "name": "describe_map_region",
@@ -1471,6 +1546,27 @@ def register_front_tools() -> None:
                                         "type": "integer",
                                         "description": "3D GridMap orthogonal orientation index.",
                                     },
+                                    "resource": {
+                                        "type": "string",
+                                        "description": "Optional semantic resource key from resource_registry.json.",
+                                    },
+                                    "resource_key": {
+                                        "type": "string",
+                                        "description": "Optional alias for resource; stored in the spatial index.",
+                                    },
+                                    "semantic_layer": {
+                                        "type": "string",
+                                        "description": "Optional logical layer such as ground, water, road, obstacle, decor.",
+                                    },
+                                    "tags": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Optional semantic tags copied into the spatial index.",
+                                    },
+                                    "cost": {
+                                        "type": "number",
+                                        "description": "Optional traversal cost copied into the spatial index.",
+                                    },
                                     "from_x": {"type": "integer"},
                                     "from_y": {"type": "integer"},
                                     "from_z": {"type": "integer"},
@@ -1481,8 +1577,465 @@ def register_front_tools() -> None:
                                 ["action"],
                             ),
                         },
+                        "update_spatial_index": {
+                            "type": "boolean",
+                            "description": (
+                                "When true, update res://.ai_agent_service/map_agent/spatial_index.json with the "
+                                "changed cells in the same preview/undo batch. Use for durable local edits, "
+                                "delete/replace tasks, and blueprint-like reuse; omit for quick exploratory edits."
+                            ),
+                        },
                     },
                     ["operations"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="query_spatial_index",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "query_spatial_index",
+                "description": (
+                    "Search the spatial index (res://.ai_agent_service/map_agent/spatial_index.json) for "
+                    "semantic objects previously recorded via edit_map(update_spatial_index=true). Filter by "
+                    "tags, semantic_layer, resource key, target node, and/or a coordinate region. Use this to "
+                    "locate existing objects for local edits ('delete the tree in the top-left', 'replace the "
+                    "village road') instead of re-reading and re-drawing the whole map."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "dimension": {
+                            "type": "string",
+                            "enum": ["2d", "3d"],
+                            "description": "Which index branch to search; defaults to 2d.",
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Match entries carrying any of these tags.",
+                        },
+                        "resource": {
+                            "type": "string",
+                            "description": "Match entries with this resource/resource_key.",
+                        },
+                        "semantic_layer": {
+                            "type": "string",
+                            "description": "Match entries on this logical layer (ground, water, road, ...).",
+                        },
+                        "target_path": {
+                            "type": "string",
+                            "description": "Restrict the search to one map node's recorded cells.",
+                        },
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum number of matches to return; defaults to 200.",
+                        },
+                    },
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="compact_spatial_index",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="json",
+            schema={
+                "name": "compact_spatial_index",
+                "description": (
+                    "Compact or clear the durable spatial index at "
+                    "res://.ai_agent_service/map_agent/spatial_index.json. Use it when describe_map_context "
+                    "shows the index is near max_entries, after large deleted/replaced regions, or when a target "
+                    "map has been regenerated. It can clear everything, clear one dimension/target/coordinate "
+                    "region, or simply prune the index down to max_entries. Previewed and undoable."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "dimension": {
+                            "type": "string",
+                            "enum": ["2d", "3d"],
+                            "description": "Optional index branch to compact.",
+                        },
+                        "target_path": {
+                            "type": "string",
+                            "description": "Optional map node path whose indexed cells should be compacted/cleared.",
+                        },
+                        "clear_all": {
+                            "type": "boolean",
+                            "description": "When true, remove all entries matching dimension/target_path filters.",
+                        },
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "max_entries": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Prune the whole remaining index down to this entry count.",
+                        },
+                    },
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="validate_map_region",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "validate_map_region",
+                "description": (
+                    "Read-only structural check over a small map region: counts filled vs empty cells and, "
+                    "when start and goal are given, runs a BFS connectivity test (4-neighbour in 2D, "
+                    "6-neighbour in 3D). By default empty cells are walkable and filled cells are obstacles; "
+                    "set walkable_is_filled=true to invert. Returns an issues list, passed flag, and a simple "
+                    "repair_plan for connectivity failures, but never edits the scene."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {
+                            "type": "string",
+                            "description": (
+                                "NodePath relative to the edited scene root. Omit to use the selected/only map node."
+                            ),
+                        },
+                        "map_layer": {
+                            "type": "integer",
+                            "description": "Layer index for a legacy TileMap; ignored by TileMapLayer and GridMap.",
+                        },
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "start": {
+                            "type": "object",
+                            "description": "Optional BFS start cell {x, y[, z]} in map coordinates.",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                            },
+                        },
+                        "goal": {
+                            "type": "object",
+                            "description": "Optional BFS goal cell {x, y[, z]} in map coordinates.",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                            },
+                        },
+                        "walkable_is_filled": {
+                            "type": "boolean",
+                            "description": "When true, filled cells are walkable and empty cells are obstacles.",
+                        },
+                    },
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="repair_map_region",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="map",
+            schema={
+                "name": "repair_map_region",
+                "description": (
+                    "Apply the simplest automatic repair for validate_map_region connectivity failures. "
+                    "It builds a Manhattan corridor between start and goal and applies it through the same "
+                    "preview/Undo map edit path: by default it erases blocking cells so empty space becomes "
+                    "walkable; with walkable_is_filled=true, it fills the corridor and therefore requires "
+                    "source_id/atlas_x/atlas_y for 2D or item for 3D. Re-run validate_map_region after repair."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {"type": "string"},
+                        "map_layer": {"type": "integer"},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "start": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                            },
+                        },
+                        "goal": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                            },
+                        },
+                        "walkable_is_filled": {"type": "boolean"},
+                        "source_id": {"type": "integer"},
+                        "fill_source_id": {"type": "integer"},
+                        "atlas_x": {"type": "integer"},
+                        "atlas_y": {"type": "integer"},
+                        "fill_atlas_x": {"type": "integer"},
+                        "fill_atlas_y": {"type": "integer"},
+                        "alternative_tile": {"type": "integer"},
+                        "item": {"type": "integer"},
+                        "fill_item": {"type": "integer"},
+                        "orientation": {"type": "integer"},
+                        "update_spatial_index": {"type": "boolean"},
+                    },
+                    ["start", "goal"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="sample_noise_grid",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "sample_noise_grid",
+                "description": (
+                    "Sample a FastNoiseLite grid of normalized 0..1 values over a region, for natural "
+                    "distribution decisions (tree/rock density, terrain variation). Pure computation; reads "
+                    "and writes nothing in the scene. Use a fixed seed for reproducible layouts, then apply a "
+                    "threshold to turn values into placement density."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "dimension": {
+                            "type": "string",
+                            "enum": ["2d", "3d"],
+                            "description": "Sample a 2D plane or a 3D volume; defaults to 2d.",
+                        },
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "seed": {"type": "integer", "description": "Noise seed for reproducibility."},
+                        "frequency": {"type": "number", "description": "Noise frequency; defaults to 0.05."},
+                        "noise_type": {
+                            "type": "string",
+                            "enum": [
+                                "simplex",
+                                "simplex_smooth",
+                                "perlin",
+                                "cellular",
+                                "value",
+                                "value_cubic",
+                            ],
+                            "description": "FastNoiseLite type; defaults to simplex.",
+                        },
+                        "octaves": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional fractal octaves; omit for the engine default.",
+                        },
+                    },
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="write_resource_registry",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="json",
+            schema={
+                "name": "write_resource_registry",
+                "description": (
+                    "Create or maintain the resource semantic registry at "
+                    "res://.ai_agent_service/map_agent/resource_registry.json, mapping natural-language keys "
+                    "(grass, wall, river, elf_house, ...) to real TileSet/MeshLibrary/PackedScene references "
+                    "so future tasks resolve resources instead of guessing ids. Entries merge by key by "
+                    "default; set replace=true to overwrite the whole table. Each write is previewed and "
+                    "undoable. Only record resources you have verified exist via describe_map_context or "
+                    "describe_map_region."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "entries": {
+                            "type": "object",
+                            "description": (
+                                "Object mapping each resource key to its definition object (display_name, "
+                                "mode, target, source_id/atlas_coords or mesh_library_item or scene_path, "
+                                "tags, cost, ...). Values are stored verbatim."
+                            ),
+                            "additionalProperties": {"type": "object"},
+                        },
+                        "replace": {
+                            "type": "boolean",
+                            "description": "When true, replace the entire registry instead of merging by key.",
+                        },
+                    },
+                    ["entries"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="save_map_blueprint",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="json",
+            schema={
+                "name": "save_map_blueprint",
+                "description": (
+                    "Capture the non-empty tiles/cells in a region as a reusable template at "
+                    "res://.ai_agent_service/map_agent/blueprints/<name>.json, storing relative coordinates "
+                    "and real resource references. Reuse later with apply_map_blueprint. Previewed and "
+                    "undoable."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "name": {
+                            "type": "string",
+                            "description": "Blueprint name (letters, digits, _ and - only).",
+                        },
+                        "target_path": {"type": "string"},
+                        "map_layer": {"type": "integer"},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional tags stored with the blueprint.",
+                        },
+                    },
+                    ["name"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="apply_map_blueprint",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="map",
+            schema={
+                "name": "apply_map_blueprint",
+                "description": (
+                    "Stamp a previously saved blueprint at a destination origin, reusing its real resource "
+                    "references. The blueprint's dimension must match the target map. Optionally update the "
+                    "spatial index. Previewed and undoable."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the saved blueprint to apply.",
+                        },
+                        "target_path": {"type": "string"},
+                        "map_layer": {"type": "integer"},
+                        "x": {"type": "integer", "description": "Destination origin x for the blueprint."},
+                        "y": {"type": "integer", "description": "Destination origin y for the blueprint."},
+                        "z": {"type": "integer", "description": "Destination origin z (3D only)."},
+                        "update_spatial_index": {
+                            "type": "boolean",
+                            "description": "When true, record stamped cells into the spatial index.",
+                        },
+                    },
+                    ["name"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="ensure_standard_map_layers",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "ensure_standard_map_layers",
+                "description": (
+                    "Create any missing standard map structure under a parent node. For 2D it ensures "
+                    "GroundLayer, WaterLayer, RoadLayer, ObstacleLayer, DecorLayer, and ObjectLayer; "
+                    "for 3D it ensures GridMap, PropsRoot, LightsRoot, and InteractRoot. Existing nodes "
+                    "are reused. TileSet/MeshLibrary is copied from reference_path or the first compatible "
+                    "map node under the parent when available. Previewed and undoable."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["2d", "3d"],
+                            "description": "Which standard structure to create; defaults to 2d.",
+                        },
+                        "parent_path": {
+                            "type": "string",
+                            "description": "Parent NodePath relative to the edited scene root; defaults to scene root.",
+                        },
+                        "reference_path": {
+                            "type": "string",
+                            "description": "Optional existing TileMapLayer/GridMap to copy TileSet/MeshLibrary from.",
+                        },
+                    },
+                    [],
                 ),
             },
         )

@@ -152,10 +152,32 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = ProjectTools.list_export_presets()
 		"describe_tilemap_selection":
 			result = MapTools.describe_selection(editor_interface)
+		"describe_map_context":
+			result = MapTools.describe_map_context(input, editor_interface)
+		"plan_map_layout":
+			result = MapTools.plan_map_layout(input, editor_interface)
 		"describe_map_region":
 			result = MapTools.describe_map_region(input, editor_interface)
 		"edit_map":
 			result = MapTools.edit_map(input, editor_interface, undo_manager)
+		"query_spatial_index":
+			result = MapTools.query_spatial_index(input, editor_interface)
+		"compact_spatial_index":
+			result = MapTools.compact_spatial_index(input, editor_interface, undo_manager)
+		"validate_map_region":
+			result = MapTools.validate_map_region(input, editor_interface)
+		"repair_map_region":
+			result = MapTools.repair_map_region(input, editor_interface, undo_manager)
+		"sample_noise_grid":
+			result = MapTools.sample_noise_grid(input, editor_interface)
+		"write_resource_registry":
+			result = MapTools.write_resource_registry(input, editor_interface, undo_manager)
+		"save_map_blueprint":
+			result = MapTools.save_map_blueprint(input, editor_interface, undo_manager)
+		"apply_map_blueprint":
+			result = MapTools.apply_map_blueprint(input, editor_interface, undo_manager)
+		"ensure_standard_map_layers":
+			result = MapTools.ensure_standard_map_layers(input, editor_interface, undo_manager)
 		"fill_rect":
 			result = MapTools.fill_rect(input, editor_interface, undo_manager)
 		"paint_from_image_grid":

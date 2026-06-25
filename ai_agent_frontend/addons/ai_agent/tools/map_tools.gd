@@ -2,9 +2,30 @@
 extends RefCounted
 
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
+const MapValidator = preload("res://addons/ai_agent/tools/map_validator.gd")
+const MapBlueprints = preload("res://addons/ai_agent/tools/map_blueprints.gd")
+const MapLayerScaffold = preload("res://addons/ai_agent/tools/map_layer_scaffold.gd")
+const MapIntentParser = preload("res://addons/ai_agent/tools/map_intent_parser.gd")
+const MapLayoutPlanner = preload("res://addons/ai_agent/tools/map_layout_planner.gd")
 
 const MAX_EDITED_CELLS := 100000
 const MAX_DESCRIBED_CELLS := 400
+const MAX_NOISE_CELLS := 4096
+## 空间索引整份读出/整份重写，条目数上限防止它随使用无限膨胀、拖慢每次 edit_map。
+## 到顶后仍允许更新/删除已有坐标，只拒绝新增坐标，并在结果里给出 warning。
+const MAX_SPATIAL_INDEX_ENTRIES := 20000
+## 地图 agent 运行期生成的数据统一落在项目下的 res://.ai_agent_service/map_agent 里，
+## 不再写进 addons（避免污染插件目录，也方便整目录清理）。读取时仍兼容旧的 addons 路径，
+## 以免历史项目里已有的语义表/索引被孤立。
+const MAP_DATA_DIR := "res://.ai_agent_service/map_agent"
+const RESOURCE_REGISTRY_WRITE_PATH := "res://.ai_agent_service/map_agent/resource_registry.json"
+const RESOURCE_REGISTRY_PATHS := [
+	"res://.ai_agent_service/map_agent/resource_registry.json",
+	"res://addons/map_agent/data/resource_registry.json",
+	"res://addons/ai_agent/data/resource_registry.json",
+]
+const SPATIAL_INDEX_PATH := "res://.ai_agent_service/map_agent/spatial_index.json"
+const BLUEPRINTS_DIR := "res://.ai_agent_service/map_agent/blueprints"
 
 
 static func describe_selection(editor_interface: EditorInterface) -> Dictionary:
@@ -36,6 +57,45 @@ static func _collect_tilemap_layers(node: Node, out: Array) -> void:
 		out.append(node)
 	for child in node.get_children():
 		_collect_tilemap_layers(child, out)
+
+
+## 读取当前场景中的地图节点、资源语义表和空间索引状态，作为地图任务的项目认知入口。
+static func describe_map_context(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var root := editor_interface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "message": "No scene is currently being edited", "error_code": "no_edited_scene"}
+
+	var found: Array = []
+	_collect_map_nodes(root, found)
+	var maps: Array = []
+	for node in found:
+		maps.append(_describe_map_node(root, node))
+
+	var registry := _read_first_json_resource(RESOURCE_REGISTRY_PATHS)
+	var spatial_index := _read_json_resource(SPATIAL_INDEX_PATH)
+	var entries_2d := _count_index_entries(spatial_index.get("data", {}).get("2d", {}))
+	var entries_3d := _count_index_entries(spatial_index.get("data", {}).get("3d", {}))
+	return {
+		"ok": true,
+		"scene": root.scene_file_path,
+		"maps": maps,
+		"resource_registry": registry,
+		"spatial_index": {
+			"path": SPATIAL_INDEX_PATH,
+			"exists": bool(spatial_index.get("exists", false)),
+			"entries_2d": entries_2d,
+			"entries_3d": entries_3d,
+			"entries_total": entries_2d + entries_3d,
+			"max_entries": MAX_SPATIAL_INDEX_ENTRIES,
+			"usage_ratio": float(entries_2d + entries_3d) / float(MAX_SPATIAL_INDEX_ENTRIES),
+		},
+		"notes": [
+			"Use describe_map_region for exact cells before editing a target area.",
+			"Use edit_map with update_spatial_index=true when the task needs durable local modification context.",
+		],
+	}
 
 
 ## Edit serialized map content through Godot APIs. This deliberately never reads or rewrites
@@ -81,6 +141,12 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 					"error_code": "map_edit_too_large"
 				}
 
+	# 先写空间索引，再动瓦片：如果索引写盘失败，此时还没有任何瓦片落入 Undo 批次，
+	# 可以直接返回错误而不留下"已改了瓦片却报失败"的半截状态（否则模型会拿着失败结果
+	# 重试同一次 edit_map，而瓦片其实已经改了，造成静默双写/错位）。
+	var index_result := _maybe_update_spatial_index(input, undo_manager, target, str(target_result.get("path", "")), dimension, after)
+	if not bool(index_result.get("ok", true)):
+		return index_result
 	if undo_manager != null:
 		undo_manager.record_tile_cells(target, before, after)
 	else:
@@ -94,6 +160,7 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		"map_layer": map_layer if target.get_class() == "TileMap" else null,
 		"operations": operations.size(),
 		"cells": after.size(),
+		"spatial_index": index_result,
 		"message": "Map edited through Godot native APIs; serialized map data was not modified directly."
 	}
 
@@ -148,10 +215,11 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		var position_3d := (target as Node3D).position
 		result["node_position"] = {"x": position_3d.x, "y": position_3d.y, "z": position_3d.z}
 	if dimension == 3 and "cell_size" in target:
-		var cell_size: Vector3 = target.cell_size
+		var cell_size: Vector3 = target.get("cell_size")
 		result["cell_size"] = {"x": cell_size.x, "y": cell_size.y, "z": cell_size.z}
-	elif dimension == 2 and "tile_set" in target and target.tile_set != null:
-		var tile_size: Vector2i = target.tile_set.tile_size
+	elif dimension == 2 and "tile_set" in target and target.get("tile_set") != null:
+		var tile_set = target.get("tile_set")
+		var tile_size: Vector2i = tile_set.tile_size
 		result["tile_size"] = {"x": tile_size.x, "y": tile_size.y}
 	if target.get_class() == "TileMap":
 		result["layers"] = _describe_tilemap_layers(target)
@@ -279,6 +347,7 @@ static func _build_map_operation(
 			var source_cell: Dictionary = snapshot["cell"]
 			var offset: Vector3i = snapshot["offset"]
 			source_cell["coords"] = destination_origin + offset
+			_copy_operation_metadata(operation, source_cell)
 			cells.append(source_cell)
 		return {"ok": true, "cells": cells}
 
@@ -302,8 +371,15 @@ static func _build_map_operation(
 						int(operation.get("atlas_y", -1))
 					)
 					cell["alternative_tile"] = int(operation.get("alternative_tile", 0))
+				_copy_operation_metadata(operation, cell)
 				cells.append(cell)
 	return {"ok": true, "cells": cells}
+
+
+static func _copy_operation_metadata(operation: Dictionary, cell: Dictionary) -> void:
+	for key in ["resource", "resource_key", "semantic_layer", "tags", "cost"]:
+		if operation.has(key):
+			cell[key] = operation[key]
 
 
 static func _read_map_cell(target: Node, coords: Vector3i, dimension: int, map_layer: int) -> Dictionary:
@@ -334,6 +410,270 @@ static func _read_map_cell(target: Node, coords: Vector3i, dimension: int, map_l
 	}
 
 
+static func _describe_map_node(root: Node, node: Node) -> Dictionary:
+	var path := str(root.get_path_to(node))
+	var result := {
+		"path": path,
+		"type": node.get_class(),
+		"dimension": 3 if node.get_class() == "GridMap" else 2,
+		"name": node.name,
+	}
+	if node.get_class() == "TileMap":
+		result["layers"] = _describe_tilemap_layers(node)
+		var layer_counts: Array = []
+		for layer in result["layers"]:
+			var layer_index := int(layer.get("index", 0))
+			layer_counts.append({"index": layer_index, "used_cells": node.call("get_used_cells", layer_index).size()})
+		result["layer_cell_counts"] = layer_counts
+	elif node.get_class() == "GridMap":
+		result["used_cells"] = node.call("get_used_cells").size()
+		if "mesh_library" in node and node.get("mesh_library") != null:
+			var mesh_library = node.get("mesh_library")
+			result["mesh_library"] = mesh_library.resource_path
+		if "cell_size" in node:
+			var cell_size: Vector3 = node.get("cell_size")
+			result["cell_size"] = {"x": cell_size.x, "y": cell_size.y, "z": cell_size.z}
+	else:
+		result["used_cells"] = node.call("get_used_cells").size() if node.has_method("get_used_cells") else 0
+		if "tile_set" in node and node.get("tile_set") != null:
+			var tile_set = node.get("tile_set")
+			result["tile_set"] = tile_set.resource_path
+			var tile_size: Vector2i = tile_set.tile_size
+			result["tile_size"] = {"x": tile_size.x, "y": tile_size.y}
+	return result
+
+
+static func _read_first_json_resource(paths: Array) -> Dictionary:
+	for path in paths:
+		var parsed := _read_json_resource(str(path))
+		if bool(parsed.get("exists", false)):
+			return parsed
+	return {"exists": false, "paths_checked": paths, "data": {}}
+
+
+static func _read_json_resource(path: String) -> Dictionary:
+	var absolute := ProjectSettings.globalize_path(path)
+	if not FileAccess.file_exists(absolute):
+		return {"exists": false, "path": path, "data": {}}
+	var text := FileAccess.get_file_as_string(absolute)
+	var parsed = JSON.parse_string(text)
+	if not (parsed is Dictionary):
+		return {"exists": true, "path": path, "data": {}, "warning": "JSON root is not an object"}
+	return {"exists": true, "path": path, "data": parsed}
+
+
+static func _count_index_entries(index_branch) -> int:
+	if not (index_branch is Dictionary):
+		return 0
+	var total := 0
+	for target_path in (index_branch as Dictionary).keys():
+		var entries = index_branch[target_path]
+		if entries is Dictionary:
+			total += entries.size()
+	return total
+
+
+static func _prune_spatial_index_to_cap(index: Dictionary, cap: int) -> Dictionary:
+	var total := _count_index_entries(index.get("2d", {})) + _count_index_entries(index.get("3d", {}))
+	if total <= cap:
+		return {"removed": 0}
+	var removed := 0
+	for branch_key in ["2d", "3d"]:
+		var branch = index.get(branch_key, {})
+		if not (branch is Dictionary):
+			continue
+		for target_path in (branch as Dictionary).keys():
+			var entries = branch[target_path]
+			if not (entries is Dictionary):
+				continue
+			var keys := (entries as Dictionary).keys()
+			for key in keys:
+				if total <= cap:
+					return {"removed": removed}
+				(entries as Dictionary).erase(key)
+				total -= 1
+				removed += 1
+			if (entries as Dictionary).is_empty():
+				(branch as Dictionary).erase(target_path)
+	return {"removed": removed}
+
+
+static func _maybe_update_spatial_index(
+	input: Dictionary,
+	undo_manager: Node,
+	target: Node,
+	target_path: String,
+	dimension: int,
+	after_cells: Array
+) -> Dictionary:
+	if not bool(input.get("update_spatial_index", false)):
+		return {"ok": true, "updated": false}
+	var absolute := ProjectSettings.globalize_path(SPATIAL_INDEX_PATH)
+	var before_text := FileAccess.get_file_as_string(absolute) if FileAccess.file_exists(absolute) else ""
+	var parsed = JSON.parse_string(before_text) if before_text != "" else {}
+	var index: Dictionary = parsed if parsed is Dictionary else {}
+	var branch_key := "3d" if dimension == 3 else "2d"
+	if not index.has(branch_key) or not (index[branch_key] is Dictionary):
+		index[branch_key] = {}
+	if not index[branch_key].has(target_path) or not (index[branch_key][target_path] is Dictionary):
+		index[branch_key][target_path] = {}
+	var target_index: Dictionary = index[branch_key][target_path]
+	# 当前索引总条目数（两个维度分支合计），用于到顶后只更新/删除、不再新增坐标。
+	var total_entries := _count_index_entries(index.get("2d", {})) + _count_index_entries(index.get("3d", {}))
+	var added := 0
+	var removed := 0
+	var hit_cap := false
+	for value in after_cells:
+		if not (value is Dictionary):
+			continue
+		var cell: Dictionary = value
+		var key := _index_coord_key(cell.get("coords", Vector3i.ZERO), dimension)
+		if _is_empty_cell(target, cell):
+			if target_index.has(key):
+				target_index.erase(key)
+				total_entries -= 1
+				removed += 1
+		elif target_index.has(key):
+			# 原地更新已有坐标，不增加体量。
+			target_index[key] = _describe_safe_cell(cell, dimension)
+		elif total_entries >= MAX_SPATIAL_INDEX_ENTRIES:
+			# 已到上限，拒绝再写入新坐标，避免文件无限膨胀。
+			hit_cap = true
+		else:
+			target_index[key] = _describe_safe_cell(cell, dimension)
+			total_entries += 1
+			added += 1
+	var after_text := JSON.stringify(index, "\t")
+	if undo_manager != null and undo_manager.has_method("record_file_write"):
+		var error: Error = undo_manager.record_file_write(SPATIAL_INDEX_PATH, before_text, after_text)
+		if error != OK:
+			return {"ok": false, "message": "failed to write spatial index", "error_code": "spatial_index_write_failed", "error": error}
+	else:
+		var dir_error := DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(MAP_DATA_DIR))
+		if dir_error != OK:
+			return {"ok": false, "message": "failed to create spatial index directory", "error_code": "spatial_index_write_failed", "error": dir_error}
+		var file := FileAccess.open(absolute, FileAccess.WRITE)
+		if file == null:
+			return {"ok": false, "message": "failed to open spatial index", "error_code": "spatial_index_write_failed", "error": FileAccess.get_open_error()}
+		file.store_string(after_text)
+	var result := {
+		"ok": true,
+		"updated": true,
+		"path": SPATIAL_INDEX_PATH,
+		"cells": after_cells.size(),
+		"added": added,
+		"removed": removed,
+		"total_entries": total_entries,
+	}
+	if hit_cap:
+		result["warning"] = "spatial index reached the %d-entry cap; new coordinates were skipped — clear it or stop passing update_spatial_index" % MAX_SPATIAL_INDEX_ENTRIES
+	return result
+
+
+static func _index_coord_key(coords: Vector3i, dimension: int) -> String:
+	return "%d,%d,%d" % [coords.x, coords.y, coords.z] if dimension == 3 else "%d,%d" % [coords.x, coords.y]
+
+
+static func _is_empty_cell(target: Node, cell: Dictionary) -> bool:
+	if target.get_class() == "GridMap":
+		return int(cell.get("item", -1)) == -1
+	return int(cell.get("source_id", -1)) == -1
+
+
+static func _apply_spatial_metadata_to_cell(target_path: String, coords: Vector3i, dimension: int, cell: Dictionary) -> void:
+	var parsed := _read_json_resource(SPATIAL_INDEX_PATH)
+	if not bool(parsed.get("exists", false)):
+		return
+	var data = parsed.get("data", {})
+	if not (data is Dictionary):
+		return
+	var branch = (data as Dictionary).get("3d" if dimension == 3 else "2d", {})
+	if not (branch is Dictionary):
+		return
+	var target_entries = (branch as Dictionary).get(target_path, {})
+	if not (target_entries is Dictionary):
+		return
+	var entry = (target_entries as Dictionary).get(_index_coord_key(coords, dimension), {})
+	if not (entry is Dictionary):
+		return
+	for key in ["resource", "resource_key", "semantic_layer", "tags", "cost"]:
+		if (entry as Dictionary).has(key):
+			cell[key] = entry[key]
+
+
+static func _collect_filled_cells(target: Node, region: Dictionary, dimension: int, map_layer: int) -> Dictionary:
+	var filled := {}
+	for dz in range(int(region["depth"])):
+		for dy in range(int(region["height"])):
+			for dx in range(int(region["width"])):
+				var coords := Vector3i(
+					int(region["x"]) + dx,
+					int(region["y"]) + dy,
+					int(region["z"]) + dz
+				)
+				var cell := _read_map_cell(target, coords, dimension, map_layer)
+				if not _is_empty_cell(target, cell):
+					filled[MapValidator.coord_key(coords)] = true
+	return filled
+
+
+static func _repair_cells_from_plan(
+	input: Dictionary,
+	target: Node,
+	dimension: int,
+	map_layer: int,
+	repair_plan: Array
+) -> Dictionary:
+	var cells: Array = []
+	for plan_value in repair_plan:
+		if not (plan_value is Dictionary):
+			continue
+		var plan: Dictionary = plan_value
+		var action := str(plan.get("action", "erase"))
+		var plan_cells = plan.get("cells", [])
+		if not (plan_cells is Array):
+			continue
+		for coord_value in plan_cells:
+			var coords := MapValidator.coord_from_input(coord_value, dimension)
+			var cell := {"coords": coords}
+			if action == "fill":
+				var filled := _filled_repair_cell(input, dimension, map_layer, coords)
+				if not bool(filled.get("ok", false)):
+					return filled
+				cell = filled["cell"]
+			elif target.get_class() == "GridMap":
+				cell["item"] = -1
+				cell["orientation"] = 0
+			else:
+				cell["map_layer"] = map_layer
+				cell["source_id"] = -1
+				cell["atlas_coords"] = Vector2i(-1, -1)
+				cell["alternative_tile"] = 0
+			cells.append(cell)
+	return {"ok": true, "cells": cells}
+
+
+static func _filled_repair_cell(input: Dictionary, dimension: int, map_layer: int, coords: Vector3i) -> Dictionary:
+	var cell := {"coords": coords}
+	if dimension == 3:
+		if not input.has("item") and not input.has("fill_item"):
+			return {"ok": false, "message": "fill repair requires item/fill_item for GridMap", "error_code": "missing_repair_resource"}
+		cell["item"] = int(input.get("fill_item", input.get("item", -1)))
+		cell["orientation"] = int(input.get("orientation", 0))
+	else:
+		if not input.has("source_id") and not input.has("fill_source_id"):
+			return {"ok": false, "message": "fill repair requires source_id/fill_source_id for TileMap", "error_code": "missing_repair_resource"}
+		cell["map_layer"] = map_layer
+		cell["source_id"] = int(input.get("fill_source_id", input.get("source_id", -1)))
+		cell["atlas_coords"] = Vector2i(
+			int(input.get("fill_atlas_x", input.get("atlas_x", -1))),
+			int(input.get("fill_atlas_y", input.get("atlas_y", -1)))
+		)
+		cell["alternative_tile"] = int(input.get("alternative_tile", 0))
+	_copy_operation_metadata(input, cell)
+	return {"ok": true, "cell": cell}
+
+
 static func _cell_key(cell: Dictionary, dimension: int, map_layer: int) -> String:
 	var coords: Vector3i = cell["coords"]
 	return "%d:%d:%d:%d" % [map_layer if dimension == 2 else 0, coords.x, coords.y, coords.z]
@@ -361,6 +701,570 @@ static func _apply_map_cell(target: Node, cell: Dictionary) -> void:
 			int(cell.get("alternative_tile", 0))
 		)
 
+
+## 创建/维护资源语义表 res://.ai_agent_service/map_agent/resource_registry.json，
+## 把自然语言资源词（grass/wall/river...）映射到真实的 TileSet/MeshLibrary/PackedScene 引用。
+## 默认按 key 合并进已有表；replace=true 时整表覆盖。写入走 Undo 批次，可撤销/可预览。
+static func write_resource_registry(input: Dictionary, _editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	var entries_value = input.get("entries", {})
+	if not (entries_value is Dictionary) or (entries_value as Dictionary).is_empty():
+		return {
+			"ok": false,
+			"message": "entries must be a non-empty object mapping resource keys to their definitions",
+			"error_code": "invalid_entries",
+		}
+	var entries: Dictionary = entries_value
+	var replace := bool(input.get("replace", false))
+	# before_text 取写入路径自身的当前内容，保证 Undo 能按字节还原。首次写入且非覆盖时，
+	# 尝试从旧 addons 路径迁移已有语义表，避免历史内容被孤立。
+	var before_text := _read_text_file(RESOURCE_REGISTRY_WRITE_PATH)
+	var data: Dictionary = {}
+	if before_text != "":
+		var parsed = JSON.parse_string(before_text)
+		if parsed is Dictionary:
+			data = (parsed as Dictionary).duplicate(true)
+	elif not replace:
+		var legacy := _read_first_json_resource(RESOURCE_REGISTRY_PATHS)
+		if legacy.get("data", {}) is Dictionary:
+			data = (legacy.get("data", {}) as Dictionary).duplicate(true)
+	if replace:
+		data = {}
+	for key in entries.keys():
+		var entry = entries[key]
+		if not (entry is Dictionary):
+			return {"ok": false, "message": "entry '%s' must be an object" % str(key), "error_code": "invalid_entry"}
+		data[str(key)] = entry
+	var after_text := JSON.stringify(data, "\t")
+	var write_result := _write_json_file(RESOURCE_REGISTRY_WRITE_PATH, before_text, after_text, undo_manager)
+	if not bool(write_result.get("ok", false)):
+		return write_result
+	return {
+		"ok": true,
+		"path": RESOURCE_REGISTRY_WRITE_PATH,
+		"keys": data.keys(),
+		"written_keys": entries.keys(),
+		"replaced": replace,
+	}
+
+
+## 按 tag / 语义层 / 资源 key / 坐标范围检索空间索引，定位"左上角的树""村庄道路"这类语义对象，
+## 支撑局部删除/替换，避免全量重绘。纯读，不需确认。
+static func query_spatial_index(input: Dictionary, _editor_interface: EditorInterface) -> Dictionary:
+	var parsed := _read_json_resource(SPATIAL_INDEX_PATH)
+	var dimension := 3 if str(input.get("dimension", "2d")) == "3d" else 2
+	var branch_key := "3d" if dimension == 3 else "2d"
+	if not bool(parsed.get("exists", false)):
+		return {
+			"ok": true,
+			"dimension": dimension,
+			"matches": [],
+			"total": 0,
+			"note": "spatial index has no data yet; run edit_map with update_spatial_index=true first",
+		}
+	var data: Dictionary = parsed.get("data", {})
+	var branch = data.get(branch_key, {})
+	if not (branch is Dictionary):
+		return {"ok": true, "dimension": dimension, "matches": [], "total": 0}
+
+	var want_tags: Array = input.get("tags", []) if input.get("tags", []) is Array else []
+	var want_resource := str(input.get("resource", input.get("resource_key", ""))).strip_edges()
+	var want_layer := str(input.get("semantic_layer", "")).strip_edges()
+	var target_filter := str(input.get("target_path", "")).strip_edges()
+	var has_region := input.has("x") or input.has("y") or input.has("z") \
+		or input.has("width") or input.has("height") or input.has("depth")
+	var region := _region_bounds(input)
+	var limit := max(1, int(input.get("limit", 200)))
+
+	var matches: Array = []
+	for target_path in branch.keys():
+		if target_filter != "" and str(target_path) != target_filter:
+			continue
+		var cells = branch[target_path]
+		if not (cells is Dictionary):
+			continue
+		for coord_key in cells.keys():
+			var entry = cells[coord_key]
+			if not (entry is Dictionary):
+				continue
+			if not _entry_matches(entry, want_tags, want_resource, want_layer):
+				continue
+			if has_region and not _entry_in_region(entry, region, dimension):
+				continue
+			var hit := (entry as Dictionary).duplicate(true)
+			hit["target_path"] = str(target_path)
+			hit["coord_key"] = str(coord_key)
+			matches.append(hit)
+			if matches.size() >= limit:
+				break
+		if matches.size() >= limit:
+			break
+	return {
+		"ok": true,
+		"dimension": dimension,
+		"matches": matches,
+		"total": matches.size(),
+		"truncated": matches.size() >= limit,
+		"index_entries": _count_index_entries(data.get("2d", {})) + _count_index_entries(data.get("3d", {})),
+		"max_entries": MAX_SPATIAL_INDEX_ENTRIES,
+	}
+
+
+## 把自然语言地图请求解析成结构化意图，并生成只读布局计划/操作草案。
+## 该工具不写场景；真正落地仍由 edit_map / ensure_standard_map_layers 等工具执行。
+static func plan_map_layout(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var context := describe_map_context({}, editor_interface)
+	if not bool(context.get("ok", false)):
+		return context
+	var intent := MapIntentParser.parse(input, context)
+	var plan := MapLayoutPlanner.plan(intent, context)
+	return {
+		"ok": true,
+		"intent": intent,
+		"plan": plan,
+		"message": "Map intent parsed and layout planned; review missing_resources before editing.",
+	}
+
+
+## 压缩或清理空间索引，避免长期使用后整份索引无限增长。
+## 可按 dimension/target_path/坐标区域清理，也可只执行 cap 修剪。
+static func compact_spatial_index(input: Dictionary, _editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	var parsed := _read_json_resource(SPATIAL_INDEX_PATH)
+	if not bool(parsed.get("exists", false)):
+		return {"ok": true, "path": SPATIAL_INDEX_PATH, "changed": false, "message": "spatial index does not exist"}
+	var before_text := _read_text_file(SPATIAL_INDEX_PATH)
+	var data: Dictionary = parsed.get("data", {}).duplicate(true)
+	var before_entries := _count_index_entries(data.get("2d", {})) + _count_index_entries(data.get("3d", {}))
+	var dimension_filter := str(input.get("dimension", "")).to_lower()
+	var target_filter := str(input.get("target_path", "")).strip_edges()
+	var clear_all := bool(input.get("clear_all", false))
+	var has_region := input.has("x") or input.has("y") or input.has("z") \
+		or input.has("width") or input.has("height") or input.has("depth")
+	var region := _region_bounds(input)
+	var removed := 0
+	for branch_key in ["2d", "3d"]:
+		if dimension_filter in ["2d", "3d"] and branch_key != dimension_filter:
+			continue
+		var branch = data.get(branch_key, {})
+		if not (branch is Dictionary):
+			continue
+		for target_path in (branch as Dictionary).keys():
+			if target_filter != "" and str(target_path) != target_filter:
+				continue
+			var entries = branch[target_path]
+			if not (entries is Dictionary):
+				continue
+			var removed_keys: Array = []
+			for coord_key in (entries as Dictionary).keys():
+				var entry = entries[coord_key]
+				if clear_all or (has_region and entry is Dictionary and _entry_in_region(entry, region, 3 if branch_key == "3d" else 2)):
+					removed_keys.append(coord_key)
+			for key in removed_keys:
+				(entries as Dictionary).erase(key)
+				removed += 1
+			if (entries as Dictionary).is_empty():
+				(branch as Dictionary).erase(target_path)
+	var cap := max(1, int(input.get("max_entries", MAX_SPATIAL_INDEX_ENTRIES)))
+	var pruned := _prune_spatial_index_to_cap(data, cap)
+	removed += int(pruned.get("removed", 0))
+	var after_entries := _count_index_entries(data.get("2d", {})) + _count_index_entries(data.get("3d", {}))
+	if removed == 0 and before_entries == after_entries:
+		return {"ok": true, "path": SPATIAL_INDEX_PATH, "changed": false, "entries": after_entries, "max_entries": cap}
+	var after_text := JSON.stringify(data, "\t")
+	var write_result := _write_json_file(SPATIAL_INDEX_PATH, before_text, after_text, undo_manager)
+	if not bool(write_result.get("ok", false)):
+		return write_result
+	return {
+		"ok": true,
+		"path": SPATIAL_INDEX_PATH,
+		"changed": true,
+		"removed": removed,
+		"entries_before": before_entries,
+		"entries_after": after_entries,
+		"max_entries": cap,
+	}
+
+
+## 只读校验一小块地图区域：统计实心/空格，可选做连通性（BFS）检测，返回问题清单。
+## 只检测不自动修复——具体怎么补由调用方用 edit_map 决定（自动改场景风险太大）。
+static func validate_map_region(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var map_layer := int(input.get("map_layer", 0))
+	var region := MapValidator.region_from_input(input, dimension)
+	if int(region["width"]) * int(region["height"]) * int(region["depth"]) > MAX_DESCRIBED_CELLS:
+		return {
+			"ok": false,
+			"message": "validation region exceeds the %d-cell limit; validate a smaller region" % MAX_DESCRIBED_CELLS,
+			"error_code": "region_too_large",
+		}
+
+	var filled := _collect_filled_cells(target, region, dimension, map_layer)
+	var result := {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"type": target.get_class(),
+		"dimension": dimension,
+		"region": region,
+	}
+	var analysis := MapValidator.validate_region(
+		filled,
+		region,
+		dimension,
+		input.get("start", null),
+		input.get("goal", null),
+		bool(input.get("walkable_is_filled", false))
+	)
+	result.merge(analysis, true)
+	return result
+
+
+## 根据 validate_map_region 的连通性修复计划应用最小 corridor 修复。
+## 默认玩法里空格可走时会清空 start->goal 的曼哈顿走廊；平台类/实心可走时可传 fill_* 参数填路。
+static func repair_map_region(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	if not input.has("start") or not input.has("goal"):
+		return {"ok": false, "message": "start and goal are required for repair", "error_code": "invalid_repair_request"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var map_layer := int(input.get("map_layer", 0))
+	var region := MapValidator.region_from_input(input, dimension)
+	if int(region["width"]) * int(region["height"]) * int(region["depth"]) > MAX_DESCRIBED_CELLS:
+		return {
+			"ok": false,
+			"message": "repair region exceeds the %d-cell limit; repair a smaller region" % MAX_DESCRIBED_CELLS,
+			"error_code": "region_too_large",
+		}
+	var filled := _collect_filled_cells(target, region, dimension, map_layer)
+	var analysis := MapValidator.validate_region(
+		filled,
+		region,
+		dimension,
+		input.get("start", null),
+		input.get("goal", null),
+		bool(input.get("walkable_is_filled", false))
+	)
+	if bool(analysis.get("passed", false)):
+		return {"ok": true, "changed": false, "message": "Region already passes validation", "validation": analysis}
+	var cells_result := _repair_cells_from_plan(input, target, dimension, map_layer, analysis.get("repair_plan", []))
+	if not bool(cells_result.get("ok", false)):
+		return cells_result
+	var after: Array = cells_result.get("cells", [])
+	if after.is_empty():
+		return {"ok": false, "message": "No repair cells were produced", "error_code": "empty_repair_plan", "validation": analysis}
+	var before: Array = []
+	var touched := {}
+	for cell in after:
+		var key := _cell_key(cell, dimension, map_layer)
+		if touched.has(key):
+			continue
+		before.append(_read_map_cell(target, cell["coords"], dimension, map_layer))
+		touched[key] = true
+	var index_result := _maybe_update_spatial_index(input, undo_manager, target, str(target_result.get("path", "")), dimension, after)
+	if not bool(index_result.get("ok", true)):
+		return index_result
+	if undo_manager != null:
+		undo_manager.record_tile_cells(target, before, after)
+	else:
+		for cell in after:
+			_apply_map_cell(target, cell)
+	return {
+		"ok": true,
+		"changed": true,
+		"target": str(target_result.get("path", "")),
+		"type": target.get_class(),
+		"dimension": dimension,
+		"cells": after.size(),
+		"validation_before": analysis,
+		"spatial_index": index_result,
+	}
+
+
+## 用 FastNoiseLite 在一块区域上采样归一化噪声值（0..1），供 agent 做"密度/自然分布"决策
+## （树木、岩石、草地变化等）。纯计算，不读写场景，不需确认。固定 seed 可复现。
+static func sample_noise_grid(input: Dictionary, _editor_interface: EditorInterface) -> Dictionary:
+	var dimension := 3 if str(input.get("dimension", "2d")) == "3d" else 2
+	var width := max(1, int(input.get("width", 1)))
+	var height := max(1, int(input.get("height", 1)))
+	var depth := max(1, int(input.get("depth", 1))) if dimension == 3 else 1
+	if width * height * depth > MAX_NOISE_CELLS:
+		return {
+			"ok": false,
+			"message": "noise grid exceeds the %d-sample limit; request a smaller grid" % MAX_NOISE_CELLS,
+			"error_code": "noise_grid_too_large",
+		}
+	var x := int(input.get("x", 0))
+	var y := int(input.get("y", 0))
+	var z := int(input.get("z", 0))
+
+	var noise := FastNoiseLite.new()
+	noise.seed = int(input.get("seed", 0))
+	noise.frequency = float(input.get("frequency", 0.05))
+	noise.noise_type = _noise_type_from_name(str(input.get("noise_type", "simplex")))
+	var octaves := int(input.get("octaves", 0))
+	if octaves > 0:
+		noise.fractal_octaves = octaves
+
+	var rows: Array = []
+	if dimension == 3:
+		for dz in range(depth):
+			var plane: Array = []
+			for dy in range(height):
+				var row: Array = []
+				for dx in range(width):
+					row.append(_normalize_noise(noise.get_noise_3d(x + dx, y + dy, z + dz)))
+				plane.append(row)
+			rows.append(plane)
+	else:
+		for dy in range(height):
+			var row: Array = []
+			for dx in range(width):
+				row.append(_normalize_noise(noise.get_noise_2d(x + dx, y + dy)))
+			rows.append(row)
+	return {
+		"ok": true,
+		"dimension": dimension,
+		"origin": {"x": x, "y": y, "z": z},
+		"width": width,
+		"height": height,
+		"depth": depth,
+		"seed": noise.seed,
+		"frequency": noise.frequency,
+		"noise_type": str(input.get("noise_type", "simplex")),
+		"values": rows,
+		"note": "values are normalized to 0..1; pick a threshold to convert to placement density",
+	}
+
+
+## 把一块现有区域里非空的瓦片/网格存成可复用模板
+## res://.ai_agent_service/map_agent/blueprints/<name>.json，记录相对坐标 + 真实资源引用。
+static func save_map_blueprint(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var name := MapBlueprints.sanitize_name(str(input.get("name", "")))
+	if name == "":
+		return {"ok": false, "message": "name is required and must contain letters/digits/_/-", "error_code": "invalid_blueprint_name"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var map_layer := int(input.get("map_layer", 0))
+	var x := int(input.get("x", 0))
+	var y := int(input.get("y", 0))
+	var z := int(input.get("z", 0)) if dimension == 3 else 0
+	var width := max(1, int(input.get("width", 1)))
+	var height := max(1, int(input.get("height", 1)))
+	var depth := max(1, int(input.get("depth", 1))) if dimension == 3 else 1
+	if width * height * depth > MAX_DESCRIBED_CELLS:
+		return {
+			"ok": false,
+			"message": "blueprint region exceeds the %d-cell limit; capture a smaller region" % MAX_DESCRIBED_CELLS,
+			"error_code": "region_too_large",
+		}
+
+	var target_path := str(target_result.get("path", ""))
+	var blueprint := MapBlueprints.build_blueprint(
+		name,
+		dimension,
+		map_layer,
+		Vector3i(x, y, z),
+		width,
+		height,
+		depth,
+		input.get("tags", []) if input.get("tags", []) is Array else [],
+		func(coords: Vector3i) -> Dictionary:
+			var cell := _read_map_cell(target, coords, dimension, map_layer)
+			_apply_spatial_metadata_to_cell(target_path, coords, dimension, cell)
+			return cell,
+		func(cell: Dictionary) -> bool:
+			return _is_empty_cell(target, cell)
+	)
+	var path := BLUEPRINTS_DIR + "/" + name + ".json"
+	var before_text := _read_text_file(path)
+	var after_text := JSON.stringify(blueprint, "\t")
+	var write_result := _write_json_file(path, before_text, after_text, undo_manager)
+	if not bool(write_result.get("ok", false)):
+		return write_result
+	return {"ok": true, "path": path, "name": name, "dimension": dimension, "cell_count": int(blueprint.get("cell_count", 0))}
+
+
+## 把已保存的模板平移到目标原点重新铺一遍，复用真实资源引用。可选写空间索引。
+## 走 Undo 预览批次，可撤销。
+static func apply_map_blueprint(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var name := MapBlueprints.sanitize_name(str(input.get("name", "")))
+	if name == "":
+		return {"ok": false, "message": "name is required", "error_code": "invalid_blueprint_name"}
+	var path := BLUEPRINTS_DIR + "/" + name + ".json"
+	var parsed := _read_json_resource(path)
+	if not bool(parsed.get("exists", false)):
+		return {"ok": false, "message": "blueprint not found: " + path, "error_code": "blueprint_not_found"}
+	var blueprint: Dictionary = parsed.get("data", {})
+	var ops = blueprint.get("ops", [])
+	if not (ops is Array) or (ops as Array).is_empty():
+		return {"ok": false, "message": "blueprint has no ops", "error_code": "blueprint_empty"}
+
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var blueprint_dimension := MapBlueprints.blueprint_dimension(blueprint)
+	if blueprint_dimension != dimension:
+		return {
+			"ok": false,
+			"message": "blueprint is %dD but target is %dD" % [blueprint_dimension, dimension],
+			"error_code": "blueprint_dimension_mismatch",
+		}
+	var map_layer := int(input.get("map_layer", 0))
+	var origin := Vector3i(
+		int(input.get("x", 0)),
+		int(input.get("y", 0)),
+		int(input.get("z", 0)) if dimension == 3 else 0
+	)
+
+	var before: Array = []
+	var after: Array = MapBlueprints.build_cells_from_blueprint(blueprint, dimension, map_layer, origin)
+	var touched := {}
+	if after.size() > MAX_EDITED_CELLS:
+		return {"ok": false, "message": "blueprint application exceeds the cell safety limit", "error_code": "map_edit_too_large"}
+	for cell in after:
+		var key := _cell_key(cell, dimension, map_layer)
+		if not touched.has(key):
+			before.append(_read_map_cell(target, cell["coords"], dimension, map_layer))
+			touched[key] = true
+
+	# 同 edit_map：先写空间索引，索引失败就在动瓦片前返回，避免半截状态。
+	var index_result := _maybe_update_spatial_index(input, undo_manager, target, str(target_result.get("path", "")), dimension, after)
+	if not bool(index_result.get("ok", true)):
+		return index_result
+	if undo_manager != null:
+		undo_manager.record_tile_cells(target, before, after)
+	else:
+		for cell in after:
+			_apply_map_cell(target, cell)
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"type": target.get_class(),
+		"dimension": dimension,
+		"map_layer": map_layer if target.get_class() == "TileMap" else null,
+		"name": name,
+		"cells": after.size(),
+		"spatial_index": index_result,
+	}
+
+
+## 创建/补齐文档约定的 2D/3D 标准地图节点结构。
+static func ensure_standard_map_layers(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	return MapLayerScaffold.ensure_standard_layers(input, editor_interface, undo_manager)
+
+
+## 读取 res:// 文本文件原始内容，文件不存在时返回空串（给 Undo before_text 用）。
+static func _read_text_file(path: String) -> String:
+	var absolute := ProjectSettings.globalize_path(path)
+	if not FileAccess.file_exists(absolute):
+		return ""
+	return FileAccess.get_file_as_string(absolute)
+
+
+## 写入 JSON 文本：优先走 undo_manager 进同一个预览/撤销批次，否则退化为直接写盘。
+static func _write_json_file(path: String, before_text: String, after_text: String, undo_manager: Node) -> Dictionary:
+	if undo_manager != null and undo_manager.has_method("record_file_write"):
+		var error: Error = undo_manager.record_file_write(path, before_text, after_text)
+		if error != OK:
+			return {"ok": false, "message": "failed to write " + path, "error_code": "file_write_failed", "error": error}
+		return {"ok": true}
+	var dir_error := DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(path.get_base_dir()))
+	if dir_error != OK and dir_error != ERR_ALREADY_EXISTS:
+		return {"ok": false, "message": "failed to create directory for " + path, "error_code": "file_write_failed", "error": dir_error}
+	var file := FileAccess.open(ProjectSettings.globalize_path(path), FileAccess.WRITE)
+	if file == null:
+		return {"ok": false, "message": "failed to open " + path, "error_code": "file_write_failed", "error": FileAccess.get_open_error()}
+	file.store_string(after_text)
+	return {"ok": true}
+
+
+static func _region_bounds(input: Dictionary) -> Dictionary:
+	var x := int(input.get("x", 0))
+	var y := int(input.get("y", 0))
+	var z := int(input.get("z", 0))
+	var width := max(1, int(input.get("width", 1)))
+	var height := max(1, int(input.get("height", 1)))
+	var depth := max(1, int(input.get("depth", 1)))
+	return {
+		"min_x": x, "max_x": x + width - 1,
+		"min_y": y, "max_y": y + height - 1,
+		"min_z": z, "max_z": z + depth - 1,
+	}
+
+
+static func _entry_matches(entry: Dictionary, want_tags: Array, want_resource: String, want_layer: String) -> bool:
+	if want_resource != "":
+		var entry_resource := str(entry.get("resource", entry.get("resource_key", "")))
+		if entry_resource != want_resource:
+			return false
+	if want_layer != "" and str(entry.get("semantic_layer", "")) != want_layer:
+		return false
+	if not want_tags.is_empty():
+		var entry_tags = entry.get("tags", [])
+		if not (entry_tags is Array):
+			return false
+		var found := false
+		for tag in want_tags:
+			if (entry_tags as Array).has(tag):
+				found = true
+				break
+		if not found:
+			return false
+	return true
+
+
+static func _entry_in_region(entry: Dictionary, region: Dictionary, dimension: int) -> bool:
+	var coords = entry.get("coords", {})
+	if not (coords is Dictionary):
+		return true
+	var cx := int(coords.get("x", 0))
+	var cy := int(coords.get("y", 0))
+	if cx < int(region["min_x"]) or cx > int(region["max_x"]):
+		return false
+	if cy < int(region["min_y"]) or cy > int(region["max_y"]):
+		return false
+	if dimension == 3:
+		var cz := int(coords.get("z", 0))
+		if cz < int(region["min_z"]) or cz > int(region["max_z"]):
+			return false
+	return true
+
+
+static func _normalize_noise(value: float) -> float:
+	return clampf((value + 1.0) * 0.5, 0.0, 1.0)
+
+
+static func _noise_type_from_name(noise_name: String) -> int:
+	match noise_name.to_lower():
+		"perlin":
+			return FastNoiseLite.TYPE_PERLIN
+		"value":
+			return FastNoiseLite.TYPE_VALUE
+		"value_cubic":
+			return FastNoiseLite.TYPE_VALUE_CUBIC
+		"cellular":
+			return FastNoiseLite.TYPE_CELLULAR
+		"simplex_smooth":
+			return FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+		_:
+			return FastNoiseLite.TYPE_SIMPLEX
 
 static func fill_rect(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
 	var selected := describe_selection(editor_interface)
