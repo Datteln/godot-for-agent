@@ -1365,7 +1365,7 @@ def register_front_tools() -> None:
                 "description": (
                     "Read the current scene's editable map context before planning a 2D/3D map task: "
                     "TileMapLayer/legacy TileMap/GridMap nodes, TileSet/MeshLibrary references, "
-                    "resource_registry.json status, and spatial_index.json summary. Use this as the "
+                    "resource_registry.json status, performance summary, and spatial_index.json summary. Use this as the "
                     "project-recognition step before resolving natural-language resources or choosing "
                     "a target map node."
                 ),
@@ -1554,6 +1554,10 @@ def register_front_tools() -> None:
                                         "type": "string",
                                         "description": "Optional alias for resource; stored in the spatial index.",
                                     },
+                                    "fallback_resource": {
+                                        "type": "string",
+                                        "description": "Optional fallback registry key used when resource/resource_key is absent.",
+                                    },
                                     "semantic_layer": {
                                         "type": "string",
                                         "description": "Optional logical layer such as ground, water, road, obstacle, decor.",
@@ -1585,8 +1589,162 @@ def register_front_tools() -> None:
                                 "delete/replace tasks, and blueprint-like reuse; omit for quick exploratory edits."
                             ),
                         },
+                        "allowed_bounds": {
+                            "type": "object",
+                            "description": (
+                                "Optional hard map bounds {x,y[,z],width,height[,depth]}. When provided, edit_map "
+                                "rejects any operation that would write outside this playable/design region."
+                            ),
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                                "width": {"type": "integer", "minimum": 1},
+                                "height": {"type": "integer", "minimum": 1},
+                                "depth": {"type": "integer", "minimum": 1},
+                            },
+                        },
                     },
                     ["operations"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="paint_terrain_connect",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="map",
+            schema={
+                "name": "paint_terrain_connect",
+                "description": (
+                    "Paint 2D TileMapLayer/legacy TileMap cells with Godot TileSet terrain connection rules. "
+                    "Use when a resource_registry entry provides terrain_set/terrain or when water/roads need "
+                    "smooth auto-connected edges. Previewed and undoable."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {"type": "string"},
+                        "map_layer": {"type": "integer"},
+                        "terrain_set": {"type": "integer"},
+                        "terrain": {"type": "integer"},
+                        "resource": {
+                            "type": "string",
+                            "description": "Optional registry key carrying terrain_set/terrain.",
+                        },
+                        "fallback_resource": {
+                            "type": "string",
+                            "description": "Optional fallback registry key carrying terrain_set/terrain.",
+                        },
+                        "ignore_empty_terrains": {"type": "boolean"},
+                        "cells": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                },
+                            },
+                        },
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "allowed_bounds": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "width": {"type": "integer", "minimum": 1},
+                                "height": {"type": "integer", "minimum": 1},
+                            },
+                        },
+                    },
+                    ["terrain_set", "terrain"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="place_map_objects",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="list",
+            schema={
+                "name": "place_map_objects",
+                "description": (
+                    "Instantiate PackedScene map objects under ObjectLayer/PropsRoot (or parent_path) at map cell "
+                    "coordinates. It resolves scene_path directly or from resource_registry entries, converts map "
+                    "cell coordinates to local Node2D/Node3D positions, rejects overlaps by default using the "
+                    "spatial index, and can record placements back into the index. Previewed and undoable."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {
+                            "type": "string",
+                            "description": "Map node used for coordinate conversion.",
+                        },
+                        "parent_path": {
+                            "type": "string",
+                            "description": "Optional ObjectLayer/PropsRoot node path; inferred when omitted.",
+                        },
+                        "objects": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 128,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "resource": {"type": "string"},
+                                    "resource_key": {"type": "string"},
+                                    "fallback_resource": {"type": "string"},
+                                    "scene_path": {"type": "string"},
+                                    "name": {"type": "string"},
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                    "semantic_layer": {"type": "string"},
+                                    "tags": {"type": "array", "items": {"type": "string"}},
+                                },
+                            },
+                        },
+                        "allow_overlap": {
+                            "type": "boolean",
+                            "description": "Defaults to false; when false, same-cell object placements are rejected.",
+                        },
+                        "allow_on_blocked": {
+                            "type": "boolean",
+                            "description": (
+                                "Defaults to false; when false, object placement is rejected on spatial-index "
+                                "water/blocked/obstacle cells."
+                            ),
+                        },
+                        "update_spatial_index": {
+                            "type": "boolean",
+                            "description": "Defaults to true; records placed objects for future semantic lookup.",
+                        },
+                        "allowed_bounds": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                                "width": {"type": "integer", "minimum": 1},
+                                "height": {"type": "integer", "minimum": 1},
+                                "depth": {"type": "integer", "minimum": 1},
+                            },
+                        },
+                    },
+                    ["objects"],
                 ),
             },
         )
@@ -1713,10 +1871,11 @@ def register_front_tools() -> None:
                 "name": "validate_map_region",
                 "description": (
                     "Read-only structural check over a small map region: counts filled vs empty cells and, "
-                    "when start and goal are given, runs a BFS connectivity test (4-neighbour in 2D, "
+                    "when start/goal, entrances/exits, or waypoints are given, runs BFS or A* connectivity (4-neighbour in 2D, "
                     "6-neighbour in 3D). By default empty cells are walkable and filled cells are obstacles; "
-                    "set walkable_is_filled=true to invert. Returns an issues list, passed flag, and a simple "
-                    "repair_plan for connectivity failures, but never edits the scene."
+                    "set walkable_is_filled=true to invert. It can also enforce allowed_bounds, check "
+                    "spatial-index overlaps, and detect objects sitting on water/blocked cells. Returns issues, "
+                    "passed, path/multi_connectivity, and repair_plan, but never edits."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1754,9 +1913,48 @@ def register_front_tools() -> None:
                                 "z": {"type": "integer"},
                             },
                         },
+                        "waypoints": {
+                            "type": "array",
+                            "description": "Optional ordered cells that the path must pass through.",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
+                        "entrances": {
+                            "type": "array",
+                            "description": "Optional entrance cells; each entrance must reach at least one exit.",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
+                        "exits": {
+                            "type": "array",
+                            "description": "Optional exit cells used with entrances.",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
                         "walkable_is_filled": {
                             "type": "boolean",
                             "description": "When true, filled cells are walkable and empty cells are obstacles.",
+                        },
+                        "path_algorithm": {
+                            "type": "string",
+                            "enum": ["bfs", "astar", "a*"],
+                            "description": "Connectivity algorithm; use astar when repairs should prefer obstacle-aware paths.",
+                        },
+                        "check_overlaps": {
+                            "type": "boolean",
+                            "description": "When true, fail validation if the spatial index has multiple entries at one coordinate.",
+                        },
+                        "check_blocked_objects": {
+                            "type": "boolean",
+                            "description": "When true, fail validation if indexed objects sit on water/blocked/obstacle cells.",
+                        },
+                        "allowed_bounds": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                                "width": {"type": "integer", "minimum": 1},
+                                "height": {"type": "integer", "minimum": 1},
+                                "depth": {"type": "integer", "minimum": 1},
+                            },
                         },
                     },
                     [],
@@ -1776,11 +1974,13 @@ def register_front_tools() -> None:
             schema={
                 "name": "repair_map_region",
                 "description": (
-                    "Apply the simplest automatic repair for validate_map_region connectivity failures. "
-                    "It builds a Manhattan corridor between start and goal and applies it through the same "
+                    "Apply automatic repairs for validate_map_region failures. "
+                    "For connectivity it prefers the validate_map_region A* path when available, otherwise builds a corridor, and applies it through the same "
                     "preview/Undo map edit path: by default it erases blocking cells so empty space becomes "
                     "walkable; with walkable_is_filled=true, it fills the corridor and therefore requires "
-                    "source_id/atlas_x/atlas_y for 2D or item for 3D. Re-run validate_map_region after repair."
+                    "source_id/atlas_x/atlas_y for 2D or item for 3D. With repair_overlaps/repair_blocked_objects "
+                    "it moves indexed object nodes to nearby free cells and updates the spatial index. Re-run "
+                    "validate_map_region after repair."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1808,7 +2008,31 @@ def register_front_tools() -> None:
                                 "z": {"type": "integer"},
                             },
                         },
+                        "waypoints": {
+                            "type": "array",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
+                        "entrances": {
+                            "type": "array",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
+                        "exits": {
+                            "type": "array",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
                         "walkable_is_filled": {"type": "boolean"},
+                        "repair_overlaps": {
+                            "type": "boolean",
+                            "description": "Move duplicate indexed objects to nearby free cells; start/goal not required.",
+                        },
+                        "repair_blocked_objects": {
+                            "type": "boolean",
+                            "description": "Move indexed objects off water/blocked/obstacle cells; start/goal not required.",
+                        },
+                        "path_algorithm": {
+                            "type": "string",
+                            "enum": ["bfs", "astar", "a*"],
+                        },
                         "source_id": {"type": "integer"},
                         "fill_source_id": {"type": "integer"},
                         "atlas_x": {"type": "integer"},
@@ -1821,7 +2045,7 @@ def register_front_tools() -> None:
                         "orientation": {"type": "integer"},
                         "update_spatial_index": {"type": "boolean"},
                     },
-                    ["start", "goal"],
+                    [],
                 ),
             },
         )
@@ -1907,8 +2131,8 @@ def register_front_tools() -> None:
                             "type": "object",
                             "description": (
                                 "Object mapping each resource key to its definition object (display_name, "
-                                "mode, target, source_id/atlas_coords or mesh_library_item or scene_path, "
-                                "tags, cost, ...). Values are stored verbatim."
+                                "mode, target, source_id/atlas_coords, terrain_set/terrain, mesh_library_item "
+                                "or scene_path, tags, cost, ...). Values are stored verbatim."
                             ),
                             "additionalProperties": {"type": "object"},
                         },

@@ -160,6 +160,10 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = MapTools.describe_map_region(input, editor_interface)
 		"edit_map":
 			result = MapTools.edit_map(input, editor_interface, undo_manager)
+		"paint_terrain_connect":
+			result = MapTools.paint_terrain_connect(input, editor_interface, undo_manager)
+		"place_map_objects":
+			result = MapTools.place_map_objects(input, editor_interface, undo_manager)
 		"query_spatial_index":
 			result = MapTools.query_spatial_index(input, editor_interface)
 		"compact_spatial_index":

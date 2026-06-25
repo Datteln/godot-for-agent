@@ -136,6 +136,8 @@ static func _detect_constraints(lower: String, task: String) -> Array:
 		constraints.append("no_overlap")
 	if _mentions_any(lower, ["河边", "near river", "river bank"]):
 		constraints.append("near_water")
+	if _mentions_any(lower, ["必须经过", "经过中心", "pass through", "waypoint"]):
+		constraints.append("must_pass_center")
 	return constraints
 
 

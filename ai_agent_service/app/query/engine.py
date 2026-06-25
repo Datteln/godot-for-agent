@@ -287,6 +287,12 @@ _HISTORY_FRONT_READ_TOOLS = frozenset(
         "read_image_metadata",
         "read_class_docs",
         "describe_tilemap_selection",
+        "describe_map_context",
+        "plan_map_layout",
+        "describe_map_region",
+        "query_spatial_index",
+        "validate_map_region",
+        "sample_noise_grid",
         "validate_scene_state",
     }
 )
@@ -307,6 +313,15 @@ _HISTORY_FRONT_SCENE_EDIT_TOOLS = frozenset(
         "save_scene",
         "bake_navigation_mesh",
         "create_animation_track",
+        "edit_map",
+        "paint_terrain_connect",
+        "place_map_objects",
+        "repair_map_region",
+        "compact_spatial_index",
+        "write_resource_registry",
+        "save_map_blueprint",
+        "apply_map_blueprint",
+        "ensure_standard_map_layers",
     }
 )
 _HISTORY_FRONT_RUN_TOOLS = frozenset(

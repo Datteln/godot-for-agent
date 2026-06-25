@@ -59,6 +59,13 @@ static func _collect_tilemap_layers(node: Node, out: Array) -> void:
 		_collect_tilemap_layers(child, out)
 
 
+static func _count_scene_nodes(node: Node) -> int:
+	var total := 1
+	for child in node.get_children():
+		total += _count_scene_nodes(child)
+	return total
+
+
 ## 读取当前场景中的地图节点、资源语义表和空间索引状态，作为地图任务的项目认知入口。
 static func describe_map_context(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
@@ -81,6 +88,11 @@ static func describe_map_context(input: Dictionary, editor_interface: EditorInte
 		"ok": true,
 		"scene": root.scene_file_path,
 		"maps": maps,
+		"performance": {
+			"scene_node_count": _count_scene_nodes(root),
+			"map_node_count": maps.size(),
+			"spatial_index_entries": entries_2d + entries_3d,
+		},
 		"resource_registry": registry,
 		"spatial_index": {
 			"path": SPATIAL_INDEX_PATH,
@@ -115,6 +127,7 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 
 	var dimension := 3 if target.get_class() == "GridMap" else 2
 	var map_layer := int(input.get("map_layer", 0))
+	var allowed_bounds := _bounds_from_input(input, dimension)
 	var before: Array = []
 	var after: Array = []
 	var touched := {}
@@ -123,11 +136,20 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		if not (operation_value is Dictionary):
 			return {"ok": false, "message": "each operation must be an object", "error_code": "invalid_operation"}
 		var operation: Dictionary = operation_value
+		_apply_registry_fallback_to_operation(operation, dimension)
 		var built := _build_map_operation(target, dimension, map_layer, operation, pending_cells)
 		if not bool(built.get("ok", false)):
 			return built
 		for cell_value in built.get("cells", []):
 			var cell: Dictionary = cell_value
+			if not _cell_within_bounds(cell.get("coords", Vector3i.ZERO), allowed_bounds):
+				return {
+					"ok": false,
+					"message": "map edit would write outside allowed_bounds",
+					"error_code": "map_edit_out_of_bounds",
+					"coords": MapValidator.coord_payload(cell.get("coords", Vector3i.ZERO), dimension),
+					"allowed_bounds": allowed_bounds,
+				}
 			var key := _cell_key(cell, dimension, map_layer)
 			if not touched.has(key):
 				before.append(_read_map_cell(target, cell["coords"], dimension, map_layer))
@@ -162,6 +184,174 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		"cells": after.size(),
 		"spatial_index": index_result,
 		"message": "Map edited through Godot native APIs; serialized map data was not modified directly."
+	}
+
+
+## 使用 TileSet terrain connect API 绘制一组 2D terrain cell，让道路/水域边缘自动衔接。
+static func paint_terrain_connect(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	if target.get_class() == "GridMap":
+		return {"ok": false, "message": "terrain_connect is only available for 2D TileMapLayer/TileMap targets", "error_code": "unsupported_map_type"}
+	if not target.has_method("set_cells_terrain_connect"):
+		return {"ok": false, "message": "Target does not support set_cells_terrain_connect", "error_code": "terrain_connect_unavailable"}
+	var dimension := 2
+	var map_layer := int(input.get("map_layer", 0))
+	var allowed_bounds := _bounds_from_input(input, dimension)
+	var coords_list := _terrain_coords_from_input(input)
+	if coords_list.is_empty():
+		return {"ok": false, "message": "terrain_connect requires cells or a positive width/height region", "error_code": "invalid_region"}
+	if coords_list.size() > MAX_EDITED_CELLS:
+		return {"ok": false, "message": "terrain_connect exceeds the cell safety limit", "error_code": "map_edit_too_large"}
+	var before: Array = []
+	for coords_2d in coords_list:
+		var coords := Vector3i(coords_2d.x, coords_2d.y, 0)
+		if not _cell_within_bounds(coords, allowed_bounds):
+			return {
+				"ok": false,
+				"message": "terrain_connect would write outside allowed_bounds",
+				"error_code": "map_edit_out_of_bounds",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"allowed_bounds": allowed_bounds,
+			}
+		before.append(_read_map_cell(target, coords, dimension, map_layer))
+	var terrain_resource := _registry_entry_for_resource_input(input)
+	var terrain_set := int(input.get("terrain_set", terrain_resource.get("terrain_set", 0)))
+	var terrain := int(input.get("terrain", terrain_resource.get("terrain", 0)))
+	var ignore_empty := bool(input.get("ignore_empty_terrains", true))
+	if target.get_class() == "TileMap":
+		target.call("set_cells_terrain_connect", map_layer, coords_list, terrain_set, terrain, ignore_empty)
+	else:
+		target.call("set_cells_terrain_connect", coords_list, terrain_set, terrain, ignore_empty)
+	var after: Array = []
+	for coords_2d in coords_list:
+		after.append(_read_map_cell(target, Vector3i(coords_2d.x, coords_2d.y, 0), dimension, map_layer))
+	if undo_manager != null:
+		undo_manager.record_tile_cells(target, before, after)
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"type": target.get_class(),
+		"dimension": dimension,
+		"map_layer": map_layer if target.get_class() == "TileMap" else null,
+		"terrain_set": terrain_set,
+		"terrain": terrain,
+		"cells": after.size(),
+		"message": "Terrain painted through set_cells_terrain_connect; edges were resolved by Godot TileSet terrain rules.",
+	}
+
+
+## 按地图 cell 坐标把 PackedScene 资源实例化到 ObjectLayer/PropsRoot 等对象层。
+static func place_map_objects(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var root := editor_interface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "message": "No scene is currently being edited", "error_code": "no_edited_scene"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var map_node: Node = target_result["node"]
+	var dimension := 3 if map_node.get_class() == "GridMap" else 2
+	var parent_result := _resolve_object_parent(input, root, map_node, dimension)
+	if not bool(parent_result.get("ok", false)):
+		return parent_result
+	var parent: Node = parent_result["node"]
+	var objects_value = input.get("objects", [])
+	if not (objects_value is Array) or (objects_value as Array).is_empty():
+		return {"ok": false, "message": "objects must be a non-empty array", "error_code": "invalid_objects"}
+	if (objects_value as Array).size() > 128:
+		return {"ok": false, "message": "at most 128 objects are allowed", "error_code": "map_object_batch_too_large"}
+	var allowed_bounds := _bounds_from_input(input, dimension)
+	var registry := _read_first_json_resource(RESOURCE_REGISTRY_PATHS)
+	var registry_data: Dictionary = registry.get("data", {}) if registry.get("data", {}) is Dictionary else {}
+	var occupied := _object_occupancy_from_spatial_index(str(target_result.get("path", "")), dimension)
+	var blocked_cells := _blocked_object_cells_from_spatial_index(str(target_result.get("path", "")), dimension)
+	var planned := {}
+	var prepared: Array = []
+	for object_value in objects_value:
+		if not (object_value is Dictionary):
+			return {"ok": false, "message": "each object must be an object", "error_code": "invalid_object"}
+		var object_spec: Dictionary = object_value
+		var coords := Vector3i(
+			int(object_spec.get("x", 0)),
+			int(object_spec.get("y", 0)),
+			int(object_spec.get("z", 0)) if dimension == 3 else 0
+		)
+		if not _cell_within_bounds(coords, allowed_bounds):
+			return {
+				"ok": false,
+				"message": "object placement would write outside allowed_bounds",
+				"error_code": "map_object_out_of_bounds",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"allowed_bounds": allowed_bounds,
+			}
+		var coord_key := MapValidator.coord_key(coords)
+		if not bool(input.get("allow_overlap", false)) and (occupied.has(coord_key) or planned.has(coord_key)):
+			return {
+				"ok": false,
+				"message": "object placement overlaps an existing or planned object",
+				"error_code": "map_object_overlap",
+				"coords": MapValidator.coord_payload(coords, dimension),
+			}
+		if not bool(input.get("allow_on_blocked", false)) and blocked_cells.has(coord_key):
+			return {
+				"ok": false,
+				"message": "object placement is on a blocked/water/obstacle cell",
+				"error_code": "map_object_blocked_cell",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"blocking_entry": blocked_cells[coord_key],
+			}
+		var resource_key := str(object_spec.get("resource", object_spec.get("resource_key", ""))).strip_edges()
+		var resource_def: Dictionary = _registry_entry_with_fallback(registry_data, resource_key, str(object_spec.get("fallback_resource", "")))
+		if resource_def.has("_resolved_resource"):
+			resource_key = str(resource_def.get("_resolved_resource", resource_key))
+		var scene_path := PathUtils.to_res_path(str(object_spec.get("scene_path", resource_def.get("scene_path", ""))))
+		if scene_path == "" or not (scene_path.ends_with(".tscn") or scene_path.ends_with(".scn")):
+			return {"ok": false, "message": "object requires a .tscn/.scn scene_path or resource registry entry", "error_code": "missing_scene_path", "resource": resource_key}
+		if not FileAccess.file_exists(scene_path):
+			return {"ok": false, "message": "scene file not found: " + scene_path, "error_code": "scene_not_found"}
+		var packed = load(scene_path)
+		if not (packed is PackedScene):
+			return {"ok": false, "message": "Failed to load as PackedScene: " + scene_path, "error_code": "load_failed"}
+		var instance := (packed as PackedScene).instantiate()
+		if not (instance is Node):
+			return {"ok": false, "message": "PackedScene did not instantiate a Node: " + scene_path, "error_code": "instantiate_failed"}
+		var node: Node = instance
+		if dimension == 2 and not (node is Node2D):
+			return {"ok": false, "message": "2D map object must instantiate a Node2D scene: " + scene_path, "error_code": "object_type_mismatch"}
+		if dimension == 3 and not (node is Node3D):
+			return {"ok": false, "message": "3D map object must instantiate a Node3D scene: " + scene_path, "error_code": "object_type_mismatch"}
+		node.name = _object_instance_name(object_spec, resource_key, scene_path)
+		_apply_object_position(node, map_node, coords, dimension)
+		_apply_object_metadata(node, object_spec, resource_key, scene_path, coords, dimension)
+		prepared.append({"node": node, "coords": coords, "scene_path": scene_path, "resource": resource_key, "spec": object_spec})
+		planned[coord_key] = true
+	var parent_path_for_index := str(root.get_path_to(parent)) if parent != root else "."
+	var index_result := _maybe_update_object_spatial_index(input, undo_manager, str(target_result.get("path", "")), parent_path_for_index, dimension, prepared)
+	if not bool(index_result.get("ok", true)):
+		return index_result
+	var paths: Array = []
+	for prepared_value in prepared:
+		var item: Dictionary = prepared_value
+		var node: Node = item["node"]
+		parent.add_child(node)
+		node.owner = root
+		if undo_manager != null and undo_manager.has_method("record_node_added"):
+			undo_manager.record_node_added(parent, node, root)
+		paths.append(str(root.get_path_to(node)))
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"parent_path": str(root.get_path_to(parent)) if parent != root else ".",
+		"dimension": dimension,
+		"objects": prepared.size(),
+		"paths": paths,
+		"spatial_index": index_result,
 	}
 
 
@@ -382,6 +572,53 @@ static func _copy_operation_metadata(operation: Dictionary, cell: Dictionary) ->
 			cell[key] = operation[key]
 
 
+static func _apply_registry_fallback_to_operation(operation: Dictionary, dimension: int) -> void:
+	var resource_entry := _registry_entry_for_resource_input(operation)
+	if resource_entry.is_empty():
+		return
+	if resource_entry.has("_resolved_resource") and not operation.has("resource"):
+		operation["resource"] = str(resource_entry.get("_resolved_resource", ""))
+	if dimension == 3:
+		if not operation.has("item") and resource_entry.has("item"):
+			operation["item"] = int(resource_entry.get("item", -1))
+		elif not operation.has("item") and resource_entry.has("mesh_library_item"):
+			operation["item"] = int(resource_entry.get("mesh_library_item", -1))
+	else:
+		if not operation.has("source_id") and resource_entry.has("source_id"):
+			operation["source_id"] = int(resource_entry.get("source_id", -1))
+		if not operation.has("atlas_x") and resource_entry.has("atlas_x"):
+			operation["atlas_x"] = int(resource_entry.get("atlas_x", -1))
+		if not operation.has("atlas_y") and resource_entry.has("atlas_y"):
+			operation["atlas_y"] = int(resource_entry.get("atlas_y", -1))
+		var atlas = resource_entry.get("atlas_coords", null)
+		if atlas is Dictionary:
+			if not operation.has("atlas_x"):
+				operation["atlas_x"] = int((atlas as Dictionary).get("x", -1))
+			if not operation.has("atlas_y"):
+				operation["atlas_y"] = int((atlas as Dictionary).get("y", -1))
+
+
+static func _registry_entry_for_resource_input(input: Dictionary) -> Dictionary:
+	var registry := _read_first_json_resource(RESOURCE_REGISTRY_PATHS)
+	var registry_data: Dictionary = registry.get("data", {}) if registry.get("data", {}) is Dictionary else {}
+	var resource_key := str(input.get("resource", input.get("resource_key", ""))).strip_edges()
+	var fallback_key := str(input.get("fallback_resource", input.get("fallback_resource_key", ""))).strip_edges()
+	return _registry_entry_with_fallback(registry_data, resource_key, fallback_key)
+
+
+static func _registry_entry_with_fallback(registry_data: Dictionary, resource_key: String, fallback_key: String) -> Dictionary:
+	if resource_key != "" and registry_data.get(resource_key, {}) is Dictionary:
+		var primary: Dictionary = (registry_data.get(resource_key, {}) as Dictionary).duplicate(true)
+		primary["_resolved_resource"] = resource_key
+		return primary
+	if fallback_key != "" and registry_data.get(fallback_key, {}) is Dictionary:
+		var fallback: Dictionary = (registry_data.get(fallback_key, {}) as Dictionary).duplicate(true)
+		fallback["_resolved_resource"] = fallback_key
+		fallback["_fallback_for"] = resource_key
+		return fallback
+	return {}
+
+
 static func _read_map_cell(target: Node, coords: Vector3i, dimension: int, map_layer: int) -> Dictionary:
 	if dimension == 3:
 		return {
@@ -423,10 +660,13 @@ static func _describe_map_node(root: Node, node: Node) -> Dictionary:
 		var layer_counts: Array = []
 		for layer in result["layers"]:
 			var layer_index := int(layer.get("index", 0))
-			layer_counts.append({"index": layer_index, "used_cells": node.call("get_used_cells", layer_index).size()})
+			var used_cells: Array = node.call("get_used_cells", layer_index)
+			layer_counts.append({"index": layer_index, "used_cells": used_cells.size(), "used_bounds": _used_bounds_2d(used_cells)})
 		result["layer_cell_counts"] = layer_counts
 	elif node.get_class() == "GridMap":
-		result["used_cells"] = node.call("get_used_cells").size()
+		var used_cells_3d: Array = node.call("get_used_cells")
+		result["used_cells"] = used_cells_3d.size()
+		result["used_bounds"] = _used_bounds_3d(used_cells_3d)
 		if "mesh_library" in node and node.get("mesh_library") != null:
 			var mesh_library = node.get("mesh_library")
 			result["mesh_library"] = mesh_library.resource_path
@@ -434,7 +674,9 @@ static func _describe_map_node(root: Node, node: Node) -> Dictionary:
 			var cell_size: Vector3 = node.get("cell_size")
 			result["cell_size"] = {"x": cell_size.x, "y": cell_size.y, "z": cell_size.z}
 	else:
-		result["used_cells"] = node.call("get_used_cells").size() if node.has_method("get_used_cells") else 0
+		var used_cells_2d: Array = node.call("get_used_cells") if node.has_method("get_used_cells") else []
+		result["used_cells"] = used_cells_2d.size()
+		result["used_bounds"] = _used_bounds_2d(used_cells_2d)
 		if "tile_set" in node and node.get("tile_set") != null:
 			var tile_set = node.get("tile_set")
 			result["tile_set"] = tile_set.resource_path
@@ -460,6 +702,46 @@ static func _read_json_resource(path: String) -> Dictionary:
 	if not (parsed is Dictionary):
 		return {"exists": true, "path": path, "data": {}, "warning": "JSON root is not an object"}
 	return {"exists": true, "path": path, "data": parsed}
+
+
+static func _used_bounds_2d(cells: Array) -> Dictionary:
+	if cells.is_empty():
+		return {}
+	var min_x := 2147483647
+	var min_y := 2147483647
+	var max_x := -2147483648
+	var max_y := -2147483648
+	for value in cells:
+		var coords: Vector2i = value
+		min_x = min(min_x, coords.x)
+		min_y = min(min_y, coords.y)
+		max_x = max(max_x, coords.x)
+		max_y = max(max_y, coords.y)
+	return {"x": min_x, "y": min_y, "width": max_x - min_x + 1, "height": max_y - min_y + 1, "min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y}
+
+
+static func _used_bounds_3d(cells: Array) -> Dictionary:
+	if cells.is_empty():
+		return {}
+	var min_x := 2147483647
+	var min_y := 2147483647
+	var min_z := 2147483647
+	var max_x := -2147483648
+	var max_y := -2147483648
+	var max_z := -2147483648
+	for value in cells:
+		var coords: Vector3i = value
+		min_x = min(min_x, coords.x)
+		min_y = min(min_y, coords.y)
+		min_z = min(min_z, coords.z)
+		max_x = max(max_x, coords.x)
+		max_y = max(max_y, coords.y)
+		max_z = max(max_z, coords.z)
+	return {
+		"x": min_x, "y": min_y, "z": min_z,
+		"width": max_x - min_x + 1, "height": max_y - min_y + 1, "depth": max_z - min_z + 1,
+		"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y, "min_z": min_z, "max_z": max_z,
+	}
 
 
 static func _count_index_entries(index_branch) -> int:
@@ -702,6 +984,378 @@ static func _apply_map_cell(target: Node, cell: Dictionary) -> void:
 		)
 
 
+static func _terrain_coords_from_input(input: Dictionary) -> Array:
+	var coords_list: Array = []
+	var cells_value = input.get("cells", [])
+	if cells_value is Array and not (cells_value as Array).is_empty():
+		for cell_value in cells_value:
+			if cell_value is Dictionary:
+				coords_list.append(Vector2i(int(cell_value.get("x", 0)), int(cell_value.get("y", 0))))
+		return coords_list
+	var x := int(input.get("x", 0))
+	var y := int(input.get("y", 0))
+	var width := max(0, int(input.get("width", 0)))
+	var height := max(0, int(input.get("height", 0)))
+	for dy in range(height):
+		for dx in range(width):
+			coords_list.append(Vector2i(x + dx, y + dy))
+	return coords_list
+
+
+static func _resolve_object_parent(input: Dictionary, root: Node, map_node: Node, dimension: int) -> Dictionary:
+	var parent_path := str(input.get("parent_path", "")).strip_edges()
+	if parent_path != "":
+		var explicit: Node = root if parent_path == "." else root.get_node_or_null(NodePath(parent_path))
+		if explicit == null:
+			return {"ok": false, "message": "Object parent not found: " + parent_path, "error_code": "object_parent_not_found"}
+		return {"ok": true, "node": explicit}
+	var wanted_name := "PropsRoot" if dimension == 3 else "ObjectLayer"
+	var parent := map_node.get_parent()
+	if parent != null:
+		var sibling := parent.get_node_or_null(NodePath(wanted_name))
+		if sibling != null:
+			return {"ok": true, "node": sibling}
+	var found := _find_first_node_named(root, wanted_name)
+	if found != null:
+		return {"ok": true, "node": found}
+	return {
+		"ok": false,
+		"message": "No object parent found; call ensure_standard_map_layers first or pass parent_path",
+		"error_code": "object_parent_required",
+		"expected_name": wanted_name,
+	}
+
+
+static func _find_first_node_named(node: Node, wanted_name: String) -> Node:
+	if node.name == wanted_name:
+		return node
+	for child in node.get_children():
+		var found := _find_first_node_named(child, wanted_name)
+		if found != null:
+			return found
+	return null
+
+
+static func _object_instance_name(object_spec: Dictionary, resource_key: String, scene_path: String) -> String:
+	var explicit := str(object_spec.get("name", "")).strip_edges()
+	if explicit != "":
+		return explicit
+	if resource_key != "":
+		return resource_key.capitalize().replace(" ", "")
+	return scene_path.get_file().get_basename()
+
+
+static func _apply_object_position(node: Node, map_node: Node, coords: Vector3i, dimension: int) -> void:
+	if dimension == 3 and node is Node3D:
+		var cell_size := Vector3.ONE
+		if "cell_size" in map_node:
+			cell_size = map_node.get("cell_size")
+		var base_3d := (map_node as Node3D).position if map_node is Node3D else Vector3.ZERO
+		(node as Node3D).position = base_3d + Vector3(coords.x * cell_size.x, coords.y * cell_size.y, coords.z * cell_size.z)
+	elif dimension == 2 and node is Node2D:
+		var tile_size := Vector2i.ONE
+		if "tile_set" in map_node and map_node.get("tile_set") != null:
+			tile_size = map_node.get("tile_set").tile_size
+		var base_2d := (map_node as Node2D).position if map_node is Node2D else Vector2.ZERO
+		(node as Node2D).position = base_2d + Vector2(coords.x * tile_size.x, coords.y * tile_size.y)
+
+
+static func _apply_object_metadata(
+	node: Node,
+	object_spec: Dictionary,
+	resource_key: String,
+	scene_path: String,
+	coords: Vector3i,
+	dimension: int
+) -> void:
+	node.set_meta("map_agent_scene_path", scene_path)
+	node.set_meta("map_agent_resource", resource_key)
+	node.set_meta("map_agent_coords", MapValidator.coord_payload(coords, dimension))
+	if object_spec.has("semantic_layer"):
+		node.set_meta("map_agent_semantic_layer", str(object_spec.get("semantic_layer", "")))
+	if object_spec.has("tags"):
+		node.set_meta("map_agent_tags", object_spec.get("tags", []))
+
+
+static func _object_occupancy_from_spatial_index(target_path: String, dimension: int) -> Dictionary:
+	var occupied := {}
+	var parsed := _read_json_resource(SPATIAL_INDEX_PATH)
+	if not bool(parsed.get("exists", false)):
+		return occupied
+	var data = parsed.get("data", {})
+	if not (data is Dictionary):
+		return occupied
+	var branch = (data as Dictionary).get("3d" if dimension == 3 else "2d", {})
+	if not (branch is Dictionary):
+		return occupied
+	var target_entries = (branch as Dictionary).get(target_path, {})
+	if not (target_entries is Dictionary):
+		return occupied
+	for key in (target_entries as Dictionary).keys():
+		var entry = (target_entries as Dictionary)[key]
+		if entry is Dictionary and (str(entry.get("kind", "")) == "object" or str(entry.get("scene_path", "")) != ""):
+			var coords = (entry as Dictionary).get("coords", {})
+			if coords is Dictionary:
+				occupied[MapValidator.coord_key(MapValidator.coord_from_input(coords, dimension))] = true
+			else:
+				occupied[str(key)] = true
+	return occupied
+
+
+static func _blocked_object_cells_from_spatial_index(target_path: String, dimension: int) -> Dictionary:
+	var blocked := {}
+	var parsed := _read_json_resource(SPATIAL_INDEX_PATH)
+	if not bool(parsed.get("exists", false)):
+		return blocked
+	var data = parsed.get("data", {})
+	if not (data is Dictionary):
+		return blocked
+	var branch = (data as Dictionary).get("3d" if dimension == 3 else "2d", {})
+	if not (branch is Dictionary):
+		return blocked
+	var target_entries = (branch as Dictionary).get(target_path, {})
+	if not (target_entries is Dictionary):
+		return blocked
+	for key in (target_entries as Dictionary).keys():
+		var entry = (target_entries as Dictionary)[key]
+		if not (entry is Dictionary):
+			continue
+		var semantic_layer := str(entry.get("semantic_layer", ""))
+		var tags = entry.get("tags", [])
+		var is_blocked := semantic_layer in ["water", "obstacle", "blocked"]
+		if tags is Array:
+			is_blocked = is_blocked or (tags as Array).has("water") or (tags as Array).has("blocked") or (tags as Array).has("obstacle")
+		if not is_blocked:
+			continue
+		var coords = (entry as Dictionary).get("coords", {})
+		if coords is Dictionary:
+			blocked[MapValidator.coord_key(MapValidator.coord_from_input(coords, dimension))] = entry
+	return blocked
+
+
+static func _maybe_update_object_spatial_index(
+	input: Dictionary,
+	undo_manager: Node,
+	target_path: String,
+	parent_path: String,
+	dimension: int,
+	prepared: Array
+) -> Dictionary:
+	if not bool(input.get("update_spatial_index", true)):
+		return {"ok": true, "updated": false}
+	var absolute := ProjectSettings.globalize_path(SPATIAL_INDEX_PATH)
+	var before_text := FileAccess.get_file_as_string(absolute) if FileAccess.file_exists(absolute) else ""
+	var parsed = JSON.parse_string(before_text) if before_text != "" else {}
+	var index: Dictionary = parsed if parsed is Dictionary else {}
+	var branch_key := "3d" if dimension == 3 else "2d"
+	if not index.has(branch_key) or not (index[branch_key] is Dictionary):
+		index[branch_key] = {}
+	if not index[branch_key].has(target_path) or not (index[branch_key][target_path] is Dictionary):
+		index[branch_key][target_path] = {}
+	var target_index: Dictionary = index[branch_key][target_path]
+	var total_entries := _count_index_entries(index.get("2d", {})) + _count_index_entries(index.get("3d", {}))
+	var added := 0
+	for prepared_value in prepared:
+		var item: Dictionary = prepared_value
+		var coords: Vector3i = item["coords"]
+		var key := _object_index_key(coords, dimension, str(item.get("scene_path", "")), str(item.get("resource", "")))
+		var existed := target_index.has(key)
+		if not existed and total_entries >= MAX_SPATIAL_INDEX_ENTRIES:
+			return {
+				"ok": false,
+				"message": "spatial index reached the %d-entry cap; compact it before placing more objects" % MAX_SPATIAL_INDEX_ENTRIES,
+				"error_code": "spatial_index_full",
+			}
+		var spec: Dictionary = item.get("spec", {})
+		var indexed_node_name := ""
+		if item.get("node", null) is Node:
+			var indexed_node: Node = item.get("node")
+			indexed_node_name = indexed_node.name
+		target_index[key] = {
+			"kind": "object",
+			"coords": MapValidator.coord_payload(coords, dimension),
+			"scene_path": str(item.get("scene_path", "")),
+			"resource": str(item.get("resource", "")),
+			"resource_key": str(item.get("resource", "")),
+			"parent_path": parent_path,
+			"node_name": indexed_node_name,
+			"semantic_layer": str(spec.get("semantic_layer", "object")),
+			"tags": spec.get("tags", []),
+		}
+		if not existed:
+			added += 1
+			total_entries += 1
+	var after_text := JSON.stringify(index, "\t")
+	var write_result := _write_json_file(SPATIAL_INDEX_PATH, before_text, after_text, undo_manager)
+	if not bool(write_result.get("ok", false)):
+		return write_result
+	return {"ok": true, "updated": true, "path": SPATIAL_INDEX_PATH, "objects": prepared.size(), "added": added, "total_entries": total_entries}
+
+
+static func _object_index_key(coords: Vector3i, dimension: int, scene_path: String, resource_key: String) -> String:
+	var suffix := resource_key if resource_key != "" else scene_path.get_file().get_basename()
+	return "object:%s:%s" % [_index_coord_key(coords, dimension), suffix]
+
+
+static func _repair_spatial_object_issues(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var root := editor_interface.get_edited_scene_root()
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var region := MapValidator.region_from_input(input, dimension)
+	var target_path := str(target_result.get("path", ""))
+	var issues: Array = []
+	if bool(input.get("repair_overlaps", false)):
+		issues.append_array(_object_entries_from_overlap_result(_detect_spatial_overlaps(target_path, region, dimension)))
+	if bool(input.get("repair_blocked_objects", false)):
+		issues.append_array(_object_entries_from_blocked_result(_detect_objects_on_blocked_cells(target_path, region, dimension)))
+	if issues.is_empty():
+		return {"ok": true, "changed": false, "message": "No repairable object overlap/blocking issues found"}
+	var occupied := _occupied_object_cells_for_repair(target_path, dimension)
+	var blocked := _blocked_object_cells_from_spatial_index(target_path, dimension)
+	var before_text := _read_text_file(SPATIAL_INDEX_PATH)
+	var parsed = JSON.parse_string(before_text) if before_text != "" else {}
+	var index: Dictionary = parsed if parsed is Dictionary else {}
+	var moved: Array = []
+	for entry in issues:
+		if not (entry is Dictionary):
+			continue
+		var object_entry: Dictionary = entry
+		var old_coords := MapValidator.coord_from_input(object_entry.get("coords", {}), dimension)
+		var node := _resolve_indexed_object_node(root, object_entry)
+		if node == null:
+			moved.append({"ok": false, "reason": "indexed object has no resolvable node", "entry": object_entry})
+			continue
+		var new_coords := _nearest_free_object_cell(old_coords, region, dimension, occupied, blocked)
+		if new_coords == old_coords:
+			moved.append({"ok": false, "reason": "no nearby free cell found", "entry": object_entry})
+			continue
+		var before_position = null
+		if node is Node3D:
+			before_position = (node as Node3D).position
+		elif node is Node2D:
+			before_position = (node as Node2D).position
+		_apply_object_position(node, target, new_coords, dimension)
+		var after_position = null
+		if node is Node3D:
+			after_position = (node as Node3D).position
+		elif node is Node2D:
+			after_position = (node as Node2D).position
+		if undo_manager != null and before_position != null and after_position != null and undo_manager.has_method("record_node_property"):
+			undo_manager.record_node_property(node, "position", before_position, after_position)
+		_update_object_entry_coords(index, object_entry, old_coords, new_coords, dimension)
+		occupied.erase(MapValidator.coord_key(old_coords))
+		occupied[MapValidator.coord_key(new_coords)] = true
+		moved.append({"ok": true, "node": str(root.get_path_to(node)), "from": MapValidator.coord_payload(old_coords, dimension), "to": MapValidator.coord_payload(new_coords, dimension)})
+	var after_text := JSON.stringify(index, "\t")
+	var write_result := _write_json_file(SPATIAL_INDEX_PATH, before_text, after_text, undo_manager)
+	if not bool(write_result.get("ok", false)):
+		return write_result
+	return {"ok": true, "changed": true, "target": target_path, "moved": moved, "spatial_index": {"ok": true, "updated": true, "path": SPATIAL_INDEX_PATH}}
+
+
+static func _object_entries_from_overlap_result(overlap_result: Dictionary) -> Array:
+	var entries: Array = []
+	for overlap in overlap_result.get("overlaps", []):
+		if not (overlap is Dictionary):
+			continue
+		var at_coord: Array = overlap.get("entries", [])
+		var first_seen := false
+		for entry in at_coord:
+			if entry is Dictionary and _is_object_index_entry(entry):
+				if first_seen:
+					entries.append(entry)
+				first_seen = true
+	return entries
+
+
+static func _object_entries_from_blocked_result(blocked_result: Dictionary) -> Array:
+	var entries: Array = []
+	for overlap in blocked_result.get("overlaps", []):
+		if not (overlap is Dictionary):
+			continue
+		for entry in overlap.get("objects", []):
+			if entry is Dictionary:
+				entries.append(entry)
+	return entries
+
+
+static func _occupied_object_cells_for_repair(target_path: String, dimension: int) -> Dictionary:
+	var region := {"min_x": -2147483648, "max_x": 2147483647, "min_y": -2147483648, "max_y": 2147483647, "min_z": -2147483648, "max_z": 2147483647}
+	var entries := _spatial_entries_in_region(target_path, region, dimension)
+	var occupied := {}
+	for entry in entries:
+		if _is_object_index_entry(entry):
+			var coords := MapValidator.coord_from_input(entry.get("coords", {}), dimension)
+			occupied[MapValidator.coord_key(coords)] = true
+	return occupied
+
+
+static func _resolve_indexed_object_node(root: Node, entry: Dictionary) -> Node:
+	var node_path := str(entry.get("node_path", "")).strip_edges()
+	if node_path != "":
+		var found := root.get_node_or_null(NodePath(node_path))
+		if found != null:
+			return found
+	var parent_path := str(entry.get("parent_path", "")).strip_edges()
+	var node_name := str(entry.get("node_name", "")).strip_edges()
+	if parent_path == "" or node_name == "":
+		return null
+	var parent := root if parent_path == "." else root.get_node_or_null(NodePath(parent_path))
+	if parent == null:
+		return null
+	return parent.get_node_or_null(NodePath(node_name))
+
+
+static func _nearest_free_object_cell(origin: Vector3i, region: Dictionary, dimension: int, occupied: Dictionary, blocked: Dictionary) -> Vector3i:
+	var max_radius := max(int(region.get("width", 1)), int(region.get("height", 1))) + int(region.get("depth", 1))
+	for radius in range(1, max_radius + 1):
+		for offset in _candidate_offsets(radius, dimension):
+			var candidate: Vector3i = origin + offset
+			var key := MapValidator.coord_key(candidate)
+			if not MapValidator.in_region(candidate, region):
+				continue
+			if occupied.has(key) or blocked.has(key):
+				continue
+			return candidate
+	return origin
+
+
+static func _candidate_offsets(radius: int, dimension: int) -> Array:
+	var offsets: Array = []
+	for dx in range(-radius, radius + 1):
+		for dy in range(-radius, radius + 1):
+			if abs(dx) + abs(dy) != radius:
+				continue
+			if dimension == 3:
+				for dz in range(-radius, radius + 1):
+					if abs(dx) + abs(dy) + abs(dz) == radius:
+						offsets.append(Vector3i(dx, dy, dz))
+			else:
+				offsets.append(Vector3i(dx, dy, 0))
+	return offsets
+
+
+static func _update_object_entry_coords(index: Dictionary, entry: Dictionary, old_coords: Vector3i, new_coords: Vector3i, dimension: int) -> void:
+	var branch_key := "3d" if dimension == 3 else "2d"
+	var target_path := str(entry.get("_target_path", ""))
+	var old_key := str(entry.get("_index_key", ""))
+	if target_path == "" or old_key == "" or not index.has(branch_key):
+		return
+	var branch: Dictionary = index[branch_key]
+	if not branch.has(target_path) or not (branch[target_path] is Dictionary):
+		return
+	var target_index: Dictionary = branch[target_path]
+	if not target_index.has(old_key):
+		return
+	var updated: Dictionary = target_index[old_key].duplicate(true)
+	updated["coords"] = MapValidator.coord_payload(new_coords, dimension)
+	target_index.erase(old_key)
+	target_index[_object_index_key(new_coords, dimension, str(updated.get("scene_path", "")), str(updated.get("resource", "")))] = updated
+
+
 ## 创建/维护资源语义表 res://.ai_agent_service/map_agent/resource_registry.json，
 ## 把自然语言资源词（grass/wall/river...）映射到真实的 TileSet/MeshLibrary/PackedScene 引用。
 ## 默认按 key 合并进已有表；replace=true 时整表覆盖。写入走 Undo 批次，可撤销/可预览。
@@ -896,6 +1550,15 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 	var dimension := 3 if target.get_class() == "GridMap" else 2
 	var map_layer := int(input.get("map_layer", 0))
 	var region := MapValidator.region_from_input(input, dimension)
+	var allowed_bounds := _bounds_from_input(input, dimension)
+	if not _region_within_bounds(region, allowed_bounds):
+		return {
+			"ok": false,
+			"message": "validation region is outside allowed_bounds",
+			"error_code": "validation_region_out_of_bounds",
+			"region": region,
+			"allowed_bounds": allowed_bounds,
+		}
 	if int(region["width"]) * int(region["height"]) * int(region["depth"]) > MAX_DESCRIBED_CELLS:
 		return {
 			"ok": false,
@@ -917,9 +1580,45 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 		dimension,
 		input.get("start", null),
 		input.get("goal", null),
-		bool(input.get("walkable_is_filled", false))
+		bool(input.get("walkable_is_filled", false)),
+		str(input.get("path_algorithm", "bfs")),
+		input.get("waypoints", null),
+		input.get("entrances", null),
+		input.get("exits", null)
 	)
 	result.merge(analysis, true)
+	if bool(input.get("check_overlaps", false)) or bool(input.get("check_blocked_objects", false)):
+		var overlap_result := _detect_spatial_overlaps(str(target_result.get("path", "")), region, dimension)
+		result["overlaps"] = overlap_result.get("overlaps", [])
+		if int(overlap_result.get("count", 0)) > 0:
+			result["passed"] = false
+			var issues: Array = result.get("issues", [])
+			issues.append("spatial index contains overlapping entries in the region")
+			result["issues"] = issues
+			var repair_plan: Array = result.get("repair_plan", [])
+			repair_plan.append({
+				"type": "overlap_review",
+				"action": "move_or_remove_duplicate_object",
+				"overlaps": overlap_result.get("overlaps", []),
+				"note": "Resolve by moving one object to a nearby free cell with place_map_objects, or deleting the unintended object manually; no scene node is removed automatically.",
+			})
+			result["repair_plan"] = repair_plan
+	if bool(input.get("check_blocked_objects", false)):
+		var pressure := _detect_objects_on_blocked_cells(str(target_result.get("path", "")), region, dimension)
+		result["blocked_object_overlaps"] = pressure.get("overlaps", [])
+		if int(pressure.get("count", 0)) > 0:
+			result["passed"] = false
+			var pressure_issues: Array = result.get("issues", [])
+			pressure_issues.append("one or more objects are placed on water/blocked/obstacle cells")
+			result["issues"] = pressure_issues
+			var pressure_repair: Array = result.get("repair_plan", [])
+			pressure_repair.append({
+				"type": "blocked_object_relocate",
+				"action": "move_object_to_free_cell",
+				"overlaps": pressure.get("overlaps", []),
+				"note": "repair_map_region can move indexed object nodes to nearby free cells when repair_blocked_objects=true.",
+			})
+			result["repair_plan"] = pressure_repair
 	return result
 
 
@@ -928,8 +1627,10 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 static func repair_map_region(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	if (bool(input.get("repair_overlaps", false)) or bool(input.get("repair_blocked_objects", false))) and not (input.has("start") and input.has("goal")):
+		return _repair_spatial_object_issues(input, editor_interface, undo_manager)
 	if not input.has("start") or not input.has("goal"):
-		return {"ok": false, "message": "start and goal are required for repair", "error_code": "invalid_repair_request"}
+		return {"ok": false, "message": "start and goal are required for connectivity repair; pass repair_overlaps/repair_blocked_objects for object repair", "error_code": "invalid_repair_request"}
 	var target_result := _resolve_map_target(input, editor_interface)
 	if not bool(target_result.get("ok", false)):
 		return target_result
@@ -950,7 +1651,11 @@ static func repair_map_region(input: Dictionary, editor_interface: EditorInterfa
 		dimension,
 		input.get("start", null),
 		input.get("goal", null),
-		bool(input.get("walkable_is_filled", false))
+		bool(input.get("walkable_is_filled", false)),
+		str(input.get("path_algorithm", "astar")),
+		input.get("waypoints", null),
+		input.get("entrances", null),
+		input.get("exits", null)
 	)
 	if bool(analysis.get("passed", false)):
 		return {"ok": true, "changed": false, "message": "Region already passes validation", "validation": analysis}
@@ -1207,6 +1912,147 @@ static func _region_bounds(input: Dictionary) -> Dictionary:
 		"min_y": y, "max_y": y + height - 1,
 		"min_z": z, "max_z": z + depth - 1,
 	}
+
+
+static func _bounds_from_input(input: Dictionary, dimension: int) -> Dictionary:
+	var raw = input.get("allowed_bounds", {})
+	if not (raw is Dictionary):
+		return {}
+	var bounds: Dictionary = raw
+	if not (bounds.has("width") and bounds.has("height")):
+		return {}
+	var x := int(bounds.get("x", 0))
+	var y := int(bounds.get("y", 0))
+	var z := int(bounds.get("z", 0)) if dimension == 3 else 0
+	var width := max(1, int(bounds.get("width", 1)))
+	var height := max(1, int(bounds.get("height", 1)))
+	var depth := max(1, int(bounds.get("depth", 1))) if dimension == 3 else 1
+	return {
+		"x": x, "y": y, "z": z,
+		"width": width, "height": height, "depth": depth,
+		"min_x": x, "max_x": x + width - 1,
+		"min_y": y, "max_y": y + height - 1,
+		"min_z": z, "max_z": z + depth - 1,
+	}
+
+
+static func _cell_within_bounds(coords: Vector3i, bounds: Dictionary) -> bool:
+	if bounds.is_empty():
+		return true
+	return coords.x >= int(bounds["min_x"]) and coords.x <= int(bounds["max_x"]) \
+		and coords.y >= int(bounds["min_y"]) and coords.y <= int(bounds["max_y"]) \
+		and coords.z >= int(bounds["min_z"]) and coords.z <= int(bounds["max_z"])
+
+
+static func _region_within_bounds(region: Dictionary, bounds: Dictionary) -> bool:
+	if bounds.is_empty():
+		return true
+	return int(region["min_x"]) >= int(bounds["min_x"]) and int(region["max_x"]) <= int(bounds["max_x"]) \
+		and int(region["min_y"]) >= int(bounds["min_y"]) and int(region["max_y"]) <= int(bounds["max_y"]) \
+		and int(region["min_z"]) >= int(bounds["min_z"]) and int(region["max_z"]) <= int(bounds["max_z"])
+
+
+static func _detect_spatial_overlaps(target_path: String, region: Dictionary, dimension: int) -> Dictionary:
+	var parsed := _read_json_resource(SPATIAL_INDEX_PATH)
+	var by_coord := {}
+	if not bool(parsed.get("exists", false)):
+		return {"count": 0, "overlaps": []}
+	var data = parsed.get("data", {})
+	if not (data is Dictionary):
+		return {"count": 0, "overlaps": []}
+	var branch = (data as Dictionary).get("3d" if dimension == 3 else "2d", {})
+	if not (branch is Dictionary):
+		return {"count": 0, "overlaps": []}
+	var targets: Array = [target_path] if target_path != "" else (branch as Dictionary).keys()
+	for target in targets:
+		var entries = (branch as Dictionary).get(target, {})
+		if not (entries is Dictionary):
+			continue
+		for key in (entries as Dictionary).keys():
+			var entry = (entries as Dictionary)[key]
+			if not (entry is Dictionary):
+				continue
+			if not _is_object_index_entry(entry):
+				continue
+			if not _entry_in_region(entry, region, dimension):
+				continue
+			var coords = (entry as Dictionary).get("coords", {})
+			var coord_key := str(key)
+			if coords is Dictionary:
+				coord_key = "%d,%d,%d" % [int(coords.get("x", 0)), int(coords.get("y", 0)), int(coords.get("z", 0))]
+			if not by_coord.has(coord_key):
+				by_coord[coord_key] = []
+			(by_coord[coord_key] as Array).append(entry)
+	var overlaps: Array = []
+	for key in by_coord.keys():
+		var entries_at_coord: Array = by_coord[key]
+		if entries_at_coord.size() > 1:
+			overlaps.append({"coord_key": key, "entries": entries_at_coord})
+	return {"count": overlaps.size(), "overlaps": overlaps}
+
+
+static func _detect_objects_on_blocked_cells(target_path: String, region: Dictionary, dimension: int) -> Dictionary:
+	var entries := _spatial_entries_in_region(target_path, region, dimension)
+	var blocked_by_coord := {}
+	var objects_by_coord := {}
+	for entry in entries:
+		var coords: Dictionary = entry.get("coords", {})
+		var coord_key := MapValidator.coord_key(MapValidator.coord_from_input(coords, dimension))
+		if _is_object_index_entry(entry):
+			if not objects_by_coord.has(coord_key):
+				objects_by_coord[coord_key] = []
+			(objects_by_coord[coord_key] as Array).append(entry)
+		elif _is_blocked_index_entry(entry):
+			blocked_by_coord[coord_key] = entry
+	var overlaps: Array = []
+	for coord_key in objects_by_coord.keys():
+		if blocked_by_coord.has(coord_key):
+			overlaps.append({
+				"coord_key": coord_key,
+				"objects": objects_by_coord[coord_key],
+				"blocking_entry": blocked_by_coord[coord_key],
+			})
+	return {"count": overlaps.size(), "overlaps": overlaps}
+
+
+static func _spatial_entries_in_region(target_path: String, region: Dictionary, dimension: int) -> Array:
+	var parsed := _read_json_resource(SPATIAL_INDEX_PATH)
+	var entries_out: Array = []
+	if not bool(parsed.get("exists", false)):
+		return entries_out
+	var data = parsed.get("data", {})
+	if not (data is Dictionary):
+		return entries_out
+	var branch = (data as Dictionary).get("3d" if dimension == 3 else "2d", {})
+	if not (branch is Dictionary):
+		return entries_out
+	var targets: Array = [target_path] if target_path != "" else (branch as Dictionary).keys()
+	for target in targets:
+		var entries = (branch as Dictionary).get(target, {})
+		if not (entries is Dictionary):
+			continue
+		for key in (entries as Dictionary).keys():
+			var entry = (entries as Dictionary)[key]
+			if not (entry is Dictionary):
+				continue
+			if _entry_in_region(entry, region, dimension):
+				var copy: Dictionary = (entry as Dictionary).duplicate(true)
+				copy["_index_key"] = str(key)
+				copy["_target_path"] = str(target)
+				entries_out.append(copy)
+	return entries_out
+
+
+static func _is_object_index_entry(entry: Dictionary) -> bool:
+	return str(entry.get("kind", "")) == "object" or str(entry.get("scene_path", "")) != ""
+
+
+static func _is_blocked_index_entry(entry: Dictionary) -> bool:
+	var semantic_layer := str(entry.get("semantic_layer", ""))
+	var tags = entry.get("tags", [])
+	if semantic_layer in ["water", "obstacle", "blocked"]:
+		return true
+	return tags is Array and ((tags as Array).has("water") or (tags as Array).has("blocked") or (tags as Array).has("obstacle"))
 
 
 static func _entry_matches(entry: Dictionary, want_tags: Array, want_resource: String, want_layer: String) -> bool:

@@ -811,12 +811,20 @@ static func bake_navigation_mesh(input: Dictionary, editor_interface: EditorInte
 		region2d.bake_navigation_polygon(false)
 		if undo_manager != null:
 			undo_manager.record_node_property(region2d, "navigation_polygon", before_polygon, baked_polygon)
-		return {
+		var result_2d := {
 			"ok": true,
 			"path": _relative_path(root, region2d),
 			"type": "NavigationRegion2D",
 			"outline_count": baked_polygon.get_outline_count()
 		}
+		if baked_polygon.get_outline_count() == 0:
+			result_2d["warning"] = "NavigationRegion2D baked an empty NavigationPolygon; keep the scene change but fall back to structural validation/path checks."
+			result_2d["fallback"] = {
+				"tool": "validate_map_region",
+				"path_algorithm": "astar",
+				"reason": "empty_navigation_polygon",
+			}
+		return result_2d
 	if node is NavigationRegion3D:
 		var region3d: NavigationRegion3D = node
 		var before_mesh: Resource = region3d.navigation_mesh
@@ -825,12 +833,20 @@ static func bake_navigation_mesh(input: Dictionary, editor_interface: EditorInte
 		region3d.bake_navigation_mesh(false)
 		if undo_manager != null:
 			undo_manager.record_node_property(region3d, "navigation_mesh", before_mesh, baked_mesh)
-		return {
+		var result_3d := {
 			"ok": true,
 			"path": _relative_path(root, region3d),
 			"type": "NavigationRegion3D",
 			"vertex_count": baked_mesh.get_vertices().size()
 		}
+		if baked_mesh.get_vertices().is_empty():
+			result_3d["warning"] = "NavigationRegion3D baked an empty NavigationMesh; keep the scene change but fall back to structural validation/path checks."
+			result_3d["fallback"] = {
+				"tool": "validate_map_region",
+				"path_algorithm": "astar",
+				"reason": "empty_navigation_mesh",
+			}
+		return result_3d
 	return {
 		"ok": false,
 		"message": "Node is not a NavigationRegion2D/NavigationRegion3D: " + path,
