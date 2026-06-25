@@ -238,7 +238,7 @@ func execute(tool_call: Dictionary) -> Dictionary:
 
 func _result_artifacts(result: Dictionary) -> Array:
 	var artifacts: Array = []
-	if result.has("path"):
+	if result.has("path") and result["path"] is String:
 		artifacts.append(result["path"])
 	return artifacts
 

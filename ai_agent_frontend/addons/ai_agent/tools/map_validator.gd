@@ -219,9 +219,9 @@ static func find_path_astar(
 
 
 static func heuristic(a: Vector3i, b: Vector3i, dimension: int) -> int:
-	var result := abs(a.x - b.x) + abs(a.y - b.y)
+	var result: int = absi(a.x - b.x) + absi(a.y - b.y)
 	if dimension == 3:
-		result += abs(a.z - b.z)
+		result += absi(a.z - b.z)
 	return result
 
 

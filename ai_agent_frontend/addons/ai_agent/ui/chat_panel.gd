@@ -135,7 +135,6 @@ var _rendered_assistant_keys := {}
 var _live_response_keys := {}   # 仅追踪本轮实时响应，避免历史加载的指纹误判为重复
 var _closed_stream_keys := {}
 var _closed_reasoning_keys := {}   # 新增：专门追踪已关闭的 reasoning stream
-var _finished_reasoning_headers := {}
 var _theme_colors: Dictionary = {}
 var _auto_scroll := true
 var _suppress_scroll_check := false   # 程序滚动时抑制 value_changed 误判
@@ -482,7 +481,6 @@ func _on_send() -> void:
 	_finish_reasoning_stream()
 	_closed_stream_keys.clear()
 	_closed_reasoning_keys.clear()   # 新增
-	_finished_reasoning_headers.clear()
 	_live_response_keys.clear()
 	_empty_final_ignored_ms = -1   # 重置空 final 超时计时器
 	_input.text = ""
@@ -1260,15 +1258,18 @@ func _on_decision(results: Array) -> void:
 ## 移除文本中的 `<think>…</think>` XML 块及所有残余的 `</think>` 标签。
 func _strip_think_xml(text: String) -> String:
 	var result := text
-	var start := result.find("<think>")
-	while start != -1:
-		var end_tag := result.find("</think>", start)
-		if end_tag == -1:
-			result = result.substr(0, start)
-			break
-		result = result.substr(0, start) + result.substr(end_tag + "</think>".length())
-		start = result.find("<think>")
-	result = result.replace("</think>", "")
+	for tag_name in ["think", "thinking"]:
+		var open_tag := "<%s>" % tag_name
+		var close_tag := "</%s>" % tag_name
+		var start := result.find(open_tag)
+		while start != -1:
+			var end_tag := result.find(close_tag, start)
+			if end_tag == -1:
+				result = result.substr(0, start)
+				break
+			result = result.substr(0, start) + result.substr(end_tag + close_tag.length())
+			start = result.find(open_tag)
+		result = result.replace(close_tag, "")
 	# 如果移除 <think> 块后文本变空或几乎为空，记录警告
 	if result.strip_edges().is_empty() and text.strip_edges().length() > 10:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "[strip_think_xml] WARNING: text becomes EMPTY after stripping", {
@@ -1279,6 +1280,36 @@ func _strip_think_xml(text: String) -> String:
 
 
 ## 若回复以 `Thought: ...` 摘要行开头，拆分出摘要文本与剩余正文。
+func _split_reasoning_xml_payload(text: String) -> Dictionary:
+	for tag_name in ["think", "thinking"]:
+		var open_tag := "<%s>" % tag_name
+		var close_tag := "</%s>" % tag_name
+		var start := text.find(open_tag)
+		if start == -1:
+			var close_only := text.find(close_tag)
+			if close_only != -1:
+				return {
+					"reasoning": text.substr(0, close_only).strip_edges(),
+					"body": text.substr(close_only + close_tag.length()).strip_edges()
+				}
+			continue
+		var content_start := start + open_tag.length()
+		var end_tag := text.find(close_tag, content_start)
+		if end_tag == -1:
+			return {
+				"reasoning": (text.substr(0, start) + text.substr(content_start)).strip_edges(),
+				"body": ""
+			}
+		var before := text.substr(0, start).strip_edges()
+		var inside := text.substr(content_start, end_tag - content_start).strip_edges()
+		var body := text.substr(end_tag + close_tag.length()).strip_edges()
+		var reasoning := inside
+		if before != "":
+			reasoning = before if reasoning == "" else before + "\n\n" + reasoning
+		return {"reasoning": reasoning, "body": body}
+	return {"reasoning": text.strip_edges(), "body": ""}
+
+
 func _split_thought_summary(text: String) -> Dictionary:
 	var stripped := text.strip_edges()
 	if not stripped.begins_with("Thought:"):
@@ -1331,7 +1362,7 @@ func _handle_final(response: Dictionary) -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Received final response.", {
 		"chars": str(response.get("text", "")).length()
 	})
-	var text := str(response.get("text", ""))
+	var text := _strip_think_xml(str(response.get("text", "")))
 	var assistant_key := _message_fingerprint(text)
 	var split := _split_thought_summary(text)
 	var rest := str(split.get("rest", ""))
@@ -2310,27 +2341,30 @@ func _on_reasoning_delta(event: Dictionary) -> void:
 	var key := _stream_event_key(payload)
 	var token_count := int(payload.get("token_count", 0))
 	if key != "" and _closed_reasoning_keys.has(key):
-		if token_count > 0 and _finished_reasoning_headers.has(key):
-			var finished: Dictionary = _finished_reasoning_headers[key]
-			var toggle = finished.get("toggle")
-			if toggle is Button and is_instance_valid(toggle):
-				toggle.text = "✻  %s · %s tokens ✓" % [
-					str(finished.get("base_header", "Thought")), _format_token_count(token_count)
-				]
+		var closed_split := _split_reasoning_xml_payload(str(payload.get("text", "")))
+		var closed_body := str(closed_split.get("body", ""))
+		if closed_body != "":
+			_render_text_delta_body(key, closed_body)
 		FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta] IGNORED - key already closed", {
 			"key": key,
+			"body_len": closed_body.length(),
 			"token_count": token_count
 		})
 		return
-	var text := str(payload.get("text", ""))
+	var split := _split_reasoning_xml_payload(str(payload.get("text", "")))
+	var text := str(split.get("reasoning", ""))
+	var body := str(split.get("body", ""))
 	FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta]", {
-		"key": key, "text_len": text.length(), "preview": text.left(60).replace("\n", "\\n")
+		"body_len": body.length(), "key": key, "text_len": text.length(), "preview": text.left(60).replace("\n", "\\n")
 	})
-	_ensure_reasoning_entry(key)
-	_reasoning_text = text
-	if token_count > 0:
-		_reasoning_token_count = token_count
-	_update_reasoning_entry()
+	if text != "":
+		_ensure_reasoning_entry(key)
+		_reasoning_text = text
+		if token_count > 0:
+			_reasoning_token_count = token_count
+		_update_reasoning_entry()
+	if body != "":
+		_render_text_delta_body(key, body)
 
 
 func _on_text_delta(event: Dictionary) -> void:
@@ -2338,6 +2372,10 @@ func _on_text_delta(event: Dictionary) -> void:
 	var payload: Dictionary = raw_payload if raw_payload is Dictionary else {}
 	var text := str(payload.get("text", ""))
 	var key := _stream_event_key(payload)
+	_render_text_delta_body(key, text)
+
+
+func _render_text_delta_body(key: String, text: String) -> void:
 	if _should_ignore_stream_delta(key, text):
 		return
 	_mark_reasoning_stream_closed()   # 防止迟到的 reasoning delta 再创建条目
@@ -2460,11 +2498,6 @@ func _finish_reasoning_stream() -> void:
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
 		var finished_header := _format_reasoning_header()
 		_reasoning_toggle.text = "✻  " + finished_header + " ✓"
-		if _reasoning_key != "":
-			_finished_reasoning_headers[_reasoning_key] = {
-				"toggle": _reasoning_toggle,
-				"base_header": _format_reasoning_base_header()
-			}
 	_reasoning_key = ""
 	_reasoning_toggle = null
 	_reasoning_detail_rich = null
@@ -2656,7 +2689,6 @@ func _clear_messages() -> void:
 	_live_response_keys.clear()
 	_closed_stream_keys.clear()
 	_closed_reasoning_keys.clear()   # 新增
-	_finished_reasoning_headers.clear()
 	for child in _message_list.get_children():
 		child.queue_free()
 

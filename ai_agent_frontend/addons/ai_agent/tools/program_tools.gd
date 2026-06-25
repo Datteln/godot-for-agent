@@ -232,8 +232,9 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 			"current_content": current_content
 		}
 
+	var before_exists := FileAccess.file_exists(ProjectSettings.globalize_path(path))
 	var before_text := ""
-	if FileAccess.file_exists(ProjectSettings.globalize_path(path)):
+	if before_exists:
 		before_text = FileAccess.get_file_as_string(ProjectSettings.globalize_path(path))
 
 	var before_state := {}
@@ -243,7 +244,7 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 	if undo_manager == null:
 		return {"ok": false, "message": "undo manager is not available"}
 
-	var write_error: Error = undo_manager.record_file_write(path, before_text, after_text)
+	var write_error: Error = undo_manager.record_file_write(path, before_text, after_text, before_exists)
 	if write_error != OK:
 		FrontendLogger.error(editor_interface, "ProgramTools", "Failed to write file.", {
 			"path": path,

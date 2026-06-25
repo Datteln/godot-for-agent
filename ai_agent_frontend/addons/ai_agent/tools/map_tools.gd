@@ -9,7 +9,7 @@ const MapIntentParser = preload("res://addons/ai_agent/tools/map_intent_parser.g
 const MapLayoutPlanner = preload("res://addons/ai_agent/tools/map_layout_planner.gd")
 
 const MAX_EDITED_CELLS := 100000
-const MAX_DESCRIBED_CELLS := 400
+const MAX_DESCRIBED_CELLS := 800
 const MAX_NOISE_CELLS := 4096
 ## 空间索引整份读出/整份重写，条目数上限防止它随使用无限膨胀、拖慢每次 edit_map。
 ## 到顶后仍允许更新/删除已有坐标，只拒绝新增坐标，并在结果里给出 warning。
@@ -791,7 +791,8 @@ static func _maybe_update_spatial_index(
 	if not bool(input.get("update_spatial_index", false)):
 		return {"ok": true, "updated": false}
 	var absolute := ProjectSettings.globalize_path(SPATIAL_INDEX_PATH)
-	var before_text := FileAccess.get_file_as_string(absolute) if FileAccess.file_exists(absolute) else ""
+	var before_exists := FileAccess.file_exists(absolute)
+	var before_text := FileAccess.get_file_as_string(absolute) if before_exists else ""
 	var parsed = JSON.parse_string(before_text) if before_text != "" else {}
 	var index: Dictionary = parsed if parsed is Dictionary else {}
 	var branch_key := "3d" if dimension == 3 else "2d"
@@ -827,7 +828,7 @@ static func _maybe_update_spatial_index(
 			added += 1
 	var after_text := JSON.stringify(index, "\t")
 	if undo_manager != null and undo_manager.has_method("record_file_write"):
-		var error: Error = undo_manager.record_file_write(SPATIAL_INDEX_PATH, before_text, after_text)
+		var error: Error = undo_manager.record_file_write(SPATIAL_INDEX_PATH, before_text, after_text, before_exists)
 		if error != OK:
 			return {"ok": false, "message": "failed to write spatial index", "error_code": "spatial_index_write_failed", "error": error}
 	else:
@@ -1144,7 +1145,8 @@ static func _maybe_update_object_spatial_index(
 	if not bool(input.get("update_spatial_index", true)):
 		return {"ok": true, "updated": false}
 	var absolute := ProjectSettings.globalize_path(SPATIAL_INDEX_PATH)
-	var before_text := FileAccess.get_file_as_string(absolute) if FileAccess.file_exists(absolute) else ""
+	var before_exists := FileAccess.file_exists(absolute)
+	var before_text := FileAccess.get_file_as_string(absolute) if before_exists else ""
 	var parsed = JSON.parse_string(before_text) if before_text != "" else {}
 	var index: Dictionary = parsed if parsed is Dictionary else {}
 	var branch_key := "3d" if dimension == 3 else "2d"
@@ -1310,7 +1312,7 @@ static func _resolve_indexed_object_node(root: Node, entry: Dictionary) -> Node:
 
 
 static func _nearest_free_object_cell(origin: Vector3i, region: Dictionary, dimension: int, occupied: Dictionary, blocked: Dictionary) -> Vector3i:
-	var max_radius := max(int(region.get("width", 1)), int(region.get("height", 1))) + int(region.get("depth", 1))
+	var max_radius: int = maxi(int(region.get("width", 1)), int(region.get("height", 1))) + int(region.get("depth", 1))
 	for radius in range(1, max_radius + 1):
 		for offset in _candidate_offsets(radius, dimension):
 			var candidate: Vector3i = origin + offset
@@ -1886,7 +1888,8 @@ static func _read_text_file(path: String) -> String:
 ## 写入 JSON 文本：优先走 undo_manager 进同一个预览/撤销批次，否则退化为直接写盘。
 static func _write_json_file(path: String, before_text: String, after_text: String, undo_manager: Node) -> Dictionary:
 	if undo_manager != null and undo_manager.has_method("record_file_write"):
-		var error: Error = undo_manager.record_file_write(path, before_text, after_text)
+		var before_exists := FileAccess.file_exists(ProjectSettings.globalize_path(path))
+		var error: Error = undo_manager.record_file_write(path, before_text, after_text, before_exists)
 		if error != OK:
 			return {"ok": false, "message": "failed to write " + path, "error_code": "file_write_failed", "error": error}
 		return {"ok": true}

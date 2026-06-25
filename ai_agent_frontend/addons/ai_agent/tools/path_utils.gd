@@ -26,9 +26,13 @@ static func to_res_path(path: String) -> String:
 	var cleaned := path.strip_edges().replace("\\", "/")
 	if cleaned == "":
 		return ""
-	if cleaned.is_absolute_path():
-		return ""
 	if cleaned.begins_with("user://"):
+		return ""
+	# `is_absolute_path()` 把任何带 "x:/" 协议头的字符串都当成绝对路径，这也包括
+	# 合法的 `res://` 前缀本身。必须先认出 `res://` 再做这个判断，否则调用方
+	# 老老实实传一个已经规范的 `res://foo.tscn` 反而会被这里直接清空成 ""
+	# （真正要挡的是系统绝对路径，如 `/etc/...`、`C:/...`，不是 `res://`）。
+	if not cleaned.begins_with("res://") and cleaned.is_absolute_path():
 		return ""
 
 	var relative := cleaned.trim_prefix("res://").trim_prefix("/")

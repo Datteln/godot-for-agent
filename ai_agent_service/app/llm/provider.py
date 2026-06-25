@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 from app.llm.message_transformer import CacheBreakpoint, inject_cache_breakpoints
@@ -365,7 +366,7 @@ class OpenAICompatibleProvider:
                 stream=True,
                 stream_options={"include_usage": True},
             )
-        except (APIConnectionError, APITimeoutError) as exc:
+        except (APIConnectionError, APITimeoutError, httpx.TransportError) as exc:
             logger.warning("LLM connection error error_type=%s", type(exc).__name__)
             raise LLMError(f"无法连接大模型端点：{exc}") from exc
         except APIStatusError as exc:
@@ -437,7 +438,7 @@ class OpenAICompatibleProvider:
                             entry["function"]["name"] += tool_call_delta.function.name
                         if tool_call_delta.function.arguments:
                             entry["function"]["arguments"] += tool_call_delta.function.arguments
-        except (APIConnectionError, APITimeoutError) as exc:
+        except (APIConnectionError, APITimeoutError, httpx.TransportError) as exc:
             logger.warning("LLM stream connection error error_type=%s", type(exc).__name__)
             raise LLMError(f"大模型流式响应中断：{exc}") from exc
         except APIStatusError as exc:

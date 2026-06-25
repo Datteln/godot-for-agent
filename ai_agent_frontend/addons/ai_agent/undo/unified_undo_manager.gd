@@ -18,7 +18,7 @@ func begin_batch(description: String) -> void:
 	_active = true
 
 
-func record_file_write(path: String, before_text: String, after_text: String) -> Error:
+func record_file_write(path: String, before_text: String, after_text: String, before_exists: bool = true) -> Error:
 	if not _active:
 		begin_batch("AI file changes")
 	# 必须先确认底层写入真的成功了，再把这次修改记入 undo batch。否则只读目录、
@@ -31,7 +31,8 @@ func record_file_write(path: String, before_text: String, after_text: String) ->
 		"type": "file_write",
 		"path": path,
 		"before": before_text,
-		"after": after_text
+		"after": after_text,
+		"before_exists": before_exists
 	})
 	return OK
 
@@ -270,7 +271,17 @@ func abort_batch() -> void:
 		var op: Dictionary = _ops[index]
 		match op.get("type", ""):
 			"file_write":
-				_write_file_text(str(op["path"]), str(op["before"]))
+				# `before_exists=false` 说明这个文件是本批次新建的（撤销前并不存在）。
+				# 写回 `before`（这种情况下是空串）只会把文件留成一个 0 字节的空文件，
+				# 而不是恢复成"不存在"——之后任何 JSON.parse_string("") 或编辑器自己
+				# 扫描这个文件都会报 "Unknown error getting token"。撤销新建文件应该
+				# 直接删掉它，才是真正的"恢复到批次开始前的状态"。
+				if not bool(op.get("before_exists", true)):
+					var absolute_path := ProjectSettings.globalize_path(str(op["path"]))
+					if FileAccess.file_exists(absolute_path):
+						DirAccess.remove_absolute(absolute_path)
+				else:
+					_write_file_text(str(op["path"]), str(op["before"]))
 			"binary_file_write":
 				_write_file_bytes(str(op["path"]), op["before"], bool(op["before_exists"]))
 			"node_add":

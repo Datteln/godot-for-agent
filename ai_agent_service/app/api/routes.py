@@ -187,8 +187,7 @@ def create_router(
     @router.get("/chat/events", response_model=ChatEventsResponse)
     async def chat_events(session_id: str, after: int = 0) -> ChatEventsResponse:
         events = event_store.list_after(session_id, after)
-        if events:
-            logger.debug("HTTP /chat/events session=%s after=%d count=%d", session_id, after, len(events))
+        logger.debug("HTTP /chat/events session=%s after=%d count=%d", session_id, after, len(events))
         return ChatEventsResponse(
             events=[
                 ChatEventDTO(

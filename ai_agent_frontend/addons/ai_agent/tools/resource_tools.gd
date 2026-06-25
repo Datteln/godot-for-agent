@@ -214,7 +214,7 @@ static func create_shader_material(input: Dictionary, undo_manager: Node) -> Dic
 			shader_before_text = existing.get_as_text()
 			existing.close()
 	if undo_manager != null:
-		var shader_write_error: Error = undo_manager.record_file_write(shader_path, shader_before_text, shader_code)
+		var shader_write_error: Error = undo_manager.record_file_write(shader_path, shader_before_text, shader_code, shader_before_exists)
 		if shader_write_error != OK:
 			return {
 				"ok": false,
