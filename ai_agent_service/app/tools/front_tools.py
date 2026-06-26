@@ -1870,12 +1870,20 @@ def register_front_tools() -> None:
             schema={
                 "name": "validate_map_region",
                 "description": (
-                    "Read-only structural check over a small map region: counts filled vs empty cells and, "
-                    "when start/goal, entrances/exits, or waypoints are given, runs BFS or A* connectivity (4-neighbour in 2D, "
-                    "6-neighbour in 3D). By default empty cells are walkable and filled cells are obstacles; "
-                    "set walkable_is_filled=true to invert. It can also enforce allowed_bounds, check "
-                    "spatial-index overlaps, and detect objects sitting on water/blocked cells. Returns issues, "
-                    "passed, path/multi_connectivity, and repair_plan, but never edits."
+                    "Read-only reachability/structure check over a small map region. Counts filled vs empty cells and, "
+                    "when start/goal, entrances/exits, or waypoints are given, runs BFS or A* connectivity under a "
+                    "pluggable MOVEMENT MODEL (movement_model): 'grid' (abstract adjacency, no gravity — tactics/top-down/"
+                    "mazes), 'leap' (gravity: a foothold must be empty with solid support directly below, and you can only "
+                    "reach other footholds within max_horizontal_gap / max_rise / max_fall — use for 2D platformers AND "
+                    "3D jump/climb), or 'free' (no gravity, single step up to max_step — flying/swimming). CRITICAL: "
+                    "'grid' only proves cells are adjacent, NOT that the character can actually traverse — for any "
+                    "jump/gravity gameplay you MUST pass movement_model='leap' with jump limits measured from the real "
+                    "character controller, otherwise a level of floating platforms over open air will wrongly pass. "
+                    "By default empty cells are walkable and filled cells are obstacles; set walkable_is_filled=true to "
+                    "invert. Optionally override gravity direction via gravity_axis/gravity_sign. It can also enforce "
+                    "allowed_bounds, check spatial-index overlaps, and detect objects on water/blocked cells. Returns "
+                    "issues, passed, path/multi_connectivity, and repair_plan, but never edits. A 'passed' result only "
+                    "means reachable under the given movement assumptions — still verify the design visually."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1932,6 +1940,47 @@ def register_front_tools() -> None:
                             "type": "boolean",
                             "description": "When true, filled cells are walkable and empty cells are obstacles.",
                         },
+                        "movement_model": {
+                            "type": "string",
+                            "enum": ["grid", "leap", "free"],
+                            "description": (
+                                "How the character moves, which decides what 'reachable' means. 'grid' = abstract "
+                                "adjacency, no gravity. 'leap' = gravity + jump/climb limits (footholds need support "
+                                "below; only reachable within max_horizontal_gap/max_rise/max_fall). 'free' = no "
+                                "gravity, step up to max_step. Use 'leap' for ANY jump/platform/gravity gameplay; "
+                                "defaults to 'grid'."
+                            ),
+                        },
+                        "max_horizontal_gap": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "leap: max horizontal distance (in cells) the character can clear in one jump. Derive from real run speed + jump airtime; do not guess.",
+                        },
+                        "max_rise": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "leap: max cells the character can gain in height per jump. Derive from real jump velocity/gravity; do not guess.",
+                        },
+                        "max_fall": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "leap: max cells the character may drop and still be considered a valid reach (falling is usually generous).",
+                        },
+                        "max_step": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "free: max single-move distance in cells (Manhattan) for gravity-free movement (flying/swimming).",
+                        },
+                        "gravity_axis": {
+                            "type": "string",
+                            "enum": ["x", "y", "z"],
+                            "description": "Optional override for which axis points 'down'. Defaults: 2D y-down, 3D y-up. Only set if your project uses a non-standard gravity direction.",
+                        },
+                        "gravity_sign": {
+                            "type": "integer",
+                            "enum": [-1, 1],
+                            "description": "Sign of the gravity axis ('down' direction). Used with gravity_axis.",
+                        },
                         "path_algorithm": {
                             "type": "string",
                             "enum": ["bfs", "astar", "a*"],
@@ -1974,13 +2023,15 @@ def register_front_tools() -> None:
             schema={
                 "name": "repair_map_region",
                 "description": (
-                    "Apply automatic repairs for validate_map_region failures. "
-                    "For connectivity it prefers the validate_map_region A* path when available, otherwise builds a corridor, and applies it through the same "
-                    "preview/Undo map edit path: by default it erases blocking cells so empty space becomes "
-                    "walkable; with walkable_is_filled=true, it fills the corridor and therefore requires "
-                    "source_id/atlas_x/atlas_y for 2D or item for 3D. With repair_overlaps/repair_blocked_objects "
-                    "it moves indexed object nodes to nearby free cells and updates the spatial index. Re-run "
-                    "validate_map_region after repair."
+                    "Apply automatic repairs for validate_map_region failures. Pass the SAME movement_model (and jump "
+                    "limits) you validated with so the repair matches how the character actually moves. For 'grid'/'free' "
+                    "connectivity it erases a corridor by default (empty space becomes walkable); with "
+                    "walkable_is_filled=true it fills the corridor. For 'leap' failures it instead proposes filling the "
+                    "SUPPORT row beneath the path (a ground/platform bridge across the gap), so it requires "
+                    "source_id/atlas_x/atlas_y for 2D or item for 3D. With repair_overlaps/repair_blocked_objects it "
+                    "moves indexed object nodes to nearby free cells and updates the spatial index. Re-run "
+                    "validate_map_region after repair. Note: it only stitches a minimal path/bridge — complex or "
+                    "art-quality fixes still need edit_map."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2021,6 +2072,17 @@ def register_front_tools() -> None:
                             "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
                         },
                         "walkable_is_filled": {"type": "boolean"},
+                        "movement_model": {
+                            "type": "string",
+                            "enum": ["grid", "leap", "free"],
+                            "description": "Must match the movement_model used in validate_map_region. 'leap' bridges gaps by filling the support row beneath the path.",
+                        },
+                        "max_horizontal_gap": {"type": "integer", "minimum": 1, "description": "leap: max horizontal jump distance in cells."},
+                        "max_rise": {"type": "integer", "minimum": 0, "description": "leap: max jump height gain in cells."},
+                        "max_fall": {"type": "integer", "minimum": 0, "description": "leap: max drop in cells treated as reachable."},
+                        "max_step": {"type": "integer", "minimum": 1, "description": "free: max single-move distance in cells."},
+                        "gravity_axis": {"type": "string", "enum": ["x", "y", "z"], "description": "Optional 'down' axis override; must match validate_map_region."},
+                        "gravity_sign": {"type": "integer", "enum": [-1, 1], "description": "Sign of the gravity axis; used with gravity_axis."},
                         "repair_overlaps": {
                             "type": "boolean",
                             "description": "Move duplicate indexed objects to nearby free cells; start/goal not required.",

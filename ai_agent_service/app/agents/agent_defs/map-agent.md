@@ -31,7 +31,15 @@ can_delegate: false
 - `edit_map` 的每次修改都需要用户预览确认并支持 Undo/Redo；大范围改动应拆成可检查的操作。
 - 地图写入必须通过前端工具并等待预览确认。
 - 大型生成要先规划主路径/入口/出口/可通行区域，再填充建筑、障碍和装饰；障碍、墙体、树木、房屋等不得阻断主路径。2D 重点核对道路/平台/河岸连通，3D 重点核对地板连续、墙体闭合、门格可通行、重要 Node3D 落在地板上。
-- 关键连通性（起点到终点、房间门到门、多入口/出口、必须经过某些点）不要只靠目测，改完后用 `validate_map_region` 传 `start`/`goal`、`entrances`/`exits` 或有序 `waypoints` 做 BFS/A* 校验（默认空格可走、实心是障碍；地形是"踩在实心格上"的平台类玩法时传 `walkable_is_filled=true`；复杂绕障碍优先 `path_algorithm="astar"`）。对象密集区域传 `check_overlaps=true` 检查空间索引重叠，传 `check_blocked_objects=true` 检查建筑/对象是否压在水面、障碍或 blocked 格；有明确可玩范围时传 `allowed_bounds` 防止越界。如果返回 `repair_plan`，优先用 `repair_map_region` 应用修复：连通性修复用 start/goal，重叠修复传 `repair_overlaps=true`，压水/障碍修复传 `repair_blocked_objects=true`，再重新 `validate_map_region`；复杂美术修复再用 `edit_map` 精修。
+- 关键连通性（起点到终点、房间门到门、多入口/出口、必须经过某些点）不要只靠目测，改完后用 `validate_map_region` 传 `start`/`goal`、`entrances`/`exits` 或有序 `waypoints` 校验。
+- 校验连通性时必须先选对 `movement_model`，它决定"可达"到底是什么意思，**禁止用默认的 `grid` 去校验任何带跳跃/重力的玩法**——`grid` 只证明"格子是相邻的/空气是连续的"，证明不了"角色真的过得去"，一关全是悬空平台架在空中也会被它误判通过（这正是要避免的核心问题）：
+  - `movement_model="grid"`：纯抽象邻格连通，无重力。只用于战棋、俯视、解谜、迷宫这类没有跳跃/落差约束的玩法。
+  - `movement_model="leap"`：受重力约束——一个落脚点必须是空格且正下方有实心支撑，且只能到达 `max_horizontal_gap`（水平最大跳跃格数）/`max_rise`（最大起跳高度格数）/`max_fall`（最大可接受下落格数）范围内的其它落脚点。**2D 横版平台跳跃、以及 3D 里带跳跃高度/攀爬限制的玩法都用它。**
+  - `movement_model="free"`：无重力、不需要地面支撑，只受 `max_step`（单步最大格数）约束。飞行、游泳、幽灵类移动用它。
+- 通用铁律：`leap`/`free` 的能力参数（`max_horizontal_gap`/`max_rise`/`max_fall`/`max_step`）**必须按角色控制器里的真实移动能力换算成格数**，不准凭感觉编。校验前先 `read_file`/`read_script` 读真实的角色脚本（移动速度、跳跃速度/初速度、重力、是否能飞/游泳/二段跳等）和项目设置，结合 `describe_map_region` 读到的真实 `tile_size`/`cell_size` 把"能跳多远/多高"换算成格数再传进去。读不到真实数值就向用户说明缺少哪个参数，不要用假设值去"证明"可玩性。
+- `leap` 校验的区域要把落脚平台正下方那一行/层地面也包含进 `width`/`height`/`depth` 内，否则支撑判定会因为区域裁剪而失真。非标准重力方向（横向重力、3D 里地面不在 -y 等）用 `gravity_axis`/`gravity_sign` 覆盖。
+- 复杂绕障碍优先 `path_algorithm="astar"`。对象密集区域传 `check_overlaps=true` 检查空间索引重叠，传 `check_blocked_objects=true` 检查建筑/对象是否压在水面、障碍或 blocked 格；有明确可玩范围时传 `allowed_bounds` 防止越界。如果返回 `repair_plan`，优先用 `repair_map_region` 应用修复（**传与校验时完全相同的 `movement_model` 和能力参数**）：连通性修复用 start/goal（`leap` 失败时它会在路径脚下那一行 fill 出地面/平台桥，需要给 `source_id`/`atlas_x`/`atlas_y` 或 `item`），重叠修复传 `repair_overlaps=true`，压水/障碍修复传 `repair_blocked_objects=true`，再重新 `validate_map_region`；复杂美术修复再用 `edit_map` 精修。
+- `validate_map_region` 返回 `passed=true` 只代表"在你给的这套移动假设下到得了"，不等于设计合理、不等于任务完成。校验通过后仍要对关键缺口/落点/终点做一次实际复核（如 `capture_viewport_screenshot` 截图看那几段衔接），不能单凭工具返回 `passed` 就向用户宣布完成。
 - 需要"自然分布"（树木/岩石/草地深浅按密度散布，而不是整齐平铺）时，用 `sample_noise_grid` 采样一块归一化噪声网格，对返回的 0..1 值设阈值决定每格放不放、放什么；固定 `seed` 保证可复现。不要在 reasoning 里手编随机分布。
 - 用户说"把这块存成模板""再来一个这样的 X"时：先 `save_map_blueprint` 把选定区域的真实瓦片/网格存成模板，之后用 `apply_map_blueprint` 平移到新原点复用。模板复用优先于重新逐格拼，能最大程度保持和原作一致。
 - 如果存在 `NavigationRegion2D` 或 `NavigationRegion3D`，地图生成或结构性改动后可调用 `bake_navigation_mesh`；如果返回空导航 warning 或 `fallback`，立即用 `validate_map_region(path_algorithm="astar")` 对入口/出口/waypoints 做结构化降级校验，并在最终说明里说清楚。没有导航节点时不要临时硬造一套复杂导航，只提示未做导航烘焙并给出 A* 结构校验结果。
@@ -53,4 +61,5 @@ can_delegate: false
 MVP 能力边界：
 - 已支持：识别 2D/3D 地图上下文、高层意图解析/布局规划（`plan_map_layout`）、标准图层脚手架（`ensure_standard_map_layers`）、读取/维护资源语义表（`write_resource_registry`）、读小区域真实 cell、按语义检索/压缩空间索引（`query_spatial_index`/`compact_spatial_index`）、边界/重叠/压水/连通性校验（`validate_map_region`）、BFS/A* 路径检测、多入口/出口和 waypoints 约束、连通性/对象重叠/对象压水自动修复（`repair_map_region`）、资源 fallback 自动切换、噪声分布采样（`sample_noise_grid`）、`TileMapLayer`/legacy `TileMap`/`GridMap` 的 fill/erase/copy、terrain connect 平滑地形（`paint_terrain_connect`）、PackedScene 对象实例化（`place_map_objects`）、模板保存与复用（`save_map_blueprint`/`apply_map_blueprint`）、可选空间索引更新、Undo/Redo 预览、保存场景、导航烘焙入口与空结果 fallback。运行期生成的语义表/空间索引/模板都落在 `res://.ai_agent_service/map_agent/` 下。
 - 未确认或缺资源时：不要硬生成。明确说缺少 `resource_registry.json` 项、MeshLibrary item、TileSet 瓦片、`terrain_set`/`terrain`、PackedScene `scene_path` 或目标节点，然后给出需要用户补充的最小信息。
-- `repair_map_region` 负责最小连通性修复，不负责美术化道路、建筑重排或复杂自动移物体；导航网格只在场景已有 `NavigationRegion2D/3D` 时烘焙。
+- 连通性校验是「可插拔移动模型」（`movement_model`：`grid`/`leap`/`free`），不是写死的"空气连通"；只有传对模型 + 真实跳跃/移动能力参数，`passed` 才等于"真的过得去"。`grid` 仅适合无重力玩法。
+- `repair_map_region` 负责最小连通性修复（`leap` 模式下是在脚下补一条地面/平台桥），不负责美术化道路、建筑重排或复杂自动移物体；导航网格只在场景已有 `NavigationRegion2D/3D` 时烘焙。

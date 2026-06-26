@@ -138,10 +138,14 @@ static func _validation_plan(intent: Dictionary, region: Dictionary) -> Dictiona
 		"entrances": [anchors.get("entry", {})],
 		"exits": [anchors.get("exit", {})],
 		"waypoints": _path_constraints(intent, region).get("waypoints", []),
-		"walkable_is_filled": false if str(intent.get("mode", "2d")) == "3d" else true,
+		# 默认按模式给一个 movement_model 提示：2D 多为跳跃玩法 → leap，3D 房间地面导航 → grid。
+		# leap 下脚步格是空格、地面在脚下（walkable_is_filled=false）。
+		"movement_model": "grid" if str(intent.get("mode", "2d")) == "3d" else "leap",
+		"walkable_is_filled": false,
 		"path_algorithm": "astar",
 		"check_overlaps": true,
 		"check_blocked_objects": true,
+		"note": "确认 movement_model 是否符合真实玩法：带跳跃/重力用 leap，并按角色控制器真实的移动速度、跳跃初速度、重力换算出 max_horizontal_gap/max_rise/max_fall（格数）后再校验，不要用默认值。",
 	}
 
 
