@@ -291,6 +291,8 @@ _HISTORY_FRONT_READ_TOOLS = frozenset(
         "plan_map_layout",
         "plan_map_algorithms",
         "plan_platform_level",
+        "plan_reachable_map_growth",
+        "compute_reachable_frontier",
         "describe_map_region",
         "query_spatial_index",
         "validate_map_region",

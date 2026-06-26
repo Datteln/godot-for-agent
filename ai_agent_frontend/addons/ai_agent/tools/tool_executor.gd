@@ -160,6 +160,10 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = MapTools.plan_map_algorithms(input, editor_interface)
 		"plan_platform_level":
 			result = MapTools.plan_platform_level(input, editor_interface)
+		"plan_reachable_map_growth":
+			result = MapTools.plan_reachable_map_growth(input, editor_interface)
+		"compute_reachable_frontier":
+			result = MapTools.compute_reachable_frontier(input, editor_interface)
 		"sample_poisson_points":
 			result = MapTools.sample_poisson_points(input, editor_interface)
 		"compose_map_blueprint_grammar":

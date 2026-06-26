@@ -1601,6 +1601,14 @@ def register_front_tools() -> None:
                 ),
                 "parameters": _object_schema(
                     {
+                        "target_path": {
+                            "type": "string",
+                            "description": "2D TileMapLayer/TileMap used to sample the existing entry boundary.",
+                        },
+                        "map_layer": {
+                            "type": "integer",
+                            "description": "Layer index for legacy TileMap boundary sampling.",
+                        },
                         "x": {"type": "integer"},
                         "y": {"type": "integer"},
                         "width": {"type": "integer", "minimum": 8},
@@ -1610,6 +1618,28 @@ def register_front_tools() -> None:
                             "description": "Support-row y coordinate for the first platform; defaults to vertical center.",
                         },
                         "seed": {"type": "integer"},
+                        "connect_from_existing": {
+                            "type": "boolean",
+                            "description": "When true, scan the left boundary and make the generated route reachable from the existing map. Defaults to true.",
+                        },
+                        "entry_sample_x": {
+                            "type": "integer",
+                            "description": "Optional x for the existing-boundary sample rectangle.",
+                        },
+                        "entry_sample_y": {
+                            "type": "integer",
+                            "description": "Optional y for the existing-boundary sample rectangle.",
+                        },
+                        "entry_sample_width": {
+                            "type": "integer",
+                            "minimum": 3,
+                            "description": "Width of the left-boundary sample used to find an existing foothold.",
+                        },
+                        "entry_sample_height": {
+                            "type": "integer",
+                            "minimum": 4,
+                            "description": "Height of the left-boundary sample used to find an existing foothold.",
+                        },
                         "max_horizontal_gap": {
                             "type": "integer",
                             "minimum": 2,
@@ -1645,6 +1675,147 @@ def register_front_tools() -> None:
                         },
                     },
                     ["width", "height"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="plan_reachable_map_growth",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "plan_reachable_map_growth",
+                "description": (
+                    "Plan map expansion from a reachable frontier instead of generating isolated content. "
+                    "Supports profile='platformer' (delegates to platform reachability), 'topdown' "
+                    "(connected roads/ground), 'dungeon' (rooms and corridors), and '3d_grid' "
+                    "(connected floor strips). Returns candidates, accepted_motifs, preview-safe "
+                    "edit_map_batches, validation, and repair strategies; it never edits the scene."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "profile": {
+                            "type": "string",
+                            "enum": ["platformer", "topdown", "dungeon", "3d_grid"],
+                            "description": "Map/gameplay profile that selects movement model, motifs, validation, and repairs.",
+                        },
+                        "target_path": {"type": "string"},
+                        "map_layer": {"type": "integer"},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "frontier": {
+                            "type": "object",
+                            "description": "Optional known reachable frontier cell {x,y[,z]}; platformer can auto-sample it from the left boundary.",
+                            "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}},
+                        },
+                        "start": {
+                            "type": "object",
+                            "description": "Optional real player/unit start. When provided, plan_reachable_map_growth first computes rightmost_frontier from real map reachability.",
+                            "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}},
+                        },
+                        "frontier_type": {"type": "string"},
+                        "walkable_is_filled": {"type": "boolean"},
+                        "movement_model": {
+                            "type": "string",
+                            "enum": ["grid", "leap", "free"],
+                            "description": "Movement model used when start is provided to compute the real reachable frontier.",
+                        },
+                        "connect_from_existing": {
+                            "type": "boolean",
+                            "description": "For platformer, scan existing left boundary and use the found foothold as frontier. Defaults to true.",
+                        },
+                        "entry_sample_x": {"type": "integer"},
+                        "entry_sample_y": {"type": "integer"},
+                        "entry_sample_width": {"type": "integer", "minimum": 3},
+                        "entry_sample_height": {"type": "integer", "minimum": 4},
+                        "max_steps": {"type": "integer", "minimum": 1},
+                        "step_length": {"type": "integer", "minimum": 1},
+                        "max_gap": {"type": "integer", "minimum": 1},
+                        "room_width": {"type": "integer", "minimum": 1},
+                        "room_height": {"type": "integer", "minimum": 1},
+                        "corridor_length": {"type": "integer", "minimum": 1},
+                        "path_depth": {"type": "integer", "minimum": 1},
+                        "max_horizontal_gap": {"type": "integer", "minimum": 2},
+                        "max_rise": {"type": "integer", "minimum": 0},
+                        "max_fall": {"type": "integer", "minimum": 1},
+                        "max_step": {"type": "integer", "minimum": 1},
+                        "gravity_axis": {"type": "string", "enum": ["x", "y", "z"]},
+                        "gravity_sign": {"type": "integer", "enum": [-1, 1]},
+                        "max_returned_cells": {"type": "integer", "minimum": 1},
+                        "min_landing_width": {"type": "integer", "minimum": 2},
+                        "road_resource": {"type": "string"},
+                        "floor_resource": {"type": "string"},
+                        "fallback_road_resource": {"type": "string"},
+                        "fallback_floor_resource": {"type": "string"},
+                    },
+                    ["profile", "width", "height"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="compute_reachable_frontier",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "compute_reachable_frontier",
+                "description": (
+                    "Read the real TileMap/TileMapLayer/GridMap cells and compute all cells reachable from a "
+                    "real player/unit start under movement_model='grid', 'leap', or 'free'. Returns "
+                    "reachable_cells, reachable_footholds, rightmost_frontier, frontier_candidates, and "
+                    "first_blocked_gap. Use before plan_reachable_map_growth when extending an existing playable map."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {"type": "string"},
+                        "map_layer": {"type": "integer"},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "start": {
+                            "type": "object",
+                            "description": "Real player/unit start cell {x,y[,z]} in map coordinates.",
+                            "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}},
+                        },
+                        "walkable_is_filled": {
+                            "type": "boolean",
+                            "description": "When true, filled cells are walkable; otherwise empty cells are walkable.",
+                        },
+                        "movement_model": {
+                            "type": "string",
+                            "enum": ["grid", "leap", "free"],
+                            "description": "grid=adjacent walking, leap=platform footholds with support/jump limits, free=gravity-free movement.",
+                        },
+                        "max_horizontal_gap": {"type": "integer", "minimum": 1},
+                        "max_rise": {"type": "integer", "minimum": 0},
+                        "max_fall": {"type": "integer", "minimum": 0},
+                        "max_step": {"type": "integer", "minimum": 1},
+                        "gravity_axis": {"type": "string", "enum": ["x", "y", "z"]},
+                        "gravity_sign": {"type": "integer", "enum": [-1, 1]},
+                        "max_returned_cells": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Caps returned reachable_cells/footholds payload size; search still visits the whole region.",
+                        },
+                    },
+                    ["start", "width", "height"],
                 ),
             },
         )

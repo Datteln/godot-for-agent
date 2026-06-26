@@ -9,6 +9,7 @@ const MapIntentParser = preload("res://addons/ai_agent/tools/map_intent_parser.g
 const MapLayoutPlanner = preload("res://addons/ai_agent/tools/map_layout_planner.gd")
 const MapAlgorithms = preload("res://addons/ai_agent/tools/map_algorithms.gd")
 const MapPlatformComposer = preload("res://addons/ai_agent/tools/map_platform_composer.gd")
+const MapReachableGrowth = preload("res://addons/ai_agent/tools/map_reachable_growth.gd")
 
 const MAX_EDITED_CELLS := 100000
 const MAX_DESCRIBED_CELLS := 400
@@ -1507,7 +1508,212 @@ static func plan_platform_level(input: Dictionary, editor_interface: EditorInter
 		return context
 	var platform_input := input.duplicate(true)
 	platform_input["mode"] = "2d"
+	if bool(platform_input.get("connect_from_existing", true)):
+		var anchor_result := _platform_entry_anchor(platform_input, editor_interface)
+		if bool(anchor_result.get("ok", false)):
+			platform_input["entry_anchor"] = anchor_result.get("entry_anchor", {})
+			platform_input["entry_support"] = anchor_result.get("entry_support", {})
+			platform_input["entry_sample"] = anchor_result
+		else:
+			# 没扫描到左侧已有落脚点：让 composer 把 edit_map_batches 结构性清空，
+			# 而不是只靠 prompt 提醒 agent "没有 entry_anchor 就别执行"。
+			platform_input["entry_anchor_scan_failed"] = true
+			platform_input["entry_sample"] = anchor_result
 	return MapPlatformComposer.plan_platform_level(platform_input, context)
+
+
+## Build a profile-based reachable frontier growth plan for platformer/topdown/dungeon/3d maps.
+static func plan_reachable_map_growth(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var context := describe_map_context({}, editor_interface)
+	if not bool(context.get("ok", false)):
+		return context
+	var growth_input := input.duplicate(true)
+	var profile := str(growth_input.get("profile", "")).to_lower()
+	if growth_input.has("start"):
+		var frontier_result := compute_reachable_frontier(growth_input, editor_interface)
+		if not bool(frontier_result.get("ok", false)):
+			return frontier_result
+		growth_input["frontier"] = frontier_result.get("rightmost_frontier", {})
+		growth_input["reachable_frontier"] = frontier_result
+		if profile in ["platform", "platformer", "side_scroller", "side-scroller"]:
+			growth_input["entry_anchor"] = frontier_result.get("rightmost_frontier", {})
+	if profile in ["platform", "platformer", "side_scroller", "side-scroller"] and bool(growth_input.get("connect_from_existing", true)):
+		if not growth_input.has("frontier"):
+			var anchor_result := _platform_entry_anchor(growth_input, editor_interface)
+			if bool(anchor_result.get("ok", false)):
+				growth_input["entry_anchor"] = anchor_result.get("entry_anchor", {})
+				growth_input["frontier"] = anchor_result.get("entry_anchor", {})
+				growth_input["entry_sample"] = anchor_result
+			else:
+				growth_input["entry_anchor_scan_failed"] = true
+				growth_input["entry_sample"] = anchor_result
+	return MapReachableGrowth.plan_growth(growth_input, context)
+
+
+## Read the real map and compute all cells reachable from a real player/unit start.
+static func compute_reachable_frontier(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var map_layer := int(input.get("map_layer", 0))
+	var region := MapValidator.region_from_input(input, dimension)
+	if int(region["width"]) * int(region["height"]) * int(region["depth"]) > MAX_DESCRIBED_CELLS:
+		return {
+			"ok": false,
+			"message": "frontier region exceeds the %d-cell limit; compute frontier in a smaller region" % MAX_DESCRIBED_CELLS,
+			"error_code": "region_too_large",
+		}
+	if not input.has("start"):
+		return {"ok": false, "message": "start is required to compute a real reachable frontier", "error_code": "missing_start"}
+	var start := MapValidator.coord_from_input(input.get("start", {}), dimension)
+	var movement := MapValidator.movement_from_input(input, dimension)
+	var filled := _collect_filled_cells(target, region, dimension, map_layer)
+	if not MapValidator.in_region(start, region):
+		return {"ok": false, "message": "start is outside the frontier region", "error_code": "start_out_of_region"}
+	if not MapValidator.is_standable(filled, start, region, movement):
+		return {
+			"ok": false,
+			"message": "start is not standable under the requested movement model",
+			"error_code": "start_not_standable",
+			"start": MapValidator.coord_payload(start, dimension),
+			"movement_model": movement.get("model", "grid"),
+		}
+	var max_returned := max(1, int(input.get("max_returned_cells", 256)))
+	var visited := {}
+	var queue: Array = [start]
+	visited[MapValidator.coord_key(start)] = start
+	var cursor := 0
+	while cursor < queue.size():
+		var current: Vector3i = queue[cursor]
+		cursor += 1
+		for next in MapValidator.movement_neighbors(filled, current, region, movement):
+			var key := MapValidator.coord_key(next)
+			if visited.has(key):
+				continue
+			visited[key] = next
+			queue.append(next)
+	var reachable_cells: Array = []
+	var reachable_footholds: Array = []
+	var rightmost := start
+	var reachable_vectors: Array = []
+	for key in visited.keys():
+		var coords: Vector3i = visited[key]
+		reachable_vectors.append(coords)
+		if coords.x > rightmost.x or (coords.x == rightmost.x and coords.y < rightmost.y):
+			rightmost = coords
+		if reachable_cells.size() < max_returned:
+			reachable_cells.append(MapValidator.coord_payload(coords, dimension))
+		if MapValidator.is_standable(filled, coords, region, movement):
+			if reachable_footholds.size() < max_returned:
+				reachable_footholds.append(MapValidator.coord_payload(coords, dimension))
+	var frontier_candidates := _rightmost_frontier_candidates(reachable_vectors, filled, region, movement, dimension, max_returned)
+	var first_blocked_gap := _first_blocked_gap(filled, rightmost, region, movement, visited, dimension)
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"type": target.get_class(),
+		"dimension": dimension,
+		"map_layer": map_layer if target.get_class() == "TileMap" else null,
+		"region": region,
+		"movement_model": movement.get("model", "grid"),
+		"start": MapValidator.coord_payload(start, dimension),
+		"reachable_count": visited.size(),
+		"returned_count": reachable_cells.size(),
+		"reachable_cells": reachable_cells,
+		"reachable_footholds": reachable_footholds,
+		"rightmost_frontier": MapValidator.coord_payload(rightmost, dimension),
+		"frontier_candidates": frontier_candidates,
+		"first_blocked_gap": first_blocked_gap,
+		"note": "Use rightmost_frontier as plan_reachable_map_growth.frontier; it was computed from the real start and real map cells.",
+	}
+
+
+static func _rightmost_frontier_candidates(reachable: Array, filled: Dictionary, region: Dictionary, movement: Dictionary, dimension: int, limit: int) -> Array:
+	if reachable.is_empty():
+		return []
+	var max_x := -2147483648
+	for coords_value in reachable:
+		var coords: Vector3i = coords_value
+		if coords.x > max_x and MapValidator.is_standable(filled, coords, region, movement):
+			max_x = coords.x
+	var candidates: Array = []
+	for coords_value in reachable:
+		var coords: Vector3i = coords_value
+		if coords.x < max_x - 2:
+			continue
+		if not MapValidator.is_standable(filled, coords, region, movement):
+			continue
+		candidates.append(coords)
+	candidates.sort_custom(func(a: Vector3i, b: Vector3i) -> bool:
+		if a.x == b.x:
+			return a.y < b.y
+		return a.x > b.x
+	)
+	var payload: Array = []
+	for coords in candidates:
+		if payload.size() >= limit:
+			break
+		payload.append(MapValidator.coord_payload(coords, dimension))
+	return payload
+
+
+static func _first_blocked_gap(filled: Dictionary, rightmost: Vector3i, region: Dictionary, movement: Dictionary, visited: Dictionary, dimension: int) -> Dictionary:
+	var probe_limit := max(1, int(movement.get("max_horizontal_gap", movement.get("max_step", 4))))
+	for dx in range(1, probe_limit + 1):
+		var probe := rightmost + Vector3i(dx, 0, 0)
+		if not MapValidator.in_region(probe, region):
+			return {"reason": "region_boundary", "after": MapValidator.coord_payload(rightmost, dimension), "probe": MapValidator.coord_payload(probe, dimension)}
+		if MapValidator.is_standable(filled, probe, region, movement) and not visited.has(MapValidator.coord_key(probe)):
+			return {"reason": "standable_but_unreachable", "after": MapValidator.coord_payload(rightmost, dimension), "probe": MapValidator.coord_payload(probe, dimension)}
+	return {}
+
+
+static func _platform_entry_anchor(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	if target.get_class() == "GridMap":
+		return {"ok": false, "message": "platform entry anchor requires a 2D TileMap/TileMapLayer", "error_code": "unsupported_map_type"}
+	var dimension := 2
+	var map_layer := int(input.get("map_layer", 0))
+	var region_x := int(input.get("x", 0))
+	var sample_width := max(3, int(input.get("entry_sample_width", 12)))
+	var sample_x := int(input.get("entry_sample_x", region_x - sample_width))
+	var sample_y := int(input.get("entry_sample_y", input.get("y", 0)))
+	var sample_height := max(4, int(input.get("entry_sample_height", input.get("height", 20))))
+	var best_support := Vector3i(-2147483648, 0, 0)
+	for y_offset in range(sample_height):
+		for x_offset in range(sample_width):
+			var coords := Vector3i(sample_x + x_offset, sample_y + y_offset, 0)
+			var cell := _read_map_cell(target, coords, dimension, map_layer)
+			if _is_empty_cell(target, cell):
+				continue
+			var above := _read_map_cell(target, coords + Vector3i(0, -1, 0), dimension, map_layer)
+			if not _is_empty_cell(target, above):
+				continue
+			if coords.x > best_support.x or (coords.x == best_support.x and coords.y < best_support.y):
+				best_support = coords
+	if best_support.x == -2147483648:
+		return {
+			"ok": false,
+			"message": "no reachable surface found in the left boundary sample",
+			"error_code": "platform_entry_anchor_not_found",
+			"sample_rect": {"x": sample_x, "y": sample_y, "width": sample_width, "height": sample_height},
+		}
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"map_layer": map_layer if target.get_class() == "TileMap" else null,
+		"sample_rect": {"x": sample_x, "y": sample_y, "width": sample_width, "height": sample_height},
+		"entry_support": {"x": best_support.x, "y": best_support.y},
+		"entry_anchor": {"x": best_support.x, "y": best_support.y - 1},
+		"note": "plan_platform_level must connect the first generated platform from this existing foothold.",
+	}
 
 
 ## Deterministically sample naturally spaced map cells for props, resources, enemies, or decor.

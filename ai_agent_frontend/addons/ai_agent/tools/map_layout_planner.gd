@@ -200,25 +200,31 @@ static func _resource_keys_for_intent(intent: Dictionary) -> Array:
 	for item in intent.get("objects", []):
 		if not (item is Dictionary):
 			continue
-		var name := str(item.get("name", ""))
+		var name := str(item.get("name", "")).strip_edges()
+		if name == "":
+			continue
 		if name in ["river", "water"]:
-			keys.append("river")
+			_add_unique(keys, "river")
 		elif name in ["path", "road"]:
-			keys.append("road")
+			_add_unique(keys, "road")
 		elif name in ["wall"]:
-			keys.append("wall")
+			_add_unique(keys, "wall")
 		elif name in ["door"]:
-			keys.append("door")
+			_add_unique(keys, "door")
 		elif name in ["torch"]:
-			keys.append("torch")
+			_add_unique(keys, "torch")
 		elif name in ["chest"]:
-			keys.append("chest")
+			_add_unique(keys, "chest")
 		elif name in ["tree"]:
-			keys.append("tree")
+			_add_unique(keys, "tree")
 		elif name in ["house"]:
-			keys.append("house")
+			_add_unique(keys, "house")
 		elif name in ["campfire"]:
-			keys.append("campfire")
+			_add_unique(keys, "campfire")
+		else:
+			# 不在已知同义词表里的资源词（lava/bridge/lantern 等）也按原名登记成一个 key，
+			# 否则 _missing_resources 完全不检查它，ready_for_edit_map 会在真缺资源时仍报"就绪"。
+			_add_unique(keys, name)
 	if str(intent.get("mode", "2d")) == "3d":
 		_add_unique(keys, "floor")
 		_add_unique(keys, "wall")
