@@ -17,7 +17,7 @@ static func _relative_path(root: Node, node: Node) -> String:
 static func _apply_optional_position(node: Node, input: Dictionary) -> Dictionary:
 	if not input.has("position"):
 		return {}
-	var position_value = input.get("position")
+	var position_value = _recover_json_encoded(input.get("position"))
 	if not position_value is Dictionary:
 		return {"ok": false, "message": "position must be an object with numeric x/y[/z] fields", "error_code": "invalid_position"}
 	var position: Dictionary = position_value
@@ -105,7 +105,19 @@ static func _coerce_property_value(current_value: Variant, raw_value: Variant) -
 	return {"ok": true, "value": raw_value}
 
 
+## 有些模型会把 {x,y}/{r,g,b,a} 这类嵌套对象再 JSON 编码成字符串传过来；
+## 能解析出 Dictionary/Array 就当真值用，解析不出来原样返回，留给下面的类型检查去报错。
+static func _recover_json_encoded(value: Variant) -> Variant:
+	if not (value is String):
+		return value
+	var parsed: Variant = JSON.parse_string(value as String)
+	if parsed is Dictionary or parsed is Array:
+		return parsed
+	return value
+
+
 static func _coerce_vector2(value: Variant) -> Dictionary:
+	value = _recover_json_encoded(value)
 	if value is Dictionary:
 		if not _has_numeric_components(value, ["x", "y"]):
 			return {"ok": false, "message": "Vector2 value must include numeric x/y fields", "error_code": "invalid_vector"}
@@ -124,6 +136,7 @@ static func _coerce_vector2(value: Variant) -> Dictionary:
 
 
 static func _coerce_vector3(value: Variant) -> Dictionary:
+	value = _recover_json_encoded(value)
 	if value is Dictionary:
 		if not _has_numeric_components(value, ["x", "y"]):
 			return {"ok": false, "message": "Vector3 value must include numeric x/y fields", "error_code": "invalid_vector"}
@@ -145,6 +158,7 @@ static func _coerce_vector3(value: Variant) -> Dictionary:
 
 
 static func _coerce_color(value: Variant) -> Dictionary:
+	value = _recover_json_encoded(value)
 	if value is Dictionary:
 		if not _has_numeric_components(value, ["r", "g", "b"]):
 			return {"ok": false, "message": "Color value must include numeric r/g/b fields", "error_code": "invalid_color"}
