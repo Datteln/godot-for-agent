@@ -138,11 +138,17 @@ def _read_only_mode(tool: ToolDef, ctx: PermissionContext) -> Decision:
     return "deny" if tool.mutating else "allow"
 
 
+def _full_access_mode(tool: ToolDef, ctx: PermissionContext) -> Decision:
+    """`full_access` 模式：硬安全边界通过后直接允许工具调用。"""
+    return "allow"
+
+
 _MODE_HANDLERS: dict[str, Callable[[ToolDef, PermissionContext], Decision]] = {
     "default": _default_mode,
     "plan": _plan_mode,
     "auto_approve": _auto_approve_mode,
     "read_only": _read_only_mode,
+    "full_access": _full_access_mode,
 }
 
 

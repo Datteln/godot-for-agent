@@ -131,6 +131,7 @@ func send_tool_results(results: Array, model = null) -> void:
 		"session_id": _session_id(),
 		"request_id": _new_request_id(),
 		"model": model,
+		"permission_mode": _setting("ai_agent/permission_mode"),
 		"tool_results": results,
 		"compact_summary_use_llm": _compact_summary_use_llm_override()
 	}

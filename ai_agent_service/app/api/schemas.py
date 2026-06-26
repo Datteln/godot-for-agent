@@ -11,7 +11,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
-PermissionMode = Literal["default", "plan", "auto_approve", "read_only"]
+PermissionMode = Literal["default", "plan", "auto_approve", "read_only", "full_access"]
 Effort = Literal["quick", "standard", "deep", "verify", "advisor"]
 
 

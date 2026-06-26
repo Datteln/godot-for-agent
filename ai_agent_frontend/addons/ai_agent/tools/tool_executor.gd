@@ -156,6 +156,14 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = MapTools.describe_map_context(input, editor_interface)
 		"plan_map_layout":
 			result = MapTools.plan_map_layout(input, editor_interface)
+		"plan_map_algorithms":
+			result = MapTools.plan_map_algorithms(input, editor_interface)
+		"plan_platform_level":
+			result = MapTools.plan_platform_level(input, editor_interface)
+		"sample_poisson_points":
+			result = MapTools.sample_poisson_points(input, editor_interface)
+		"compose_map_blueprint_grammar":
+			result = MapTools.compose_map_blueprint_grammar(input, editor_interface)
 		"describe_map_region":
 			result = MapTools.describe_map_region(input, editor_interface)
 		"edit_map":

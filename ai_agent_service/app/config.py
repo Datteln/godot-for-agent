@@ -81,7 +81,7 @@ class AppSettings(BaseSettings):
         default_factory=Path.cwd,
         description="当前 Godot 工程根目录；server 工具的检索/读取均限定于此目录。",
     )
-    permission_mode: Literal["default", "plan", "auto_approve", "read_only"] = Field(
+    permission_mode: Literal["default", "plan", "auto_approve", "read_only", "full_access"] = Field(
         default="default",
         description="会话初始权限模式，可被单次请求的 permission_mode 覆盖。",
     )

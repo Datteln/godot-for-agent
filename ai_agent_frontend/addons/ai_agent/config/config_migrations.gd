@@ -72,7 +72,7 @@ const DEFAULTS := {
 const PROPERTY_HINTS := {
 	"ai_agent/permission_mode": {
 		"hint": PROPERTY_HINT_ENUM,
-		"hint_string": "default,plan,auto_approve,read_only"
+		"hint_string": "read_only,default,full_access"
 	},
 	"ai_agent/ui_language": {
 		"hint": PROPERTY_HINT_ENUM,

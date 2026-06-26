@@ -7,9 +7,11 @@ const MapBlueprints = preload("res://addons/ai_agent/tools/map_blueprints.gd")
 const MapLayerScaffold = preload("res://addons/ai_agent/tools/map_layer_scaffold.gd")
 const MapIntentParser = preload("res://addons/ai_agent/tools/map_intent_parser.gd")
 const MapLayoutPlanner = preload("res://addons/ai_agent/tools/map_layout_planner.gd")
+const MapAlgorithms = preload("res://addons/ai_agent/tools/map_algorithms.gd")
+const MapPlatformComposer = preload("res://addons/ai_agent/tools/map_platform_composer.gd")
 
 const MAX_EDITED_CELLS := 100000
-const MAX_DESCRIBED_CELLS := 800
+const MAX_DESCRIBED_CELLS := 400
 const MAX_NOISE_CELLS := 4096
 ## 空间索引整份读出/整份重写，条目数上限防止它随使用无限膨胀、拖慢每次 edit_map。
 ## 到顶后仍允许更新/删除已有坐标，只拒绝新增坐标，并在结果里给出 warning。
@@ -1473,12 +1475,63 @@ static func plan_map_layout(input: Dictionary, editor_interface: EditorInterface
 		return context
 	var intent := MapIntentParser.parse(input, context)
 	var plan := MapLayoutPlanner.plan(intent, context)
+	var algorithm_input := input.duplicate(true)
+	algorithm_input["mode"] = str(intent.get("mode", input.get("mode", "2d")))
+	algorithm_input["theme"] = str(intent.get("theme", input.get("theme", "generic")))
+	algorithm_input["density"] = str(intent.get("style", {}).get("density", input.get("density", "medium"))) if intent.get("style", {}) is Dictionary else str(input.get("density", "medium"))
+	for key in ["x", "y", "z", "width", "height", "depth"]:
+		if not algorithm_input.has(key) and plan.get("region", {}) is Dictionary and (plan.get("region", {}) as Dictionary).has(key):
+			algorithm_input[key] = (plan.get("region", {}) as Dictionary)[key]
+	var algorithm_plan := MapAlgorithms.build_algorithm_plan(algorithm_input, context)
+	plan["algorithm_plan"] = algorithm_plan
 	return {
 		"ok": true,
 		"intent": intent,
 		"plan": plan,
 		"message": "Map intent parsed and layout planned; review missing_resources before editing.",
 	}
+
+
+## Build a reusable, read-only algorithm plan for map generation/editing.
+static func plan_map_algorithms(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var context := describe_map_context({}, editor_interface)
+	if not bool(context.get("ok", false)):
+		return context
+	return MapAlgorithms.build_algorithm_plan(input, context)
+
+
+## Build a platformer-specific critical path, jump graph, tile batches, reward arcs, and leap validation plan.
+static func plan_platform_level(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var context := describe_map_context({}, editor_interface)
+	if not bool(context.get("ok", false)):
+		return context
+	var platform_input := input.duplicate(true)
+	platform_input["mode"] = "2d"
+	return MapPlatformComposer.plan_platform_level(platform_input, context)
+
+
+## Deterministically sample naturally spaced map cells for props, resources, enemies, or decor.
+static func sample_poisson_points(input: Dictionary, _editor_interface: EditorInterface) -> Dictionary:
+	return MapAlgorithms.sample_poisson_points(input)
+
+
+## Compose reusable map modules into a blueprint/prefab stamping plan.
+static func compose_map_blueprint_grammar(input: Dictionary, _editor_interface: EditorInterface) -> Dictionary:
+	var result := MapAlgorithms.compose_blueprint_grammar(input)
+	var missing_files: Array = []
+	for stamp in result.get("stamps", []):
+		if not (stamp is Dictionary):
+			continue
+		var name := MapBlueprints.sanitize_name(str((stamp as Dictionary).get("name", "")))
+		if name == "":
+			continue
+		var path := BLUEPRINTS_DIR + "/" + name + ".json"
+		if not FileAccess.file_exists(ProjectSettings.globalize_path(path)):
+			missing_files.append({"name": name, "path": path})
+	if not missing_files.is_empty():
+		result["ok"] = false
+		result["missing_blueprints"] = missing_files
+	return result
 
 
 ## 压缩或清理空间索引，避免长期使用后整份索引无限增长。

@@ -29,6 +29,7 @@ const MAX_MESSAGE_RENDER_CHARS := 90000
 const MAX_REASONING_RENDER_CHARS := 30000
 const INPUT_MIN_HEIGHT := 60
 const INPUT_MAX_HEIGHT := 240
+const FINAL_RESPONSE_EVENT_WAIT_MS := 2500
 ## Plan/Verify 的展示性事件：通常没有活跃 LLM 文本流陪同到达，需要强制滚动一次，
 ## 否则容易在 ScrollContainer 重新计算高度期间被误判为"用户已上滑"而停止跟随。
 const _MILESTONE_EVENT_TYPES := {
@@ -93,6 +94,7 @@ var _history_btn: Button
 var _history_popup: PopupMenu
 var _history_session_ids: Array = []
 var _effort_options: OptionButton
+var _permission_options: OptionButton
 var _style_options: OptionButton
 var _model_input: LineEdit
 var _active_model_name := ""
@@ -115,6 +117,9 @@ var _indent_current_text := false
 var _event_queue: Array = []
 var _draining_events := false
 var _force_scroll_once := false
+var _pending_final_response := {}
+var _pending_final_event := {}
+var _pending_final_received_ms: int = -1
 
 var _stream_key := ""
 var _stream_row: Control
@@ -177,6 +182,15 @@ func _process(_delta: float) -> void:
 		var reasoning_now_ms := Time.get_ticks_msec()
 		if _reasoning_last_render_ms == 0 or reasoning_now_ms - _reasoning_last_render_ms >= REASONING_RENDER_INTERVAL_MS:
 			_render_reasoning_entry()
+	if not _pending_final_response.is_empty() and _pending_final_received_ms >= 0:
+		var final_wait_ms := Time.get_ticks_msec() - _pending_final_received_ms
+		if final_wait_ms >= FINAL_RESPONSE_EVENT_WAIT_MS and _event_queue.is_empty() and not _draining_events:
+			var pending_final: Dictionary = _pending_final_response.duplicate(true)
+			_clear_pending_final_pair()
+			FrontendLogger.warn(editor_interface, "ChatPanel", "Rendering pending final without matching event.", {
+				"wait_ms": final_wait_ms
+			})
+			_handle_final(pending_final)
 	# 空 final 超时兜底：收到空 final 后 60 秒内没有真正的 final 到来，强制结束 turn
 	if _empty_final_ignored_ms >= 0 and _state != AgentState.IDLE:
 		var elapsed_ms := Time.get_ticks_msec() - _empty_final_ignored_ms
@@ -358,6 +372,14 @@ func _build_ui() -> void:
 	status_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	status_row.add_child(status_spacer)
 
+	_permission_options = OptionButton.new()
+	_permission_options.tooltip_text = _ui("permission_tooltip")
+	for choice in _permission_choices():
+		_permission_options.add_item(str(choice.get("label", "")))
+		_permission_options.set_item_metadata(_permission_options.get_item_count() - 1, choice.get("mode", "default"))
+	status_row.add_child(_permission_options)
+	_sync_permission_selection()
+
 	_effort_options = OptionButton.new()
 	for effort in ["quick", "standard", "deep", "verify", "advisor"]:
 		_effort_options.add_item(effort)
@@ -416,6 +438,7 @@ func _connect_signals() -> void:
 	_new_session_btn.pressed.connect(_on_new_session)
 	_input.gui_input.connect(_on_input_gui_input)
 	_input.text_changed.connect(func(): _on_input_text_changed(_input.text))
+	_permission_options.item_selected.connect(_on_permission_selected)
 	_effort_options.item_selected.connect(_on_effort_selected)
 	_style_options.item_selected.connect(_on_style_selected)
 	_doctor_btn.pressed.connect(func(): _http_client.fetch_doctor())
@@ -476,6 +499,7 @@ func _on_send() -> void:
 	_auto_scroll = true
 	_force_scroll_once = true
 	_interrupted_locally = false
+	_clear_pending_final_pair()
 	_finish_streaming()
 	_mark_reasoning_stream_closed()
 	_finish_reasoning_stream()
@@ -829,7 +853,7 @@ func _on_response(response: Dictionary) -> void:
 			_handle_tool_calls(response)
 		"final":
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: final")
-			_handle_final(response)
+			_on_final_response(response)
 		"error":
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: error", {
 				"text": str(response.get("text", ""))
@@ -1875,6 +1899,7 @@ func _on_interrupt() -> void:
 	_event_queue.clear()
 	_draining_events = false
 	_clear_inline_confirmation()
+	_clear_pending_final_pair()
 	_finish_streaming()
 	_finish_reasoning_stream()
 	if undo_manager != null:
@@ -1993,9 +2018,18 @@ func _on_events(events: Array) -> void:
 				"payload_keys": payload.keys(),
 				"text_len": str(payload.get("text", "")).length()
 			})
-			_event_queue.append(event)
+			_enqueue_event(event)
 	if not _draining_events:
 		_drain_event_queue()
+
+
+func _enqueue_event(event: Dictionary) -> void:
+	_event_queue.append(event)
+	_event_queue.sort_custom(func(a, b):
+		if not (a is Dictionary) or not (b is Dictionary):
+			return false
+		return int(a.get("seq", 0)) < int(b.get("seq", 0))
+	)
 
 
 func _coalesce_events(events: Array) -> Array:
@@ -2036,6 +2070,29 @@ func _flush_delta_events(result: Array, latest_delta: Dictionary, ordered_delta_
 	ordered_delta_keys.clear()
 
 
+func _on_final_response(response: Dictionary) -> void:
+	if not _pending_final_event.is_empty():
+		var event: Dictionary = _pending_final_event.duplicate(true)
+		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+		payload["text"] = str(response.get("text", ""))
+		event["payload"] = payload
+		_clear_pending_final_pair()
+		_enqueue_event(event)
+		if not _draining_events:
+			_drain_event_queue()
+		return
+	_pending_final_response = response.duplicate(true)
+	_pending_final_received_ms = Time.get_ticks_msec()
+	if _http_client != null:
+		_http_client.poll_events()
+
+
+func _clear_pending_final_pair() -> void:
+	_pending_final_response.clear()
+	_pending_final_event.clear()
+	_pending_final_received_ms = -1
+
+
 func _drain_event_queue() -> void:
 	if _event_queue.is_empty():
 		_draining_events = false
@@ -2072,7 +2129,17 @@ func _handle_event(event: Dictionary) -> void:
 		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 		if payload.has("text"):
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (via event stream)", {})
+			_clear_pending_final_pair()
 			_handle_final(payload)
+		elif not _pending_final_response.is_empty():
+			var response: Dictionary = _pending_final_response.duplicate(true)
+			_clear_pending_final_pair()
+			FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (paired response)", {
+				"seq": int(event.get("seq", 0))
+			})
+			_handle_final(response)
+		else:
+			_pending_final_event = event.duplicate(true)
 	elif event_type == "agent_model_selected":
 		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 		_active_model_name = str(payload.get("model", "")).strip_edges()
@@ -2167,6 +2234,15 @@ func _on_style_selected(index: int) -> void:
 		state_store.set_value("output_style", style)
 
 
+func _on_permission_selected(index: int) -> void:
+	var mode := str(_permission_options.get_item_metadata(index))
+	FrontendLogger.info(editor_interface, "ChatPanel", "Permission mode selected.", {"permission_mode": mode})
+	ConfigMigrations.set_value(editor_interface, "ai_agent/permission_mode", mode)
+	_refresh_status_text()
+	if state_store != null:
+		state_store.set_value("permission_mode", mode)
+
+
 func _sync_effort_selection() -> void:
 	if editor_interface == null:
 		return
@@ -2175,6 +2251,50 @@ func _sync_effort_selection() -> void:
 		if _effort_options.get_item_text(index) == current:
 			_effort_options.select(index)
 			return
+
+
+func _sync_permission_selection() -> void:
+	if editor_interface == null:
+		return
+	var configured := str(ConfigMigrations.get_value(editor_interface, "ai_agent/permission_mode"))
+	var current := _normalize_permission_mode(configured)
+	if current != configured:
+		ConfigMigrations.set_value(editor_interface, "ai_agent/permission_mode", current)
+	for index in range(_permission_options.get_item_count()):
+		if str(_permission_options.get_item_metadata(index)) == current:
+			_permission_options.select(index)
+			return
+
+
+func _permission_choices() -> Array:
+	return [
+		{"mode": "read_only", "label": _ui("permission_read_only")},
+		{"mode": "default", "label": _ui("permission_confirm")},
+		{"mode": "full_access", "label": _ui("permission_full")},
+	]
+
+
+func _normalize_permission_mode(mode: String) -> String:
+	match mode:
+		"read_only", "plan":
+			return "read_only"
+		"full_access", "auto_approve":
+			return "full_access"
+		_:
+			return "default"
+
+
+func _permission_label() -> String:
+	var mode := "default"
+	if editor_interface != null:
+		mode = _normalize_permission_mode(str(ConfigMigrations.get_value(editor_interface, "ai_agent/permission_mode")))
+	match mode:
+		"read_only":
+			return _ui("permission_read_only")
+		"full_access":
+			return _ui("permission_full")
+		_:
+			return _ui("permission_confirm")
 
 
 func _update_output_styles(styles: Array) -> void:
@@ -2294,6 +2414,7 @@ func _status_text_for_state(value: int) -> String:
 	var parts: Array[String] = [base]
 	if _active_model_name != "":
 		parts.append(_active_model_name)
+	parts.append(_ui("status_permission") % _permission_label())
 	if _last_context_usage_status != "":
 		parts.append(_last_context_usage_status)
 	return " · ".join(parts)
@@ -2683,6 +2804,7 @@ func _append_tool_result_panel(call: Dictionary, result: Dictionary, preview: Co
 
 
 func _clear_messages() -> void:
+	_clear_pending_final_pair()
 	_finish_streaming()
 	_finish_reasoning_stream()
 	_rendered_assistant_keys.clear()

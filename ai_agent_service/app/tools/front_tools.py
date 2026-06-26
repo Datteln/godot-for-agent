@@ -1086,7 +1086,14 @@ def register_front_tools() -> None:
                     "Capture the editor's current 2D or 3D viewport as a PNG so the model can see the actual "
                     "result of a map/UI/animation change instead of only reading scene data. When asset "
                     "understanding is configured, the service also sends the screenshot through the multimodal "
-                    "asset-understanding model after applying the shared image compression/format conversion."
+                    "asset-understanding model after applying the shared image compression/format conversion. "
+                    "By default the viewport camera stays wherever the user last left it in the editor, so a "
+                    "screenshot can easily miss the region you just edited. Pass EITHER focus_node_path (any "
+                    "Node2D/Node3D path in the edited scene) OR focus_region+target_path (a map cell-coordinate "
+                    "rect, same x/y/z/width/height/depth shape used by edit_map/validate_map_region, target_path "
+                    "pointing at the TileMapLayer/TileMap/GridMap) to re-center the camera (3D) or pan/zoom the "
+                    "2D canvas onto the target before capturing, instead of guessing where the viewport happens "
+                    "to be pointed."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1095,6 +1102,39 @@ def register_front_tools() -> None:
                         "output_path": {
                             "type": "string",
                             "description": "Optional project-relative output path; defaults to a temp user:// location.",
+                        },
+                        "focus_node_path": {
+                            "type": "string",
+                            "description": (
+                                "Path (relative to the edited scene root) of a Node2D/Node3D to center the "
+                                "camera/canvas on before capturing. Mutually exclusive with focus_region; use "
+                                "this for a single node (a prop, a sign, a character) rather than a tile region."
+                            ),
+                        },
+                        "focus_region": {
+                            "type": "object",
+                            "description": (
+                                "Map cell-coordinate rect to frame before capturing, e.g. {\"x\":0,\"y\":0,"
+                                "\"width\":20,\"height\":10}. Requires target_path to identify the map node. "
+                                "Use the same region you just passed to edit_map/validate_map_region so the "
+                                "screenshot actually shows what you changed."
+                            ),
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer", "description": "3D only."},
+                                "width": {"type": "integer"},
+                                "height": {"type": "integer"},
+                                "depth": {"type": "integer", "description": "3D only."},
+                            },
+                        },
+                        "target_path": {
+                            "type": "string",
+                            "description": "TileMapLayer/TileMap/GridMap path; required when focus_region is set.",
+                        },
+                        "focus_margin": {
+                            "type": "number",
+                            "description": "Padding multiplier around the focus bounds (default 1.3); raise it to zoom out further.",
                         },
                     },
                 ),
@@ -1471,6 +1511,234 @@ def register_front_tools() -> None:
                         "depth": {"type": "integer", "minimum": 1},
                     },
                     [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="plan_map_algorithms",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "plan_map_algorithms",
+                "description": (
+                    "Build a reusable read-only algorithm plan for map generation/editing using the preferred "
+                    "general stack: zone planning, Poisson disk sampling, A*/NavMesh validation, "
+                    "grammar/blueprint composition, and constraint validation/repair. Use this before large "
+                    "or style-sensitive map edits when plan_map_layout is not enough."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "mode": {"type": "string", "enum": ["2d", "3d"]},
+                        "dimension": {"type": "string", "enum": ["2d", "3d"]},
+                        "theme": {"type": "string"},
+                        "pattern": {"type": "string"},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "density": {"type": "string", "enum": ["low", "medium", "high"]},
+                        "seed": {"type": "integer"},
+                        "min_object_distance": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Minimum grid distance between sampled object/decor points.",
+                        },
+                        "max_object_points": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Maximum sampled object/decor points.",
+                        },
+                        "blueprints": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional saved blueprint names to compose into the generated structure.",
+                        },
+                        "start": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        "goal": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        "waypoints": {
+                            "type": "array",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
+                        "entrances": {
+                            "type": "array",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
+                        "exits": {
+                            "type": "array",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
+                    },
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="plan_platform_level",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "plan_platform_level",
+                "description": (
+                    "Plan a 2D side-scrolling platformer level from player movement ability first. It builds "
+                    "a critical route of gameplay motifs, a jump reachability graph, preview-safe edit_map "
+                    "batches for support platforms, reward coin arcs, enemy slots, a score, and a "
+                    "validate_map_region plan using movement_model='leap'. Use for Mario/Celeste/platform "
+                    "maps instead of generic zone/Poisson planning."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 8},
+                        "height": {"type": "integer", "minimum": 8},
+                        "ground_y": {
+                            "type": "integer",
+                            "description": "Support-row y coordinate for the first platform; defaults to vertical center.",
+                        },
+                        "seed": {"type": "integer"},
+                        "max_horizontal_gap": {
+                            "type": "integer",
+                            "minimum": 2,
+                            "description": "Maximum horizontal jump distance in cells, derived from the real controller.",
+                        },
+                        "max_rise": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Maximum upward jump height in cells, derived from the real controller.",
+                        },
+                        "max_fall": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum acceptable downward landing difference in cells.",
+                        },
+                        "min_landing_width": {
+                            "type": "integer",
+                            "minimum": 2,
+                            "description": "Minimum safe landing platform width in cells.",
+                        },
+                        "platform_thickness": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Tile thickness for emitted platform support fill operations.",
+                        },
+                        "ground_resource": {
+                            "type": "string",
+                            "description": "Semantic resource key used by emitted edit_map platform fill drafts.",
+                        },
+                        "fallback_ground_resource": {
+                            "type": "string",
+                            "description": "Fallback resource key for emitted platform fill drafts.",
+                        },
+                    },
+                    ["width", "height"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="sample_poisson_points",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "sample_poisson_points",
+                "description": (
+                    "Deterministically sample naturally spaced map cells for props, resources, enemies, "
+                    "collectibles, or decoration. Use instead of hand-rolling random coordinates."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "mode": {"type": "string", "enum": ["2d", "3d"]},
+                        "dimension": {"type": "string", "enum": ["2d", "3d"]},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "min_distance": {"type": "integer", "minimum": 1},
+                        "max_points": {"type": "integer", "minimum": 0},
+                        "seed": {"type": "integer"},
+                        "zone": {
+                            "type": "string",
+                            "description": "Optional zone/semantic_layer name when zones are provided.",
+                        },
+                        "zones": {
+                            "type": "array",
+                            "description": "Optional zones from plan_map_algorithms/plan_map_layout.algorithm_plan.",
+                            "items": {"type": "object"},
+                        },
+                        "exclude": {
+                            "type": "array",
+                            "description": "Exact cells to exclude from sampling.",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
+                    },
+                    ["width", "height"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="compose_map_blueprint_grammar",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "compose_map_blueprint_grammar",
+                "description": (
+                    "Compose saved map blueprints/prefabs into a read-only stamping plan. Returns "
+                    "apply_map_blueprint drafts when blueprint names are supplied, or edit/terrain fallback "
+                    "drafts when no blueprints are available. It never edits the scene."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "mode": {"type": "string", "enum": ["2d", "3d"]},
+                        "dimension": {"type": "string", "enum": ["2d", "3d"]},
+                        "pattern": {"type": "string"},
+                        "region": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                                "width": {"type": "integer", "minimum": 1},
+                                "height": {"type": "integer", "minimum": 1},
+                                "depth": {"type": "integer", "minimum": 1},
+                            },
+                        },
+                        "zones": {"type": "array", "items": {"type": "object"}},
+                        "anchors": {"type": "object"},
+                        "blueprints": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Saved blueprint names to stamp in grammar slots.",
+                        },
+                        "seed": {"type": "integer"},
+                    },
+                    ["region"],
                 ),
             },
         )

@@ -2,6 +2,7 @@
 extends RefCounted
 
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
+const MapTools = preload("res://addons/ai_agent/tools/map_tools.gd")
 
 
 ## 节点路径相对于"被编辑场景的根节点"而非 `node.get_path()` 的 SceneTree 绝对路径。
@@ -880,6 +881,9 @@ static func list_open_scenes(editor_interface: EditorInterface) -> Dictionary:
 
 
 ## 截取编辑器当前 2D/3D 视口画面并存为 PNG，让 agent 能"看到"地图/UI/动画的实际效果。
+## 可选 focus_node_path（任意 Node2D/Node3D 的场景内路径）或 focus_region+target_path
+## （地图格子坐标区域，复用 map_tools 的 target 解析）让相机/2D 画布在截图前自动对准目标，
+## 不再依赖用户手动把编辑器视口滚动到对的位置。
 static func capture_viewport_screenshot(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available"}
@@ -891,6 +895,18 @@ static func capture_viewport_screenshot(input: Dictionary, editor_interface: Edi
 		viewport = editor_interface.get_editor_viewport_2d()
 	if viewport == null:
 		return {"ok": false, "message": "Requested editor viewport is not available", "error_code": "viewport_unavailable"}
+
+	var focus_result := _resolve_focus_points(input, editor_interface)
+	if not bool(focus_result.get("ok", false)):
+		return focus_result
+	var focus_applied := {}
+	var focus_points: Array = focus_result.get("points", [])
+	if not focus_points.is_empty():
+		var margin := maxf(1.0, float(input.get("focus_margin", 1.3)))
+		var apply_result := _apply_camera_focus(viewport, mode, focus_points, margin)
+		if not bool(apply_result.get("ok", false)):
+			return apply_result
+		focus_applied = apply_result
 
 	var tree := editor_interface.get_base_control().get_tree()
 	if tree != null:
@@ -919,7 +935,119 @@ static func capture_viewport_screenshot(input: Dictionary, editor_interface: Edi
 	var err := image.save_png(absolute)
 	if err != OK:
 		return {"ok": false, "message": "Failed to save screenshot (error %d)" % err, "error_code": "save_failed"}
-	return {"ok": true, "path": output_path, "absolute_path": absolute, "width": image.get_width(), "height": image.get_height()}
+	var result := {"ok": true, "path": output_path, "absolute_path": absolute, "width": image.get_width(), "height": image.get_height()}
+	if not focus_applied.is_empty():
+		result["focus"] = focus_applied
+	return result
+
+
+## 解析 focus_node_path（场景内任意 Node2D/Node3D 路径）或 focus_region+target_path
+## （地图格子坐标区域，配合 map_tools._resolve_map_target 解析地图节点并用其
+## map_to_local/to_global 转出真实世界坐标，而不是手算 tile_size/cell_size 乘法）。
+## 两者都没传时返回空 points，调用方按"不需要对焦"处理。
+static func _resolve_focus_points(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var focus_node_path := str(input.get("focus_node_path", "")).strip_edges()
+	var region_value = input.get("focus_region", null)
+	if focus_node_path == "" and not (region_value is Dictionary):
+		return {"ok": true, "points": []}
+
+	var root := editor_interface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "message": "No scene is currently being edited", "error_code": "no_edited_scene"}
+
+	if focus_node_path != "":
+		var node := root if focus_node_path == "." else root.get_node_or_null(NodePath(focus_node_path))
+		if node == null:
+			return {"ok": false, "message": "focus_node_path not found: " + focus_node_path, "error_code": "focus_node_not_found"}
+		if node is Node2D:
+			return {"ok": true, "points": [(node as Node2D).global_position]}
+		elif node is Node3D:
+			return {"ok": true, "points": [(node as Node3D).global_position]}
+		return {"ok": false, "message": "focus_node_path must point to a Node2D or Node3D", "error_code": "unsupported_focus_node"}
+
+	var target_result := MapTools._resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var map_node: Node = target_result["node"]
+	var dimension := 3 if map_node.get_class() == "GridMap" else 2
+	var region: Dictionary = region_value
+	var x := int(region.get("x", 0))
+	var y := int(region.get("y", 0))
+	var width := maxi(1, int(region.get("width", 1)))
+	var height := maxi(1, int(region.get("height", 1)))
+	var points: Array = []
+	if dimension == 3:
+		var z := int(region.get("z", 0))
+		var depth := maxi(1, int(region.get("depth", 1)))
+		var corners3: Array[Vector3i] = [
+			Vector3i(x, y, z),
+			Vector3i(x + width - 1, y, z),
+			Vector3i(x, y + height - 1, z),
+			Vector3i(x, y, z + depth - 1),
+			Vector3i(x + width - 1, y + height - 1, z + depth - 1),
+		]
+		for corner in corners3:
+			var local3: Vector3 = map_node.call("map_to_local", corner)
+			points.append((map_node as Node3D).to_global(local3))
+	else:
+		var corners2: Array[Vector2i] = [
+			Vector2i(x, y),
+			Vector2i(x + width - 1, y),
+			Vector2i(x, y + height - 1),
+			Vector2i(x + width - 1, y + height - 1),
+		]
+		for corner in corners2:
+			var local2: Vector2 = map_node.call("map_to_local", corner)
+			points.append((map_node as Node2D).to_global(local2))
+	return {"ok": true, "points": points}
+
+
+## 2D 直接改写 viewport 的 global_canvas_transform（编辑器画布缩放/平移用的就是这个属性），
+## 3D 沿相机当前朝向后退到能把目标包进视野的距离，再 look_at 目标中心——
+## 不依赖任何"模拟按键触发 Frame Selected"这种内部实现细节，全部走公开 API。
+static func _apply_camera_focus(viewport: Viewport, mode: String, points: Array, margin: float) -> Dictionary:
+	if points.is_empty():
+		return {"ok": true, "applied": false}
+	if mode == "3d":
+		var camera := viewport.get_camera_3d()
+		if camera == null:
+			return {"ok": false, "message": "No active Camera3D in the requested viewport", "error_code": "no_active_camera"}
+		var min_p: Vector3 = points[0]
+		var max_p: Vector3 = points[0]
+		for p in points:
+			min_p = min_p.min(p)
+			max_p = max_p.max(p)
+		var center := (min_p + max_p) * 0.5
+		var radius := maxf((max_p - min_p).length() * 0.5, 0.5)
+		var fov_deg := camera.fov if camera.projection == Camera3D.PROJECTION_PERSPECTIVE else 50.0
+		var fov_rad := deg_to_rad(fov_deg)
+		var distance := (radius * margin) / maxf(0.001, tan(fov_rad * 0.5))
+		distance = maxf(distance, camera.near * 4.0)
+		var back := camera.global_transform.basis.z
+		if back.length() < 0.001:
+			back = Vector3(0, 0, 1)
+		back = back.normalized()
+		camera.global_position = center + back * distance
+		camera.look_at(center, Vector3.UP)
+		return {"ok": true, "applied": true, "center": {"x": center.x, "y": center.y, "z": center.z}, "distance": distance}
+	else:
+		var min_p2: Vector2 = points[0]
+		var max_p2: Vector2 = points[0]
+		for p in points:
+			min_p2 = min_p2.min(p)
+			max_p2 = max_p2.max(p)
+		var center2 := (min_p2 + max_p2) * 0.5
+		var size2 := max_p2 - min_p2
+		size2 = Vector2(maxf(size2.x, 16.0), maxf(size2.y, 16.0))
+		var viewport_size := Vector2(viewport.size)
+		if viewport_size.x <= 0.0 or viewport_size.y <= 0.0:
+			return {"ok": false, "message": "Viewport has no size", "error_code": "viewport_no_size"}
+		var zoom := minf(viewport_size.x / (size2.x * margin), viewport_size.y / (size2.y * margin))
+		zoom = clampf(zoom, 0.02, 16.0)
+		var transform := Transform2D(0.0, Vector2.ZERO).scaled(Vector2(zoom, zoom))
+		transform.origin = viewport_size * 0.5 - center2 * zoom
+		viewport.global_canvas_transform = transform
+		return {"ok": true, "applied": true, "center": {"x": center2.x, "y": center2.y}, "zoom": zoom}
 
 
 static func _set_owner_preserving_scene_instances(node: Node, owner: Node) -> void:

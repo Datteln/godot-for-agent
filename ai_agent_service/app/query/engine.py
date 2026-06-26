@@ -289,10 +289,14 @@ _HISTORY_FRONT_READ_TOOLS = frozenset(
         "describe_tilemap_selection",
         "describe_map_context",
         "plan_map_layout",
+        "plan_map_algorithms",
+        "plan_platform_level",
         "describe_map_region",
         "query_spatial_index",
         "validate_map_region",
         "sample_noise_grid",
+        "sample_poisson_points",
+        "compose_map_blueprint_grammar",
         "validate_scene_state",
     }
 )

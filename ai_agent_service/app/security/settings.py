@@ -43,7 +43,7 @@ class SecuritySettings(BaseModel):
 
     project_root: Path
     trusted: bool = False
-    permission_mode: Literal["default", "plan", "auto_approve", "read_only"] = "default"
+    permission_mode: Literal["default", "plan", "auto_approve", "read_only", "full_access"] = "default"
     enabled_domains: list[str] = Field(
         default_factory=lambda: ["core", "program", "map", "scene", "resource", "project"]
     )
