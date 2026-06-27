@@ -99,6 +99,17 @@ func _replace_event_http() -> void:
 	_create_event_http()
 
 
+func _abandon_inflight_request() -> void:
+	if _busy:
+		_replace_chat_http()
+	_busy = false
+	_inflight_generation = -1
+	_inflight_path = ""
+	_inflight_session_id = ""
+	_inflight_started_at_msec = 0
+	_request_timeout_timer.stop()
+
+
 func send_user_message(text: String, context: Dictionary, model = null) -> void:
 	_suppress_events = false
 	_configure_event_timer()
@@ -124,15 +135,41 @@ func send_user_message(text: String, context: Dictionary, model = null) -> void:
 
 func send_tool_results(results: Array, model = null) -> void:
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing tool results.", {"count": results.size()})
+	var valid_results: Array = []
+	var dropped := 0
 	for item in results:
-		if item is Dictionary:
-			item["turn_id"] = current_turn_id
+		if not (item is Dictionary):
+			dropped += 1
+			continue
+		var result: Dictionary = item
+		var missing_required := false
+		for key in ["tool_use_id", "frame_id", "status"]:
+			if str(result.get(key, "")).strip_edges() == "":
+				missing_required = true
+				break
+		if missing_required:
+			dropped += 1
+			FrontendLogger.warn(editor_interface, "HTTP", "Dropping invalid tool result before /chat.", {
+				"keys": result.keys(),
+				"turn_id": str(result.get("turn_id", "")),
+			})
+			continue
+		result["turn_id"] = current_turn_id
+		valid_results.append(result)
+	if dropped > 0:
+		FrontendLogger.warn(editor_interface, "HTTP", "Dropped invalid tool results.", {"dropped": dropped, "kept": valid_results.size()})
+		emit_signal("error_occurred", "Invalid tool results; suppressed partial tool result submission.")
+		return
+	if valid_results.is_empty():
+		FrontendLogger.warn(editor_interface, "HTTP", "No valid tool results to send; request suppressed.", {})
+		emit_signal("error_occurred", "No valid tool results to send.")
+		return
 	var payload := {
 		"session_id": _session_id(),
 		"request_id": _new_request_id(),
 		"model": model,
 		"permission_mode": _setting("ai_agent/permission_mode"),
-		"tool_results": results,
+		"tool_results": valid_results,
 		"compact_summary_use_llm": _compact_summary_use_llm_override()
 	}
 	_enqueue("POST", "/chat", payload)
@@ -151,10 +188,18 @@ func _compact_summary_use_llm_override() -> Variant:
 
 
 func reset_session() -> void:
+	var abandoned_path := _inflight_path
+	var abandoned_session_id := _inflight_session_id
 	current_turn_id = ""
 	_request_generation += 1
+	_queue.clear()
+	_abandon_inflight_request()
 	_suppress_events = false
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing session reset.", {"session_id": _session_id()})
+	if abandoned_path == "/chat":
+		_enqueue("POST", "/chat/interrupt", {
+			"session_id": abandoned_session_id if abandoned_session_id != "" else _session_id()
+		})
 	_enqueue("POST", "/reset", {"session_id": _session_id()})
 
 
@@ -166,9 +211,7 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 	})
 	_request_generation += 1
 	_queue.clear()
-	_replace_chat_http()
-	_busy = false
-	_request_timeout_timer.stop()
+	_abandon_inflight_request()
 	_replace_event_http()
 	current_turn_id = ""
 	_last_event_seq = 0
@@ -184,13 +227,11 @@ func interrupt_current() -> void:
 	_request_generation += 1
 	_suppress_events = true
 	_queue.clear()
-	_replace_chat_http()
+	_abandon_inflight_request()
 	# `cancel_request()` 不保证触发 `request_completed`（曾导致 `_busy` 卡死为
 	# true，后续所有请求——包括下面要发的 `/chat/interrupt` 和用户的下一条
 	# 消息——永远排在队列里发不出去）。这里不再等待那个信号，直接复位，
 	# 迟到的信号会被 `_on_request_completed` 的生成号检查丢弃。
-	_busy = false
-	_request_timeout_timer.stop()
 	_replace_event_http()
 	if _event_timer != null:
 		_event_timer.stop()
@@ -398,8 +439,7 @@ func _on_request_timeout() -> void:
 		"queue_size": _queue.size()
 	})
 	_request_generation += 1
-	_replace_chat_http()
-	_busy = false
+	_abandon_inflight_request()
 	var interrupt_enqueued := false
 	if timed_out_path == "/chat":
 		# 前端单方面放弃等待并不会让后端的 agent 循环停下来——它会继续跑完
@@ -431,6 +471,13 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			"completed_generation": completed_generation,
 			"current_generation": _request_generation
 		})
+		_busy = false
+		_inflight_generation = -1
+		_inflight_path = ""
+		_inflight_session_id = ""
+		_inflight_started_at_msec = 0
+		_request_timeout_timer.stop()
+		_pump()
 		return
 	_request_timeout_timer.stop()
 	_busy = false

@@ -432,6 +432,15 @@ func _build_children() -> void:
 	_log_renderer.rich_text_setup = _configure_message_rich_text
 
 
+func _ensure_log_renderer() -> void:
+	if _log_renderer != null:
+		return
+	_log_renderer = LogEntryRenderer.new()
+	_log_renderer.theme_colors = _theme_colors
+	_log_renderer.editor_interface = editor_interface
+	_log_renderer.rich_text_setup = _configure_message_rich_text
+
+
 func _connect_signals() -> void:
 	_send_btn.pressed.connect(_on_send)
 	_stop_btn.pressed.connect(_on_interrupt)
@@ -1238,6 +1247,7 @@ func _handle_tool_calls(response: Dictionary) -> void:
 			var result: Dictionary = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
+			result = _ensure_tool_result_for_call(call, result)
 			results.append(result)
 			_append_tool_result(call, result, preview, stats)
 
@@ -1374,6 +1384,7 @@ func _apply_thought_prefix(text: String) -> String:
 ## 渲染后端为历史回放重建的 "Thought for Xs\n<思考正文>" 条目：第一行做折叠标题，
 ## 剩余部分原样作为 detail，整段不经过通用的按行动作前缀拆分（见调用处注释）。
 func _append_history_thought_item(text: String) -> void:
+	_ensure_log_renderer()
 	var stripped := text.strip_edges()
 	var newline := stripped.find("\n")
 	var header := stripped if newline == -1 else stripped.substr(0, newline)
@@ -1448,6 +1459,7 @@ func _handle_final(response: Dictionary) -> void:
 
 
 func _handle_session_history(response: Dictionary) -> void:
+	_ensure_log_renderer()
 	if _state != AgentState.IDLE:
 		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored session history while a turn is active.", {
 			"state": _status.text
@@ -1533,6 +1545,7 @@ func _render_legacy_history_items(items: Array) -> void:
 
 
 func _render_history_block(block: Dictionary) -> void:
+	_ensure_log_renderer()
 	var block_type := str(block.get("type", ""))
 	match block_type:
 		"user":
@@ -1838,6 +1851,7 @@ func _on_error(message: String) -> void:
 
 
 func _show_pending_results_notice() -> void:
+	_ensure_log_renderer()
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
@@ -2346,6 +2360,7 @@ func _on_inline_apply() -> void:
 			var result: Dictionary = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
+			result = _ensure_tool_result_for_call(call, result)
 			result["grant_session_allow"] = _inline_confirm.grant_session_allow()
 			results.append(result)
 			_append_tool_result(call, result, preview, stats)
@@ -2400,6 +2415,23 @@ func _request_model():
 	return model if model != "" else null
 
 
+func _ensure_tool_result_for_call(call: Dictionary, result: Dictionary) -> Dictionary:
+	for key in ["tool_use_id", "frame_id", "status"]:
+		if str(result.get(key, "")).strip_edges() == "":
+			FrontendLogger.warn(editor_interface, "ChatPanel", "Tool executor returned an invalid result; converting to error result.", {
+				"tool": str(call.get("name", "")),
+				"tool_use_id": str(call.get("id", "")),
+				"frame_id": str(call.get("frame_id", "")),
+				"result_keys": result.keys(),
+			})
+			return AgentDTO.error_result(
+				call,
+				"Tool executor returned an invalid result without required metadata.",
+				"invalid_front_tool_result"
+			)
+	return result
+
+
 func _status_text_for_state(value: int) -> String:
 	var base := _ui("idle")
 	match value:
@@ -2414,7 +2446,6 @@ func _status_text_for_state(value: int) -> String:
 	var parts: Array[String] = [base]
 	if _active_model_name != "":
 		parts.append(_active_model_name)
-	parts.append(_ui("status_permission") % _permission_label())
 	if _last_context_usage_status != "":
 		parts.append(_last_context_usage_status)
 	return " · ".join(parts)
@@ -2537,6 +2568,7 @@ func _should_ignore_stream_delta(key: String, text: String) -> bool:
 
 
 func _ensure_reasoning_entry(key: String) -> void:
+	_ensure_log_renderer()
 	if _reasoning_key == key and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
 		return
 	_mark_reasoning_stream_closed()
@@ -2589,6 +2621,7 @@ func _format_token_count(count: int) -> String:
 
 
 func _ensure_stream_message(key: String, indent := false) -> void:
+	_ensure_log_renderer()
 	if _stream_key == key and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		return
 	_discard_stream_message()
@@ -2672,6 +2705,7 @@ func _render_event_description(event: Dictionary) -> String:
 
 
 func _append_message(role: String, text: String, color = null) -> void:
+	_ensure_log_renderer()
 	if role == "assistant":
 		var assistant_key := _message_fingerprint(text)
 		if _rendered_assistant_keys.has(assistant_key):
@@ -2716,6 +2750,7 @@ func _message_fingerprint(text: String) -> String:
 
 
 func _append_log_stream_message(text: String, color = null, mark_text: bool = false) -> void:
+	_ensure_log_renderer()
 	_log_renderer.append_log_stream_message(
 		_message_list,
 		_limit_render_text(text, MAX_MESSAGE_RENDER_CHARS),
@@ -2754,6 +2789,7 @@ func _append_tool_result(call: Dictionary, result: Dictionary, preview: Control 
 ## diff 预览 + 状态行。特意不用卡片面板包起来——要和 Read/Grep 等其它工作流
 ## 条目保持同样的"⏺ 标记 + 纯文本行"外观，否则会显得是另一种不同的 UI 元素。
 func _append_tool_result_panel(call: Dictionary, result: Dictionary, preview: Control, diff_stats: Dictionary) -> void:
+	_ensure_log_renderer()
 	var status := str(result.get("status", ""))
 	var content := VBoxContainer.new()
 	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL

@@ -88,6 +88,7 @@ func _on_apply() -> void:
 		var apply := index < _checkboxes.size() and _checkboxes[index].button_pressed
 		if apply and tool_executor != null:
 			var result: Dictionary = await tool_executor.execute(call)
+			result = _ensure_tool_result_for_call(call, result)
 			result["grant_session_allow"] = _always_allow.button_pressed
 			results.append(result)
 		else:
@@ -106,6 +107,17 @@ func _on_reject() -> void:
 			results.append(AgentDTO.rejected_result(call))
 	hide()
 	rejected.emit(results)
+
+
+func _ensure_tool_result_for_call(call: Dictionary, result: Dictionary) -> Dictionary:
+	for key in ["tool_use_id", "frame_id", "status"]:
+		if str(result.get(key, "")).strip_edges() == "":
+			return AgentDTO.error_result(
+				call,
+				"Tool executor returned an invalid result without required metadata.",
+				"invalid_front_tool_result"
+			)
+	return result
 
 
 func _set_busy(value: bool) -> void:

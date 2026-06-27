@@ -137,7 +137,10 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 	var coverage_edited_extent_before := _layer_used_extent_2d(target, map_layer)
 	var coverage_siblings := _sibling_layers_for_coverage(target, map_layer)
 	for sibling in coverage_siblings:
-		(sibling as Dictionary)["extent"] = _layer_used_extent_2d((sibling as Dictionary)["node"], int((sibling as Dictionary)["map_layer"]))
+		var sibling_node: Node = (sibling as Dictionary)["node"]
+		var sibling_map_layer := int((sibling as Dictionary)["map_layer"])
+		(sibling as Dictionary)["extent"] = _layer_used_extent_2d(sibling_node, sibling_map_layer)
+		(sibling as Dictionary)["columns"] = _used_columns_2d(sibling_node, sibling_map_layer)
 	var before: Array = []
 	var after: Array = []
 	var touched := {}
@@ -146,7 +149,22 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		if not (operation_value is Dictionary):
 			return {"ok": false, "message": "each operation must be an object", "error_code": "invalid_operation"}
 		var operation: Dictionary = operation_value
-		_apply_registry_fallback_to_operation(operation, dimension)
+		var resolved_resource_entry := _apply_registry_fallback_to_operation(operation, dimension)
+		var resolved_scene_path := str(resolved_resource_entry.get("scene_path", "")).strip_edges()
+		if resolved_scene_path != "":
+			# 语义表里这个资源是按 scene_path（对象/PackedScene）登记的，不是瓦片——用 edit_map
+			# 硬拒绝，而不是只在 prompt 里提醒模型"别这么做"。否则模型容易用 fill 拼瓦片
+			# 凑出一个视觉上不对的近似形状（比如把"树"垒成几块毫不相关的地形瓦片）。
+			return {
+				"ok": false,
+				"message": (
+					"Resource '%s' is registered with scene_path '%s' (an object/PackedScene), not a tile — " +
+					"use place_map_objects to instantiate it instead of edit_map."
+				) % [str(resolved_resource_entry.get("_resolved_resource", operation.get("resource", operation.get("resource_key", "")))), resolved_scene_path],
+				"error_code": "resource_requires_object_placement",
+				"resource": str(resolved_resource_entry.get("_resolved_resource", "")),
+				"scene_path": resolved_scene_path,
+			}
 		var built := _build_map_operation(target, dimension, map_layer, operation, pending_cells)
 		if not bool(built.get("ok", false)):
 			return built
@@ -185,7 +203,8 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		for cell in after:
 			_apply_map_cell(target, cell)
 	var coverage_edited_extent_after := _layer_used_extent_2d(target, map_layer)
-	var coverage_gaps := _compute_coverage_gaps(coverage_edited_extent_before, coverage_edited_extent_after, coverage_siblings)
+	var coverage_target_columns_after := _used_columns_2d(target, map_layer)
+	var coverage_gaps := _compute_coverage_gaps(coverage_edited_extent_before, coverage_edited_extent_after, coverage_siblings, coverage_target_columns_after)
 	var result := {
 		"ok": true,
 		"target": str(target_result.get("path", "")),
@@ -223,6 +242,42 @@ static func _layer_used_extent_2d(node: Node, map_layer: int) -> Dictionary:
 	if node.get_class() == "TileMap":
 		return _used_bounds_2d(node.call("get_used_cells", map_layer))
 	return {}
+
+
+## 取一个 2D 图层当前"有瓦片的列"集合（x -> true）。光比 min/max 边界测不出中间的洞——
+## 背景层最外边界可能早就跟上了，但夹在中间的一段从来没铺过；逐列扫一遍才能发现这种洞。
+static func _used_columns_2d(node: Node, map_layer: int) -> Dictionary:
+	var columns := {}
+	if node == null:
+		return columns
+	var cells: Array = []
+	if node.get_class() == "TileMapLayer":
+		cells = node.call("get_used_cells")
+	elif node.get_class() == "TileMap":
+		cells = node.call("get_used_cells", map_layer)
+	for cell_value in cells:
+		var coords: Vector2i = cell_value
+		columns[coords.x] = true
+	return columns
+
+
+## 把一串已排序的整数列号压缩成连续区间，报告里不堆一长串单独的列号。
+static func _compress_columns_to_ranges(columns: Array) -> Array:
+	if columns.is_empty():
+		return []
+	var ranges: Array = []
+	var range_start := int(columns[0])
+	var range_end := int(columns[0])
+	for i in range(1, columns.size()):
+		var value := int(columns[i])
+		if value == range_end + 1:
+			range_end = value
+		else:
+			ranges.append({"from": range_start, "to": range_end})
+			range_start = value
+			range_end = value
+	ranges.append({"from": range_start, "to": range_end})
+	return ranges
 
 
 ## 跟当前编辑的图层"同组"的其它图层：legacy TileMap 下是同一个节点的其它 layer index；
@@ -288,8 +343,10 @@ static func _is_blanket_layer(extent: Dictionary, union_extent: Dictionary) -> b
 ## 哪些"毯式"图层的覆盖范围已经跟不上地图整体范围了。extent_before/extent_after 是
 ## 同一个目标图层自己的范围（`edit_map` 传编辑前后两个不同的值；`validate_map_region`
 ## 没有编辑动作，传同一个"当前范围"两次即可，逻辑完全复用）。siblings 是同组其它图层
-## （每个元素带它们当前的 "extent"，不受这次调用影响）。
-static func _compute_coverage_gaps(extent_before: Dictionary, extent_after: Dictionary, siblings: Array) -> Array:
+## （每个元素带它们当前的 "extent" 和 "columns"，不受这次调用影响）。target_columns_after
+## 是目标图层自己当前（`edit_map` 编辑后/`validate_map_region` 当前）的"有瓦片的列"集合，
+## 用来做逐列空洞扫描——只比边界测不出"中间漏了一段"这种洞，边界对得上也可能有洞。
+static func _compute_coverage_gaps(extent_before: Dictionary, extent_after: Dictionary, siblings: Array, target_columns_after: Dictionary = {}) -> Array:
 	if extent_after.is_empty() or siblings.is_empty():
 		return []
 	var sibling_extents: Array = []
@@ -317,8 +374,15 @@ static func _compute_coverage_gaps(extent_before: Dictionary, extent_after: Dict
 			shortfall["top"] = int(sibling_extent["min_y"]) - int(union_after["min_y"])
 		if int(sibling_extent["max_y"]) < int(union_after["max_y"]) - tolerance:
 			shortfall["bottom"] = int(union_after["max_y"]) - int(sibling_extent["max_y"])
-		if not shortfall.is_empty():
-			gaps.append({
+		var sibling_columns: Dictionary = sibling.get("columns", {})
+		var missing_columns: Array = []
+		for column_key in target_columns_after.keys():
+			if not sibling_columns.has(column_key):
+				missing_columns.append(int(column_key))
+		missing_columns.sort()
+		var interior_holes := _compress_columns_to_ranges(missing_columns)
+		if not shortfall.is_empty() or not interior_holes.is_empty():
+			var gap_entry := {
 				"layer": sibling.get("label", ""),
 				"map_layer": sibling.get("map_layer", 0),
 				"current_extent": {
@@ -327,12 +391,135 @@ static func _compute_coverage_gaps(extent_before: Dictionary, extent_after: Dict
 					"min_y": sibling_extent["min_y"],
 					"max_y": sibling_extent["max_y"],
 				},
-				"shortfall_cells": shortfall,
-			})
+			}
+			if not shortfall.is_empty():
+				gap_entry["shortfall_cells"] = shortfall
+			if not interior_holes.is_empty():
+				gap_entry["interior_holes_x"] = interior_holes
+			gaps.append(gap_entry)
 	return gaps
 
 
 ## 使用 TileSet terrain connect API 绘制一组 2D terrain cell，让道路/水域边缘自动衔接。
+static func validate_layer_coverage(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	if target.get_class() == "GridMap":
+		return {"ok": true, "target": str(target_result.get("path", "")), "dimension": 3, "passed": true, "layer_coverage_gaps": []}
+	var map_layer := int(input.get("map_layer", 0))
+	var coverage_extent := _layer_used_extent_2d(target, map_layer)
+	var coverage_siblings := _sibling_layers_for_coverage(target, map_layer)
+	for sibling in coverage_siblings:
+		var sibling_node: Node = (sibling as Dictionary)["node"]
+		var sibling_map_layer := int((sibling as Dictionary)["map_layer"])
+		(sibling as Dictionary)["extent"] = _layer_used_extent_2d(sibling_node, sibling_map_layer)
+		(sibling as Dictionary)["columns"] = _used_columns_2d(sibling_node, sibling_map_layer)
+	var coverage_target_columns := _used_columns_2d(target, map_layer)
+	var coverage_gaps := _compute_coverage_gaps(coverage_extent, coverage_extent, coverage_siblings, coverage_target_columns)
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"dimension": 2,
+		"map_layer": map_layer if target.get_class() == "TileMap" else null,
+		"target_extent": coverage_extent,
+		"passed": coverage_gaps.is_empty(),
+		"layer_coverage_gaps": coverage_gaps,
+	}
+
+
+static func repair_layer_coverage(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	if target.get_class() == "GridMap":
+		return {"ok": false, "message": "layer coverage repair is only available for 2D TileMap/TileMapLayer targets", "error_code": "unsupported_map_type"}
+	var map_layer := int(input.get("map_layer", 0))
+	var target_extent := _layer_used_extent_2d(target, map_layer)
+	var siblings := _sibling_layers_for_coverage(target, map_layer)
+	var sibling_extents: Array = []
+	for sibling in siblings:
+		var sibling_node: Node = (sibling as Dictionary)["node"]
+		var sibling_map_layer := int((sibling as Dictionary)["map_layer"])
+		(sibling as Dictionary)["extent"] = _layer_used_extent_2d(sibling_node, sibling_map_layer)
+		(sibling as Dictionary)["columns"] = _used_columns_2d(sibling_node, sibling_map_layer)
+		sibling_extents.append((sibling as Dictionary)["extent"])
+	var target_columns := _used_columns_2d(target, map_layer)
+	var gaps := _compute_coverage_gaps(target_extent, target_extent, siblings, target_columns)
+	if gaps.is_empty():
+		return {"ok": true, "target": str(target_result.get("path", "")), "repaired": false, "cells": 0, "layer_coverage_gaps": []}
+	var union_extent := _merge_extents_2d([target_extent] + sibling_extents)
+	var max_cells := max(1, int(input.get("max_cells", 4096)))
+	var jobs: Array = []
+	var repaired_layers := {}
+	for gap_value in gaps:
+		var gap: Dictionary = gap_value
+		var repair_sibling := _coverage_sibling_for_gap(siblings, gap)
+		if repair_sibling.is_empty():
+			continue
+		var repair_node: Node = repair_sibling["node"]
+		var repair_layer := int(repair_sibling["map_layer"])
+		var repair_extent: Dictionary = repair_sibling.get("extent", {})
+		if repair_extent.is_empty():
+			continue
+		var columns := _coverage_repair_columns(gap, union_extent, target_columns)
+		for x_value in columns:
+			var x := int(x_value)
+			var source_x := clampi(x, int(repair_extent["min_x"]), int(repair_extent["max_x"]))
+			for y in range(int(union_extent["min_y"]), int(union_extent["max_y"]) + 1):
+				var target_coords := Vector3i(x, y, 0)
+				var source_coords := Vector3i(source_x, clampi(y, int(repair_extent["min_y"]), int(repair_extent["max_y"])), 0)
+				var source_cell := _read_map_cell(repair_node, source_coords, 2, repair_layer)
+				if _is_empty_cell(repair_node, source_cell):
+					continue
+				var current_cell := _read_map_cell(repair_node, target_coords, 2, repair_layer)
+				if not _is_empty_cell(repair_node, current_cell):
+					continue
+				var next_cell := source_cell.duplicate(true)
+				next_cell["coords"] = target_coords
+				next_cell["map_layer"] = repair_layer
+				jobs.append({"node": repair_node, "before": current_cell, "after": next_cell})
+				repaired_layers[str(gap.get("layer", repair_layer))] = true
+				if jobs.size() > max_cells:
+					return {
+						"ok": false,
+						"message": "layer coverage repair exceeds max_cells; rerun with a smaller region or larger max_cells",
+						"error_code": "coverage_repair_too_large",
+						"cells": jobs.size(),
+						"max_cells": max_cells,
+						"layer_coverage_gaps": gaps,
+					}
+	if jobs.is_empty():
+		return {
+			"ok": false,
+			"message": "no source background cells were available to copy into the coverage gap",
+			"error_code": "coverage_repair_no_source_cells",
+			"layer_coverage_gaps": gaps,
+		}
+	for job_value in jobs:
+		var job: Dictionary = job_value
+		if undo_manager != null:
+			undo_manager.record_tile_cells(job["node"], [job["before"]], [job["after"]])
+		else:
+			_apply_map_cell(job["node"], job["after"])
+	var remaining := validate_layer_coverage(input, editor_interface).get("layer_coverage_gaps", [])
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"repaired": true,
+		"cells": jobs.size(),
+		"layers": repaired_layers.keys(),
+		"previous_layer_coverage_gaps": gaps,
+		"layer_coverage_gaps": remaining,
+	}
+
+
 static func paint_terrain_connect(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
@@ -365,6 +552,18 @@ static func paint_terrain_connect(input: Dictionary, editor_interface: EditorInt
 			}
 		before.append(_read_map_cell(target, coords, dimension, map_layer))
 	var terrain_resource := _registry_entry_for_resource_input(input)
+	var terrain_scene_path := str(terrain_resource.get("scene_path", "")).strip_edges()
+	if terrain_scene_path != "" and not input.has("terrain_set") and not input.has("terrain"):
+		return {
+			"ok": false,
+			"message": (
+				"Resource '%s' is registered with scene_path '%s' (an object/PackedScene), not a terrain — " +
+				"use place_map_objects instead of paint_terrain_connect."
+			) % [str(terrain_resource.get("_resolved_resource", input.get("resource", input.get("resource_key", "")))), terrain_scene_path],
+			"error_code": "resource_requires_object_placement",
+			"resource": str(terrain_resource.get("_resolved_resource", "")),
+			"scene_path": terrain_scene_path,
+		}
 	var terrain_set := int(input.get("terrain_set", terrain_resource.get("terrain_set", 0)))
 	var terrain := int(input.get("terrain", terrain_resource.get("terrain", 0)))
 	var ignore_empty := bool(input.get("ignore_empty_terrains", true))
@@ -451,6 +650,21 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 				"coords": MapValidator.coord_payload(coords, dimension),
 				"blocking_entry": blocked_cells[coord_key],
 			}
+		var placement_profile := _placement_profile_from_spec(object_spec, input)
+		var placement_check := _validate_single_object_placement(
+			map_node,
+			str(target_result.get("path", "")),
+			dimension,
+			map_layer_for_placement(input),
+			coords,
+			placement_profile,
+			occupied,
+			blocked_cells,
+			planned,
+			input
+		)
+		if not bool(placement_check.get("ok", true)):
+			return placement_check
 		var resource_key := str(object_spec.get("resource", object_spec.get("resource_key", ""))).strip_edges()
 		var resource_def: Dictionary = _registry_entry_with_fallback(registry_data, resource_key, str(object_spec.get("fallback_resource", "")))
 		if resource_def.has("_resolved_resource"):
@@ -503,6 +717,247 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 ## 只读地查询一小块现有地图区域的真实瓦片/网格数据，外加地图节点自身的坐标系数。
 ## 用于在扩建/延伸地形前先弄清楚现有内容到底长什么样、世界坐标怎么换算，而不是
 ## 靠 tile_catalog 里"有哪些瓦片可用"自己瞎拼，或者假设 origin/tile_size 是常量。
+static func find_placement_anchors(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var map_layer := map_layer_for_placement(input)
+	var region := MapValidator.region_from_input(input, dimension)
+	if int(region["width"]) * int(region["height"]) * int(region["depth"]) > MAX_DESCRIBED_CELLS:
+		return {
+			"ok": false,
+			"message": "anchor search region exceeds the %d-cell limit; search a smaller region" % MAX_DESCRIBED_CELLS,
+			"error_code": "region_too_large",
+		}
+	var profile := _placement_profile_from_spec(input, input)
+	var occupied := _object_occupancy_from_spatial_index(str(target_result.get("path", "")), dimension)
+	var blocked_cells := _blocked_object_cells_from_spatial_index(str(target_result.get("path", "")), dimension)
+	var protected_cells := _protected_cell_set(input, dimension)
+	var candidate_result := _placement_candidate_cells(input, region, profile, dimension)
+	if not bool(candidate_result.get("ok", false)):
+		return candidate_result
+	var anchors: Array = []
+	var rejected := {
+		"occupied_or_blocked": 0,
+		"missing_support": 0,
+		"not_empty": 0,
+		"clearance": 0,
+		"protected_path": 0,
+	}
+	for coords in candidate_result.get("candidates", []):
+		var check := _validate_single_object_placement(
+			target,
+			str(target_result.get("path", "")),
+			dimension,
+			map_layer,
+			coords,
+			profile,
+			occupied,
+			blocked_cells,
+			{},
+			input
+		)
+		if bool(check.get("ok", false)):
+			anchors.append({
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"score": _score_placement_anchor(coords, profile, protected_cells, str(target_result.get("path", "")), input, dimension),
+				"profile": profile.get("name", ""),
+				"surface_source": candidate_result.get("source", "region"),
+				"footprint_cells": check.get("footprint_cells", []),
+				"support_cells": check.get("support_cells", []),
+			})
+		else:
+			var reason := str(check.get("error_code", "rejected"))
+			match reason:
+				"placement_missing_support":
+					rejected["missing_support"] = int(rejected["missing_support"]) + 1
+				"placement_cell_not_empty":
+					rejected["not_empty"] = int(rejected["not_empty"]) + 1
+				"placement_clearance_blocked":
+					rejected["clearance"] = int(rejected["clearance"]) + 1
+				"placement_protected_cell":
+					rejected["protected_path"] = int(rejected["protected_path"]) + 1
+				_:
+					rejected["occupied_or_blocked"] = int(rejected["occupied_or_blocked"]) + 1
+	anchors.sort_custom(func(a, b): return float(a.get("score", 0.0)) > float(b.get("score", 0.0)))
+	var max_results := max(1, int(input.get("max_results", 32)))
+	if anchors.size() > max_results:
+		anchors = anchors.slice(0, max_results)
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"dimension": dimension,
+		"map_layer": map_layer if target.get_class() == "TileMap" else null,
+		"region": region,
+		"profile": profile,
+		"candidate_source": candidate_result.get("source", "region"),
+		"anchors": anchors,
+		"rejected_summary": rejected,
+	}
+
+
+static func validate_object_placements(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var map_layer := map_layer_for_placement(input)
+	var objects_value = input.get("objects", [])
+	if not (objects_value is Array) or (objects_value as Array).is_empty():
+		return {"ok": false, "message": "objects must be a non-empty array", "error_code": "invalid_objects"}
+	var occupied := _object_occupancy_from_spatial_index(str(target_result.get("path", "")), dimension)
+	var blocked_cells := _blocked_object_cells_from_spatial_index(str(target_result.get("path", "")), dimension)
+	var planned := {}
+	var issues: Array = []
+	var placements: Array = []
+	for object_value in objects_value:
+		if not (object_value is Dictionary):
+			issues.append({"error_code": "invalid_object", "message": "each object must be an object"})
+			continue
+		var object_spec: Dictionary = object_value
+		var coords := MapValidator.coord_from_input(object_spec, dimension)
+		var profile := _placement_profile_from_spec(object_spec, input)
+		var check := _validate_single_object_placement(
+			target,
+			str(target_result.get("path", "")),
+			dimension,
+			map_layer,
+			coords,
+			profile,
+			occupied,
+			blocked_cells,
+			planned,
+			input
+		)
+		var entry := {
+			"coords": MapValidator.coord_payload(coords, dimension),
+			"profile": profile.get("name", ""),
+			"passed": bool(check.get("ok", false)),
+		}
+		if bool(check.get("ok", false)):
+			entry["footprint_cells"] = check.get("footprint_cells", [])
+			entry["support_cells"] = check.get("support_cells", [])
+			planned[MapValidator.coord_key(coords)] = true
+		else:
+			entry["issue"] = check
+			issues.append(entry)
+		placements.append(entry)
+	var repair_plan: Array = []
+	for issue_value in issues:
+		var issue: Dictionary = issue_value
+		var issue_coords = issue.get("coords", {})
+		if issue_coords is Dictionary:
+			repair_plan.append({
+				"type": "object_relocate",
+				"action": "find_placement_anchors",
+				"from": issue_coords,
+				"profile": issue.get("profile", ""),
+				"note": "Search nearby legal anchors with the same placement profile, then call place_map_objects on the chosen anchor.",
+			})
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"dimension": dimension,
+		"map_layer": map_layer if target.get_class() == "TileMap" else null,
+		"passed": issues.is_empty(),
+		"placements": placements,
+		"issues": issues,
+		"repair_plan": repair_plan,
+	}
+
+
+static func repair_placements(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var root := editor_interface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "message": "No scene is currently being edited", "error_code": "no_edited_scene"}
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var map_layer := map_layer_for_placement(input)
+	var region := MapValidator.region_from_input(input, dimension)
+	var target_path := str(target_result.get("path", ""))
+	var entries := _repairable_placement_entries(input, target_path, region, dimension)
+	if entries.is_empty():
+		return {"ok": true, "changed": false, "message": "No indexed objects matched the repair request", "moved": []}
+	var before_text := _read_text_file(SPATIAL_INDEX_PATH)
+	var parsed = JSON.parse_string(before_text) if before_text != "" else {}
+	var index: Dictionary = parsed if parsed is Dictionary else {}
+	var occupied := _occupied_object_cells_for_repair(target_path, dimension)
+	var blocked := _blocked_object_cells_from_spatial_index(target_path, dimension)
+	var moved: Array = []
+	var plans: Array = []
+	for entry_value in entries:
+		var entry: Dictionary = entry_value
+		var old_coords := MapValidator.coord_from_input(entry.get("coords", {}), dimension)
+		var old_key := MapValidator.coord_key(old_coords)
+		var profile_input := input.duplicate(true)
+		profile_input["ignore_object_coords"] = [MapValidator.coord_payload(old_coords, dimension)]
+		if not profile_input.has("placement_kind") and not profile_input.has("kind"):
+			profile_input["placement_kind"] = _placement_kind_from_entry(entry)
+		var profile := _placement_profile_from_spec(profile_input, profile_input)
+		occupied.erase(old_key)
+		var current_check := _validate_single_object_placement(target, target_path, dimension, map_layer, old_coords, profile, occupied, blocked, {}, profile_input)
+		if bool(current_check.get("ok", false)):
+			occupied[old_key] = true
+			continue
+		var anchor_result := _best_placement_anchor(target, target_path, region, dimension, map_layer, profile, occupied, blocked, profile_input)
+		if not bool(anchor_result.get("ok", false)):
+			occupied[old_key] = true
+			plans.append({"entry": entry, "issue": current_check, "repair": anchor_result})
+			continue
+		var new_coords := MapValidator.coord_from_input(anchor_result.get("coords", {}), dimension)
+		var node := _resolve_indexed_object_node(root, entry)
+		if node == null:
+			occupied[old_key] = true
+			plans.append({"entry": entry, "issue": current_check, "suggested_anchor": anchor_result, "reason": "indexed object has no resolvable node"})
+			continue
+		var before_position = null
+		if node is Node3D:
+			before_position = (node as Node3D).position
+		elif node is Node2D:
+			before_position = (node as Node2D).position
+		_apply_object_position(node, target, new_coords, dimension)
+		var after_position = null
+		if node is Node3D:
+			after_position = (node as Node3D).position
+		elif node is Node2D:
+			after_position = (node as Node2D).position
+		if undo_manager != null and before_position != null and after_position != null and undo_manager.has_method("record_node_property"):
+			undo_manager.record_node_property(node, "position", before_position, after_position)
+		_update_object_entry_coords(index, entry, old_coords, new_coords, dimension)
+		occupied[MapValidator.coord_key(new_coords)] = true
+		moved.append({
+			"node": str(root.get_path_to(node)),
+			"from": MapValidator.coord_payload(old_coords, dimension),
+			"to": MapValidator.coord_payload(new_coords, dimension),
+			"score": anchor_result.get("score", 0.0),
+			"issue": current_check.get("error_code", ""),
+		})
+	var after_text := JSON.stringify(index, "\t")
+	var write_result := _write_json_file(SPATIAL_INDEX_PATH, before_text, after_text, undo_manager)
+	if not bool(write_result.get("ok", false)):
+		return write_result
+	return {
+		"ok": true,
+		"changed": not moved.is_empty(),
+		"target": target_path,
+		"moved": moved,
+		"unrepaired": plans,
+		"spatial_index": {"ok": true, "updated": true, "path": SPATIAL_INDEX_PATH},
+	}
+
+
 static func describe_map_region(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
@@ -720,10 +1175,10 @@ static func _copy_operation_metadata(operation: Dictionary, cell: Dictionary) ->
 			cell[key] = operation[key]
 
 
-static func _apply_registry_fallback_to_operation(operation: Dictionary, dimension: int) -> void:
+static func _apply_registry_fallback_to_operation(operation: Dictionary, dimension: int) -> Dictionary:
 	var resource_entry := _registry_entry_for_resource_input(operation)
 	if resource_entry.is_empty():
-		return
+		return resource_entry
 	if resource_entry.has("_resolved_resource") and not operation.has("resource"):
 		operation["resource"] = str(resource_entry.get("_resolved_resource", ""))
 	if dimension == 3:
@@ -744,6 +1199,7 @@ static func _apply_registry_fallback_to_operation(operation: Dictionary, dimensi
 				operation["atlas_x"] = int((atlas as Dictionary).get("x", -1))
 			if not operation.has("atlas_y"):
 				operation["atlas_y"] = int((atlas as Dictionary).get("y", -1))
+	return resource_entry
 
 
 static func _registry_entry_for_resource_input(input: Dictionary) -> Dictionary:
@@ -1226,6 +1682,705 @@ static func _apply_object_metadata(
 		node.set_meta("map_agent_tags", object_spec.get("tags", []))
 
 
+static func map_layer_for_placement(input: Dictionary) -> int:
+	return int(input.get("map_layer", input.get("ground_map_layer", 0)))
+
+
+static func _placement_profile_from_spec(spec: Dictionary, fallback: Dictionary) -> Dictionary:
+	var kind := str(spec.get("placement_kind", spec.get("kind", fallback.get("placement_kind", fallback.get("kind", ""))))).to_lower()
+	var profile := {
+		"name": kind if kind != "" else "generic",
+		"anchor": "bottom_center",
+		"surface_type": "ground",
+		"footprint_width": 1,
+		"footprint_height": 1,
+		"requires_support": true,
+		"support_mode": "bottom",
+		"support_layers": [],
+		"forbidden_layers": ["water", "hazard", "blocked", "obstacle"],
+		"clearance_left": 0,
+		"clearance_right": 0,
+		"clearance_up": 0,
+		"clearance_down": 0,
+		"clearance_front": 0,
+		"clearance_back": 0,
+		"avoid_protected_cells": true,
+		"requires_reachable": false,
+		"reachability_point": "anchor",
+		"interaction_offset": {"x": 0, "y": 0, "z": 0},
+		"entrance_offset": {"x": 0, "y": 0, "z": 0},
+	}
+	match kind:
+		"tree", "rock", "bush", "decor":
+			profile["footprint_width"] = 1
+			profile["footprint_height"] = 3 if kind == "tree" else 1
+			profile["clearance_left"] = 1 if kind == "tree" else 0
+			profile["clearance_right"] = 1 if kind == "tree" else 0
+		"building", "house", "hut":
+			profile["footprint_width"] = 4
+			profile["footprint_height"] = 4
+			profile["clearance_left"] = 1
+			profile["clearance_right"] = 1
+			profile["clearance_up"] = 1
+		"npc", "enemy":
+			profile["footprint_width"] = 1
+			profile["footprint_height"] = 2
+			profile["clearance_left"] = 1
+			profile["clearance_right"] = 1
+		"chest", "pickup", "save_point":
+			profile["footprint_width"] = 1
+			profile["footprint_height"] = 1
+			profile["clearance_left"] = 1
+			profile["clearance_right"] = 1
+		"coin", "flying", "air":
+			profile["requires_support"] = false
+			profile["surface_type"] = "air"
+			profile["footprint_width"] = 1
+			profile["footprint_height"] = 1
+	profile["anchor"] = str(spec.get("anchor", fallback.get("anchor", profile["anchor"]))).to_lower()
+	profile["surface_type"] = str(spec.get("surface_type", fallback.get("surface_type", profile["surface_type"]))).to_lower()
+	if profile["surface_type"] in ["water", "water_surface"]:
+		profile["support_layers"] = ["water"]
+		profile["requires_support"] = true
+	if profile["surface_type"] == "wall":
+		profile["support_mode"] = "wall"
+	profile["footprint_width"] = max(1, int(spec.get("footprint_width", fallback.get("footprint_width", profile["footprint_width"]))))
+	profile["footprint_height"] = max(1, int(spec.get("footprint_height", fallback.get("footprint_height", profile["footprint_height"]))))
+	profile["requires_support"] = bool(spec.get("requires_support", fallback.get("requires_support", profile["requires_support"])))
+	profile["support_mode"] = str(spec.get("support_mode", fallback.get("support_mode", profile["support_mode"])))
+	profile["support_layers"] = _string_array_from_value(spec.get("support_layers", fallback.get("support_layers", profile["support_layers"])))
+	profile["forbidden_layers"] = _string_array_from_value(spec.get("forbidden_layers", fallback.get("forbidden_layers", profile["forbidden_layers"])))
+	var clearance_value := max(0, int(spec.get("clearance", fallback.get("clearance", 0))))
+	profile["clearance_left"] = max(0, int(spec.get("clearance_left", fallback.get("clearance_left", profile["clearance_left"])))) + clearance_value
+	profile["clearance_right"] = max(0, int(spec.get("clearance_right", fallback.get("clearance_right", profile["clearance_right"])))) + clearance_value
+	profile["clearance_up"] = max(0, int(spec.get("clearance_up", fallback.get("clearance_up", profile["clearance_up"])))) + clearance_value
+	profile["clearance_down"] = max(0, int(spec.get("clearance_down", fallback.get("clearance_down", profile["clearance_down"])))) + clearance_value
+	profile["clearance_front"] = max(0, int(spec.get("clearance_front", fallback.get("clearance_front", profile["clearance_front"])))) + clearance_value
+	profile["clearance_back"] = max(0, int(spec.get("clearance_back", fallback.get("clearance_back", profile["clearance_back"])))) + clearance_value
+	profile["min_distance_to_protected"] = max(0, int(spec.get("min_distance_to_protected", fallback.get("min_distance_to_protected", 0))))
+	profile["preferred_distance_to_protected"] = max(0, int(spec.get("preferred_distance_to_protected", fallback.get("preferred_distance_to_protected", 0))))
+	profile["min_distance_from_same_kind"] = max(0, int(spec.get("min_distance_from_same_kind", fallback.get("min_distance_from_same_kind", 0))))
+	profile["requires_reachable"] = bool(spec.get("requires_reachable", fallback.get("requires_reachable", profile["requires_reachable"])))
+	profile["reachability_point"] = str(spec.get("reachability_point", fallback.get("reachability_point", profile["reachability_point"]))).to_lower()
+	profile["interaction_offset"] = _coord_dict_from_value(spec.get("interaction_offset", fallback.get("interaction_offset", profile["interaction_offset"])), dimension_from_profile(fallback))
+	profile["entrance_offset"] = _coord_dict_from_value(spec.get("entrance_offset", fallback.get("entrance_offset", profile["entrance_offset"])), dimension_from_profile(fallback))
+	return profile
+
+
+static func _validate_single_object_placement(
+	map_node: Node,
+	target_path: String,
+	dimension: int,
+	map_layer: int,
+	coords: Vector3i,
+	profile: Dictionary,
+	occupied: Dictionary,
+	blocked_cells: Dictionary,
+	planned: Dictionary,
+	input: Dictionary
+) -> Dictionary:
+	var footprint := _placement_footprint(coords, profile, dimension)
+	var support := _placement_support_cells(coords, profile, dimension)
+	var protected_cells := _protected_cell_set(input, dimension)
+	var forbidden_layers: Array = profile.get("forbidden_layers", [])
+	var support_layers: Array = profile.get("support_layers", [])
+	for cell in footprint:
+		var key := MapValidator.coord_key(cell)
+		if occupied.has(key) or blocked_cells.has(key) or planned.has(key):
+			return {
+				"ok": false,
+				"message": "object footprint overlaps an occupied/blocked/protected map cell",
+				"error_code": "placement_clearance_blocked",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"blocking_cell": MapValidator.coord_payload(cell, dimension),
+				"target": target_path,
+			}
+		var semantic_hit := _cell_has_any_semantic_layer(target_path, cell, dimension, forbidden_layers)
+		if bool(semantic_hit.get("hit", false)):
+			return {
+				"ok": false,
+				"message": "object footprint intersects a forbidden semantic layer",
+				"error_code": "placement_forbidden_layer",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"blocking_cell": MapValidator.coord_payload(cell, dimension),
+				"semantic": semantic_hit,
+			}
+		if protected_cells.has(key) and bool(profile.get("avoid_protected_cells", true)):
+			return {
+				"ok": false,
+				"message": "object footprint intersects a protected route/frontier cell",
+				"error_code": "placement_protected_cell",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"blocking_cell": MapValidator.coord_payload(cell, dimension),
+			}
+		var map_cell := _read_map_cell(map_node, cell, dimension, map_layer)
+		if not _is_empty_cell(map_node, map_cell):
+			return {
+				"ok": false,
+				"message": "object footprint must be empty",
+				"error_code": "placement_cell_not_empty",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"blocking_cell": MapValidator.coord_payload(cell, dimension),
+			}
+	var clearance_cells := _placement_clearance_cells(coords, profile, dimension)
+	for cell in clearance_cells:
+		var key := MapValidator.coord_key(cell)
+		if protected_cells.has(key):
+			return {
+				"ok": false,
+				"message": "object clearance intersects a protected route/frontier cell",
+				"error_code": "placement_protected_cell",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"blocking_cell": MapValidator.coord_payload(cell, dimension),
+			}
+		if occupied.has(key) or blocked_cells.has(key) or planned.has(key):
+			return {
+				"ok": false,
+				"message": "object clearance overlaps an occupied/blocked map cell",
+				"error_code": "placement_clearance_blocked",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"blocking_cell": MapValidator.coord_payload(cell, dimension),
+			}
+		var clearance_semantic_hit := _cell_has_any_semantic_layer(target_path, cell, dimension, forbidden_layers)
+		if bool(clearance_semantic_hit.get("hit", false)):
+			return {
+				"ok": false,
+				"message": "object clearance intersects a forbidden semantic layer",
+				"error_code": "placement_forbidden_layer",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"blocking_cell": MapValidator.coord_payload(cell, dimension),
+				"semantic": clearance_semantic_hit,
+			}
+	if bool(profile.get("requires_support", true)):
+		var supported := false
+		var support_layer_match := support_layers.is_empty()
+		for cell in support:
+			var support_cell := _read_map_cell(map_node, cell, dimension, map_layer)
+			if not _is_empty_cell(map_node, support_cell):
+				supported = true
+				if support_layers.is_empty() or bool(_cell_has_any_semantic_layer(target_path, cell, dimension, support_layers).get("hit", false)):
+					support_layer_match = true
+				break
+		if not supported:
+			return {
+				"ok": false,
+				"message": "object placement requires solid support under its footprint",
+				"error_code": "placement_missing_support",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"support_cells": _coord_payloads(support, dimension),
+			}
+		if not support_layer_match:
+			return {
+				"ok": false,
+				"message": "object support exists but does not match required support_layers",
+				"error_code": "placement_support_layer_mismatch",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"support_cells": _coord_payloads(support, dimension),
+				"support_layers": support_layers,
+			}
+	var surface_check := _validate_placement_surface(map_node, target_path, coords, profile, dimension, map_layer)
+	if not bool(surface_check.get("ok", true)):
+		return surface_check
+	var reachability_check := _validate_placement_reachability(map_node, coords, profile, input, dimension, map_layer)
+	if not bool(reachability_check.get("ok", true)):
+		return reachability_check
+	var same_kind_distance := int(profile.get("min_distance_from_same_kind", 0))
+	if same_kind_distance > 0:
+		var nearest_same := _nearest_same_kind_distance(coords, profile, target_path, input, dimension)
+		if nearest_same < same_kind_distance:
+			return {
+				"ok": false,
+				"message": "object placement is too close to another object of the same kind/resource",
+				"error_code": "placement_same_kind_too_close",
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"nearest_same_kind_distance": nearest_same,
+				"min_distance_from_same_kind": same_kind_distance,
+			}
+	return {
+		"ok": true,
+		"coords": MapValidator.coord_payload(coords, dimension),
+		"footprint_cells": _coord_payloads(footprint, dimension),
+		"support_cells": _coord_payloads(support, dimension),
+	}
+
+
+static func _placement_footprint(anchor: Vector3i, profile: Dictionary, dimension: int) -> Array:
+	var width := max(1, int(profile.get("footprint_width", 1)))
+	var height := max(1, int(profile.get("footprint_height", 1)))
+	var cells: Array = []
+	var bounds := _placement_bounds(anchor, profile, dimension)
+	if dimension == 3:
+		for x in range(int(bounds["min_x"]), int(bounds["max_x"]) + 1):
+			for y in range(int(bounds["min_y"]), int(bounds["max_y"]) + 1):
+				for z in range(int(bounds["min_z"]), int(bounds["max_z"]) + 1):
+					cells.append(Vector3i(x, y, z))
+	else:
+		for x in range(int(bounds["min_x"]), int(bounds["max_x"]) + 1):
+			for y in range(int(bounds["min_y"]), int(bounds["max_y"]) + 1):
+				cells.append(Vector3i(x, y, 0))
+	return cells
+
+
+static func _placement_support_cells(anchor: Vector3i, profile: Dictionary, dimension: int) -> Array:
+	var bounds := _placement_bounds(anchor, profile, dimension)
+	var cells: Array = []
+	if dimension == 3:
+		for x in range(int(bounds["min_x"]), int(bounds["max_x"]) + 1):
+			for z in range(int(bounds["min_z"]), int(bounds["max_z"]) + 1):
+				cells.append(Vector3i(x, int(bounds["min_y"]) - 1, z))
+	else:
+		for x in range(int(bounds["min_x"]), int(bounds["max_x"]) + 1):
+			cells.append(Vector3i(x, int(bounds["max_y"]) + 1, 0))
+	return cells
+
+
+static func _placement_clearance_cells(anchor: Vector3i, profile: Dictionary, dimension: int) -> Array:
+	var left := max(0, int(profile.get("clearance_left", 0)))
+	var right := max(0, int(profile.get("clearance_right", 0)))
+	var up := max(0, int(profile.get("clearance_up", 0)))
+	var down := max(0, int(profile.get("clearance_down", 0)))
+	var front := max(0, int(profile.get("clearance_front", 0)))
+	var back := max(0, int(profile.get("clearance_back", 0)))
+	if left + right + up + down + front + back <= 0:
+		return []
+	var bounds := _placement_bounds(anchor, profile, dimension)
+	var footprint_keys := {}
+	for cell in _placement_footprint(anchor, profile, dimension):
+		footprint_keys[MapValidator.coord_key(cell)] = true
+	var cells: Array = []
+	for x in range(int(bounds["min_x"]) - left, int(bounds["max_x"]) + right + 1):
+		for y in range(int(bounds["min_y"]) - up, int(bounds["max_y"]) + down + 1):
+			for z in range((int(bounds["min_z"]) - back) if dimension == 3 else 0, ((int(bounds["max_z"]) + front + 1) if dimension == 3 else 1)):
+				var next := Vector3i(x, y, z)
+				var key := MapValidator.coord_key(next)
+				if not footprint_keys.has(key):
+					cells.append(next)
+					footprint_keys[key] = true
+	return cells
+
+
+static func _placement_bounds(anchor: Vector3i, profile: Dictionary, dimension: int) -> Dictionary:
+	var width := max(1, int(profile.get("footprint_width", 1)))
+	var height := max(1, int(profile.get("footprint_height", 1)))
+	var anchor_mode := str(profile.get("anchor", "bottom_center")).to_lower()
+	var min_x := anchor.x
+	var max_x := anchor.x
+	var min_y := anchor.y
+	var max_y := anchor.y
+	if anchor_mode.ends_with("left"):
+		min_x = anchor.x
+		max_x = anchor.x + width - 1
+	elif anchor_mode.ends_with("right"):
+		min_x = anchor.x - width + 1
+		max_x = anchor.x
+	else:
+		var left := int(floor(float(width - 1) / 2.0))
+		min_x = anchor.x - left
+		max_x = min_x + width - 1
+	if anchor_mode.begins_with("top"):
+		min_y = anchor.y
+		max_y = anchor.y + height - 1
+	elif anchor_mode == "center":
+		var up := int(floor(float(height - 1) / 2.0))
+		min_y = anchor.y - up
+		max_y = min_y + height - 1
+	else:
+		min_y = anchor.y - height + 1
+		max_y = anchor.y
+	var result := {"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y, "min_z": anchor.z, "max_z": anchor.z}
+	if dimension == 3:
+		var depth := max(1, int(profile.get("footprint_depth", profile.get("footprint_width", 1))))
+		var back := int(floor(float(depth - 1) / 2.0))
+		result["min_z"] = anchor.z - back
+		result["max_z"] = int(result["min_z"]) + depth - 1
+	return result
+
+
+static func _validate_placement_surface(map_node: Node, target_path: String, coords: Vector3i, profile: Dictionary, dimension: int, map_layer: int) -> Dictionary:
+	var surface_type := str(profile.get("surface_type", "ground")).to_lower()
+	if surface_type in ["", "ground", "air", "water", "water_surface", "room_center", "branch_end", "path_edge"]:
+		return {"ok": true}
+	if surface_type == "wall":
+		var bounds := _placement_bounds(coords, profile, dimension)
+		var wall_layers: Array = profile.get("support_layers", [])
+		var candidates: Array = []
+		if dimension == 3:
+			for y in range(int(bounds["min_y"]), int(bounds["max_y"]) + 1):
+				for z in range(int(bounds["min_z"]), int(bounds["max_z"]) + 1):
+					candidates.append(Vector3i(int(bounds["min_x"]) - 1, y, z))
+					candidates.append(Vector3i(int(bounds["max_x"]) + 1, y, z))
+		else:
+			for y in range(int(bounds["min_y"]), int(bounds["max_y"]) + 1):
+				candidates.append(Vector3i(int(bounds["min_x"]) - 1, y, 0))
+				candidates.append(Vector3i(int(bounds["max_x"]) + 1, y, 0))
+		for cell in candidates:
+			var map_cell := _read_map_cell(map_node, cell, dimension, map_layer)
+			if _is_empty_cell(map_node, map_cell):
+				continue
+			if wall_layers.is_empty() or bool(_cell_has_any_semantic_layer(target_path, cell, dimension, wall_layers).get("hit", false)):
+				return {"ok": true}
+		return {
+			"ok": false,
+			"message": "wall placement requires a solid/semantic wall cell next to the footprint",
+			"error_code": "placement_missing_wall_support",
+			"coords": MapValidator.coord_payload(coords, dimension),
+			"support_layers": wall_layers,
+		}
+	return {"ok": true}
+
+
+static func _validate_placement_reachability(map_node: Node, coords: Vector3i, profile: Dictionary, input: Dictionary, dimension: int, map_layer: int) -> Dictionary:
+	if not bool(profile.get("requires_reachable", false)):
+		return {"ok": true}
+	if not input.has("start"):
+		return {
+			"ok": false,
+			"message": "placement requires reachability but no start was provided",
+			"error_code": "placement_reachability_start_required",
+			"coords": MapValidator.coord_payload(coords, dimension),
+		}
+	var region := MapValidator.region_from_input(input, dimension)
+	var goal := _placement_reachability_point(coords, profile, dimension)
+	if not MapValidator.in_region(goal, region):
+		return {
+			"ok": false,
+			"message": "placement reachability point is outside the validation/search region",
+			"error_code": "placement_reachability_goal_out_of_region",
+			"coords": MapValidator.coord_payload(coords, dimension),
+			"goal": MapValidator.coord_payload(goal, dimension),
+		}
+	var reachable := _reachable_cells_for_input(map_node, input, region, dimension, map_layer)
+	if not bool(reachable.get("ok", false)):
+		return reachable
+	var reachable_cells: Dictionary = reachable.get("reachable", {})
+	var goal_key := MapValidator.coord_key(goal)
+	if not reachable_cells.has(goal_key):
+		return {
+			"ok": false,
+			"message": "placement reachability point is not reachable from start under the requested movement model",
+			"error_code": "placement_unreachable",
+			"coords": MapValidator.coord_payload(coords, dimension),
+			"goal": MapValidator.coord_payload(goal, dimension),
+			"start": input.get("start", {}),
+			"movement_model": str(MapValidator.movement_from_input(input, dimension).get("model", "grid")),
+		}
+	return {"ok": true, "goal": MapValidator.coord_payload(goal, dimension)}
+
+
+static func _placement_reachability_point(coords: Vector3i, profile: Dictionary, dimension: int) -> Vector3i:
+	var point_type := str(profile.get("reachability_point", "anchor")).to_lower()
+	var offset_key := "entrance_offset" if point_type == "entrance" else "interaction_offset"
+	if point_type in ["interaction", "entrance"]:
+		var offset := MapValidator.coord_from_input(profile.get(offset_key, {}), dimension)
+		return coords + offset
+	return coords
+
+
+static func _reachable_cells_for_input(map_node: Node, input: Dictionary, region: Dictionary, dimension: int, map_layer: int) -> Dictionary:
+	var cache_key := "_placement_reachable_%s_%s_%s_%s_%s_%s" % [
+		str(input.get("start", {})),
+		str(input.get("movement_model", "grid")),
+		str(region.get("x", 0)),
+		str(region.get("y", 0)),
+		str(region.get("width", 1)),
+		str(region.get("height", 1)),
+	]
+	if input.has(cache_key):
+		return input[cache_key]
+	var start := MapValidator.coord_from_input(input.get("start", {}), dimension)
+	var movement := MapValidator.movement_from_input(input, dimension)
+	var filled := _collect_filled_cells(map_node, region, dimension, map_layer)
+	if not MapValidator.in_region(start, region):
+		var out_of_region := {"ok": false, "message": "placement reachability start is outside region", "error_code": "placement_reachability_start_out_of_region"}
+		input[cache_key] = out_of_region
+		return out_of_region
+	if not MapValidator.is_standable(filled, start, region, movement):
+		var not_standable := {"ok": false, "message": "placement reachability start is not standable", "error_code": "placement_reachability_start_not_standable"}
+		input[cache_key] = not_standable
+		return not_standable
+	var reachable := {}
+	var queue: Array = [start]
+	reachable[MapValidator.coord_key(start)] = true
+	var cursor := 0
+	while cursor < queue.size():
+		var current: Vector3i = queue[cursor]
+		cursor += 1
+		for next in MapValidator.movement_neighbors(filled, current, region, movement):
+			var key := MapValidator.coord_key(next)
+			if reachable.has(key):
+				continue
+			reachable[key] = true
+			queue.append(next)
+	var result := {"ok": true, "reachable": reachable, "count": reachable.size()}
+	input[cache_key] = result
+	return result
+
+
+static func _placement_candidate_cells(input: Dictionary, region: Dictionary, profile: Dictionary, dimension: int) -> Dictionary:
+	var surface_type := str(profile.get("surface_type", "ground")).to_lower()
+	match surface_type:
+		"room_center":
+			return _candidate_cells_from_named_sets(input, region, dimension, ["room_centers"], "room_centers")
+		"branch_end":
+			return _candidate_cells_from_named_sets(input, region, dimension, ["branch_ends"], "branch_ends")
+		"path_edge":
+			return _path_edge_candidate_cells(input, region, dimension)
+		_:
+			return {"ok": true, "source": "region", "candidates": _all_region_cells(region, dimension)}
+
+
+static func _candidate_cells_from_named_sets(input: Dictionary, region: Dictionary, dimension: int, fields: Array, source_name: String) -> Dictionary:
+	var candidates: Array = []
+	var seen := {}
+	for field in fields:
+		var value = input.get(field, [])
+		if not (value is Array):
+			continue
+		for coord_value in value:
+			var coords := MapValidator.coord_from_input(coord_value, dimension)
+			var key := MapValidator.coord_key(coords)
+			if seen.has(key) or not MapValidator.in_region(coords, region):
+				continue
+			seen[key] = true
+			candidates.append(coords)
+	if candidates.is_empty():
+		return {"ok": false, "message": "surface_type requires explicit %s candidates" % source_name, "error_code": "placement_anchor_candidates_required", "source": source_name}
+	return {"ok": true, "source": source_name, "candidates": candidates}
+
+
+static func _path_edge_candidate_cells(input: Dictionary, region: Dictionary, dimension: int) -> Dictionary:
+	var path_cells := _protected_cell_set(input, dimension)
+	if path_cells.is_empty():
+		return {"ok": false, "message": "surface_type=path_edge requires protected/path/route/frontier cells", "error_code": "placement_anchor_candidates_required", "source": "path_edge"}
+	var candidates: Array = []
+	var seen := {}
+	var offsets := [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0), Vector3i(0, -1, 0)]
+	if dimension == 3:
+		offsets.append_array([Vector3i(0, 0, 1), Vector3i(0, 0, -1)])
+	for key in path_cells.keys():
+		var base := _coords_from_key(str(key), dimension)
+		for offset in offsets:
+			var candidate: Vector3i = base + offset
+			var candidate_key := MapValidator.coord_key(candidate)
+			if seen.has(candidate_key) or path_cells.has(candidate_key) or not MapValidator.in_region(candidate, region):
+				continue
+			seen[candidate_key] = true
+			candidates.append(candidate)
+	if candidates.is_empty():
+		return {"ok": false, "message": "no path edge candidate cells were found inside the region", "error_code": "placement_anchor_candidates_empty", "source": "path_edge"}
+	return {"ok": true, "source": "path_edge", "candidates": candidates}
+
+
+static func _all_region_cells(region: Dictionary, dimension: int) -> Array:
+	var candidates: Array = []
+	for dz in range(int(region["depth"])):
+		for dy in range(int(region["height"])):
+			for dx in range(int(region["width"])):
+				candidates.append(Vector3i(int(region["x"]) + dx, int(region["y"]) + dy, int(region["z"]) + dz))
+	return candidates
+
+
+static func _protected_cell_set(input: Dictionary, dimension: int) -> Dictionary:
+	var protected := {}
+	for field in ["protected_cells", "path_cells", "route_cells", "frontier_cells"]:
+		var value = input.get(field, [])
+		if not (value is Array):
+			continue
+		for coord_value in value:
+			var coords := MapValidator.coord_from_input(coord_value, dimension)
+			protected[MapValidator.coord_key(coords)] = true
+	return protected
+
+
+static func _score_placement_anchor(coords: Vector3i, profile: Dictionary, protected_cells: Dictionary, target_path: String, input: Dictionary, dimension: int) -> float:
+	var score := 100.0
+	var min_distance := int(profile.get("min_distance_to_protected", 0))
+	if min_distance > 0 and not protected_cells.is_empty():
+		var nearest := _nearest_distance_to_cell_set(coords, protected_cells, dimension)
+		if nearest < min_distance:
+			score -= float((min_distance - nearest) * 25)
+	var preferred_distance := int(profile.get("preferred_distance_to_protected", 0))
+	if preferred_distance > 0 and not protected_cells.is_empty():
+		var nearest_preferred := _nearest_distance_to_cell_set(coords, protected_cells, dimension)
+		score += maxf(0.0, 40.0 - float(abs(nearest_preferred - preferred_distance) * 8))
+	var same_kind_distance := int(profile.get("min_distance_from_same_kind", 0))
+	if same_kind_distance > 0:
+		var nearest_same := _nearest_same_kind_distance(coords, profile, target_path, input, dimension)
+		if nearest_same < same_kind_distance:
+			score -= float((same_kind_distance - nearest_same) * 40)
+		else:
+			score += minf(30.0, float(nearest_same - same_kind_distance))
+	score += _nearest_bonus(coords, _protected_cell_set_from_field(input, "branch_ends", dimension), 35.0, dimension)
+	score += _nearest_bonus(coords, _protected_cell_set_from_field(input, "room_centers", dimension), 25.0, dimension)
+	score += _nearest_bonus(coords, _protected_cell_set_from_field(input, "reward_cells", dimension), 20.0, dimension)
+	return score
+
+
+static func _nearest_distance_to_cell_set(coords: Vector3i, cells: Dictionary, dimension: int) -> int:
+	var nearest := 999999
+	for key in cells.keys():
+		var other := _coords_from_key(str(key), dimension)
+		nearest = mini(nearest, abs(coords.x - other.x) + abs(coords.y - other.y) + abs(coords.z - other.z))
+	return nearest
+
+
+static func _nearest_bonus(coords: Vector3i, cells: Dictionary, max_bonus: float, dimension: int) -> float:
+	if cells.is_empty():
+		return 0.0
+	var nearest := _nearest_distance_to_cell_set(coords, cells, dimension)
+	return maxf(0.0, max_bonus - float(nearest * 6))
+
+
+static func _protected_cell_set_from_field(input: Dictionary, field: String, dimension: int) -> Dictionary:
+	var protected := {}
+	var value = input.get(field, [])
+	if not (value is Array):
+		return protected
+	for coord_value in value:
+		var coords := MapValidator.coord_from_input(coord_value, dimension)
+		protected[MapValidator.coord_key(coords)] = true
+	return protected
+
+
+static func _coords_from_key(key: String, dimension: int) -> Vector3i:
+	var parts := key.split(",")
+	return Vector3i(int(parts[0]), int(parts[1]), int(parts[2]) if dimension == 3 and parts.size() > 2 else 0)
+
+
+static func _nearest_same_kind_distance(coords: Vector3i, profile: Dictionary, target_path: String, input: Dictionary, dimension: int) -> int:
+	var region := {"min_x": -2147483648, "max_x": 2147483647, "min_y": -2147483648, "max_y": 2147483647, "min_z": -2147483648, "max_z": 2147483647}
+	var entries := _spatial_entries_in_region(target_path, region, dimension)
+	var wanted_kind := str(profile.get("name", ""))
+	var wanted_resource := str(input.get("resource", input.get("resource_key", "")))
+	var nearest := 999999
+	var ignored := _protected_cell_set_from_field(input, "ignore_object_coords", dimension)
+	for entry in entries:
+		if not _is_object_index_entry(entry):
+			continue
+		var other := MapValidator.coord_from_input(entry.get("coords", {}), dimension)
+		if ignored.has(MapValidator.coord_key(other)):
+			continue
+		var entry_resource := str(entry.get("resource", entry.get("resource_key", "")))
+		var tags = entry.get("tags", [])
+		var same := wanted_resource != "" and entry_resource == wanted_resource
+		if not same and wanted_kind != "":
+			same = str(entry.get("semantic_layer", "")) == wanted_kind
+			if tags is Array:
+				same = same or (tags as Array).has(wanted_kind)
+		if not same:
+			continue
+		nearest = mini(nearest, abs(coords.x - other.x) + abs(coords.y - other.y) + abs(coords.z - other.z))
+	return nearest
+
+
+static func _best_placement_anchor(
+	target: Node,
+	target_path: String,
+	region: Dictionary,
+	dimension: int,
+	map_layer: int,
+	profile: Dictionary,
+	occupied: Dictionary,
+	blocked_cells: Dictionary,
+	input: Dictionary
+) -> Dictionary:
+	var protected_cells := _protected_cell_set(input, dimension)
+	var candidate_result := _placement_candidate_cells(input, region, profile, dimension)
+	if not bool(candidate_result.get("ok", false)):
+		return candidate_result
+	var best := {}
+	var best_score := -999999.0
+	for coords in candidate_result.get("candidates", []):
+		var check := _validate_single_object_placement(target, target_path, dimension, map_layer, coords, profile, occupied, blocked_cells, {}, input)
+		if not bool(check.get("ok", false)):
+			continue
+		var score := _score_placement_anchor(coords, profile, protected_cells, target_path, input, dimension)
+		if best.is_empty() or score > best_score:
+			best_score = score
+			best = {
+				"ok": true,
+				"coords": MapValidator.coord_payload(coords, dimension),
+				"score": score,
+				"surface_source": candidate_result.get("source", "region"),
+				"footprint_cells": check.get("footprint_cells", []),
+				"support_cells": check.get("support_cells", []),
+			}
+	if best.is_empty():
+		return {"ok": false, "message": "no legal placement anchor found in repair region", "error_code": "placement_anchor_not_found"}
+	return best
+
+
+static func _coord_payloads(cells: Array, dimension: int) -> Array:
+	var payloads: Array = []
+	for cell in cells:
+		payloads.append(MapValidator.coord_payload(cell, dimension))
+	return payloads
+
+
+static func _string_array_from_value(value) -> Array:
+	var result: Array = []
+	if value is Array:
+		for item in value:
+			var text := str(item).strip_edges().to_lower()
+			if text != "":
+				result.append(text)
+	elif value is String:
+		for item in str(value).split(","):
+			var text := str(item).strip_edges().to_lower()
+			if text != "":
+				result.append(text)
+	return result
+
+
+static func dimension_from_profile(profile_source: Dictionary) -> int:
+	if profile_source.has("z") or profile_source.has("depth") or profile_source.has("footprint_depth"):
+		return 3
+	return 2
+
+
+static func _coord_dict_from_value(value, dimension: int) -> Dictionary:
+	if value is Dictionary:
+		return {
+			"x": int((value as Dictionary).get("x", 0)),
+			"y": int((value as Dictionary).get("y", 0)),
+			"z": int((value as Dictionary).get("z", 0)) if dimension == 3 else 0,
+		}
+	if value is Array:
+		var values: Array = value
+		return {
+			"x": int(values[0]) if values.size() > 0 else 0,
+			"y": int(values[1]) if values.size() > 1 else 0,
+			"z": int(values[2]) if dimension == 3 and values.size() > 2 else 0,
+		}
+	return {"x": 0, "y": 0, "z": 0}
+
+
+static func _cell_has_any_semantic_layer(target_path: String, coords: Vector3i, dimension: int, layers: Array) -> Dictionary:
+	if layers.is_empty():
+		return {"hit": false}
+	var normalized := {}
+	for layer in layers:
+		normalized[str(layer).to_lower()] = true
+	var region := {
+		"x": coords.x, "y": coords.y, "z": coords.z,
+		"width": 1, "height": 1, "depth": 1,
+		"min_x": coords.x, "max_x": coords.x,
+		"min_y": coords.y, "max_y": coords.y,
+		"min_z": coords.z, "max_z": coords.z,
+	}
+	for entry in _spatial_entries_in_region(target_path, region, dimension):
+		var semantic_layer := str(entry.get("semantic_layer", "")).to_lower()
+		if normalized.has(semantic_layer):
+			return {"hit": true, "semantic_layer": semantic_layer, "entry": entry}
+		var tags = entry.get("tags", [])
+		if tags is Array:
+			for tag in tags:
+				var tag_text := str(tag).to_lower()
+				if normalized.has(tag_text):
+					return {"hit": true, "tag": tag_text, "entry": entry}
+	return {"hit": false}
+
+
 static func _object_occupancy_from_spatial_index(target_path: String, dimension: int) -> Dictionary:
 	var occupied := {}
 	var parsed := _read_json_resource(SPATIAL_INDEX_PATH)
@@ -1430,6 +2585,49 @@ static func _object_entries_from_blocked_result(blocked_result: Dictionary) -> A
 			if entry is Dictionary:
 				entries.append(entry)
 	return entries
+
+
+static func _repairable_placement_entries(input: Dictionary, target_path: String, region: Dictionary, dimension: int) -> Array:
+	var entries := _spatial_entries_in_region(target_path, region, dimension)
+	var want_resource := str(input.get("resource", input.get("resource_key", ""))).strip_edges()
+	var want_kind := str(input.get("placement_kind", input.get("kind", ""))).strip_edges().to_lower()
+	var want_tags := _string_array_from_value(input.get("tags", []))
+	var result: Array = []
+	for entry in entries:
+		if not _is_object_index_entry(entry):
+			continue
+		if want_resource != "":
+			var entry_resource := str(entry.get("resource", entry.get("resource_key", "")))
+			if entry_resource != want_resource:
+				continue
+		if want_kind != "" and _placement_kind_from_entry(entry) != want_kind:
+			continue
+		if not want_tags.is_empty():
+			var entry_tags = entry.get("tags", [])
+			var matched_tag := false
+			if entry_tags is Array:
+				for tag in want_tags:
+					if (entry_tags as Array).has(tag):
+						matched_tag = true
+						break
+			if not matched_tag:
+				continue
+		result.append(entry)
+	return result
+
+
+static func _placement_kind_from_entry(entry: Dictionary) -> String:
+	var semantic := str(entry.get("semantic_layer", "")).strip_edges().to_lower()
+	if semantic != "" and semantic != "object":
+		return semantic
+	var tags = entry.get("tags", [])
+	if tags is Array and not (tags as Array).is_empty():
+		return str((tags as Array)[0]).strip_edges().to_lower()
+	var resource := str(entry.get("resource", entry.get("resource_key", ""))).strip_edges().to_lower()
+	for known in ["tree", "rock", "bush", "decor", "building", "house", "hut", "npc", "enemy", "chest", "pickup", "save_point", "coin", "flying", "air"]:
+		if resource.find(known) >= 0:
+			return known
+	return "generic"
 
 
 static func _occupied_object_cells_for_repair(target_path: String, dimension: int) -> Dictionary:
@@ -2030,8 +3228,12 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 	var coverage_extent := _layer_used_extent_2d(target, map_layer)
 	var coverage_siblings := _sibling_layers_for_coverage(target, map_layer)
 	for sibling in coverage_siblings:
-		(sibling as Dictionary)["extent"] = _layer_used_extent_2d((sibling as Dictionary)["node"], int((sibling as Dictionary)["map_layer"]))
-	var coverage_gaps := _compute_coverage_gaps(coverage_extent, coverage_extent, coverage_siblings)
+		var coverage_sibling_node: Node = (sibling as Dictionary)["node"]
+		var coverage_sibling_map_layer := int((sibling as Dictionary)["map_layer"])
+		(sibling as Dictionary)["extent"] = _layer_used_extent_2d(coverage_sibling_node, coverage_sibling_map_layer)
+		(sibling as Dictionary)["columns"] = _used_columns_2d(coverage_sibling_node, coverage_sibling_map_layer)
+	var coverage_target_columns := _used_columns_2d(target, map_layer)
+	var coverage_gaps := _compute_coverage_gaps(coverage_extent, coverage_extent, coverage_siblings, coverage_target_columns)
 	result["layer_coverage_gaps"] = coverage_gaps
 	if not coverage_gaps.is_empty():
 		result["passed"] = false
@@ -2511,6 +3713,51 @@ static func _entry_in_region(entry: Dictionary, region: Dictionary, dimension: i
 		if cz < int(region["min_z"]) or cz > int(region["max_z"]):
 			return false
 	return true
+
+
+static func _coverage_sibling_for_gap(siblings: Array, gap: Dictionary) -> Dictionary:
+	var wanted_layer := int(gap.get("map_layer", -1))
+	var wanted_label := str(gap.get("layer", ""))
+	for sibling_value in siblings:
+		var sibling: Dictionary = sibling_value
+		if int(sibling.get("map_layer", -2)) == wanted_layer and (wanted_label == "" or str(sibling.get("label", "")) == wanted_label):
+			return sibling
+	for sibling_value in siblings:
+		var sibling: Dictionary = sibling_value
+		if int(sibling.get("map_layer", -2)) == wanted_layer:
+			return sibling
+	for sibling_value in siblings:
+		var sibling: Dictionary = sibling_value
+		if wanted_label != "" and str(sibling.get("label", "")) == wanted_label:
+			return sibling
+	return {}
+
+
+static func _coverage_repair_columns(gap: Dictionary, union_extent: Dictionary, target_columns: Dictionary) -> Array:
+	var columns := {}
+	var shortfall: Dictionary = gap.get("shortfall_cells", {})
+	var current: Dictionary = gap.get("current_extent", {})
+	if not shortfall.is_empty() and not current.is_empty():
+		if shortfall.has("left"):
+			for x in range(int(union_extent["min_x"]), int(current["min_x"])):
+				columns[x] = true
+		if shortfall.has("right"):
+			for x in range(int(current["max_x"]) + 1, int(union_extent["max_x"]) + 1):
+				columns[x] = true
+		if shortfall.has("top") or shortfall.has("bottom"):
+			for key in target_columns.keys():
+				columns[int(key)] = true
+	var holes = gap.get("interior_holes_x", [])
+	if holes is Array:
+		for hole_value in holes:
+			if not (hole_value is Dictionary):
+				continue
+			var hole: Dictionary = hole_value
+			for x in range(int(hole.get("from", 0)), int(hole.get("to", 0)) + 1):
+				columns[x] = true
+	var out := columns.keys()
+	out.sort()
+	return out
 
 
 static func _normalize_noise(value: float) -> float:

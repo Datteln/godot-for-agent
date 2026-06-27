@@ -1939,9 +1939,16 @@ def register_front_tools() -> None:
                     "The result includes `layer_coverage_gaps`: any sibling layer (other legacy-TileMap layer "
                     "index, or other TileMapLayer under the same parent) that already covered ~90%+ of the map's "
                     "extent before this edit (a background/sky/water backdrop, not local decoration) but now falls "
-                    "short of the map's new overall extent after this edit. When non-empty, extend those layers "
-                    "to match before treating a level-extension task as finished — do not rely on remembering to "
-                    "check this yourself; read the field every time."
+                    "short of the map's new overall extent after this edit. Each entry may include "
+                    "`shortfall_cells` (boundary lag — left/right/top/bottom cell counts) and/or "
+                    "`interior_holes_x` (column ranges where that layer has NO tiles even though they're inside "
+                    "its own already-covered boundary — e.g. a background that nominally spans the right width "
+                    "but still has a gray gap in the middle). When non-empty, extend those layers to match before "
+                    "treating a level-extension task as finished — do not rely on remembering to check this "
+                    "yourself; read the field every time. Also: if the `resource`/`resource_key` you passed is "
+                    "registered with a scene_path (an object/PackedScene, e.g. a tree), this call fails with "
+                    "error_code 'resource_requires_object_placement' — use place_map_objects for it instead of "
+                    "approximating it out of tiles."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2073,7 +2080,10 @@ def register_front_tools() -> None:
                 "description": (
                     "Paint 2D TileMapLayer/legacy TileMap cells with Godot TileSet terrain connection rules. "
                     "Use when a resource_registry entry provides terrain_set/terrain or when water/roads need "
-                    "smooth auto-connected edges. Previewed and undoable."
+                    "smooth auto-connected edges. Previewed and undoable. If the resolved resource is registered "
+                    "with a scene_path instead (an object/PackedScene) and you didn't explicitly pass "
+                    "terrain_set/terrain, this fails with error_code 'resource_requires_object_placement' — use "
+                    "place_map_objects for it instead."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2194,6 +2204,228 @@ def register_front_tools() -> None:
                         },
                     },
                     ["objects"],
+                ),
+            },
+        )
+    )
+    placement_profile_properties = {
+        "placement_kind": {
+            "type": "string",
+            "description": "Generic object placement preset: tree, decor, building, npc, enemy, chest, coin, etc.",
+        },
+        "kind": {"type": "string"},
+        "anchor": {
+            "type": "string",
+            "enum": ["bottom_center", "bottom_left", "bottom_right", "top_center", "top_left", "top_right", "center"],
+            "description": "How the object footprint is aligned to the input cell; defaults to bottom_center.",
+        },
+        "surface_type": {
+            "type": "string",
+            "enum": ["ground", "wall", "water_surface", "water", "air", "room_center", "branch_end", "path_edge"],
+        },
+        "footprint_width": {"type": "integer", "minimum": 1},
+        "footprint_height": {"type": "integer", "minimum": 1},
+        "footprint_depth": {"type": "integer", "minimum": 1},
+        "requires_support": {"type": "boolean"},
+        "support_mode": {"type": "string", "enum": ["bottom", "wall"]},
+        "support_layers": {"type": "array", "items": {"type": "string"}},
+        "forbidden_layers": {"type": "array", "items": {"type": "string"}},
+        "clearance": {"type": "integer", "minimum": 0},
+        "clearance_left": {"type": "integer", "minimum": 0},
+        "clearance_right": {"type": "integer", "minimum": 0},
+        "clearance_up": {"type": "integer", "minimum": 0},
+        "clearance_down": {"type": "integer", "minimum": 0},
+        "clearance_front": {"type": "integer", "minimum": 0},
+        "clearance_back": {"type": "integer", "minimum": 0},
+        "min_distance_to_protected": {"type": "integer", "minimum": 0},
+        "preferred_distance_to_protected": {"type": "integer", "minimum": 0},
+        "min_distance_from_same_kind": {"type": "integer", "minimum": 0},
+        "requires_reachable": {
+            "type": "boolean",
+            "description": "When true, the anchor/interaction/entrance point must be reachable from start under movement_model.",
+        },
+        "reachability_point": {
+            "type": "string",
+            "enum": ["anchor", "interaction", "entrance"],
+            "description": "Which point to test for reachability; interaction/entrance use their offset from the anchor.",
+        },
+        "interaction_offset": {"type": "object"},
+        "entrance_offset": {"type": "object"},
+        "map_layer": {"type": "integer"},
+        "ground_map_layer": {"type": "integer"},
+        "start": {"type": "object"},
+        "movement_model": {"type": "string", "enum": ["grid", "leap", "free"]},
+        "path_algorithm": {"type": "string", "enum": ["bfs", "astar", "a*"]},
+        "walkable_is_filled": {"type": "boolean"},
+        "max_horizontal_gap": {"type": "integer", "minimum": 1},
+        "max_rise": {"type": "integer", "minimum": 0},
+        "max_fall": {"type": "integer", "minimum": 0},
+        "max_step": {"type": "integer", "minimum": 1},
+        "protected_cells": {"type": "array", "items": {"type": "object"}},
+        "path_cells": {"type": "array", "items": {"type": "object"}},
+        "route_cells": {"type": "array", "items": {"type": "object"}},
+        "frontier_cells": {"type": "array", "items": {"type": "object"}},
+        "branch_ends": {"type": "array", "items": {"type": "object"}},
+        "room_centers": {"type": "array", "items": {"type": "object"}},
+        "reward_cells": {"type": "array", "items": {"type": "object"}},
+    }
+    register(
+        ToolDef(
+            name="find_placement_anchors",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "find_placement_anchors",
+                "description": (
+                    "Search real map cells for legal object anchors before placing trees, buildings, NPCs, enemies, "
+                    "chests, and other PackedScene objects. It checks empty footprint cells, solid support, clearance, "
+                    "spatial-index object/blocked cells, and optional protected route/path cells, then returns scored "
+                    "candidate anchors. Use before place_map_objects instead of guessing decoration coordinates."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {"type": "string"},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "max_results": {"type": "integer", "minimum": 1},
+                        **placement_profile_properties,
+                    },
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="validate_object_placements",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "validate_object_placements",
+                "description": (
+                    "Validate proposed PackedScene object coordinates with the same generic placement rules used by "
+                    "place_map_objects: footprint emptiness, support, clearance, object overlap, blocked/water/obstacle "
+                    "cells, and optional protected route/path cells. Returns issues and relocation repair hints."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {"type": "string"},
+                        "objects": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                    "resource": {"type": "string"},
+                                    "resource_key": {"type": "string"},
+                                    **placement_profile_properties,
+                                },
+                            },
+                        },
+                        **placement_profile_properties,
+                    },
+                    ["objects"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="repair_placements",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="json",
+            schema={
+                "name": "repair_placements",
+                "description": (
+                    "Preview/undoable semantic relocation repair for indexed PackedScene map objects. It validates "
+                    "objects in a region with the same placement profile rules as validate_object_placements, finds "
+                    "the highest-scoring legal anchor, moves resolvable scene nodes there, and updates the spatial "
+                    "index. If an indexed object has no resolvable node, it returns a suggested relocation plan."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {"type": "string"},
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "z": {"type": "integer"},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                        "depth": {"type": "integer", "minimum": 1},
+                        "resource": {"type": "string"},
+                        "resource_key": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        **placement_profile_properties,
+                    },
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="validate_layer_coverage",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "validate_layer_coverage",
+                "description": (
+                    "Read-only check for blanket layers such as background/sky/water that originally covered about "
+                    "90% of the map extent but now fall short of the foreground map extent or have interior column "
+                    "holes. Use after map growth and before final screenshots."
+                ),
+                "parameters": _object_schema(
+                    {"target_path": {"type": "string"}, "map_layer": {"type": "integer"}},
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
+            name="repair_layer_coverage",
+            domain="map",
+            side="front",
+            reads_project=True,
+            writes_project=True,
+            needs_preview=True,
+            render_kind="json",
+            schema={
+                "name": "repair_layer_coverage",
+                "description": (
+                    "Preview/undoable repair for blanket layer coverage gaps. It copies real existing cells from the "
+                    "nearest available column of the lagging blanket layer into missing boundary columns or interior "
+                    "holes, so backgrounds extend with the playable map instead of exposing the editor gray area."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {"type": "string"},
+                        "map_layer": {"type": "integer"},
+                        "max_cells": {"type": "integer", "minimum": 1},
+                    },
+                    [],
                 ),
             },
         )
@@ -2335,9 +2567,11 @@ def register_front_tools() -> None:
                     "means reachable under the given movement assumptions — still verify the design visually. It also "
                     "always returns `layer_coverage_gaps`: any sibling layer (other legacy-TileMap layer index, or "
                     "other TileMapLayer under the same parent) that already covers ~90%+ of the map's extent (a "
-                    "background/sky/water backdrop, not local decoration) but currently falls short of the map's "
-                    "overall extent — this forces `passed=false` just like a failed connectivity check, regardless "
-                    "of whether the gap was introduced by a recent edit or was already there."
+                    "background/sky/water backdrop, not local decoration) but currently falls short — either at the "
+                    "boundary (`shortfall_cells`) or with a gap in the middle of its own already-covered range "
+                    "(`interior_holes_x`, e.g. a background that nominally spans the right width but still has a "
+                    "gray hole partway through). Either kind forces `passed=false` just like a failed connectivity "
+                    "check, regardless of whether the gap was introduced by a recent edit or was already there."
                 ),
                 "parameters": _object_schema(
                     {

@@ -169,13 +169,23 @@ func execute(tool_call: Dictionary) -> Dictionary:
 		"compose_map_blueprint_grammar":
 			result = MapTools.compose_map_blueprint_grammar(input, editor_interface)
 		"describe_map_region":
-			result = MapTools.describe_map_region(input, editor_interface)
+			result = _call_map_tool("describe_map_region", [input, editor_interface])
 		"edit_map":
 			result = MapTools.edit_map(input, editor_interface, undo_manager)
 		"paint_terrain_connect":
 			result = MapTools.paint_terrain_connect(input, editor_interface, undo_manager)
 		"place_map_objects":
 			result = MapTools.place_map_objects(input, editor_interface, undo_manager)
+		"find_placement_anchors":
+			result = MapTools.find_placement_anchors(input, editor_interface)
+		"validate_object_placements":
+			result = MapTools.validate_object_placements(input, editor_interface)
+		"repair_placements":
+			result = MapTools.repair_placements(input, editor_interface, undo_manager)
+		"validate_layer_coverage":
+			result = MapTools.validate_layer_coverage(input, editor_interface)
+		"repair_layer_coverage":
+			result = MapTools.repair_layer_coverage(input, editor_interface, undo_manager)
 		"query_spatial_index":
 			result = MapTools.query_spatial_index(input, editor_interface)
 		"compact_spatial_index":
@@ -253,6 +263,26 @@ func _result_artifacts(result: Dictionary) -> Array:
 	if result.has("path") and result["path"] is String:
 		artifacts.append(result["path"])
 	return artifacts
+
+
+func _call_map_tool(method_name: String, args: Array) -> Dictionary:
+	var map_tools_instance := MapTools.new()
+	if not map_tools_instance.has_method(method_name):
+		return {
+			"ok": false,
+			"message": "MapTools is missing method: " + method_name + ". Restart the Godot editor or reinstall the AI Agent addon so the latest scripts are loaded.",
+			"error_code": "map_tool_method_missing",
+			"method": method_name,
+		}
+	var value = map_tools_instance.callv(method_name, args)
+	if value is Dictionary:
+		return value
+	return {
+		"ok": false,
+		"message": "MapTools method returned a non-dictionary result: " + method_name,
+		"error_code": "invalid_map_tool_result",
+		"method": method_name,
+	}
 
 
 func _read_debugger_errors(input: Dictionary) -> Dictionary:
