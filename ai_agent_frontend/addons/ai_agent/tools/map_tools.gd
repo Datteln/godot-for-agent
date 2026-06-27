@@ -118,7 +118,7 @@ static func describe_map_context(input: Dictionary, editor_interface: EditorInte
 static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
@@ -404,7 +404,7 @@ static func _compute_coverage_gaps(extent_before: Dictionary, extent_after: Dict
 static func validate_layer_coverage(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
@@ -434,7 +434,7 @@ static func validate_layer_coverage(input: Dictionary, editor_interface: EditorI
 static func repair_layer_coverage(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
@@ -523,7 +523,7 @@ static func repair_layer_coverage(input: Dictionary, editor_interface: EditorInt
 static func paint_terrain_connect(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
@@ -596,7 +596,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 	var root := editor_interface.get_edited_scene_root()
 	if root == null:
 		return {"ok": false, "message": "No scene is currently being edited", "error_code": "no_edited_scene"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var map_node: Node = target_result["node"]
@@ -664,7 +664,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 			input
 		)
 		if not bool(placement_check.get("ok", true)):
-			return placement_check
+			return _with_placement_retry_hint(placement_check)
 		var resource_key := str(object_spec.get("resource", object_spec.get("resource_key", ""))).strip_edges()
 		var resource_def: Dictionary = _registry_entry_with_fallback(registry_data, resource_key, str(object_spec.get("fallback_resource", "")))
 		if resource_def.has("_resolved_resource"):
@@ -720,7 +720,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 static func find_placement_anchors(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
@@ -803,7 +803,7 @@ static func find_placement_anchors(input: Dictionary, editor_interface: EditorIn
 static func validate_object_placements(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
@@ -876,7 +876,7 @@ static func validate_object_placements(input: Dictionary, editor_interface: Edit
 static func repair_placements(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var root := editor_interface.get_edited_scene_root()
@@ -1045,7 +1045,40 @@ static func _describe_safe_cell(cell: Dictionary, dimension: int) -> Dictionary:
 	return safe
 
 
-static func _resolve_map_target(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+## 写入/校验类工具传 require_explicit_map_layer=true：legacy TileMap 常见同时挂多个互不遮挡的
+## 图层（比如背景 "Background" 是 layer 0，真正承载碰撞的地面在另一层），不传 map_layer 时
+## 这里曾经悄悄默认成 0，写错层/校验错层不会有任何报错信号。现在改成在工具层直接拒绝，
+## 而不是只在 prompt 里提醒模型"自己记得选对层"——错误信息本身就在决策当下把 layers 列表和
+## 下一步动作（先调用 describe_map_region 确认层，再带着确认过的 map_layer 重试）一起带出来。
+static func _resolve_map_target(
+	input: Dictionary,
+	editor_interface: EditorInterface,
+	require_explicit_map_layer: bool = false
+) -> Dictionary:
+	var result := _resolve_map_target_unchecked(input, editor_interface)
+	if not require_explicit_map_layer or not bool(result.get("ok", false)):
+		return result
+	var node: Node = result["node"]
+	if node.get_class() != "TileMap" or input.has("map_layer"):
+		return result
+	var layer_count: int = node.get_layers_count()
+	if layer_count <= 1:
+		return result
+	return {
+		"ok": false,
+		"message": (
+			"Target TileMap '%s' has %d layers and no map_layer was given; map_layer cannot " +
+			"silently default to 0 here because background/decoration and real collision ground " +
+			"are often on different layers. Call describe_map_region on this target_path first, " +
+			"pick the right layer from the returned 'layers' list, then retry with that map_layer."
+		) % [str(result.get("path", "")), layer_count],
+		"error_code": "map_layer_required_for_multilayer_tilemap",
+		"target": str(result.get("path", "")),
+		"layers": _describe_tilemap_layers(node),
+	}
+
+
+static func _resolve_map_target_unchecked(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	var root := editor_interface.get_edited_scene_root()
 	if root == null:
 		return {"ok": false, "message": "No scene is currently being edited", "error_code": "no_edited_scene"}
@@ -1765,6 +1798,27 @@ static func _placement_profile_from_spec(spec: Dictionary, fallback: Dictionary)
 	profile["interaction_offset"] = _coord_dict_from_value(spec.get("interaction_offset", fallback.get("interaction_offset", profile["interaction_offset"])), dimension_from_profile(fallback))
 	profile["entrance_offset"] = _coord_dict_from_value(spec.get("entrance_offset", fallback.get("entrance_offset", profile["entrance_offset"])), dimension_from_profile(fallback))
 	return profile
+
+
+## 摆放被拒绝时直接在返回结果里带上下一步动作，而不是只在 prompt 里要求模型"记得改用
+## find_placement_anchors"——错误发生的当下就给出具体指引，比期望模型从一堆铁律里
+## 翻出对应那条更可靠。
+const _PLACEMENT_RETRY_HINT := "Do not retry with another guessed coordinate. Call find_placement_anchors (same target_path/profile/region) to get a real legal anchor, or validate_object_placements to check a specific candidate."
+
+static func _with_placement_retry_hint(check: Dictionary) -> Dictionary:
+	var retryable_codes := [
+		"placement_missing_support",
+		"placement_support_layer_mismatch",
+		"placement_forbidden_layer",
+		"placement_same_kind_too_close",
+		"placement_unreachable",
+		"placement_cell_not_empty",
+		"placement_clearance_blocked",
+		"placement_protected_cell",
+	]
+	if str(check.get("error_code", "")) in retryable_codes:
+		check["hint"] = _PLACEMENT_RETRY_HINT
+	return check
 
 
 static func _validate_single_object_placement(
@@ -2503,7 +2557,7 @@ static func _object_index_key(coords: Vector3i, dimension: int, scene_path: Stri
 
 
 static func _repair_spatial_object_issues(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var root := editor_interface.get_edited_scene_root()
@@ -3147,7 +3201,7 @@ static func compact_spatial_index(input: Dictionary, _editor_interface: EditorIn
 static func validate_map_region(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
@@ -3252,7 +3306,7 @@ static func repair_map_region(input: Dictionary, editor_interface: EditorInterfa
 		return _repair_spatial_object_issues(input, editor_interface, undo_manager)
 	if not input.has("start") or not input.has("goal"):
 		return {"ok": false, "message": "start and goal are required for connectivity repair; pass repair_overlaps/repair_blocked_objects for object repair", "error_code": "invalid_repair_request"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
@@ -3378,7 +3432,7 @@ static func save_map_blueprint(input: Dictionary, editor_interface: EditorInterf
 	var name := MapBlueprints.sanitize_name(str(input.get("name", "")))
 	if name == "":
 		return {"ok": false, "message": "name is required and must contain letters/digits/_/-", "error_code": "invalid_blueprint_name"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
@@ -3440,7 +3494,7 @@ static func apply_map_blueprint(input: Dictionary, editor_interface: EditorInter
 	if not (ops is Array) or (ops as Array).is_empty():
 		return {"ok": false, "message": "blueprint has no ops", "error_code": "blueprint_empty"}
 
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]

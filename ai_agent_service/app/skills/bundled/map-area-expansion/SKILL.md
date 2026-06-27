@@ -1,0 +1,35 @@
+---
+name: map-area-expansion
+description: 扩建已有地图的可达性增长流程、横版平台关卡专用规划（critical route/jump graph/coin arcs/enemy slots）、移动模型能力校准与导航烘焙。
+when_to_use: 扩展已有地图（而不是从空白区生成）、横版平台跳跃关卡设计、需要校准 leap/free 移动能力参数、或需要导航网格烘焙时加载。
+allowed-tools: [plan_reachable_map_growth, compute_reachable_frontier, plan_platform_level, validate_map_region, repair_map_region, bake_navigation_mesh, describe_map_region, query_spatial_index, read_file, read_class_docs]
+paths: []
+---
+
+加载前提：已完成认知阶段，已确定 target_path/map_layer，并已读过 [[map-agent]] 核心规则里关于 `movement_model`（grid/leap/free）的选型说明。
+
+## 可达性增长优先于空白生成
+
+扩展已有地图时优先考虑 `plan_reachable_map_growth`，而不是从空白区凭空生成。它把地图增长抽象成 `frontier → candidates → accepted_motifs → edit_map_batches → validation → repair_strategies`，支持 `profile="platformer"`、`topdown`、`dungeon`、`3d_grid`。选择 profile：横版跳跃用 platformer；俯视 RPG/道路用 topdown；房间走廊用 dungeon；3D GridMap 地板/室内用 3d_grid。执行前必须确认 frontier 来自真实已可达区域；没有 frontier 时先用 `describe_map_region`/`query_spatial_index` 定位可达边界。
+
+如果用户给了玩家/单位真实起点，或项目里能从场景/脚本定位起点，扩展地图前必须先用 `compute_reachable_frontier` 在真实地图 cell 上计算可达集合。`plan_reachable_map_growth` 应使用返回的 `rightmost_frontier` 作为 `frontier`；不得把"左侧边界看起来有平台"当成已可达。`compute_reachable_frontier` 的 `movement_model` 和能力参数必须与后续 `validate_map_region` 一致。
+
+## 横版平台关卡专用规划
+
+横版平台跳跃关卡不要只用通用 zone/Poisson 算法。用户目标是平台游戏、Mario/Celeste 类跳跃、Brackeys 平台地图、关卡主路径、跳跃/落点/金币弧线/敌人槽位时，优先调用 `plan_platform_level`。它会先生成 critical route、platform motifs、jump_graph、`edit_map_batches`、`coin_arcs`、`enemy_slots` 和 `movement_model="leap"` 校验计划；再把批次转成小批 `edit_map`，把奖励弧线/敌人槽位转成真实资源放置。不要先随便铺瓦片再事后 A* 校验。
+
+扩展已有横版地图时，`plan_platform_level`/`plan_reachable_map_growth` 必须默认 `connect_from_existing=true`，并传 `target_path`/`map_layer` 让工具扫描左侧边界已有表面，返回 `entry_anchor`。返回的 `blocked_reason` 非空（`entry_anchor_not_found`/`jump_graph_failed`/`score_issues`）时，`edit_map_batches` 已经被工具结构性清空，不需要你自己再判断要不要执行——但仍要按 `blocked_reason` 处理：`entry_anchor_not_found` 时扩大/移动 `entry_sample_*` 重新找边界落脚点；`jump_graph_failed`/`score_issues` 时降低新平台起点高度、缩短 gap 或增大 landing_width 后重新规划。右侧新区内部可达不算完成，必须从左侧初始地图的真实落脚点一路可达。
+
+`plan_platform_level` 返回的 `ability_used_defaults` 非空时，说明你没传 `max_horizontal_gap`/`max_rise`/`max_fall`/`min_landing_width` 中的某些字段，工具用了写死的默认值（4/2/6/3），这条规划**不能**当作"已验证可玩"——先按下面"能力校准"读真实角色脚本和 `tile_size` 补全这些参数再重新调用，不要因为它返回了 `ok:true` 就直接执行。
+
+调用 `plan_platform_level` 前也遵守同一条：先读取角色脚本和 tile_size，把 `max_horizontal_gap`、`max_rise`、`max_fall`、`min_landing_width` 传进去。`plan_platform_level` 返回的 `validation.validate_map_region.start` 必须是左侧已有 `entry_anchor`，不是新区第一块平台；返回的 `jump_graph.passed=false` 或 `score.issues` 不为空时，不要执行它的 `edit_map_batches`，先缩小 gap、增加 landing_width 或降低 vertical_delta 后重新规划。
+
+## leap/free 能力校准（通用铁律）
+
+`leap`/`free` 的能力参数（`max_horizontal_gap`/`max_rise`/`max_fall`/`max_step`）**必须按角色控制器里的真实移动能力换算成格数**，不准凭感觉编。校验前先 `read_file`/`read_script` 读真实的角色脚本（移动速度、跳跃速度/初速度、重力、是否能飞/游泳/二段跳等）和项目设置，结合 `describe_map_region` 读到的真实 `tile_size`/`cell_size` 把"能跳多远/多高"换算成格数再传进去。读不到真实数值就向用户说明缺少哪个参数，不要用假设值去"证明"可玩性。
+
+`leap` 校验的区域要把落脚平台正下方那一行/层地面也包含进 `width`/`height`/`depth` 内，否则支撑判定会因为区域裁剪而失真。非标准重力方向（横向重力、3D 里地面不在 -y 等）用 `gravity_axis`/`gravity_sign` 覆盖。
+
+## 导航网格烘焙
+
+如果存在 `NavigationRegion2D` 或 `NavigationRegion3D`，地图生成或结构性改动后可调用 `bake_navigation_mesh`；如果返回空导航 warning 或 `fallback`，立即用 `validate_map_region(path_algorithm="astar")` 对入口/出口/waypoints 做结构化降级校验，并在最终说明里说清楚。没有导航节点时不要临时硬造一套复杂导航，只提示未做导航烘焙并给出 A* 结构校验结果。

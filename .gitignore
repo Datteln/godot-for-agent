@@ -410,3 +410,4 @@ ai_map_agent/
 **/.coverage
 .godot/
 *.md
+!ai_agent_service/**/*.md
