@@ -131,6 +131,13 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 	var dimension := 3 if target.get_class() == "GridMap" else 2
 	var map_layer := int(input.get("map_layer", 0))
 	var allowed_bounds := _bounds_from_input(input, dimension)
+	# 编辑前先记录"毯式图层"（背景/天空这类本来就铺满全图的图层）的现状，
+	# 编辑后跟新的整体范围一比，就能发现哪些图层没跟着扩——不用 agent 自己记得去查，
+	# edit_map 自己的返回结果里就会带出来。GridMap(3D)/无同组图层时这里自然是空操作。
+	var coverage_edited_extent_before := _layer_used_extent_2d(target, map_layer)
+	var coverage_siblings := _sibling_layers_for_coverage(target, map_layer)
+	for sibling in coverage_siblings:
+		(sibling as Dictionary)["extent"] = _layer_used_extent_2d((sibling as Dictionary)["node"], int((sibling as Dictionary)["map_layer"]))
 	var before: Array = []
 	var after: Array = []
 	var touched := {}
@@ -177,7 +184,9 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 	else:
 		for cell in after:
 			_apply_map_cell(target, cell)
-	return {
+	var coverage_edited_extent_after := _layer_used_extent_2d(target, map_layer)
+	var coverage_gaps := _compute_coverage_gaps(coverage_edited_extent_before, coverage_edited_extent_after, coverage_siblings)
+	var result := {
 		"ok": true,
 		"target": str(target_result.get("path", "")),
 		"type": target.get_class(),
@@ -186,8 +195,141 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		"operations": operations.size(),
 		"cells": after.size(),
 		"spatial_index": index_result,
+		"layer_coverage_gaps": coverage_gaps,
 		"message": "Map edited through Godot native APIs; serialized map data was not modified directly."
 	}
+	if not coverage_gaps.is_empty():
+		result["coverage_gap_warning"] = "One or more full-coverage layers (background/sky/water etc.) now fall short of this map's overall extent. Extend them to match before treating this edit as finished."
+	return result
+
+
+## 单个 2D 图层（legacy TileMap 的某个 layer index，或某个 TileMapLayer 节点）当前
+## 实际有瓦片覆盖的格子范围（min/max x/y，单位是 cell）。3D/GridMap、空图层都返回 {}
+## ——跟 `_used_bounds_2d`/describe_map_context 已经在用的"空字典代表没数据"约定保持一致，
+## TileMap 这边直接复用 `_used_bounds_2d`，不再重复写一遍 min/max 扫描。
+static func _layer_used_extent_2d(node: Node, map_layer: int) -> Dictionary:
+	if node == null:
+		return {}
+	if node.get_class() == "TileMapLayer":
+		var rect: Rect2i = node.call("get_used_rect")
+		if rect.size.x <= 0 or rect.size.y <= 0:
+			return {}
+		return {
+			"min_x": rect.position.x,
+			"max_x": rect.position.x + rect.size.x - 1,
+			"min_y": rect.position.y,
+			"max_y": rect.position.y + rect.size.y - 1,
+		}
+	if node.get_class() == "TileMap":
+		return _used_bounds_2d(node.call("get_used_cells", map_layer))
+	return {}
+
+
+## 跟当前编辑的图层"同组"的其它图层：legacy TileMap 下是同一个节点的其它 layer index；
+## 标准脚手架下是同一个父节点下的其它 TileMapLayer 兄弟节点。GridMap 没有这个概念，返回空。
+static func _sibling_layers_for_coverage(target: Node, map_layer: int) -> Array:
+	var siblings: Array = []
+	if target.get_class() == "TileMap":
+		var count := int(target.call("get_layers_count"))
+		for idx in range(count):
+			if idx == map_layer:
+				continue
+			var label := str(target.call("get_layer_name", idx))
+			if label == "":
+				label = "layer_%d" % idx
+			siblings.append({"node": target, "map_layer": idx, "label": label})
+	elif target.get_class() == "TileMapLayer":
+		var parent := target.get_parent()
+		if parent != null:
+			for child in parent.get_children():
+				if child != target and child.get_class() == "TileMapLayer":
+					siblings.append({"node": child, "map_layer": 0, "label": str(child.name)})
+	return siblings
+
+
+## 合并多个 extent（跳过空字典），得到覆盖它们全部的最小范围。空输入返回 {}。
+static func _merge_extents_2d(extents: Array) -> Dictionary:
+	var result := {}
+	for extent_value in extents:
+		var extent: Dictionary = extent_value
+		if extent.is_empty():
+			continue
+		if result.is_empty():
+			result = {
+				"min_x": int(extent["min_x"]),
+				"max_x": int(extent["max_x"]),
+				"min_y": int(extent["min_y"]),
+				"max_y": int(extent["max_y"]),
+			}
+		else:
+			result["min_x"] = mini(int(result["min_x"]), int(extent["min_x"]))
+			result["max_x"] = maxi(int(result["max_x"]), int(extent["max_x"]))
+			result["min_y"] = mini(int(result["min_y"]), int(extent["min_y"]))
+			result["max_y"] = maxi(int(result["max_y"]), int(extent["max_y"]))
+	return result
+
+
+## "毯式图层"判定：覆盖范围在 x 或 y 任一轴上已经占到整图范围的 90% 以上，
+## 就认为这个图层本来就该跟着地图整体范围走（背景/天空/水面渐变这类）。
+## 阈值先用 0.9 试效果，不合适再调；目前 OR 判定对"又高又窄"的竖向装饰会误判，
+## 是已知的待改进点，不是这次要解决的问题。
+static func _is_blanket_layer(extent: Dictionary, union_extent: Dictionary) -> bool:
+	if extent.is_empty() or union_extent.is_empty():
+		return false
+	var union_w := int(union_extent["max_x"]) - int(union_extent["min_x"]) + 1
+	var union_h := int(union_extent["max_y"]) - int(union_extent["min_y"]) + 1
+	var extent_w := int(extent["max_x"]) - int(extent["min_x"]) + 1
+	var extent_h := int(extent["max_y"]) - int(extent["min_y"]) + 1
+	var ratio_x := float(extent_w) / float(maxi(1, union_w))
+	var ratio_y := float(extent_h) / float(maxi(1, union_h))
+	return ratio_x >= 0.9 or ratio_y >= 0.9
+
+
+## 哪些"毯式"图层的覆盖范围已经跟不上地图整体范围了。extent_before/extent_after 是
+## 同一个目标图层自己的范围（`edit_map` 传编辑前后两个不同的值；`validate_map_region`
+## 没有编辑动作，传同一个"当前范围"两次即可，逻辑完全复用）。siblings 是同组其它图层
+## （每个元素带它们当前的 "extent"，不受这次调用影响）。
+static func _compute_coverage_gaps(extent_before: Dictionary, extent_after: Dictionary, siblings: Array) -> Array:
+	if extent_after.is_empty() or siblings.is_empty():
+		return []
+	var sibling_extents: Array = []
+	for sibling_value in siblings:
+		sibling_extents.append((sibling_value as Dictionary).get("extent", {}))
+	var union_before := _merge_extents_2d([extent_before] + sibling_extents)
+	var union_after := _merge_extents_2d([extent_after] + sibling_extents)
+	if union_after.is_empty():
+		return []
+	var tolerance := 2
+	var gaps: Array = []
+	for sibling_value in siblings:
+		var sibling: Dictionary = sibling_value
+		var sibling_extent: Dictionary = sibling.get("extent", {})
+		if sibling_extent.is_empty():
+			continue
+		if not _is_blanket_layer(sibling_extent, union_before):
+			continue
+		var shortfall := {}
+		if int(sibling_extent["min_x"]) > int(union_after["min_x"]) + tolerance:
+			shortfall["left"] = int(sibling_extent["min_x"]) - int(union_after["min_x"])
+		if int(sibling_extent["max_x"]) < int(union_after["max_x"]) - tolerance:
+			shortfall["right"] = int(union_after["max_x"]) - int(sibling_extent["max_x"])
+		if int(sibling_extent["min_y"]) > int(union_after["min_y"]) + tolerance:
+			shortfall["top"] = int(sibling_extent["min_y"]) - int(union_after["min_y"])
+		if int(sibling_extent["max_y"]) < int(union_after["max_y"]) - tolerance:
+			shortfall["bottom"] = int(union_after["max_y"]) - int(sibling_extent["max_y"])
+		if not shortfall.is_empty():
+			gaps.append({
+				"layer": sibling.get("label", ""),
+				"map_layer": sibling.get("map_layer", 0),
+				"current_extent": {
+					"min_x": sibling_extent["min_x"],
+					"max_x": sibling_extent["max_x"],
+					"min_y": sibling_extent["min_y"],
+					"max_y": sibling_extent["max_y"],
+				},
+				"shortfall_cells": shortfall,
+			})
+	return gaps
 
 
 ## 使用 TileSet terrain connect API 绘制一组 2D terrain cell，让道路/水域边缘自动衔接。
@@ -430,6 +572,9 @@ static func _describe_tilemap_layers(target: Node) -> Array:
 			"index": layer_index,
 			"name": str(target.get_layer_name(layer_index)),
 			"enabled": bool(target.is_layer_enabled(layer_index)),
+			# 这一层瓦片实际铺到哪——背景/天空这类"毯式"图层扩图时要不要跟着扩，
+			# 直接看这个范围跟其它层比是不是已经跟不上，不用再去猜。
+			"used_bounds": _used_bounds_2d(target.call("get_used_cells", layer_index)),
 		})
 	return layers
 
@@ -1880,6 +2025,19 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 				"note": "repair_map_region can move indexed object nodes to nearby free cells when repair_blocked_objects=true.",
 			})
 			result["repair_plan"] = pressure_repair
+	# edit_map 编辑后会主动报"毯式图层跟不上了"，validate_map_region 这边同一套逻辑也要跑一遍——
+	# 不依赖"刚好是这次编辑造成的"，哪怕落后是上一轮留下的旧问题，校验时一样要能发现。
+	var coverage_extent := _layer_used_extent_2d(target, map_layer)
+	var coverage_siblings := _sibling_layers_for_coverage(target, map_layer)
+	for sibling in coverage_siblings:
+		(sibling as Dictionary)["extent"] = _layer_used_extent_2d((sibling as Dictionary)["node"], int((sibling as Dictionary)["map_layer"]))
+	var coverage_gaps := _compute_coverage_gaps(coverage_extent, coverage_extent, coverage_siblings)
+	result["layer_coverage_gaps"] = coverage_gaps
+	if not coverage_gaps.is_empty():
+		result["passed"] = false
+		var coverage_issues: Array = result.get("issues", [])
+		coverage_issues.append("one or more full-coverage layers (background/sky/water etc.) fall short of the map's overall extent")
+		result["issues"] = coverage_issues
 	return result
 
 

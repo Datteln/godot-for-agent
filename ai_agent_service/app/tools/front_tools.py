@@ -1481,10 +1481,14 @@ def register_front_tools() -> None:
                     "Use this before extending or blending with existing terrain/background so new content "
                     "reuses the real source_id/atlas_coords already in use, and before computing world "
                     "coordinates for nodes placed relative to the map, instead of guessing constants. "
-                    "For a legacy TileMap, the response also includes a `layers` array (index/name/enabled) "
-                    "listing every layer the node actually has — check it and pick the right map_layer "
-                    "explicitly; do not assume map_layer 0 is the visible/collidable foreground layer, many "
-                    "templates put a non-collidable background/decoration layer at index 0."
+                    "For a legacy TileMap, the response also includes a `layers` array (index/name/enabled/"
+                    "used_bounds) listing every layer the node actually has — check it and pick the right "
+                    "map_layer explicitly; do not assume map_layer 0 is the visible/collidable foreground layer, "
+                    "many templates put a non-collidable background/decoration layer at index 0. Each layer's "
+                    "`used_bounds` (min_x/max_x/min_y/max_y, empty {} if the layer has no tiles) tells you how "
+                    "far that layer's content actually reaches — compare a background/sky/water layer's bounds "
+                    "against the foreground layer's to see whether the backdrop has fallen behind before you "
+                    "extend the level further."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1931,7 +1935,13 @@ def register_front_tools() -> None:
                     "Supports fill, erase, and overlap-safe region copy; all changes are previewed and undoable. "
                     "For a legacy TileMap with multiple layers, call describe_map_region first to see the real "
                     "`layers` list and confirm which index is the visible/collidable foreground layer before "
-                    "picking map_layer — do not assume index 0 is the right one."
+                    "picking map_layer — do not assume index 0 is the right one. "
+                    "The result includes `layer_coverage_gaps`: any sibling layer (other legacy-TileMap layer "
+                    "index, or other TileMapLayer under the same parent) that already covered ~90%+ of the map's "
+                    "extent before this edit (a background/sky/water backdrop, not local decoration) but now falls "
+                    "short of the map's new overall extent after this edit. When non-empty, extend those layers "
+                    "to match before treating a level-extension task as finished — do not rely on remembering to "
+                    "check this yourself; read the field every time."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2322,7 +2332,12 @@ def register_front_tools() -> None:
                     "invert. Optionally override gravity direction via gravity_axis/gravity_sign. It can also enforce "
                     "allowed_bounds, check spatial-index overlaps, and detect objects on water/blocked cells. Returns "
                     "issues, passed, path/multi_connectivity, and repair_plan, but never edits. A 'passed' result only "
-                    "means reachable under the given movement assumptions — still verify the design visually."
+                    "means reachable under the given movement assumptions — still verify the design visually. It also "
+                    "always returns `layer_coverage_gaps`: any sibling layer (other legacy-TileMap layer index, or "
+                    "other TileMapLayer under the same parent) that already covers ~90%+ of the map's extent (a "
+                    "background/sky/water backdrop, not local decoration) but currently falls short of the map's "
+                    "overall extent — this forces `passed=false` just like a failed connectivity check, regardless "
+                    "of whether the gap was introduced by a recent edit or was already there."
                 ),
                 "parameters": _object_schema(
                     {
