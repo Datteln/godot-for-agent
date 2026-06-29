@@ -12,6 +12,8 @@ const MapPlatformComposer = preload("res://addons/ai_agent/tools/map_platform_co
 const MapReachableGrowth = preload("res://addons/ai_agent/tools/map_reachable_growth.gd")
 
 const MAX_EDITED_CELLS := 100000
+const MAX_EDIT_MAP_BATCH_CELLS := 200
+const MAX_THIN_NON_BLANKET_FILL_WIDTH := 12
 const MAX_DESCRIBED_CELLS := 400
 ## describe_map_region 是纯内存读取（一次循环读完整片区域），400 只是响应体大小的策略上限，
 ## 不是 IO 成本。超过 400 但不超过这个上限时直接自动整片返回（标 auto_served），模型无需自己
@@ -33,6 +35,83 @@ const RESOURCE_REGISTRY_PATHS := [
 ]
 const SPATIAL_INDEX_PATH := "res://.ai_agent_service/map_agent/spatial_index.json"
 const BLUEPRINTS_DIR := "res://.ai_agent_service/map_agent/blueprints"
+
+
+static func _map_completion_blocker(reason: String, issues: Array = []) -> Dictionary:
+	return {
+		"completion_allowed": false,
+		"blocking_completion": true,
+		"validation": {
+			"passed": false,
+			"blocking_completion": true,
+			"issues": issues if not issues.is_empty() else [reason],
+		},
+	}
+
+
+static func _merge_map_completion_blocker(result: Dictionary, reason: String, issues: Array = []) -> Dictionary:
+	var merged := result.duplicate(true)
+	merged.merge(_map_completion_blocker(reason, issues), true)
+	return merged
+
+
+static func _operation_cells(operation: Dictionary, dimension: int) -> int:
+	var width := max(1, int(operation.get("width", 1)))
+	var height := max(1, int(operation.get("height", 1)))
+	var depth := max(1, int(operation.get("depth", 1))) if dimension == 3 else 1
+	return width * height * depth
+
+
+static func _is_blanket_layer_operation(operation: Dictionary) -> bool:
+	var semantic_layer := str(operation.get("semantic_layer", operation.get("resource", operation.get("resource_key", "")))).to_lower()
+	for token in ["background", "backdrop", "sky", "water", "ocean", "sea"]:
+		if semantic_layer.find(token) >= 0:
+			return true
+	var tags_value = operation.get("tags", [])
+	var tags: Array = tags_value if tags_value is Array else []
+	for tag in tags:
+		var tag_text := str(tag).to_lower()
+		if tag_text in ["background", "backdrop", "sky", "water", "blanket_layer"]:
+			return true
+	return false
+
+
+static func _validate_edit_map_batch_shape(operations: Array, dimension: int) -> Dictionary:
+	var total_cells := 0
+	for operation_value in operations:
+		if not (operation_value is Dictionary):
+			return {"ok": false, "message": "each operation must be an object", "error_code": "invalid_operation"}
+		var operation: Dictionary = operation_value
+		var cells := _operation_cells(operation, dimension)
+		total_cells += cells
+		if cells > MAX_EDIT_MAP_BATCH_CELLS:
+			return _merge_map_completion_blocker({
+				"ok": false,
+				"message": "single edit_map operation writes %d cells, over the %d-cell batch limit; split it into smaller previewed chunks." % [cells, MAX_EDIT_MAP_BATCH_CELLS],
+				"error_code": "map_edit_batch_too_large",
+				"cells": cells,
+				"max_cells": MAX_EDIT_MAP_BATCH_CELLS,
+			}, "map_edit_batch_too_large")
+		if str(operation.get("action", "")) == "fill" and dimension == 2 and not _is_blanket_layer_operation(operation):
+			var width := max(1, int(operation.get("width", 1)))
+			var height := max(1, int(operation.get("height", 1)))
+			if width > MAX_THIN_NON_BLANKET_FILL_WIDTH and height <= 2:
+				return _merge_map_completion_blocker({
+					"ok": false,
+					"message": "thin non-blanket fill width=%d height=%d looks like an over-broad map repair; split into local segments or use a background/water semantic layer if this is a blanket layer." % [width, height],
+					"error_code": "thin_fill_requires_local_segments",
+					"width": width,
+					"height": height,
+				}, "thin_fill_requires_local_segments")
+	if total_cells > MAX_EDIT_MAP_BATCH_CELLS:
+		return _merge_map_completion_blocker({
+			"ok": false,
+			"message": "edit_map batch writes %d cells in total, over the %d-cell batch limit; split it into smaller previewed chunks." % [total_cells, MAX_EDIT_MAP_BATCH_CELLS],
+			"error_code": "map_edit_batch_too_large",
+			"cells": total_cells,
+			"max_cells": MAX_EDIT_MAP_BATCH_CELLS,
+		}, "map_edit_batch_too_large")
+	return {"ok": true}
 
 
 static func describe_selection(editor_interface: EditorInterface) -> Dictionary:
@@ -133,6 +212,15 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		return {"ok": false, "message": "at most 128 operations are allowed", "error_code": "map_edit_too_large"}
 
 	var dimension := 3 if target.get_class() == "GridMap" else 2
+	if not input.has("expected_cells"):
+		return _merge_map_completion_blocker({
+			"ok": false,
+			"message": "expected_cells is required for every edit_map call so the tool can reject off-by-one or under-specified map edits before writing.",
+			"error_code": "expected_cells_required",
+		}, "expected_cells_required")
+	var batch_shape := _validate_edit_map_batch_shape(operations, dimension)
+	if not bool(batch_shape.get("ok", false)):
+		return batch_shape
 	var map_layer := int(input.get("map_layer", 0))
 	var allowed_bounds := _bounds_from_input(input, dimension)
 	# 编辑前先记录"毯式图层"（背景/天空这类本来就铺满全图的图层）的现状，
@@ -201,7 +289,7 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 	if input.has("expected_cells"):
 		var expected_cells := int(input.get("expected_cells"))
 		if expected_cells != after.size():
-			return {
+			return _merge_map_completion_blocker({
 				"ok": false,
 				"message": (
 					"expected_cells=%d but these operations write %d cells; the batch does not match the " +
@@ -211,7 +299,7 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 				"error_code": "cell_count_mismatch",
 				"expected_cells": expected_cells,
 				"actual_cells": after.size(),
-			}
+			}, "cell_count_mismatch")
 
 	# 先写空间索引，再动瓦片：如果索引写盘失败，此时还没有任何瓦片落入 Undo 批次，
 	# 可以直接返回错误而不留下"已改了瓦片却报失败"的半截状态（否则模型会拿着失败结果
@@ -229,6 +317,13 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 	var coverage_gaps := _compute_coverage_gaps(coverage_edited_extent_before, coverage_edited_extent_after, coverage_siblings, coverage_target_columns_after)
 	var result := {
 		"ok": true,
+		"completion_allowed": false,
+		"blocking_completion": true,
+		"validation": {
+			"passed": false,
+			"blocking_completion": true,
+			"issues": ["map_edit_requires_followup_validation"],
+		},
 		"target": str(target_result.get("path", "")),
 		"type": target.get_class(),
 		"dimension": dimension,
@@ -3277,13 +3372,13 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 	if validate_cells > MAX_DESCRIBED_CELLS:
 		# 校验区域不能像 describe 那样随便拆——切碎会破坏跨段可达性判定。提示按"路线分段、每段
 		# 带自己的 start/goal 校验"的方式缩小，并把支撑行留在区域内，而不是盲目砍宽高。
-		return {
+		return _merge_map_completion_blocker({
 			"ok": false,
 			"message": "validation region has %d cells, over the %d-cell limit; validate fewer cells per call — split the route into segments and validate each with its own start/goal, keeping each segment's support row inside the region." % [validate_cells, MAX_DESCRIBED_CELLS],
 			"error_code": "region_too_large",
 			"cells": validate_cells,
 			"max_cells": MAX_DESCRIBED_CELLS,
-		}
+		}, "region_too_large")
 
 	var filled := _collect_filled_cells(target, region, dimension, map_layer)
 	var result := {
@@ -3294,6 +3389,12 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 		"region": region,
 	}
 	var movement := MapValidator.movement_from_input(input, dimension)
+	if bool(input.get("check_platform_design", false)) and str(movement.get("model", "grid")) != "leap":
+		return _merge_map_completion_blocker({
+			"ok": false,
+			"message": "platformer map validation must use movement_model='leap'; grid only proves abstract adjacency and cannot validate jumps or gravity.",
+			"error_code": "platformer_validation_requires_leap",
+		}, "platformer_validation_requires_leap")
 	var analysis := MapValidator.validate_region(
 		filled,
 		region,
@@ -3370,6 +3471,18 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 		var coverage_issues: Array = result.get("issues", [])
 		coverage_issues.append("one or more full-coverage layers (background/sky/water etc.) fall short of the map's overall extent")
 		result["issues"] = coverage_issues
+	var route_checked := (input.has("start") and (input.has("goal") or input.has("waypoints"))) or (input.has("entrances") and input.has("exits"))
+	var completion_issues: Array = result.get("issues", [])
+	if not route_checked:
+		completion_issues.append("route_validation_not_checked: pass start plus goal/waypoints or entrances/exits before treating a route/map edit as complete")
+	result["issues"] = completion_issues
+	result["completion_allowed"] = bool(result.get("passed", false)) and route_checked
+	result["blocking_completion"] = not bool(result["completion_allowed"])
+	result["validation"] = {
+		"passed": bool(result.get("passed", false)),
+		"blocking_completion": bool(result["blocking_completion"]),
+		"issues": completion_issues,
+	}
 	return result
 
 
@@ -3391,13 +3504,13 @@ static func repair_map_region(input: Dictionary, editor_interface: EditorInterfa
 	var region := MapValidator.region_from_input(input, dimension)
 	var repair_cells := int(region["width"]) * int(region["height"]) * int(region["depth"])
 	if repair_cells > MAX_DESCRIBED_CELLS:
-		return {
+		return _merge_map_completion_blocker({
 			"ok": false,
 			"message": "repair region has %d cells, over the %d-cell limit; repair fewer cells per call — repair one route segment at a time with its own start/goal." % [repair_cells, MAX_DESCRIBED_CELLS],
 			"error_code": "region_too_large",
 			"cells": repair_cells,
 			"max_cells": MAX_DESCRIBED_CELLS,
-		}
+		}, "region_too_large")
 	var filled := _collect_filled_cells(target, region, dimension, map_layer)
 	var analysis := MapValidator.validate_region(
 		filled,
@@ -3412,7 +3525,14 @@ static func repair_map_region(input: Dictionary, editor_interface: EditorInterfa
 		input.get("exits", null)
 	)
 	if bool(analysis.get("passed", false)):
-		return {"ok": true, "changed": false, "message": "Region already passes validation", "validation": analysis}
+		return {
+			"ok": true,
+			"changed": false,
+			"completion_allowed": true,
+			"blocking_completion": false,
+			"message": "Region already passes validation",
+			"validation": analysis,
+		}
 	var cells_result := _repair_cells_from_plan(input, target, dimension, map_layer, analysis.get("repair_plan", []))
 	if not bool(cells_result.get("ok", false)):
 		return cells_result
@@ -3455,6 +3575,8 @@ static func repair_map_region(input: Dictionary, editor_interface: EditorInterfa
 		"ok": true,
 		"changed": true,
 		"repaired": repaired,
+		"completion_allowed": repaired,
+		"blocking_completion": not repaired,
 		"target": str(target_result.get("path", "")),
 		"type": target.get_class(),
 		"dimension": dimension,

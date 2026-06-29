@@ -52,6 +52,8 @@ class Session:
             不存在活跃计划时为 None。
         verify_retry_count: 文件路径 → 该文件已触发的"校验失败-修复"重试次数，
             用于防止 Verify 与 LLM 修复之间死循环。
+        map_completion_blockers: 地图编辑任务的阻断完成原因；前端地图工具回传
+            `blocking_completion` 或尚未通过路线校验时写入，最终回复前清空或拦截。
         rag_context: 当前用户提问检索到的 RAG 上下文（分层 prompt 的 L3 段），
             在新用户消息到达时刷新、在工具结果回填等同一轮的后续请求里复用，
             使该段在整轮 agent 循环内保持稳定、可被缓存（§16.1 RAG 段缓存）。
@@ -72,6 +74,7 @@ class Session:
     pending_plan: dict[str, Any] | None = None
     verify_retry_count: dict[str, int] = field(default_factory=dict)
     pending_verify_candidates: list[dict[str, Any]] = field(default_factory=list)
+    map_completion_blockers: list[dict[str, Any]] = field(default_factory=list)
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
@@ -296,6 +299,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "pending_plan": session.pending_plan,
         "verify_retry_count": session.verify_retry_count,
         "pending_verify_candidates": session.pending_verify_candidates,
+        "map_completion_blockers": session.map_completion_blockers,
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
         "rag_context": session.rag_context,
@@ -389,6 +393,11 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         pending_verify_candidates=[
             item
             for item in _as_list(data.get("pending_verify_candidates"))
+            if isinstance(item, dict)
+        ],
+        map_completion_blockers=[
+            item
+            for item in _as_list(data.get("map_completion_blockers"))
             if isinstance(item, dict)
         ],
         history_event_counter=history_event_counter,

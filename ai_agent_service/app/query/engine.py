@@ -347,6 +347,26 @@ _HISTORY_FRONT_RUN_TOOLS = frozenset(
 _HISTORY_FRONT_TOOLS = (
     _HISTORY_FRONT_READ_TOOLS | _HISTORY_FRONT_SCENE_EDIT_TOOLS | _HISTORY_FRONT_RUN_TOOLS
 )
+_MAP_COMPLETION_TOOL_NAMES = frozenset(
+    {
+        "edit_map",
+        "paint_terrain_connect",
+        "place_map_objects",
+        "repair_map_region",
+        "repair_layer_coverage",
+        "validate_map_region",
+        "validate_layer_coverage",
+    }
+)
+_MAP_WRITE_TOOL_NAMES = frozenset(
+    {
+        "edit_map",
+        "paint_terrain_connect",
+        "place_map_objects",
+        "repair_map_region",
+        "repair_layer_coverage",
+    }
+)
 _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
     {
         "agent_reasoning_delta",
@@ -532,6 +552,77 @@ def _front_tool_error_message(result: dict[str, Any]) -> str:
         if value not in (None, ""):
             return str(value)
     return "Unknown error"
+
+
+def _map_completion_blocker(
+    tool_name: str, status: str, result: Any, error_code: str | None
+) -> dict[str, Any] | None:
+    """从地图工具结果中提取阻断最终完成的原因。"""
+    if tool_name not in _MAP_COMPLETION_TOOL_NAMES:
+        return None
+    result_dict = result if isinstance(result, dict) else {}
+    if status != "applied":
+        return {
+            "tool": tool_name,
+            "reason": error_code or status,
+            "issues": [str(error_code or status)],
+        }
+
+    issues = result_dict.get("issues")
+    if not isinstance(issues, list):
+        validation = result_dict.get("validation")
+        issues = validation.get("issues", []) if isinstance(validation, dict) else []
+    normalized_issues = [str(issue) for issue in issues if str(issue).strip()]
+
+    if bool(result_dict.get("blocking_completion", False)):
+        return {
+            "tool": tool_name,
+            "reason": "blocking_completion",
+            "issues": normalized_issues or ["map tool reported blocking_completion=true"],
+        }
+    if result_dict.get("completion_allowed") is False:
+        return {
+            "tool": tool_name,
+            "reason": "completion_not_allowed",
+            "issues": normalized_issues or ["map tool reported completion_allowed=false"],
+        }
+    if tool_name in _MAP_WRITE_TOOL_NAMES and result_dict.get("completion_allowed") is not True:
+        return {
+            "tool": tool_name,
+            "reason": "map_write_requires_validation",
+            "issues": ["map write applied but no successful validation has cleared completion"],
+        }
+    return None
+
+
+def _map_completion_gate_text(blockers: list[dict[str, Any]]) -> str:
+    """生成地图完成门拦截后的最终回复文本。"""
+    issue_lines: list[str] = []
+    for blocker in blockers[:3]:
+        tool = str(blocker.get("tool", "map tool"))
+        reason = str(blocker.get("reason", "blocked"))
+        issues = blocker.get("issues", [])
+        if isinstance(issues, list) and issues:
+            issue_lines.append(f"- {tool}: {reason}; {str(issues[0])}")
+        else:
+            issue_lines.append(f"- {tool}: {reason}")
+    details = "\n".join(issue_lines)
+    return (
+        "地图任务还不能标记为完成。\n\n"
+        f"{details}\n\n"
+        "需要继续按小批编辑、分段 validate_map_region、截图复核的流程修完；"
+        "在 completion_allowed=true 前，最终回复已被服务层拦截。"
+    )
+
+
+def _replace_last_assistant_final(session: Session, text: str) -> None:
+    """用服务层拦截文本替换最近一条无工具调用 assistant 回复。"""
+    frame = session.top_frame()
+    if frame is None or not frame.messages:
+        return
+    last = frame.messages[-1]
+    if last.get("role") == "assistant" and not last.get("tool_calls"):
+        last["content"] = text
 
 
 def _unknown_tool_result_summary(payload: dict[str, Any], inner: dict[str, Any]) -> str:
@@ -2180,6 +2271,7 @@ class QueryEngine:
                 return ChatErrorResponse(text="会话没有活跃的 agent 帧")
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
             session.pending_verify_candidates.clear()
+            session.map_completion_blockers.clear()
             self._emit(
                 session.session_id, "user_submitted", {"has_context": request.context is not None}
             )
@@ -2317,6 +2409,10 @@ class QueryEngine:
                 len(response.calls),
             )
         elif isinstance(response, ChatFinalResponse):
+            if session.map_completion_blockers:
+                gated_text = _map_completion_gate_text(session.map_completion_blockers)
+                _replace_last_assistant_final(session, gated_text)
+                response = ChatFinalResponse(text=gated_text)
             self._emit(session.session_id, "final", {"text_length": len(response.text)})
             logger.info(
                 "Chat produced final response session=%s text_length=%d",
@@ -2547,6 +2643,17 @@ class QueryEngine:
                     "error_code": result.error_code,
                     "result": result.result,
                 }
+            result_for_gate = payload.get("result") if isinstance(payload, dict) else None
+            blocker = _map_completion_blocker(
+                tool_name, result.status, result_for_gate, result.error_code
+            )
+            if tool_name == "validate_map_region" and isinstance(result_for_gate, dict):
+                if result_for_gate.get("completion_allowed") is True:
+                    session.map_completion_blockers.clear()
+                elif blocker is not None:
+                    session.map_completion_blockers = [blocker]
+            elif blocker is not None:
+                session.map_completion_blockers = [blocker]
             frame.messages.append(_tool_message(result.tool_use_id, payload, is_error=is_error))
             logger.info(
                 "Tool result appended session=%s turn_id=%s tool=%s status=%s frame=%s",

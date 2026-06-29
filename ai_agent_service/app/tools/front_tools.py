@@ -2027,10 +2027,12 @@ def register_front_tools() -> None:
                     "yourself; read the field every time. Also: if the `resource`/`resource_key` you passed is "
                     "registered with a scene_path (an object/PackedScene, e.g. a tree), this call fails with "
                     "error_code 'resource_requires_object_placement' — use place_map_objects for it instead of "
-                    "approximating it out of tiles. Pass `expected_cells` (the number of cells this batch should "
+                    "approximating it out of tiles. `expected_cells` is required (the number of cells this batch should "
                     "write, e.g. an inclusive x=A..B span is B-A+1 columns × the fill height) so the tool can "
                     "reject an off-by-one batch (error_code 'cell_count_mismatch') before any tiles are written, "
-                    "instead of discovering the gap later in validate_map_region."
+                    "instead of discovering the gap later in validate_map_region. The tool also rejects oversized "
+                    "batches and thin, non-blanket fills that look like broad map repair; split those into local "
+                    "segments, or mark true backdrop/water/sky work with the matching semantic_layer/tags."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2146,7 +2148,7 @@ def register_front_tools() -> None:
                             "type": "integer",
                             "minimum": 1,
                             "description": (
-                                "Optional self-check: the number of cells this batch is supposed to write. If it "
+                                "Required self-check: the number of cells this batch is supposed to write. If it "
                                 "does not match what the operations actually produce, the call is rejected with "
                                 "error_code 'cell_count_mismatch' and nothing is written. Always set it to your "
                                 "declared coverage (sum of width*height[*depth] per op) so a miscounted inclusive "
@@ -2154,7 +2156,7 @@ def register_front_tools() -> None:
                             ),
                         },
                     },
-                    ["operations"],
+                    ["operations", "expected_cells"],
                 ),
             },
         )
@@ -2666,7 +2668,11 @@ def register_front_tools() -> None:
                     "boundary (`shortfall_cells`) or with a gap in the middle of its own already-covered range "
                     "(`interior_holes_x`, e.g. a background that nominally spans the right width but still has a "
                     "gray hole partway through). Either kind forces `passed=false` just like a failed connectivity "
-                    "check, regardless of whether the gap was introduced by a recent edit or was already there."
+                    "check, regardless of whether the gap was introduced by a recent edit or was already there. "
+                    "The result includes `completion_allowed` and `blocking_completion`; final completion is only "
+                    "allowed after a validation with real route endpoints/waypoints (or entrances/exits) passes and "
+                    "`completion_allowed=true`. Oversized validation returns `blocking_completion=true` and must be "
+                    "split into route segments instead of being ignored."
                 ),
                 "parameters": _object_schema(
                     {
