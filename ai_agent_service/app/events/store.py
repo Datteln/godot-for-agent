@@ -21,9 +21,8 @@ class Event:
 
 _MAX_EVENTS_PER_SESSION = 500
 
-# 这两种事件是逐字/逐 token 的流式增量，同一段（相同 type + frame_id + loop）
-# 往往会产生几十条事件，但每条都携带"截至当前的完整累积文本"——只有同一段里
-# 最后一条对历史回放/SSE 补发有意义，中间那些只是同一份内容的早期截断版本。
+# 旧版流式事件每条都携带"截至当前的完整累积文本"；这种 snapshot 可原地覆盖。
+# 新版 `append_delta` 事件只携带新增片段，必须逐条保留，否则会丢内容。
 # 不去重的话，_MAX_EVENTS_PER_SESSION 的额度会被这些中间态迅速消耗掉，导致
 # 较早几轮的 Thought/正文流被挤出缓冲区，历史回放时只剩最近一两段。
 _COALESCED_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta"}
@@ -32,6 +31,8 @@ _COALESCED_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta"}
 def _coalesce_stream_key(event_type: str, payload: dict[str, Any]) -> tuple[str, str, str] | None:
     """非流式增量事件返回 None；流式增量返回其 (type, frame_id, loop) 去重键。"""
     if event_type not in _COALESCED_EVENT_TYPES:
+        return None
+    if bool(payload.get("append_delta", False)):
         return None
     return (event_type, str(payload.get("frame_id", "")), str(payload.get("loop", "")))
 

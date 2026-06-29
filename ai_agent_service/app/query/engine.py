@@ -1048,17 +1048,34 @@ def _history_item_for_stream_event(event: Event) -> SessionHistoryItemDTO | None
     return SessionHistoryItemDTO(role="assistant", text=text, frame_id=frame_id)
 
 
+def _merged_stream_event(events: list[Event]) -> Event | None:
+    """把同一段流式事件合并为一个可回放的完整文本事件。"""
+    if not events:
+        return None
+    text_parts: list[str] = []
+    selected = events[0]
+    for event in sorted(events, key=lambda item: item.seq):
+        selected = event
+        text = str(event.payload.get("text", ""))
+        if bool(event.payload.get("append_delta", False)):
+            text_parts.append(text)
+        else:
+            text_parts = [text]
+    return replace(selected, payload={**selected.payload, "text": "".join(text_parts)})
+
+
 def _history_items_for_events(events: list[Event], seen: set[str]) -> list[SessionHistoryItemDTO]:
     """从事件日志中恢复不在 frame messages 里的 workflow 历史条目。"""
     items: list[SessionHistoryItemDTO] = []
-    current_stream: Event | None = None
+    current_stream_events: list[Event] = []
     current_stream_key: tuple[str, str, str] | None = None
 
     def flush_stream() -> None:
-        nonlocal current_stream, current_stream_key
+        nonlocal current_stream_events, current_stream_key
+        current_stream = _merged_stream_event(current_stream_events)
         stream_item = _history_item_for_stream_event(current_stream) if current_stream else None
         _append_history_item_if_new(items, seen, stream_item)
-        current_stream = None
+        current_stream_events = []
         current_stream_key = None
 
     for event in events:
@@ -1067,11 +1084,11 @@ def _history_items_for_events(events: list[Event], seen: set[str]) -> list[Sessi
             stream_key = (
                 event.type,
                 str(payload.get("frame_id", "")),
-                str(payload.get("loop", "")),
+                str(payload.get("message_index", payload.get("loop", ""))),
             )
             if current_stream_key is not None and stream_key != current_stream_key:
                 flush_stream()
-            current_stream = event
+            current_stream_events.append(event)
             current_stream_key = stream_key
             continue
 
@@ -1564,14 +1581,10 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
         text_events = group["text"]
         assert isinstance(reasoning_events, list)
         assert isinstance(text_events, list)
-        text = max(text_events, key=lambda event: event.seq) if text_events else None
+        text = _merged_stream_event(text_events)
         if text is not None:
             reasoning_before_text = [event for event in reasoning_events if event.seq < text.seq]
-            reasoning = (
-                max(reasoning_before_text, key=lambda event: event.seq)
-                if reasoning_before_text
-                else None
-            )
+            reasoning = _merged_stream_event(reasoning_before_text)
             usage_events = [
                 event
                 for event in reasoning_events
@@ -1587,9 +1600,7 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
                     },
                 )
         else:
-            reasoning = (
-                max(reasoning_events, key=lambda event: event.seq) if reasoning_events else None
-            )
+            reasoning = _merged_stream_event(reasoning_events)
         selected = [event for event in (reasoning, text) if event is not None]
         first_seq = min((event.seq for event in selected), default=2**31 - 1)
         if reasoning is not None:

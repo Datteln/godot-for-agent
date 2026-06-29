@@ -1143,9 +1143,11 @@ def _delta_callback(
         return None
 
     reasoning_started_at = time.monotonic()
+    accumulated_text: dict[str, str] = {"content": "", "reasoning": ""}
 
     def _on_delta(kind: str, text: str, token_count: int | None) -> None:
         event_type = "agent_reasoning_delta" if kind == "reasoning" else "agent_text_delta"
+        accumulated_text[kind] = accumulated_text.get(kind, "") + text
         payload: dict[str, Any] = {
             "frame_id": frame_id,
             "loop": loop,
@@ -1153,11 +1155,14 @@ def _delta_callback(
             "timeline_frame_id": timeline_frame_id,
             "timeline_message_index": timeline_message_index,
             "text": text,
+            "append_delta": True,
         }
         if kind == "reasoning":
             payload["elapsed_ms"] = max(int((time.monotonic() - reasoning_started_at) * 1000), 1)
             payload["token_count"] = (
-                token_count if token_count is not None else _estimate_stream_token_count(text)
+                token_count
+                if token_count is not None
+                else _estimate_stream_token_count(accumulated_text[kind])
             )
         event_callback(event_type, payload)
 
@@ -1779,6 +1784,10 @@ async def run_turn(
                     **_history_timeline_payload(frame),
                 },
             )
+
+        if server_calls and event_callback is not None:
+            # ponytail: sync event stores do not need flushing; this yields for async transports.
+            await asyncio.sleep(0)
 
         # 第三遍：按 `tool_calls` 原始顺序把结果 append 回 `frame.messages`。
         for item in pending_items:

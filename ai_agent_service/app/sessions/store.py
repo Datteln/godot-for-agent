@@ -155,7 +155,11 @@ class Session:
             "type": event_type,
             "payload": dict(payload),
         }
-        if event_type in _COALESCED_HISTORY_EVENT_TYPES and self.history_events:
+        if (
+            event_type in _COALESCED_HISTORY_EVENT_TYPES
+            and not bool(payload.get("append_delta", False))
+            and self.history_events
+        ):
             previous = self.history_events[-1]
             previous_payload = previous.get("payload", {})
             if not isinstance(previous_payload, dict):

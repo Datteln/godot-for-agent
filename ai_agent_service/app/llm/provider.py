@@ -19,8 +19,8 @@ from app.llm.message_transformer import CacheBreakpoint, inject_cache_breakpoint
 
 logger = logging.getLogger(__name__)
 
-# 流式增量回调：`(kind, accumulated_text)`，`kind` 为 `"content"`（回复正文）
-# 或 `"reasoning"`（思考过程），`accumulated_text` 为截至当前的完整累积文本。
+# 流式增量回调：`(kind, delta_text)`，`kind` 为 `"content"`（回复正文）
+# 或 `"reasoning"`（思考过程），`delta_text` 为本次新增片段。
 DeltaCallback = Callable[[str, str, int | None], None]
 
 # 降级回调：`(primary_model, fallback_model)`，主模型请求失败、即将用
@@ -29,7 +29,7 @@ DeltaCallback = Callable[[str, str, int | None], None]
 FallbackCallback = Callable[[str, str], None]
 
 # 流式增量事件的最小推送间隔（秒），避免逐 token 产生事件淹没事件队列。
-_DELTA_MIN_INTERVAL_S = 0.12
+_DELTA_MIN_INTERVAL_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -172,7 +172,7 @@ class LLMProvider(Protocol):
                 限制上限；==0 时关闭 thinking（确定性优先）；==-1（默认）时
                 沿用 enable_thinking:true 不限预算的原有行为。
             on_delta: 流式增量回调，参数为
-                `(kind, accumulated_text, token_count)`；精确 token 数仅在最终
+                `(kind, delta_text, token_count)`；精确 token 数仅在最终
                 usage 可用时传入，否则为 None。
             on_fallback: 降级回调，主模型失败、即将用 `fallback_model`
                 重试前触发一次；为 None 时不通知。
@@ -383,6 +383,8 @@ class OpenAICompatibleProvider:
         finish_reason: str | None = None
         last_content_emit = 0.0
         last_reasoning_emit = 0.0
+        emitted_content_len = 0
+        emitted_reasoning_len = 0
         reasoning_tokens: int | None = None
         cached_tokens: int | None = None
         cache_creation_tokens: int | None = None
@@ -415,15 +417,21 @@ class OpenAICompatibleProvider:
                     content_parts.append(delta.content)
                     now = time.monotonic()
                     if on_delta is not None and now - last_content_emit >= _DELTA_MIN_INTERVAL_S:
+                        content_text = "".join(content_parts)
+                        delta_text = content_text[emitted_content_len:]
+                        emitted_content_len = len(content_text)
                         last_content_emit = now
-                        on_delta("content", "".join(content_parts), None)
+                        on_delta("content", delta_text, None)
                 reasoning_piece = getattr(delta, "reasoning_content", None)
                 if reasoning_piece:
                     reasoning_parts.append(reasoning_piece)
                     now = time.monotonic()
                     if on_delta is not None and now - last_reasoning_emit >= _DELTA_MIN_INTERVAL_S:
+                        reasoning_text = "".join(reasoning_parts)
+                        delta_text = reasoning_text[emitted_reasoning_len:]
+                        emitted_reasoning_len = len(reasoning_text)
                         last_reasoning_emit = now
-                        on_delta("reasoning", "".join(reasoning_parts), None)
+                        on_delta("reasoning", delta_text, None)
                 for tool_call_delta in delta.tool_calls or []:
                     entry = tool_calls_acc.setdefault(
                         tool_call_delta.index,
@@ -452,9 +460,13 @@ class OpenAICompatibleProvider:
         reasoning = "".join(reasoning_parts) or None
         if on_delta is not None:
             if content is not None:
-                on_delta("content", content, None)
+                delta_text = content[emitted_content_len:]
+                if delta_text:
+                    on_delta("content", delta_text, None)
             if reasoning is not None:
-                on_delta("reasoning", reasoning, reasoning_tokens)
+                delta_text = reasoning[emitted_reasoning_len:]
+                if delta_text or reasoning_tokens is not None:
+                    on_delta("reasoning", delta_text, reasoning_tokens)
 
         tool_calls = [
             ToolCallRequest(

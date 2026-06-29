@@ -140,6 +140,8 @@ var _rendered_assistant_keys := {}
 var _live_response_keys := {}   # 仅追踪本轮实时响应，避免历史加载的指纹误判为重复
 var _closed_stream_keys := {}
 var _closed_reasoning_keys := {}   # 新增：专门追踪已关闭的 reasoning stream
+var _stream_delta_text_by_key := {}
+var _reasoning_delta_text_by_key := {}
 var _theme_colors: Dictionary = {}
 var _auto_scroll := true
 var _suppress_scroll_check := false   # 程序滚动时抑制 value_changed 误判
@@ -514,6 +516,8 @@ func _on_send() -> void:
 	_finish_reasoning_stream()
 	_closed_stream_keys.clear()
 	_closed_reasoning_keys.clear()   # 新增
+	_stream_delta_text_by_key.clear()
+	_reasoning_delta_text_by_key.clear()
 	_live_response_keys.clear()
 	_empty_final_ignored_ms = -1   # 重置空 final 超时计时器
 	_input.text = ""
@@ -2056,6 +2060,11 @@ func _coalesce_events(events: Array) -> Array:
 		var event: Dictionary = raw_event
 		var event_type := str(event.get("type", ""))
 		if event_type == "agent_reasoning_delta" or event_type == "agent_text_delta":
+			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+			if bool(payload.get("append_delta", false)):
+				_flush_delta_events(result, latest_delta, ordered_delta_keys)
+				result.append(event)
+				continue
 			_remember_delta_event(event, latest_delta, ordered_delta_keys)
 			continue
 		_flush_delta_events(result, latest_delta, ordered_delta_keys)
@@ -2178,8 +2187,7 @@ func _handle_event(event: Dictionary) -> void:
 			_state_before_compact = _state
 			_set_state(AgentState.COMPACTING)
 		if _REASONING_BOUNDARY_EVENT_TYPES.has(event_type):
-			_mark_reasoning_stream_closed()
-			_finish_reasoning_stream()
+			_close_reasoning_for_boundary_event(event)
 		var force_milestone_scroll := _MILESTONE_EVENT_TYPES.has(event_type)
 		if force_milestone_scroll:
 			_force_scroll_once = true
@@ -2505,7 +2513,8 @@ func _on_reasoning_delta(event: Dictionary) -> void:
 			"token_count": token_count
 		})
 		return
-	var split := _split_reasoning_xml_payload(str(payload.get("text", "")))
+	var raw_text := _accumulated_stream_text(payload, key, _reasoning_delta_text_by_key)
+	var split := _split_reasoning_xml_payload(raw_text)
 	var text := str(split.get("reasoning", ""))
 	var body := str(split.get("body", ""))
 	FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta]", {
@@ -2524,8 +2533,8 @@ func _on_reasoning_delta(event: Dictionary) -> void:
 func _on_text_delta(event: Dictionary) -> void:
 	var raw_payload: Variant = event.get("payload", {})
 	var payload: Dictionary = raw_payload if raw_payload is Dictionary else {}
-	var text := str(payload.get("text", ""))
 	var key := _stream_event_key(payload)
+	var text := _accumulated_stream_text(payload, key, _stream_delta_text_by_key)
 	_render_text_delta_body(key, text)
 
 
@@ -2569,6 +2578,17 @@ func _render_text_delta_body(key: String, text: String) -> void:
 ## 内只会单调增长，不会重置，才是真正稳定唯一的"这是哪一次 LLM 调用"标识。
 func _stream_event_key(payload: Dictionary) -> String:
 	return "%s:%s" % [str(payload.get("frame_id", "")), str(payload.get("message_index", ""))]
+
+
+func _accumulated_stream_text(payload: Dictionary, key: String, accumulator: Dictionary) -> String:
+	var text := str(payload.get("text", ""))
+	if key == "" or not bool(payload.get("append_delta", false)):
+		if key != "":
+			accumulator[key] = text
+		return text
+	var accumulated := str(accumulator.get(key, "")) + text
+	accumulator[key] = accumulated
+	return accumulated
 
 
 func _should_ignore_stream_delta(key: String, text: String) -> bool:
@@ -2653,6 +2673,8 @@ func _ensure_stream_message(key: String, indent := false) -> void:
 
 
 func _finish_streaming() -> void:
+	if _stream_key != "":
+		_stream_delta_text_by_key.erase(_stream_key)
 	_stream_key = ""
 	_stream_row = null
 	_stream_content_rich = null
@@ -2668,6 +2690,8 @@ func _finish_reasoning_stream() -> void:
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
 		var finished_header := _format_reasoning_header()
 		_reasoning_toggle.text = "✻  " + finished_header + " ✓"
+	if _reasoning_key != "":
+		_reasoning_delta_text_by_key.erase(_reasoning_key)
 	_reasoning_key = ""
 	_reasoning_toggle = null
 	_reasoning_detail_rich = null
@@ -2686,6 +2710,46 @@ func _mark_current_stream_closed() -> void:
 func _mark_reasoning_stream_closed() -> void:
 	if _reasoning_key != "":
 		_closed_reasoning_keys[_reasoning_key] = true
+
+
+func _close_reasoning_for_boundary_event(event: Dictionary) -> void:
+	if not _should_close_reasoning_for_boundary_event(event):
+		return
+	_mark_reasoning_stream_closed()
+	_finish_reasoning_stream()
+
+
+func _should_close_reasoning_for_boundary_event(event: Dictionary) -> bool:
+	if _reasoning_key == "":
+		return true
+	var event_index := _boundary_event_message_index(event)
+	var reasoning_index := _reasoning_stream_message_index()
+	return event_index < 0 or reasoning_index < 0 or event_index >= reasoning_index
+
+
+func _boundary_event_message_index(event: Dictionary) -> int:
+	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+	return _coerce_stream_message_index(payload.get("timeline_message_index", payload.get("message_index", -1)))
+
+
+func _reasoning_stream_message_index() -> int:
+	var parts := _reasoning_key.split(":")
+	if parts.size() < 2:
+		return -1
+	return _coerce_stream_message_index(parts[1])
+
+
+func _coerce_stream_message_index(value: Variant) -> int:
+	if value is int:
+		return int(value)
+	if value is float:
+		return int(value)
+	var text := str(value)
+	if text.is_valid_int():
+		return int(text)
+	if text.is_valid_float():
+		return int(float(text))
+	return -1
 
 
 func _discard_stream_message() -> void:
@@ -2863,6 +2927,8 @@ func _clear_messages() -> void:
 	_live_response_keys.clear()
 	_closed_stream_keys.clear()
 	_closed_reasoning_keys.clear()   # 新增
+	_stream_delta_text_by_key.clear()
+	_reasoning_delta_text_by_key.clear()
 	for child in _message_list.get_children():
 		child.queue_free()
 
