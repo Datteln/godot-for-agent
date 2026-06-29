@@ -103,6 +103,102 @@ static func validate_region(
 	return result
 
 
+static func analyze_platform_design(
+	filled: Dictionary,
+	region: Dictionary,
+	dimension: int,
+	movement: Dictionary,
+	input: Dictionary = {}
+) -> Dictionary:
+	var issues: Array = []
+	var oversized_runs: Array = []
+	var oversized_columns: Array = []
+	var oversized_masses: Array = []
+	var max_run_width := maxi(4, int(input.get("max_solid_run_width", 12)))
+	var max_column_height := maxi(3, int(input.get("max_solid_column_height", 5)))
+	var max_mass_width := maxi(4, int(input.get("max_solid_mass_width", 10)))
+	var max_mass_height := maxi(3, int(input.get("max_solid_mass_height", 4)))
+	var min_finish_buffer := maxi(2, int(input.get("min_finish_buffer_width", 6)))
+	if dimension != 2 or str(movement.get("model", "grid")) != "leap":
+		return {"passed": true, "issues": issues, "note": "platform design checks apply only to 2D leap validation"}
+
+	for y in range(int(region["min_y"]), int(region["max_y"]) + 1):
+		var run_start := 0
+		var run_length := 0
+		for x in range(int(region["min_x"]), int(region["max_x"]) + 2):
+			var filled_here := x <= int(region["max_x"]) and filled.has(coord_key(Vector3i(x, y, 0)))
+			if filled_here:
+				if run_length == 0:
+					run_start = x
+				run_length += 1
+				continue
+			if run_length > max_run_width:
+				oversized_runs.append({"x": run_start, "y": y, "width": run_length, "limit": max_run_width})
+			run_length = 0
+
+	for x in range(int(region["min_x"]), int(region["max_x"]) + 1):
+		var run_start_y := 0
+		var run_height := 0
+		for y in range(int(region["min_y"]), int(region["max_y"]) + 2):
+			var filled_here := y <= int(region["max_y"]) and filled.has(coord_key(Vector3i(x, y, 0)))
+			if filled_here:
+				if run_height == 0:
+					run_start_y = y
+				run_height += 1
+				continue
+			if run_height > max_column_height:
+				oversized_columns.append({"x": x, "y": run_start_y, "height": run_height, "limit": max_column_height})
+			run_height = 0
+
+	oversized_masses = _oversized_solid_masses(filled, region, max_mass_width, max_mass_height)
+	if not oversized_runs.is_empty():
+		issues.append("platformer design has overly long solid rows; split them into shorter platform surfaces")
+	if not oversized_columns.is_empty():
+		issues.append("platformer design has overly tall solid columns; thin supports or replace with decoration")
+	if not oversized_masses.is_empty():
+		issues.append("platformer design has oversized solid masses; use thin platforms and sparse supports instead of filled blocks")
+
+	var finish_buffer := {}
+	if input.has("goal"):
+		var goal := coord_from_input(input.get("goal", {}), 2)
+		var buffer_width := _standable_run_width_at(filled, region, movement, goal)
+		finish_buffer = {
+			"goal": coord_payload(goal, 2),
+			"standable_width": buffer_width,
+			"minimum": min_finish_buffer,
+			"passed": buffer_width >= min_finish_buffer,
+		}
+		if buffer_width < min_finish_buffer:
+			issues.append("finish area has insufficient safe flat standable buffer")
+
+	var repair_plan: Array = []
+	if not issues.is_empty():
+		repair_plan.append({
+			"type": "platform_design_refactor",
+			"action": "thin_split_and_space_platforms",
+			"note": "Replace large filled blocks with 1-2 tile thick platforms, split long rows, remove tall pillars from the main route, and keep a safe flat finish buffer.",
+			"oversized_runs": oversized_runs.slice(0, mini(8, oversized_runs.size())),
+			"oversized_columns": oversized_columns.slice(0, mini(8, oversized_columns.size())),
+			"oversized_masses": oversized_masses.slice(0, mini(8, oversized_masses.size())),
+		})
+	return {
+		"passed": issues.is_empty(),
+		"issues": issues,
+		"oversized_runs": oversized_runs,
+		"oversized_columns": oversized_columns,
+		"oversized_masses": oversized_masses,
+		"finish_buffer": finish_buffer,
+		"repair_plan": repair_plan,
+		"limits": {
+			"max_solid_run_width": max_run_width,
+			"max_solid_column_height": max_column_height,
+			"max_solid_mass_width": max_mass_width,
+			"max_solid_mass_height": max_mass_height,
+			"min_finish_buffer_width": min_finish_buffer,
+		},
+	}
+
+
 static func check_multi_point_connectivity(
 	filled: Dictionary,
 	region: Dictionary,
@@ -139,6 +235,67 @@ static func check_multi_point_connectivity(
 	if (result["segments"] as Array).is_empty() and (result["pairs"] as Array).is_empty():
 		return {}
 	return result
+
+
+static func _oversized_solid_masses(filled: Dictionary, region: Dictionary, max_width: int, max_height: int) -> Array:
+	var visited := {}
+	var result: Array = []
+	for y in range(int(region["min_y"]), int(region["max_y"]) + 1):
+		for x in range(int(region["min_x"]), int(region["max_x"]) + 1):
+			var start := Vector3i(x, y, 0)
+			var start_key := coord_key(start)
+			if visited.has(start_key) or not filled.has(start_key):
+				continue
+			var queue: Array = [start]
+			visited[start_key] = true
+			var cursor := 0
+			var min_x := x
+			var max_x := x
+			var min_y := y
+			var max_y := y
+			var cells := 0
+			while cursor < queue.size():
+				var current: Vector3i = queue[cursor]
+				cursor += 1
+				cells += 1
+				min_x = mini(min_x, current.x)
+				max_x = maxi(max_x, current.x)
+				min_y = mini(min_y, current.y)
+				max_y = maxi(max_y, current.y)
+				for offset in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0), Vector3i(0, -1, 0)]:
+					var next := current + offset
+					if not in_region(next, region):
+						continue
+					var next_key := coord_key(next)
+					if visited.has(next_key) or not filled.has(next_key):
+						continue
+					visited[next_key] = true
+					queue.append(next)
+			var width := max_x - min_x + 1
+			var height := max_y - min_y + 1
+			var density := float(cells) / float(maxi(1, width * height))
+			if width > max_width and height > max_height and density >= 0.65:
+				result.append({"x": min_x, "y": min_y, "width": width, "height": height, "cells": cells, "density": density})
+	return result
+
+
+static func _standable_run_width_at(filled: Dictionary, region: Dictionary, movement: Dictionary, center: Vector3i) -> int:
+	if not in_region(center, region) or not is_standable(filled, center, region, movement):
+		return 0
+	var width := 1
+	var x := center.x - 1
+	while x >= int(region["min_x"]):
+		if not is_standable(filled, Vector3i(x, center.y, 0), region, movement):
+			break
+		width += 1
+		x -= 1
+	x = center.x + 1
+	while x <= int(region["max_x"]):
+		if not is_standable(filled, Vector3i(x, center.y, 0), region, movement):
+			break
+		width += 1
+		x += 1
+	return width
 
 
 static func build_connectivity_repair_plan(

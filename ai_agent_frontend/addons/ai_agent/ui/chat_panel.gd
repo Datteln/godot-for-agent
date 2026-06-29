@@ -2066,10 +2066,12 @@ func _coalesce_events(events: Array) -> Array:
 
 func _remember_delta_event(event: Dictionary, latest_delta: Dictionary, ordered_delta_keys: Array[String]) -> void:
 	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+	# 同 `_stream_event_key()`：用 `message_index` 而不是会在每次 round-trip 重新清零
+	# 的 `loop` 去重，否则跨轮次合批时可能把两个不同轮次的增量错误合并成一条。
 	var key := "%s:%s:%s" % [
 		str(event.get("type", "")),
 		str(payload.get("frame_id", "")),
-		str(payload.get("loop", ""))
+		str(payload.get("message_index", ""))
 	]
 	if not latest_delta.has(key):
 		ordered_delta_keys.append(key)
@@ -2530,8 +2532,16 @@ func _on_text_delta(event: Dictionary) -> void:
 func _render_text_delta_body(key: String, text: String) -> void:
 	if _should_ignore_stream_delta(key, text):
 		return
-	_mark_reasoning_stream_closed()   # 防止迟到的 reasoning delta 再创建条目
-	_finish_reasoning_stream()         # 置空 toggle，停止 _process 中的计时刷新
+	# 只有当这条 text_delta 确实属于另一个 key 时才提前结束当前 reasoning——
+	# 同一个 key（同一 frame_id:loop）下，后端会出现先吐一两句简短旁白
+	# text_delta、随后继续吐大段 reasoning_delta 的交错顺序，并不是"text 一
+	# 开始就代表这轮 reasoning 已经结束"。之前不分 key 一律关闭，会导致同一
+	# key 后续真正的 reasoning_delta 全部被当成"迟到"丢弃（参见
+	# `_on_reasoning_delta` 里的 IGNORED 分支）。真正的结束时机交给各响应
+	# 路由（tool_calls/最终响应）那几处现有的 `_finish_reasoning_stream()`。
+	if key != _reasoning_key:
+		_mark_reasoning_stream_closed()
+		_finish_reasoning_stream()
 	if key != _stream_key:
 		# 流式 key 变了（典型场景：coordinator 在服务端 delegate 给子 agent，
 		# frame_id 从 f1 变成 f2，前端从未收到 tool_calls，_handle_tool_calls()
@@ -2551,8 +2561,14 @@ func _render_text_delta_body(key: String, text: String) -> void:
 	})
 
 
+## 不能用 `loop` 拼 key：`loop` 是单次 `run_turn()` 调用内部的局部计数器，从 0 开始；
+## map-agent 这类几乎全是前端工具的 agent，每次前端把工具结果 POST 回去都会触发后端
+## 重新调一次 `run_turn()`，同一个 frame 的 `loop` 几乎每轮 round-trip 都会重新变成 1，
+## 导致不同轮次的 reasoning/text 流共享同一个 key，互相误判成"迟到的旧流"而被吞掉。
+## `message_index`（= 这条增量即将写入 `frame.messages` 的下标）在整个 frame 生命周期
+## 内只会单调增长，不会重置，才是真正稳定唯一的"这是哪一次 LLM 调用"标识。
 func _stream_event_key(payload: Dictionary) -> String:
-	return "%s:%s" % [str(payload.get("frame_id", "")), str(payload.get("loop", ""))]
+	return "%s:%s" % [str(payload.get("frame_id", "")), str(payload.get("message_index", ""))]
 
 
 func _should_ignore_stream_delta(key: String, text: String) -> bool:

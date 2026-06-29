@@ -19,8 +19,9 @@ static func plan_platform_level(input: Dictionary, context: Dictionary = {}) -> 
 	var edit_batches := _emit_platform_tile_batches(platforms, input)
 	var coin_arcs := _emit_coin_arcs(route.get("segments", []), ability)
 	var enemy_slots := _emit_enemy_slots(platforms)
-	var validation := _validation_plan(region, platforms, ability)
-	var score := _score_level(route.get("segments", []), jump_graph, coin_arcs, enemy_slots)
+	var design_limits := _design_limits_from_input(input, ability)
+	var validation := _validation_plan(region, platforms, ability, design_limits)
+	var score := _score_level(route.get("segments", []), platforms, jump_graph, coin_arcs, enemy_slots, design_limits)
 	# 三种"不该执行 edit_map_batches"的情况在这里直接清空批次，而不是只在 prompt 里告诉
 	# agent "别执行"——后者只是建议，前者让误执行在数据层面就不可能发生。
 	var blocked_reason := ""
@@ -49,6 +50,7 @@ static func plan_platform_level(input: Dictionary, context: Dictionary = {}) -> 
 		"enemy_slots": enemy_slots,
 		"validation": validation,
 		"score": score,
+		"design_limits": design_limits,
 		"execution_order": [
 			"describe_map_region at the current boundary",
 			"apply edit_map_batches in small previewed chunks",
@@ -141,7 +143,7 @@ static func _build_motif(kind: String, x: int, y: int, max_x: int, ability: Dict
 	var segment := {"index": index, "type": kind, "start": {"x": x, "y": y - 1}}
 	match kind:
 		"safe_intro", "rest":
-			var width := mini(max_x - x + 1, maxi(6, min_landing + 4))
+			var width := mini(max_x - x + 1, maxi(6, min_landing + 3))
 			platforms.append(_platform(x, y, width, kind))
 			segment["end"] = {"x": x + width - 1, "y": y - 1}
 			segment["difficulty"] = 1
@@ -190,11 +192,14 @@ static func _build_motif(kind: String, x: int, y: int, max_x: int, ability: Dict
 			segment["difficulty"] = 2
 			return {"segment": segment, "platforms": platforms, "next_anchor": {"x": down_end_x, "y": y + 2}}
 		"hazard_crossing":
-			var bridge_width := mini(max_x - x + 1, maxi(10, min_landing * 3))
+			var bridge_width := mini(max_x - x + 1, maxi(9, min_landing * 3))
+			var hazard_width := clampi(max_gap - 1, 2, max_gap)
+			var exit_x := x + min_landing + hazard_width
+			var exit_width := mini(max_x - exit_x + 1, maxi(min_landing, 4))
 			platforms.append(_platform(x, y, min_landing, "hazard_entry"))
-			if x + bridge_width - min_landing <= max_x:
-				platforms.append(_platform(x + bridge_width - min_landing, y, min_landing, "hazard_exit"))
-			segment["hazard_rect"] = {"x": x + min_landing, "y": y + 1, "width": maxi(1, bridge_width - min_landing * 2), "height": 2}
+			if exit_width > 0:
+				platforms.append(_platform(exit_x, y, exit_width, "hazard_exit"))
+			segment["hazard_rect"] = {"x": x + min_landing, "y": y + 1, "width": hazard_width, "height": 2}
 			segment["end"] = {"x": mini(max_x, x + bridge_width - 1), "y": y - 1}
 			segment["difficulty"] = 4
 			return {"segment": segment, "platforms": platforms, "next_anchor": {"x": x + bridge_width, "y": y}}
@@ -209,9 +214,9 @@ static func _build_motif(kind: String, x: int, y: int, max_x: int, ability: Dict
 static func _motif_for_progress(progress: float, index: int, seed: int) -> String:
 	if progress < 0.12:
 		return "safe_intro"
-	if progress > 0.88:
+	if progress > 0.82:
 		return "rest"
-	var cycle := (index + seed) % 6
+	var cycle := (index + seed) % 7
 	match cycle:
 		0:
 			return "gap_jump"
@@ -223,6 +228,8 @@ static func _motif_for_progress(progress: float, index: int, seed: int) -> Strin
 			return "hazard_crossing"
 		4:
 			return "stair_down"
+		5:
+			return "rest"
 		_:
 			return "gap_jump"
 
@@ -260,6 +267,7 @@ static func _jump_edge(from_platform: Dictionary, to_platform: Dictionary, abili
 
 static func _emit_platform_tile_batches(platforms: Array, input: Dictionary) -> Array:
 	var batches: Array = []
+	var thickness := clampi(int(input.get("platform_thickness", 1)), 1, int(input.get("max_platform_thickness", 2)))
 	for platform in platforms:
 		if bool(platform.get("existing", false)):
 			continue
@@ -272,7 +280,7 @@ static func _emit_platform_tile_batches(platforms: Array, input: Dictionary) -> 
 				"x": cursor,
 				"y": int(platform["y"]),
 				"width": batch_width,
-				"height": int(input.get("platform_thickness", 1)),
+				"height": thickness,
 				"resource": str(input.get("ground_resource", "ground")),
 				"fallback_resource": str(input.get("fallback_ground_resource", "")),
 				"semantic_layer": "ground",
@@ -281,7 +289,7 @@ static func _emit_platform_tile_batches(platforms: Array, input: Dictionary) -> 
 			batches.append({
 				"tool": "edit_map",
 				"operations": [op],
-				"expected_cells": batch_width * int(input.get("platform_thickness", 1)),
+				"expected_cells": batch_width * thickness,
 				"platform_id": platform.get("id", ""),
 				"note": "Connection batch; apply before decorative/challenge platforms." if bool(platform.get("connection", false)) else "Apply after describe_map_region confirms this support row is safe to overwrite.",
 			})
@@ -326,7 +334,7 @@ static func _emit_enemy_slots(platforms: Array) -> Array:
 	return slots
 
 
-static func _validation_plan(region: Dictionary, platforms: Array, ability: Dictionary) -> Dictionary:
+static func _validation_plan(region: Dictionary, platforms: Array, ability: Dictionary, design_limits: Dictionary) -> Dictionary:
 	if platforms.is_empty():
 		return {}
 	var first: Dictionary = platforms.front()
@@ -356,26 +364,71 @@ static func _validation_plan(region: Dictionary, platforms: Array, ability: Dict
 			"path_algorithm": "astar",
 			"check_overlaps": true,
 			"check_blocked_objects": true,
+			"check_platform_design": true,
+			"max_solid_run_width": design_limits.get("max_platform_width", 12),
+			"max_solid_column_height": design_limits.get("max_solid_column_height", 5),
+			"max_solid_mass_width": design_limits.get("max_solid_mass_width", 10),
+			"max_solid_mass_height": design_limits.get("max_solid_mass_height", 4),
+			"min_finish_buffer_width": design_limits.get("min_finish_buffer_width", 6),
 		}
 	}
 
 
-static func _score_level(segments: Array, jump_graph: Dictionary, coin_arcs: Array, enemy_slots: Array) -> Dictionary:
+static func _score_level(segments: Array, platforms: Array, jump_graph: Dictionary, coin_arcs: Array, enemy_slots: Array, limits: Dictionary) -> Dictionary:
 	var issues: Array = []
 	if not bool(jump_graph.get("passed", true)):
 		issues.append("one or more planned platform transitions exceed movement ability")
 	if segments.size() < 3:
 		issues.append("route has too few gameplay segments")
+	var long_platforms: Array = []
+	var repeated_roles := 0
+	var previous_role := ""
+	for platform in platforms:
+		var width := int(platform.get("width", 0))
+		var role := str(platform.get("role", ""))
+		if width > int(limits.get("max_platform_width", 8)) and not (role in ["safe_intro", "rest"]):
+			long_platforms.append({"id": platform.get("id", ""), "x": platform.get("x", 0), "y": platform.get("y", 0), "width": width, "role": role})
+		if role == previous_role and role in ["gap_jump", "hazard_entry", "hazard_exit", "stair"]:
+			repeated_roles += 1
+		previous_role = role
+	if not long_platforms.is_empty():
+		issues.append("planned route contains overly long non-rest platforms")
+	if repeated_roles > int(limits.get("max_repeated_challenge_roles", 2)):
+		issues.append("planned route repeats the same challenge shape too often")
+	var finish_buffer := _finish_buffer_width(platforms)
+	if finish_buffer < int(limits.get("min_finish_buffer_width", 6)):
+		issues.append("planned finish platform is too short for a safe ending buffer")
 	var difficulty := 0
 	for segment in segments:
 		difficulty += int(segment.get("difficulty", 1))
 	return {
 		"passed": issues.is_empty(),
 		"issues": issues,
+		"long_platforms": long_platforms,
+		"finish_buffer_width": finish_buffer,
 		"segment_count": segments.size(),
 		"estimated_difficulty": difficulty,
 		"reward_arc_count": coin_arcs.size(),
 		"enemy_slot_count": enemy_slots.size(),
+	}
+
+
+static func _finish_buffer_width(platforms: Array) -> int:
+	if platforms.is_empty():
+		return 0
+	var last: Dictionary = platforms.back()
+	return int(last.get("width", 0))
+
+
+static func _design_limits_from_input(input: Dictionary, ability: Dictionary) -> Dictionary:
+	return {
+		"max_platform_width": maxi(5, int(input.get("max_platform_width", maxi(8, int(ability.get("max_horizontal_gap", 4)) + 4)))),
+		"max_platform_thickness": clampi(int(input.get("max_platform_thickness", 2)), 1, 3),
+		"min_finish_buffer_width": maxi(4, int(input.get("min_finish_buffer_width", maxi(6, int(ability.get("min_landing_width", 3)) + 3)))),
+		"max_repeated_challenge_roles": maxi(1, int(input.get("max_repeated_challenge_roles", 2))),
+		"max_solid_column_height": maxi(3, int(input.get("max_solid_column_height", 5))),
+		"max_solid_mass_width": maxi(4, int(input.get("max_solid_mass_width", 10))),
+		"max_solid_mass_height": maxi(3, int(input.get("max_solid_mass_height", 4))),
 	}
 
 

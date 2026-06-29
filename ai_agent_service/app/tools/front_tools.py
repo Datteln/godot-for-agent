@@ -1599,9 +1599,10 @@ def register_front_tools() -> None:
                 "description": (
                     "Plan a 2D side-scrolling platformer level from player movement ability first. It builds "
                     "a critical route of gameplay motifs, a jump reachability graph, preview-safe edit_map "
-                    "batches for support platforms, reward coin arcs, enemy slots, a score, and a "
-                    "validate_map_region plan using movement_model='leap'. Use for Mario/Celeste/platform "
-                    "maps instead of generic zone/Poisson planning."
+                    "batches for thin support platforms, reward coin arcs, enemy slots, a score, and a "
+                    "validate_map_region plan using movement_model='leap'. It also applies platformer design "
+                    "grammar limits so routes avoid oversized solid blocks, repeated pillar patterns, and unsafe "
+                    "finish buffers. Use for Mario/Celeste/platform maps instead of generic zone/Poisson planning."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1669,6 +1670,41 @@ def register_front_tools() -> None:
                             "minimum": 1,
                             "description": "Tile thickness for emitted platform support fill operations.",
                         },
+                        "max_platform_thickness": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Hard cap for emitted platform thickness; default 2 to avoid wall-like masses.",
+                        },
+                        "max_platform_width": {
+                            "type": "integer",
+                            "minimum": 5,
+                            "description": "Maximum non-rest platform surface width before the plan is rejected as too blocky.",
+                        },
+                        "min_finish_buffer_width": {
+                            "type": "integer",
+                            "minimum": 4,
+                            "description": "Minimum flat safe landing width before the finish area.",
+                        },
+                        "max_repeated_challenge_roles": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum tolerated repetition of the same challenge role before the plan is rejected.",
+                        },
+                        "max_solid_column_height": {
+                            "type": "integer",
+                            "minimum": 3,
+                            "description": "Platform design validation limit for tall solid columns in the emitted route.",
+                        },
+                        "max_solid_mass_width": {
+                            "type": "integer",
+                            "minimum": 4,
+                            "description": "Platform design validation limit for dense connected solid mass width.",
+                        },
+                        "max_solid_mass_height": {
+                            "type": "integer",
+                            "minimum": 3,
+                            "description": "Platform design validation limit for dense connected solid mass height.",
+                        },
                         "ground_resource": {
                             "type": "string",
                             "description": "Semantic resource key used by emitted edit_map platform fill drafts.",
@@ -1699,7 +1735,9 @@ def register_front_tools() -> None:
                     "Supports profile='platformer' (delegates to platform reachability), 'topdown' "
                     "(connected roads/ground), 'dungeon' (rooms and corridors), and '3d_grid' "
                     "(connected floor strips). Returns candidates, accepted_motifs, preview-safe "
-                    "edit_map_batches, validation, and repair strategies; it never edits the scene."
+                    "edit_map_batches, validation, and repair strategies; it never edits the scene. For "
+                    "profile='platformer', the delegated plan uses platformer design grammar checks to prefer "
+                    "thin platforms, varied motifs, safe finish buffers, and reachable growth from the real frontier."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1756,6 +1794,13 @@ def register_front_tools() -> None:
                         "gravity_sign": {"type": "integer", "enum": [-1, 1]},
                         "max_returned_cells": {"type": "integer", "minimum": 1},
                         "min_landing_width": {"type": "integer", "minimum": 2},
+                        "max_platform_thickness": {"type": "integer", "minimum": 1},
+                        "max_platform_width": {"type": "integer", "minimum": 5},
+                        "min_finish_buffer_width": {"type": "integer", "minimum": 4},
+                        "max_repeated_challenge_roles": {"type": "integer", "minimum": 1},
+                        "max_solid_column_height": {"type": "integer", "minimum": 3},
+                        "max_solid_mass_width": {"type": "integer", "minimum": 4},
+                        "max_solid_mass_height": {"type": "integer", "minimum": 3},
                         "road_resource": {"type": "string"},
                         "floor_resource": {"type": "string"},
                         "fallback_road_resource": {"type": "string"},
@@ -2563,7 +2608,9 @@ def register_front_tools() -> None:
                     "By default empty cells are walkable and filled cells are obstacles; set walkable_is_filled=true to "
                     "invert. Optionally override gravity direction via gravity_axis/gravity_sign. It can also enforce "
                     "allowed_bounds, check spatial-index overlaps, and detect objects on water/blocked cells. Returns "
-                    "issues, passed, path/multi_connectivity, and repair_plan, but never edits. A 'passed' result only "
+                    "issues, passed, path/multi_connectivity, and repair_plan, but never edits. For leap/platformer "
+                    "validation it can also run platform_design checks for oversized solid rows, tall columns, filled "
+                    "masses, and insufficient finish buffer. A 'passed' result only "
                     "means reachable under the given movement assumptions — still verify the design visually. It also "
                     "always returns `layer_coverage_gaps`: any sibling layer (other legacy-TileMap layer index, or "
                     "other TileMapLayer under the same parent) that already covers ~90%+ of the map's extent (a "
@@ -2681,6 +2728,35 @@ def register_front_tools() -> None:
                         "check_blocked_objects": {
                             "type": "boolean",
                             "description": "When true, fail validation if indexed objects sit on water/blocked/obstacle cells.",
+                        },
+                        "check_platform_design": {
+                            "type": "boolean",
+                            "description": "When true, fail 2D leap validation on wall-like platformer shapes: oversized solid rows, tall columns, large filled masses, or unsafe finish buffer. Defaults on for leap.",
+                        },
+                        "max_solid_run_width": {
+                            "type": "integer",
+                            "minimum": 4,
+                            "description": "Platform design check: longest allowed continuous solid row before it is considered too blocky.",
+                        },
+                        "max_solid_column_height": {
+                            "type": "integer",
+                            "minimum": 3,
+                            "description": "Platform design check: tallest allowed continuous solid column before it is considered a wall/pillar problem.",
+                        },
+                        "max_solid_mass_width": {
+                            "type": "integer",
+                            "minimum": 4,
+                            "description": "Platform design check: maximum bounding-box width for dense connected solid masses.",
+                        },
+                        "max_solid_mass_height": {
+                            "type": "integer",
+                            "minimum": 3,
+                            "description": "Platform design check: maximum bounding-box height for dense connected solid masses.",
+                        },
+                        "min_finish_buffer_width": {
+                            "type": "integer",
+                            "minimum": 2,
+                            "description": "Platform design check: minimum contiguous standable width at goal.",
                         },
                         "allowed_bounds": {
                             "type": "object",

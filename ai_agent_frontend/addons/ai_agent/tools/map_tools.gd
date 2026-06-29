@@ -3232,19 +3232,34 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 		"dimension": dimension,
 		"region": region,
 	}
+	var movement := MapValidator.movement_from_input(input, dimension)
 	var analysis := MapValidator.validate_region(
 		filled,
 		region,
 		dimension,
 		input.get("start", null),
 		input.get("goal", null),
-		MapValidator.movement_from_input(input, dimension),
+		movement,
 		str(input.get("path_algorithm", "bfs")),
 		input.get("waypoints", null),
 		input.get("entrances", null),
 		input.get("exits", null)
 	)
 	result.merge(analysis, true)
+	var check_platform_design := bool(input.get("check_platform_design", str(movement.get("model", "grid")) == "leap"))
+	if check_platform_design:
+		var platform_design := MapValidator.analyze_platform_design(filled, region, dimension, movement, input)
+		result["platform_design"] = platform_design
+		if not bool(platform_design.get("passed", true)):
+			result["passed"] = false
+			var design_issues: Array = result.get("issues", [])
+			for issue in platform_design.get("issues", []):
+				design_issues.append(str(issue))
+			result["issues"] = design_issues
+			var design_repair: Array = result.get("repair_plan", [])
+			for repair in platform_design.get("repair_plan", []):
+				design_repair.append(repair)
+			result["repair_plan"] = design_repair
 	if bool(input.get("check_overlaps", false)) or bool(input.get("check_blocked_objects", false)):
 		var overlap_result := _detect_spatial_overlaps(str(target_result.get("path", "")), region, dimension)
 		result["overlaps"] = overlap_result.get("overlaps", [])

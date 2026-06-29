@@ -18,15 +18,19 @@ paths: []
 
 横版平台跳跃关卡不要只用通用 zone/Poisson 算法。用户目标是平台游戏、Mario/Celeste 类跳跃、Brackeys 平台地图、关卡主路径、跳跃/落点/金币弧线/敌人槽位时，优先调用 `plan_platform_level`。它会先生成 critical route、platform motifs、jump_graph、`edit_map_batches`、`coin_arcs`、`enemy_slots` 和 `movement_model="leap"` 校验计划；再把批次转成小批 `edit_map`，把奖励弧线/敌人槽位转成真实资源放置。不要先随便铺瓦片再事后 A* 校验。
 
+`plan_platform_level` 不是只管能不能跳到，它也会执行平台关卡形态语法：平台默认 1-2 格厚、非休息段限制最大宽度、终点前必须有安全平地、重复挑战形状会被扣分/拒绝。返回 `score.passed=false` 或 `blocked_reason="score_issues"` 时，不要执行 `edit_map_batches`，先调小 `max_platform_width`/`max_platform_thickness`、调大 `min_finish_buffer_width` 或换 seed 重新规划。目标是先生成一串可读的落点/表面，再用少量支撑和装饰表达形状；禁止把新区铺成连续厚墙、密集竖柱阵列或大块实心矩形。
+
 扩展已有横版地图时，`plan_platform_level`/`plan_reachable_map_growth` 必须默认 `connect_from_existing=true`，并传 `target_path`/`map_layer` 让工具扫描左侧边界已有表面，返回 `entry_anchor`。返回的 `blocked_reason` 非空（`entry_anchor_not_found`/`jump_graph_failed`/`score_issues`）时，`edit_map_batches` 已经被工具结构性清空，不需要你自己再判断要不要执行——但仍要按 `blocked_reason` 处理：`entry_anchor_not_found` 时扩大/移动 `entry_sample_*` 重新找边界落脚点；`jump_graph_failed`/`score_issues` 时降低新平台起点高度、缩短 gap 或增大 landing_width 后重新规划。右侧新区内部可达不算完成，必须从左侧初始地图的真实落脚点一路可达。
 
 `plan_platform_level` 返回的 `ability_used_defaults` 非空时，说明你没传 `max_horizontal_gap`/`max_rise`/`max_fall`/`min_landing_width` 中的某些字段，工具用了写死的默认值（4/2/6/3），这条规划**不能**当作"已验证可玩"——先按下面"能力校准"读真实角色脚本和 `tile_size` 补全这些参数再重新调用，不要因为它返回了 `ok:true` 就直接执行。
 
 调用 `plan_platform_level` 前也遵守同一条：先读取角色脚本和 tile_size，把 `max_horizontal_gap`、`max_rise`、`max_fall`、`min_landing_width` 传进去。`plan_platform_level` 返回的 `validation.validate_map_region.start` 必须是左侧已有 `entry_anchor`，不是新区第一块平台；返回的 `jump_graph.passed=false` 或 `score.issues` 不为空时，不要执行它的 `edit_map_batches`，先缩小 gap、增加 landing_width 或降低 vertical_delta 后重新规划。
 
+执行后用 `validate_map_region(movement_model="leap", check_platform_design=true)` 校验同一片区域。`platform_design.passed=false` 与可达性失败同级：长实心行、过高竖柱、大块实心体量或终点缓冲不足都必须通过重规划/拆薄/删柱修复，不能只靠 `repair_map_region` 补一条桥。
+
 ## leap/free 能力校准（通用铁律）
 
-`leap`/`free` 的能力参数（`max_horizontal_gap`/`max_rise`/`max_fall`/`max_step`）**必须按角色控制器里的真实移动能力换算成格数**，不准凭感觉编。校验前先 `read_file`/`read_script` 读真实的角色脚本（移动速度、跳跃速度/初速度、重力、是否能飞/游泳/二段跳等）和项目设置，结合 `describe_map_region` 读到的真实 `tile_size`/`cell_size` 把"能跳多远/多高"换算成格数再传进去。读不到真实数值就向用户说明缺少哪个参数，不要用假设值去"证明"可玩性。
+`leap`/`free` 的能力参数（`max_horizontal_gap`/`max_rise`/`max_fall`/`max_step`）**必须按角色控制器里的真实移动能力换算成格数**，不准凭感觉编。校验前先 `read_file` 读真实的角色脚本（移动速度、跳跃速度/初速度、重力、是否能飞/游泳/二段跳等）和项目设置，结合 `describe_map_region` 读到的真实 `tile_size`/`cell_size` 把"能跳多远/多高"换算成格数再传进去。读不到真实数值就向用户说明缺少哪个参数，不要用假设值去"证明"可玩性。
 
 `leap` 校验的区域要把落脚平台正下方那一行/层地面也包含进 `width`/`height`/`depth` 内，否则支撑判定会因为区域裁剪而失真。非标准重力方向（横向重力、3D 里地面不在 -y 等）用 `gravity_axis`/`gravity_sign` 覆盖。
 
