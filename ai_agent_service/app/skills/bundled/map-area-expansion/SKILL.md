@@ -14,6 +14,12 @@ paths: []
 
 如果用户给了玩家/单位真实起点，或项目里能从场景/脚本定位起点，扩展地图前必须先用 `compute_reachable_frontier` 在真实地图 cell 上计算可达集合。`plan_reachable_map_growth` 应使用返回的 `rightmost_frontier` 作为 `frontier`；不得把"左侧边界看起来有平台"当成已可达。`compute_reachable_frontier` 的 `movement_model` 和能力参数必须与后续 `validate_map_region` 一致。
 
+扩建已有地形/背景前必须先用 `describe_map_region` 读边界附近真实 `source_id`/`atlas_coords`（或 3D 的 `item`/`orientation`），用 `copy` 原样延伸；只有新绘制区域才用上下文里的 tile_catalog 或 MeshLibrary item。目标是多图层 legacy TileMap 时，必须先确认正确 `map_layer`，不要默认第 0 层。
+
+大范围地形按「读边界 → 写块计划 → 小批 `edit_map` → 核对结果 → 必要时重读」执行。单次 `edit_map` 单轴范围不超过 5 格；动手前说明区域、动作、来源边界、预期 cells；调用时传 `expected_cells`。闭区间格数按 `B-A+1` 算：`x=85..87` 是 3 列，不是 2 列。每铺完一段独立地形（平台/阶梯/悬浮台）就地 `validate_map_region`，不要全部铺完再一次性校验。
+
+`describe_map_region` 的读取频率：处理一段新地形前第一批必须读边界；后续只在衔接边界没读过、上一批返回的 `cells`/`operations` 数量不符、或发现边界/空洞/已有节点推翻当前假设时补读。`region_too_large` 时照返回的 `suggested_regions` 读，不要自己再拆。
+
 ## 横版平台关卡专用规划
 
 横版平台跳跃关卡不要只用通用 zone/Poisson 算法。用户目标是平台游戏、Mario/Celeste 类跳跃、Brackeys 平台地图、关卡主路径、跳跃/落点/金币弧线/敌人槽位时，优先调用 `plan_platform_level`。它会先生成 critical route、platform motifs、jump_graph、`edit_map_batches`、`coin_arcs`、`enemy_slots` 和 `movement_model="leap"` 校验计划；再把批次转成小批 `edit_map`，把奖励弧线/敌人槽位转成真实资源放置。不要先随便铺瓦片再事后 A* 校验。
@@ -33,6 +39,14 @@ paths: []
 `leap`/`free` 的能力参数（`max_horizontal_gap`/`max_rise`/`max_fall`/`max_step`）**必须按角色控制器里的真实移动能力换算成格数**，不准凭感觉编。校验前先 `read_file` 读真实的角色脚本（移动速度、跳跃速度/初速度、重力、是否能飞/游泳/二段跳等）和项目设置，结合 `describe_map_region` 读到的真实 `tile_size`/`cell_size` 把"能跳多远/多高"换算成格数再传进去。读不到真实数值就向用户说明缺少哪个参数，不要用假设值去"证明"可玩性。
 
 `leap` 校验的区域要把落脚平台正下方那一行/层地面也包含进 `width`/`height`/`depth` 内，否则支撑判定会因为区域裁剪而失真。非标准重力方向（横向重力、3D 里地面不在 -y 等）用 `gravity_axis`/`gravity_sign` 覆盖。
+
+`validate_map_region` 返回起点/终点不是合法落脚点时，优先使用结果里的 `suggested_foothold` 作为新的 start/goal 重试。地表瓦片本身是实心格，玩家落脚点通常是它正上方的空格，不要从原始瓦片逐格反推。
+
+如果返回 `repair_plan`，优先用 `repair_map_region` 应用修复，并传与校验完全相同的 `movement_model` 和能力参数。连通性修复传 start/goal；重叠修复传 `repair_overlaps=true`；对象压水/障碍修复传 `repair_blocked_objects=true`。修完必须重跑校验。
+
+`repair_map_region` 返回 `ok=true` 或 `changed=true` 不代表修好；只有 `repaired=true` 才算完成。`repaired=false` 时按 `validation_after.reason`/`repair_plan` 重新定位，必要时 `describe_map_region` 重读。同一段连续修复失败 2 次以上，停止硬试坐标，先重读真实数据。
+
+`validate_map_region.passed=true` 只证明在当前移动假设下可达，不等于设计合理或任务完成。通过后仍要复核关键缺口、落点和终点；可用 `capture_viewport_screenshot` 传 `focus_region` + `target_path`，但截图只做视觉复核，真实数据仍以读取工具为准。
 
 ## 导航网格烘焙
 
