@@ -263,7 +263,7 @@ static func _oversized_solid_masses(filled: Dictionary, region: Dictionary, max_
 				min_y = mini(min_y, current.y)
 				max_y = maxi(max_y, current.y)
 				for offset in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0), Vector3i(0, -1, 0)]:
-					var next := current + offset
+					var next: Vector3i = current + offset
 					if not in_region(next, region):
 						continue
 					var next_key := coord_key(next)
@@ -358,9 +358,9 @@ static func check_connectivity(
 	if not in_region(start, region) or not in_region(goal, region):
 		return {"reachable": false, "reason": "start or goal is outside the validated region"}
 	if not is_standable(filled, start, region, movement):
-		return {"reachable": false, "reason": _not_standable_reason("start", model)}
+		return _foothold_failure(filled, start, region, movement, "start")
 	if not is_standable(filled, goal, region, movement):
-		return {"reachable": false, "reason": _not_standable_reason("goal", model)}
+		return _foothold_failure(filled, goal, region, movement, "goal")
 	if path_algorithm.to_lower() == "astar" or path_algorithm.to_lower() == "a*":
 		return find_path_astar(filled, start, goal, region, dimension, movement)
 	var visited := {}
@@ -401,9 +401,9 @@ static func find_path_astar(
 	if not in_region(start, region) or not in_region(goal, region):
 		return {"reachable": false, "algorithm": "astar", "reason": "start or goal is outside the validated region"}
 	if not is_standable(filled, start, region, movement):
-		return {"reachable": false, "algorithm": "astar", "reason": _not_standable_reason("start", model)}
+		return _foothold_failure(filled, start, region, movement, "start", "astar")
 	if not is_standable(filled, goal, region, movement):
-		return {"reachable": false, "algorithm": "astar", "reason": _not_standable_reason("goal", model)}
+		return _foothold_failure(filled, goal, region, movement, "goal", "astar")
 	var open: Array = [start]
 	var open_keys := {coord_key(start): true}
 	var came_from := {}
@@ -442,6 +442,50 @@ static func _not_standable_reason(which: String, model: String) -> String:
 	if model == "leap":
 		return "%s cell is not a valid foothold (must be empty with solid support directly below)" % which
 	return "%s cell is not walkable" % which
+
+
+## 把"起点/终点不是合法落脚点"从一句话升级成结构化诊断：这一格本身是不是实心、以及同一列里
+## 最近的那个真正能站的格子在哪。模型不用再从原始瓦片数据反推（这正是反复"Wait...Hmm"绕圈的根因）。
+static func _foothold_diagnostic(filled: Dictionary, coords: Vector3i, region: Dictionary, movement: Dictionary, which: String) -> Dictionary:
+	var model := str(movement.get("model", "grid"))
+	var dimension := int(movement.get("dimension", 2))
+	var diag := {
+		"reason": _not_standable_reason(which, model),
+		"which": which,
+		"cell": coord_payload(coords, dimension),
+		"cell_filled": filled.has(coord_key(coords)),
+	}
+	if model == "leap":
+		var suggested := _nearest_standable_on_axis(filled, coords, region, movement)
+		if suggested != coords:
+			diag["suggested_foothold"] = coord_payload(suggested, dimension)
+			diag["reason"] = "%s; nearest valid foothold in this column is %s (empty cell with solid support directly below)" % [diag["reason"], str(diag["suggested_foothold"])]
+	return diag
+
+
+## 沿重力轴在同一列里找最近的合法落脚点：地表通常在支撑格上方，所以先往 -support_offset 方向找，
+## 再往下找。区域内找不到就原样返回 coords（调用方据此判断"没有建议落脚点"）。
+static func _nearest_standable_on_axis(filled: Dictionary, coords: Vector3i, region: Dictionary, movement: Dictionary) -> Vector3i:
+	var support_offset: Vector3i = movement.get("support_offset", Vector3i(0, 1, 0))
+	var span := maxi(int(region.get("max_y", 0)) - int(region.get("min_y", 0)), 0)
+	span = maxi(span, int(region.get("max_x", 0)) - int(region.get("min_x", 0)))
+	span = maxi(span, int(region.get("max_z", 0)) - int(region.get("min_z", 0)))
+	for d in range(1, span + 1):
+		var up: Vector3i = coords - support_offset * d
+		if in_region(up, region) and is_standable(filled, up, region, movement):
+			return up
+		var down: Vector3i = coords + support_offset * d
+		if in_region(down, region) and is_standable(filled, down, region, movement):
+			return down
+	return coords
+
+
+static func _foothold_failure(filled: Dictionary, coords: Vector3i, region: Dictionary, movement: Dictionary, which: String, algorithm: String = "") -> Dictionary:
+	var failure := _foothold_diagnostic(filled, coords, region, movement, which)
+	failure["reachable"] = false
+	if algorithm != "":
+		failure["algorithm"] = algorithm
+	return failure
 
 
 static func heuristic(a: Vector3i, b: Vector3i, dimension: int) -> int:

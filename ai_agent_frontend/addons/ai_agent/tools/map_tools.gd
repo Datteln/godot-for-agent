@@ -13,6 +13,10 @@ const MapReachableGrowth = preload("res://addons/ai_agent/tools/map_reachable_gr
 
 const MAX_EDITED_CELLS := 100000
 const MAX_DESCRIBED_CELLS := 400
+## describe_map_region 是纯内存读取（一次循环读完整片区域），400 只是响应体大小的策略上限，
+## 不是 IO 成本。超过 400 但不超过这个上限时直接自动整片返回（标 auto_served），模型无需自己
+## 分块多次查询；只有超过这个上限才回退成 region_too_large + suggested_regions。
+const MAX_AUTOSERVED_DESCRIBED_CELLS := 1600
 const MAX_NOISE_CELLS := 4096
 ## 空间索引整份读出/整份重写，条目数上限防止它随使用无限膨胀、拖慢每次 edit_map。
 ## 到顶后仍允许更新/删除已有坐标，只拒绝新增坐标，并在结果里给出 warning。
@@ -190,6 +194,24 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 					"message": "map edit exceeds the 100000-cell safety limit",
 					"error_code": "map_edit_too_large"
 				}
+
+	# 调用方可声明 expected_cells（这一批本应写多少格）。不符就拒绝、且此时还没动任何瓦片——
+	# 把"心里想的是 x=85..87 三列、手却只写了 85/86 两列"这类 off-by-one 在落地前当场拦下，
+	# 而不是等后面 validate_map_region 绕一大圈才发现漏了一格。
+	if input.has("expected_cells"):
+		var expected_cells := int(input.get("expected_cells"))
+		if expected_cells != after.size():
+			return {
+				"ok": false,
+				"message": (
+					"expected_cells=%d but these operations write %d cells; the batch does not match the " +
+					"declared coverage. Re-check inclusive ranges (x=A..B spans B-A+1 columns) before retrying. " +
+					"No tiles were written."
+				) % [expected_cells, after.size()],
+				"error_code": "cell_count_mismatch",
+				"expected_cells": expected_cells,
+				"actual_cells": after.size(),
+			}
 
 	# 先写空间索引，再动瓦片：如果索引写盘失败，此时还没有任何瓦片落入 Undo 批次，
 	# 可以直接返回错误而不留下"已改了瓦片却报失败"的半截状态（否则模型会拿着失败结果
@@ -958,6 +980,31 @@ static func repair_placements(input: Dictionary, editor_interface: EditorInterfa
 	}
 
 
+## 把一块超过单次读取上限的区域切成若干 ≤max_cells 的对齐子区域。每块边长取 max_cells 的
+## 维度方根量级（2D 方块 / 3D 立方块），保证 w*h*d ≤ max_cells，拼起来正好覆盖原区域无重叠。
+static func _split_region(origin: Vector3i, width: int, height: int, depth: int, dimension: int, max_cells: int) -> Array:
+	var step := maxi(1, int(floor(pow(float(max_cells), 1.0 / float(dimension)))))
+	var regions: Array = []
+	var z := 0
+	while z < depth:
+		var dz := mini(step, depth - z) if dimension == 3 else 1
+		var y := 0
+		while y < height:
+			var dy := mini(step, height - y)
+			var x := 0
+			while x < width:
+				var dx := mini(step, width - x)
+				var entry := {"x": origin.x + x, "y": origin.y + y, "width": dx, "height": dy}
+				if dimension == 3:
+					entry["z"] = origin.z + z
+					entry["depth"] = dz
+				regions.append(entry)
+				x += dx
+			y += dy
+		z += dz
+	return regions
+
+
 static func describe_map_region(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
@@ -976,11 +1023,16 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	var width := max(1, int(input.get("width", 1)))
 	var height := max(1, int(input.get("height", 1)))
 	var depth := max(1, int(input.get("depth", 1))) if dimension == 3 else 1
-	if width * height * depth > MAX_DESCRIBED_CELLS:
+	var requested_cells: int = width * height * depth
+	if requested_cells > MAX_AUTOSERVED_DESCRIBED_CELLS:
+		# 超出自动整片返回的上限：回退成切好的 suggested_regions，模型照着逐块读即可，不用自己推拆分。
 		return {
 			"ok": false,
-			"message": "requested region exceeds the %d-cell read limit; query a smaller region" % MAX_DESCRIBED_CELLS,
+			"message": "requested region has %d cells, over the %d-cell auto-serve limit; issue these smaller queries instead (already split for you)." % [requested_cells, MAX_AUTOSERVED_DESCRIBED_CELLS],
 			"error_code": "region_too_large",
+			"cells": requested_cells,
+			"max_cells": MAX_AUTOSERVED_DESCRIBED_CELLS,
+			"suggested_regions": _split_region(origin, width, height, depth, dimension, MAX_DESCRIBED_CELLS),
 		}
 
 	var cells: Array = []
@@ -998,6 +1050,10 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		"map_layer": map_layer if target.get_class() == "TileMap" else null,
 		"cells": cells,
 	}
+	if requested_cells > MAX_DESCRIBED_CELLS:
+		# 这次区域大于单块上限，但工具已自动整片读完返回；告知模型不必再自己分块查询。
+		result["auto_served"] = true
+		result["cells_returned"] = requested_cells
 	if target is Node2D:
 		var position_2d := (target as Node2D).position
 		result["node_position"] = {"x": position_2d.x, "y": position_2d.y}
@@ -3217,11 +3273,16 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 			"region": region,
 			"allowed_bounds": allowed_bounds,
 		}
-	if int(region["width"]) * int(region["height"]) * int(region["depth"]) > MAX_DESCRIBED_CELLS:
+	var validate_cells := int(region["width"]) * int(region["height"]) * int(region["depth"])
+	if validate_cells > MAX_DESCRIBED_CELLS:
+		# 校验区域不能像 describe 那样随便拆——切碎会破坏跨段可达性判定。提示按"路线分段、每段
+		# 带自己的 start/goal 校验"的方式缩小，并把支撑行留在区域内，而不是盲目砍宽高。
 		return {
 			"ok": false,
-			"message": "validation region exceeds the %d-cell limit; validate a smaller region" % MAX_DESCRIBED_CELLS,
+			"message": "validation region has %d cells, over the %d-cell limit; validate fewer cells per call — split the route into segments and validate each with its own start/goal, keeping each segment's support row inside the region." % [validate_cells, MAX_DESCRIBED_CELLS],
 			"error_code": "region_too_large",
+			"cells": validate_cells,
+			"max_cells": MAX_DESCRIBED_CELLS,
 		}
 
 	var filled := _collect_filled_cells(target, region, dimension, map_layer)
@@ -3328,11 +3389,14 @@ static func repair_map_region(input: Dictionary, editor_interface: EditorInterfa
 	var dimension := 3 if target.get_class() == "GridMap" else 2
 	var map_layer := int(input.get("map_layer", 0))
 	var region := MapValidator.region_from_input(input, dimension)
-	if int(region["width"]) * int(region["height"]) * int(region["depth"]) > MAX_DESCRIBED_CELLS:
+	var repair_cells := int(region["width"]) * int(region["height"]) * int(region["depth"])
+	if repair_cells > MAX_DESCRIBED_CELLS:
 		return {
 			"ok": false,
-			"message": "repair region exceeds the %d-cell limit; repair a smaller region" % MAX_DESCRIBED_CELLS,
+			"message": "repair region has %d cells, over the %d-cell limit; repair fewer cells per call — repair one route segment at a time with its own start/goal." % [repair_cells, MAX_DESCRIBED_CELLS],
 			"error_code": "region_too_large",
+			"cells": repair_cells,
+			"max_cells": MAX_DESCRIBED_CELLS,
 		}
 	var filled := _collect_filled_cells(target, region, dimension, map_layer)
 	var analysis := MapValidator.validate_region(
@@ -3371,14 +3435,37 @@ static func repair_map_region(input: Dictionary, editor_interface: EditorInterfa
 	else:
 		for cell in after:
 			_apply_map_cell(target, cell)
+	# 修完立刻在新状态上重跑一次校验，把"应用了修复"和"修复真的生效了"分开：以前不论是否真修好
+	# 都返回 ok，模型据此当作已解决继续往下，结果（日志里就发生过）repair 方案本身根本没让它通过。
+	var filled_after := _collect_filled_cells(target, region, dimension, map_layer)
+	var validation_after := MapValidator.validate_region(
+		filled_after,
+		region,
+		dimension,
+		input.get("start", null),
+		input.get("goal", null),
+		MapValidator.movement_from_input(input, dimension),
+		str(input.get("path_algorithm", "astar")),
+		input.get("waypoints", null),
+		input.get("entrances", null),
+		input.get("exits", null)
+	)
+	var repaired := bool(validation_after.get("passed", false))
 	return {
 		"ok": true,
 		"changed": true,
+		"repaired": repaired,
 		"target": str(target_result.get("path", "")),
 		"type": target.get_class(),
 		"dimension": dimension,
 		"cells": after.size(),
 		"validation_before": analysis,
+		"validation_after": validation_after,
+		"message": (
+			"Repair applied and the region now passes validation."
+			if repaired else
+			"Repair applied but the region STILL fails validation — do not treat it as fixed. Read validation_after.reason/repair_plan (and re-read describe_map_region) and resolve the remaining failure before continuing."
+		),
 		"spatial_index": index_result,
 	}
 

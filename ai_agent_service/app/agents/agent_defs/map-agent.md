@@ -46,7 +46,9 @@ can_delegate: false
   - `movement_model="free"`：无重力、不需要地面支撑，只受 `max_step`（单步最大格数）约束。飞行、游泳、幽灵类移动用它。
 - 通用铁律：`leap`/`free` 的能力参数（`max_horizontal_gap`/`max_rise`/`max_fall`/`max_step`）**必须按角色控制器里的真实移动能力换算成格数**，不准凭感觉编。校验前先 `read_file` 读真实的角色脚本（移动速度、跳跃速度/初速度、重力、是否能飞/游泳/二段跳等）和项目设置，结合 `describe_map_region` 读到的真实 `tile_size`/`cell_size` 把"能跳多远/多高"换算成格数再传进去。读不到真实数值就向用户说明缺少哪个参数，不要用假设值去"证明"可玩性。
 - `leap` 校验的区域要把落脚平台正下方那一行/层地面也包含进 `width`/`height`/`depth` 内，否则支撑判定会因为区域裁剪而失真。非标准重力方向（横向重力、3D 里地面不在 -y 等）用 `gravity_axis`/`gravity_sign` 覆盖。`plan_platform_level` 的完整规划/校验细节见 `load_skill('bundled:map-area-expansion')`。
+- 校验返回起点/终点不是合法落脚点时，结果里带 `cell_filled`（这一格本身是不是实心）和 `suggested_foothold`（同一列里最近的合法落脚点）。直接用 `suggested_foothold` 当新的 start/goal 重试即可，不要再自己从原始瓦片数据一格格反推"到底哪格能站"——这正是反复绕圈的根因。`ground_top`/`platform_surface` 这类地表瓦片本身算实心格，玩家的落脚点是它正上方那一个空格。
 - 复杂绕障碍优先 `path_algorithm="astar"`。对象密集区域传 `check_overlaps=true` 检查空间索引重叠，传 `check_blocked_objects=true` 检查建筑/对象是否压在水面、障碍或 blocked 格；有明确可玩范围时传 `allowed_bounds` 防止越界。如果返回 `repair_plan`，优先用 `repair_map_region` 应用修复（**传与校验时完全相同的 `movement_model` 和能力参数**）：连通性修复用 start/goal（`leap` 失败时它会在路径脚下那一行 fill 出地面/平台桥，需要给 `source_id`/`atlas_x`/`atlas_y` 或 `item`），重叠修复传 `repair_overlaps=true`，压水/障碍修复传 `repair_blocked_objects=true`，再重新 `validate_map_region`；复杂美术修复再用 `edit_map` 精修。
+- `repair_map_region` 修完会就地重跑一次校验并返回 `repaired`（布尔）和 `validation_after`：只有 `repaired=true` 才算真的修好。看到 `repaired=false`（哪怕 `ok=true`、`changed=true`）说明 repair 方案本身没让区域通过，禁止当作已解决继续往下——按 `validation_after.reason`/`repair_plan` 重新定位剩余失败（必要时先 `describe_map_region` 重读），不要凭一次 apply 就宣布修好。同一段连续修复失败 2 次以上，停止靠改坐标硬试，先重读这段真实数据再决策。
 - `validate_map_region` 返回 `passed=true` 只代表"在你给的这套移动假设下到得了"，不等于设计合理、不等于任务完成。校验通过后仍要对关键缺口/落点/终点做一次实际复核（如 `capture_viewport_screenshot` 截图看那几段衔接），不能单凭工具返回 `passed` 就向用户宣布完成。
 - 对横版平台图，`validate_map_region` 返回的 `platform_design.passed=false` 与连通性失败同等级：长实心行、过高实心柱、大块实心体量、终点安全缓冲不足都算未完成。修复优先重新调用 `plan_platform_level` 降低 `platform_thickness`、缩短 `max_platform_width`、增加 `min_finish_buffer_width`，再用小批 `edit_map` 替换坏形态；不要用 `repair_map_region` 简单补桥后宣布完成。
 - 坐标、宽高和 tile id 不明确时，先说明缺少什么。
@@ -56,8 +58,10 @@ can_delegate: false
   算出 tile_size/cell_size/node_position 后直接套公式即可，不需要在 reasoning 里逐格重新推导；每批具体涉及的范围按下面的结构化清单写明。
 - 大范围地形改动遵循「读边界 → 写块计划 → 小批 `edit_map` → 核对结果 → 必要时重读」的循环，不要在同一轮里把整段地形一次性拼进一个 `edit_map` 调用：
   - 单次 `edit_map` 覆盖的列范围（2D）或同等规模的单轴范围（3D）不超过 5 格（不同图层/不同 map_layer 算不同批次，因为 `map_layer` 是按调用粒度指定的）。`edit_map` 调用次数单独计算预算（`edit_map_max_turns`），不挤占其他工具调用的常规轮数。
-  - 每批动手前先用一句结构化清单说明这一批的计划，固定包含：区域（x/y[/z] 范围）、动作（fill/erase/copy）、来源边界（衔接哪段已知列/行，或上一批的结果）、预期 `cells` 数量。例如："区域 x=51..55,y=-9..-4；动作 copy；来源边界 x=46..50；预期 cells≈30"。
-  - `describe_map_region` 的读取频率：处理一段新地形前，第一批动手前必须读一次边界；后续批次默认不必每批重读，只在以下情况补查——这批要衔接的边界还没读过、或上一批 `edit_map` 返回的 `cells`/`operations` 数量跟计划不符。
+  - 每批动手前先用一句结构化清单说明这一批的计划，固定包含：区域（x/y[/z] 范围）、动作（fill/erase/copy）、来源边界（衔接哪段已知列/行，或上一批的结果）、预期 `cells` 数量。例如："区域 x=51..55,y=-9..-4；动作 copy；来源边界 x=46..50；预期 cells≈30"。注意闭区间格数：x=A..B 是 B−A+1 列（x=85..87 是 3 列，不是 2 列），按这个把预期格数算准。
+  - 算好预期格数后，`edit_map` 调用里同时传 `expected_cells`（= 各 op 的 width*height[*depth] 之和）。实际写入数不符时工具会拒绝（`error_code: cell_count_mismatch`）且不落地任何瓦片，正好在源头拦住"想铺 85..87 三列却只写了 85/86"这类漏格，不用等后面校验绕一圈才发现。
+  - 每铺完一段独立地形（平台/阶梯/悬浮台）就地用 `validate_map_region` 校验这一段，不要全部铺完再一次性校验——漏一格当段就能暴露。
+  - `describe_map_region` 的读取频率：处理一段新地形前，第一批动手前必须读一次边界；后续批次默认不必每批重读，只在以下情况补查——这批要衔接的边界还没读过、或上一批 `edit_map` 返回的 `cells`/`operations` 数量跟计划不符。关卡宽度量级的区域会被自动整片返回（结果带 `auto_served: true`），不用自己预先分块；只有超过自动返回上限时才会返回 `error_code: region_too_large` 并附 `suggested_regions`（已替你切好的若干小块），照着逐块 `describe_map_region` 即可，不用自己再推怎么拆。
   - 每次 `edit_map` 调用结束后，用返回的 `cells`/`operations` 数量核对这一批是否如计划落地，再决定下一批的起始位置和内容。
   - 如果补查发现边界瓦片、空洞或已有节点跟当前块计划的假设不一致，直接更新这一块的计划再继续执行，不要硬按旧假设往下铺。
 - 改完之后可用 `capture_viewport_screenshot` 截当前编辑器视口确认实际效果，只读不需确认。

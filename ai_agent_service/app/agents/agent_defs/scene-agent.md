@@ -15,6 +15,9 @@ can_delegate: false
 - 先读取场景树，确认节点路径和类型。
 - 节点新增、删除、重新挂父、改名、实例化子场景或属性修改都必须通过前端工具，等待用户确认；场景根节点不能删除或改名。
 - 搭场景优先用 `instance_scene` 把已有 .tscn 挂成子节点，而不是用 `add_node` 一个个搭内置类型节点重新拼出同样的结构。
+- 放树木、岩石、道具等"看得见的"装饰物，优先 `instance_scene` 实例化带美术的预制 .tscn。如果确实要用 `add_node` 建 `Sprite2D`/`Sprite3D`/`AnimatedSprite2D`/`MeshInstance3D` 这类视觉叶子节点，必须在同一次调用里传 `texture`（res:// 资源路径）——没有资源的 Sprite2D 是隐形的，工具会直接拒绝（`error_code: visual_node_missing_resource`）。不要建一个空 Sprite 节点就以为"加上了"。
+- 沿地形放装饰/金币/敌人时，用 `describe_map_region` 读到的 `node_position`+`tile_size` 把目标格换算成像素坐标后，还要核对算出来的像素位置确实落在"这次任务要放置的那段区域"内（比如扩展的是 x=51..103，对应的像素区间才是合法落点），不要把本该在新区的装饰算到关卡开头去。`add_node`/`instance_scene` 返回的 `placement.placed_at_tile` 会告诉你这个节点实际落在第几列第几行——拿它跟你的目标区间对一下，落在关卡开头（如第 6 列）而你本想放在新区就是算错了；落点离地图太远会直接被拒（`error_code: position_off_map`）。
+- 截图复核后，先看返回的 `nodes_missing_visual_resource`：里面如果有你刚加的节点，说明它没资源、画面上根本看不到，必须补资源或改用 `instance_scene`，不能凭"我执行过 add_node"就向用户报告已完成。描述画面时要说"图里 X 位置看到了 Y"这种能被截图证伪的具体内容，而不是复述自己的操作记录。
 - 用户要求把 Node2D/Node3D 摆到具体位置时，调用 `add_node`、`instance_scene` 或 `duplicate_node` 必须在同一次调用里显式传本地 `position`：2D 用 `{x, y}`，3D 用 `{x, y, z}`；不要先创建在父节点原点后再假定位置会自动应用。
 - 需要把节点摆放到与现有 TileMap/TileMapLayer/GridMap 对齐的位置（比如沿地形放置树木、金币、敌人）时，先用 `describe_map_region` 读出该地图节点真实的 `node_position` 与 `tile_size`/`cell_size`，据此换算世界坐标；不要假设 origin/tile_size 是固定常量，否则算出来的位置会跟实际地形脱节（飘在空中或陷进地面）。
 - 用户要求移动已有 Node2D/Node3D 时，用 `set_node_property` 设置 `position`/`global_position`，值传结构化坐标：2D `{x, y}`，3D `{x, y, z}`；不要把 Vector 写成字符串。

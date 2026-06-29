@@ -4,6 +4,17 @@ extends RefCounted
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 const MapTools = preload("res://addons/ai_agent/tools/map_tools.gd")
 
+## 视觉叶子节点 -> 它必须有内容才画得出来的那个资源属性。Sprite2D 没有 texture、MeshInstance3D
+## 没有 mesh 时渲染完全不可见——add_node 建出来只是个空节点，工具返回 ok 看起来"成功了"，画面
+## 上却什么都没有。这张表既用于 add_node 的建节点拦截，也用于截图时核对真实渲染状态。
+const VISUAL_LEAF_RESOURCE_PROPERTY := {
+	"Sprite2D": "texture",
+	"Sprite3D": "texture",
+	"AnimatedSprite2D": "sprite_frames",
+	"AnimatedSprite3D": "sprite_frames",
+	"MeshInstance3D": "mesh",
+}
+
 
 ## 节点路径相对于"被编辑场景的根节点"而非 `node.get_path()` 的 SceneTree 绝对路径。
 ## 在编辑器里运行时，被编辑场景是挂在编辑器自身视口树很深的位置下的，
@@ -58,6 +69,57 @@ static func _node_position_payload(node: Node) -> Dictionary:
 		var position_control := (node as Control).position
 		return {"x": position_control.x, "y": position_control.y}
 	return {}
+
+
+static func _first_tilemap_2d(node: Node) -> Node:
+	var cls := node.get_class()
+	if cls == "TileMapLayer" or cls == "TileMap":
+		return node
+	for child in node.get_children():
+		if child is Node:
+			var found := _first_tilemap_2d(child)
+			if found != null:
+				return found
+	return null
+
+
+## 把一个刚摆好的 2D 节点换算成它落在地图的哪一格，并把地图当前瓦片范围一并带出来。模型/用户
+## 据此能立刻看出"这棵树其实落在第 6 列（关卡开头），不在我要扩展的 51..103 区间"——工具拿不到
+## "本次任务的目标区间"，没法据此硬判错，但把真实落点格子摆到台面上就能戳穿这类放错位置。
+## 只有当落点离地图瓦片范围远到一个地图自身尺寸的余量之外（基本是飘在空中的野坐标）才标 off_map
+## 让调用方硬拒绝；地表上方放装饰、边缘外延一两格都属正常，不拦。
+static func _placement_reference(root: Node, node: Node) -> Dictionary:
+	if not (node is Node2D):
+		return {}
+	var map := _first_tilemap_2d(root)
+	if map == null or not (map is Node2D):
+		return {}
+	var tile_set = map.get("tile_set")
+	if tile_set == null:
+		return {}
+	var used: Rect2i = map.call("get_used_rect")
+	if used.size.x <= 0 or used.size.y <= 0:
+		return {}
+	var tile_size: Vector2i = tile_set.tile_size
+	if tile_size.x <= 0 or tile_size.y <= 0:
+		return {}
+	var local: Vector2 = (map as Node2D).to_local((node as Node2D).global_position)
+	var col := int(floor(local.x / float(tile_size.x)))
+	var row := int(floor(local.y / float(tile_size.y)))
+	var min_x := used.position.x
+	var min_y := used.position.y
+	var max_x := used.position.x + used.size.x - 1
+	var max_y := used.position.y + used.size.y - 1
+	var reference := {
+		"map": _relative_path(root, map),
+		"placed_at_tile": {"x": col, "y": row},
+		"map_tile_bounds": {"min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y},
+	}
+	var margin_x := maxi(8, used.size.x)
+	var margin_y := maxi(8, used.size.y)
+	if col < min_x - margin_x or col > max_x + margin_x or row < min_y - margin_y or row > max_y + margin_y:
+		reference["off_map"] = true
+	return reference
 
 
 static func _coerce_property_value(current_value: Variant, raw_value: Variant) -> Dictionary:
@@ -392,6 +454,35 @@ static func _validate_scene_check(root: Node, raw_check: Variant, index: int, to
 	return details
 
 
+## 视觉叶子节点（Sprite2D 等）必须随 add_node 提供它的内容资源（参数 texture，res:// 路径），
+## 否则在工具层直接拒绝——一个没有 texture 的 Sprite2D 是隐形的，建出来等于没建。提示改用
+## instance_scene 实例化已经带美术的预制 .tscn，或在同一次调用里把资源路径传进来。
+static func _apply_visual_resource(node: Node, type_name: String, input: Dictionary) -> Dictionary:
+	if not VISUAL_LEAF_RESOURCE_PROPERTY.has(type_name):
+		return {}
+	var property := str(VISUAL_LEAF_RESOURCE_PROPERTY[type_name])
+	var resource_arg := str(input.get("texture", "")).strip_edges()
+	if resource_arg == "":
+		return {
+			"ok": false,
+			"message": (
+				"%s renders nothing without a %s resource; an empty %s node is invisible. Pass " +
+				"\"texture\" (a res:// resource path) in this same add_node call, or use instance_scene " +
+				"to instantiate a prefab .tscn that already carries its art."
+			) % [type_name, property, type_name],
+			"error_code": "visual_node_missing_resource",
+		}
+	if not ResourceLoader.exists(resource_arg):
+		return {"ok": false, "message": "texture resource not found: " + resource_arg, "error_code": "resource_not_found"}
+	var res := ResourceLoader.load(resource_arg)
+	if res == null:
+		return {"ok": false, "message": "failed to load texture resource: " + resource_arg, "error_code": "resource_load_failed"}
+	node.set(property, res)
+	if node.get(property) == null:
+		return {"ok": false, "message": "resource at %s did not apply to %s.%s; wrong resource type?" % [resource_arg, type_name, property], "error_code": "resource_type_mismatch"}
+	return {}
+
+
 static func add_node(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available"}
@@ -413,16 +504,32 @@ static func add_node(input: Dictionary, editor_interface: EditorInterface, undo_
 	var position_error := _apply_optional_position(node, input)
 	if not position_error.is_empty():
 		return position_error
+	var visual_error := _apply_visual_resource(node, type_name, input)
+	if not visual_error.is_empty():
+		return visual_error
 	parent.add_child(node)
 	node.owner = root
+	var placement := _placement_reference(root, node)
+	if bool(placement.get("off_map", false)):
+		parent.remove_child(node)
+		node.free()
+		return {
+			"ok": false,
+			"message": "node would land at tile %s, far outside the map's tile bounds %s — likely a miscomputed coordinate (recompute pixel = node_position + tile*tile_size). Nothing was added." % [str(placement.get("placed_at_tile")), str(placement.get("map_tile_bounds"))],
+			"error_code": "position_off_map",
+			"placement": placement,
+		}
 	if undo_manager != null:
 		undo_manager.record_node_added(parent, node, root)
-	return {
+	var result := {
 		"ok": true,
 		"path": _relative_path(root, node),
 		"type": type_name,
 		"position": _node_position_payload(node),
 	}
+	if not placement.is_empty():
+		result["placement"] = placement
+	return result
 
 
 static func set_node_property(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
@@ -557,14 +664,27 @@ static func instance_scene(input: Dictionary, editor_interface: EditorInterface,
 		return position_error
 	parent.add_child(node)
 	node.owner = root
+	var placement := _placement_reference(root, node)
+	if bool(placement.get("off_map", false)):
+		parent.remove_child(node)
+		node.free()
+		return {
+			"ok": false,
+			"message": "instance would land at tile %s, far outside the map's tile bounds %s — likely a miscomputed coordinate (recompute pixel = node_position + tile*tile_size). Nothing was added." % [str(placement.get("placed_at_tile")), str(placement.get("map_tile_bounds"))],
+			"error_code": "position_off_map",
+			"placement": placement,
+		}
 	if undo_manager != null:
 		undo_manager.record_node_added(parent, node, root)
-	return {
+	var result := {
 		"ok": true,
 		"path": _relative_path(root, node),
 		"scene_path": scene_path,
 		"position": _node_position_payload(node),
 	}
+	if not placement.is_empty():
+		result["placement"] = placement
+	return result
 
 
 static func duplicate_node(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
@@ -952,7 +1072,41 @@ static func capture_viewport_screenshot(input: Dictionary, editor_interface: Edi
 	var result := {"ok": true, "path": output_path, "absolute_path": absolute, "width": image.get_width(), "height": image.get_height()}
 	if not focus_applied.is_empty():
 		result["focus"] = focus_applied
+	var scene_root := editor_interface.get_edited_scene_root()
+	if scene_root != null:
+		var render_state := _collect_render_state(scene_root)
+		result["rendered_nodes"] = render_state.get("rendered", [])
+		result["nodes_missing_visual_resource"] = render_state.get("missing", [])
 	return result
+
+
+## 截图是像素，模型容易"看着自己的操作记录说做过了"而不真正核对画面。这里随截图一并返回
+## 场景里实际带可见资源、会画出像素的节点（rendered），以及"是视觉节点却没有资源、因此根本
+## 画不出来"的节点（missing）。后者正好戳穿"add 了 Sprite2D 但没贴图、看似添加其实隐形"的假完成。
+static func _collect_render_state(root: Node) -> Dictionary:
+	var rendered: Array = []
+	var missing: Array = []
+	_walk_render_state(root, root, rendered, missing)
+	return {"rendered": rendered, "missing": missing}
+
+
+static func _walk_render_state(root: Node, node: Node, rendered: Array, missing: Array) -> void:
+	if VISUAL_LEAF_RESOURCE_PROPERTY.has(node.get_class()):
+		var property := str(VISUAL_LEAF_RESOURCE_PROPERTY[node.get_class()])
+		var has_resource := node.get(property) != null
+		var is_visible := true
+		if node is CanvasItem:
+			is_visible = (node as CanvasItem).visible
+		elif node is Node3D:
+			is_visible = (node as Node3D).visible
+		var entry := {"path": _relative_path(root, node), "type": node.get_class()}
+		if has_resource and is_visible:
+			rendered.append(entry)
+		elif not has_resource:
+			missing.append(entry)
+	for child in node.get_children():
+		if child is Node:
+			_walk_render_state(root, child, rendered, missing)
 
 
 ## 解析 focus_node_path（场景内任意 Node2D/Node3D 路径）或 focus_region+target_path

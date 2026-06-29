@@ -582,7 +582,18 @@ def register_front_tools() -> None:
             render_kind="list",
             schema={
                 "name": "add_node",
-                "description": "Add a node under a parent in the currently edited scene, with an optional local 2D/3D position.",
+                "description": (
+                    "Add a node under a parent in the currently edited scene, with an optional local 2D/3D "
+                    "position. Visual leaf nodes (Sprite2D/Sprite3D/AnimatedSprite2D/AnimatedSprite3D/"
+                    "MeshInstance3D) render nothing without their content resource, so add_node REQUIRES a "
+                    "`texture` (res:// resource path) for those types and rejects them otherwise with "
+                    "error_code 'visual_node_missing_resource'. For a finished prop with art, prefer "
+                    "instance_scene on a prefab .tscn instead of hand-building an empty Sprite node. When the "
+                    "scene has a TileMap, the result includes `placement` with `placed_at_tile` (the tile cell "
+                    "the node actually landed on) and `map_tile_bounds` — check placed_at_tile is inside the "
+                    "region you intended to populate; a coordinate far outside the map is rejected with "
+                    "error_code 'position_off_map'."
+                ),
                 "parameters": _object_schema(
                     {
                         "parent_path": {
@@ -591,6 +602,15 @@ def register_front_tools() -> None:
                         },
                         "type": {"type": "string", "description": "Node class to instantiate."},
                         "name": {"type": "string", "description": "New node name."},
+                        "texture": {
+                            "type": "string",
+                            "description": (
+                                "res:// path to the content resource for a visual leaf node — assigned to "
+                                "texture (Sprite2D/Sprite3D), sprite_frames (AnimatedSprite2D/3D) or mesh "
+                                "(MeshInstance3D). Required for those types; without it the node is invisible "
+                                "and the call is rejected."
+                            ),
+                        },
                         "position": {
                             "type": "object",
                             "description": "Optional local position relative to the parent: x/y for Node2D, x/y/z for Node3D (z defaults to 0).",
@@ -716,7 +736,13 @@ def register_front_tools() -> None:
             read_path_args=["scene_path"],
             schema={
                 "name": "instance_scene",
-                "description": "Instantiate a .tscn/.scn file as a new child node, with an optional local 2D/3D position.",
+                "description": (
+                    "Instantiate a .tscn/.scn file as a new child node, with an optional local 2D/3D position. "
+                    "When the scene has a TileMap, the result includes `placement` with `placed_at_tile` (the "
+                    "tile cell the instance landed on) and `map_tile_bounds` — verify placed_at_tile is inside "
+                    "the region you intended; a coordinate far outside the map is rejected with error_code "
+                    "'position_off_map'."
+                ),
                 "parameters": _object_schema(
                     {
                         "parent_path": {
@@ -1093,7 +1119,11 @@ def register_front_tools() -> None:
                     "rect, same x/y/z/width/height/depth shape used by edit_map/validate_map_region, target_path "
                     "pointing at the TileMapLayer/TileMap/GridMap) to re-center the camera (3D) or pan/zoom the "
                     "2D canvas onto the target before capturing, instead of guessing where the viewport happens "
-                    "to be pointed."
+                    "to be pointed. The result also includes `rendered_nodes` (visual nodes that actually have "
+                    "their texture/mesh/sprite_frames set and will draw pixels) and `nodes_missing_visual_resource` "
+                    "(Sprite/Mesh nodes that exist but have NO resource and therefore render nothing). Cross-check "
+                    "these against what you claim to have added: a tree node appearing in nodes_missing_visual_resource "
+                    "means it is invisible despite being in the tree — do not report it as done."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1488,7 +1518,11 @@ def register_front_tools() -> None:
                     "`used_bounds` (min_x/max_x/min_y/max_y, empty {} if the layer has no tiles) tells you how "
                     "far that layer's content actually reaches — compare a background/sky/water layer's bounds "
                     "against the foreground layer's to see whether the backdrop has fallen behind before you "
-                    "extend the level further."
+                    "extend the level further. A larger-than-usual region is served whole automatically (the "
+                    "response carries `auto_served: true`), so you do NOT need to pre-split typical level-width "
+                    "reads yourself. Only a region above the auto-serve ceiling fails with error_code "
+                    "'region_too_large', and then it returns `suggested_regions`: smaller pre-split rectangles "
+                    "covering the same area — just issue describe_map_region for each."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1993,7 +2027,10 @@ def register_front_tools() -> None:
                     "yourself; read the field every time. Also: if the `resource`/`resource_key` you passed is "
                     "registered with a scene_path (an object/PackedScene, e.g. a tree), this call fails with "
                     "error_code 'resource_requires_object_placement' — use place_map_objects for it instead of "
-                    "approximating it out of tiles."
+                    "approximating it out of tiles. Pass `expected_cells` (the number of cells this batch should "
+                    "write, e.g. an inclusive x=A..B span is B-A+1 columns × the fill height) so the tool can "
+                    "reject an off-by-one batch (error_code 'cell_count_mismatch') before any tiles are written, "
+                    "instead of discovering the gap later in validate_map_region."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2104,6 +2141,17 @@ def register_front_tools() -> None:
                                 "height": {"type": "integer", "minimum": 1},
                                 "depth": {"type": "integer", "minimum": 1},
                             },
+                        },
+                        "expected_cells": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Optional self-check: the number of cells this batch is supposed to write. If it "
+                                "does not match what the operations actually produce, the call is rejected with "
+                                "error_code 'cell_count_mismatch' and nothing is written. Always set it to your "
+                                "declared coverage (sum of width*height[*depth] per op) so a miscounted inclusive "
+                                "range — e.g. meaning x=85..87 but only emitting 85 and 86 — is caught immediately."
+                            ),
                         },
                     },
                     ["operations"],
