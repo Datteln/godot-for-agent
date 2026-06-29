@@ -170,6 +170,8 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = MapTools.compose_map_blueprint_grammar(input, editor_interface)
 		"describe_map_region":
 			result = _call_map_tool("describe_map_region", [input, editor_interface])
+		"convert_map_coords":
+			result = MapTools.convert_map_coords(input, editor_interface)
 		"edit_map":
 			result = MapTools.edit_map(input, editor_interface, undo_manager)
 		"paint_terrain_connect":

@@ -1167,6 +1167,61 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	return result
 
 
+## 瓦片/网格坐标(cell) ↔ 世界坐标(world) 互转。直接走 Godot 原生 map_to_local/local_to_map
+## + to_global/to_local，而不是让模型自己用 node_position + tile_size 手算——手算公式不处理瓦片
+## 偏移/半格/等距投影，且容易让 map-agent 陷入对坐标系的反复推理循环（一次任务里曾空转 70+ 秒、
+## 8000+ 字符）。传 `cells`（[{x,y[,z]}]）返回对应 `world`；传 `world` 返回对应 `cells`；可同时传。
+## GridMap 用三维，TileMapLayer/legacy TileMap 用二维。
+static func convert_map_coords(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var world_out: Array = []
+	for raw in (input.get("cells", []) if input.get("cells", []) is Array else []):
+		world_out.append(_cell_to_world(target, raw, dimension))
+	var cells_out: Array = []
+	for raw in (input.get("world", []) if input.get("world", []) is Array else []):
+		cells_out.append(_world_to_cell(target, raw, dimension))
+	return {
+		"ok": true,
+		"target": str(target_result.get("path", "")),
+		"type": target.get_class(),
+		"dimension": dimension,
+		"world": world_out,   # 与输入 cells 顺序一一对应
+		"cells": cells_out,   # 与输入 world 顺序一一对应
+	}
+
+
+static func _cell_to_world(target: Node, raw: Variant, dimension: int) -> Dictionary:
+	var d: Dictionary = raw if raw is Dictionary else {}
+	if dimension == 3:
+		var cell := Vector3i(int(d.get("x", 0)), int(d.get("y", 0)), int(d.get("z", 0)))
+		var local: Vector3 = target.call("map_to_local", cell)
+		var world: Vector3 = (target as Node3D).to_global(local)
+		return {"x": world.x, "y": world.y, "z": world.z}
+	var cell2 := Vector2i(int(d.get("x", 0)), int(d.get("y", 0)))
+	var local2: Vector2 = target.call("map_to_local", cell2)
+	var world2: Vector2 = (target as Node2D).to_global(local2)
+	return {"x": world2.x, "y": world2.y}
+
+
+static func _world_to_cell(target: Node, raw: Variant, dimension: int) -> Dictionary:
+	var d: Dictionary = raw if raw is Dictionary else {}
+	if dimension == 3:
+		var world := Vector3(float(d.get("x", 0.0)), float(d.get("y", 0.0)), float(d.get("z", 0.0)))
+		var local: Vector3 = (target as Node3D).to_local(world)
+		var cell: Vector3i = target.call("local_to_map", local)
+		return {"x": cell.x, "y": cell.y, "z": cell.z}
+	var world2 := Vector2(float(d.get("x", 0.0)), float(d.get("y", 0.0)))
+	var local2: Vector2 = (target as Node2D).to_local(world2)
+	var cell2: Vector2i = target.call("local_to_map", local2)
+	return {"x": cell2.x, "y": cell2.y}
+
+
 ## 一个 legacy TileMap 节点可能同时挂多个图层（比如 "Background"/"Mid"），
 ## 各图层互相独立、互不遮挡判定；不能假设 map_layer=0 就是承载碰撞的前景层。
 ## 调用方应该看这份列表自己选对 map_layer，而不是不传 map_layer 时悄悄默认成 0。

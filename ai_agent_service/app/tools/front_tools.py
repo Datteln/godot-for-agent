@@ -1555,6 +1555,52 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="convert_map_coords",
+            domain="map",
+            side="front",
+            reads_project=True,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            render_kind="json",
+            schema={
+                "name": "convert_map_coords",
+                "description": (
+                    "Convert between map cell coordinates and world coordinates for a 2D TileMapLayer/legacy "
+                    "TileMap or 3D GridMap, using Godot's native map_to_local/local_to_map plus the node's "
+                    "global transform. ALWAYS use this instead of doing the math yourself from node_position + "
+                    "tile_size: the manual formula ignores tile offsets, half-offset/isometric tile shapes and "
+                    "the node's transform, and hand-computing coordinates is exactly what makes coordinate "
+                    "reasoning spiral. Pass `cells` (a list of {x, y[, z]}) to get the matching `world` list back; "
+                    "pass `world` (a list of {x, y[, z]}) to get the matching `cells` list back; you may pass "
+                    "both. Output order matches input order. 3D uses x/y/z, 2D uses x/y."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "target_path": {
+                            "type": "string",
+                            "description": (
+                                "NodePath relative to the edited scene root. Omit to use the selected map node "
+                                "or the only compatible map node in the scene."
+                            ),
+                        },
+                        "cells": {
+                            "type": "array",
+                            "description": "Cell coordinates to convert to world coordinates.",
+                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        },
+                        "world": {
+                            "type": "array",
+                            "description": "World coordinates to convert to cell coordinates.",
+                            "items": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}},
+                        },
+                    },
+                    [],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="plan_map_algorithms",
             domain="map",
             side="front",
@@ -2672,7 +2718,11 @@ def register_front_tools() -> None:
                     "The result includes `completion_allowed` and `blocking_completion`; final completion is only "
                     "allowed after a validation with real route endpoints/waypoints (or entrances/exits) passes and "
                     "`completion_allowed=true`. Oversized validation returns `blocking_completion=true` and must be "
-                    "split into route segments instead of being ignored."
+                    "split into route segments instead of being ignored. HARD LIMIT: the region width*height (*depth) "
+                    "must be <= 400 cells per call; a larger region is rejected with error_code='region_too_large'. "
+                    "Plan for this BEFORE calling — split a long route into segments and validate each with its own "
+                    "start/goal, keeping each segment's support row inside its region, rather than sending one big "
+                    "region and reacting to the error."
                 ),
                 "parameters": _object_schema(
                     {

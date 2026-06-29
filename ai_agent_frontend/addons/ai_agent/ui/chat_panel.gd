@@ -2187,7 +2187,11 @@ func _handle_event(event: Dictionary) -> void:
 			_state_before_compact = _state
 			_set_state(AgentState.COMPACTING)
 		if _REASONING_BOUNDARY_EVENT_TYPES.has(event_type):
-			_close_reasoning_for_boundary_event(event)
+			# 把关闭动作推迟到当前同步批次（_drain_event_queue 的 while 循环）跑完之后再执行。
+			# 否则同一 SSE 批次里排在 boundary 事件后面的 trailing reasoning_delta，会因为 key
+			# 已被同步关闭而在 _on_reasoning_delta 里当成"迟到"丢弃（日志里 55 次 IGNORED 即此）。
+			# call_deferred 在本帧 idle flush 时才运行，那时批内的 reasoning_delta 都已同步应用完。
+			call_deferred("_close_reasoning_for_boundary_event", event)
 		var force_milestone_scroll := _MILESTONE_EVENT_TYPES.has(event_type)
 		if force_milestone_scroll:
 			_force_scroll_once = true
