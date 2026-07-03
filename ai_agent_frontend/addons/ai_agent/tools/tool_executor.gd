@@ -13,15 +13,56 @@ const ResourceTools = preload("res://addons/ai_agent/tools/resource_tools.gd")
 const ProjectTools = preload("res://addons/ai_agent/tools/project_tools.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 
+const MAP_WRITE_TOOLS := {
+	"edit_map": true,
+	"paint_terrain_connect": true,
+	"place_map_objects": true,
+	"repair_placements": true,
+	"repair_layer_coverage": true,
+	"repair_map_region": true,
+	"compact_spatial_index": true,
+	"write_resource_registry": true,
+	"save_map_blueprint": true,
+	"apply_map_blueprint": true,
+	"ensure_standard_map_layers": true,
+	"fill_rect": true,
+	"paint_from_image_grid": true,
+}
+
+const MAP_READ_TOOLS := {
+	"describe_tilemap_selection": true,
+	"describe_map_context": true,
+	"plan_map_layout": true,
+	"plan_map_algorithms": true,
+	"plan_platform_level": true,
+	"plan_reachable_map_growth": true,
+	"compute_reachable_frontier": true,
+	"sample_poisson_points": true,
+	"compose_map_blueprint_grammar": true,
+	"describe_map_region": true,
+	"convert_map_coords": true,
+	"find_placement_anchors": true,
+	"validate_object_placements": true,
+	"validate_layer_coverage": true,
+	"query_spatial_index": true,
+	"validate_map_region": true,
+	"sample_noise_grid": true,
+}
+
+const MAP_REVISIONS_PATH := "res://.ai_agent_service/map_agent/revisions.json"
+
 var editor_interface: EditorInterface
 var undo_manager: Node
 var file_state_cache: Node
+var _map_revisions := {}
+var _map_revisions_loaded := false
 
 
 func _ready() -> void:
 	if file_state_cache == null:
 		file_state_cache = FileStateCache.new()
 		add_child(file_state_cache)
+	_ensure_map_revisions_loaded()
 
 
 ## 记录服务端 read_file/read_script 已成功读取的文件，让后续前端编辑共享同一份读取状态。
@@ -49,11 +90,26 @@ func execute(tool_call: Dictionary) -> Dictionary:
 	var input: Dictionary = tool_call.get("input", {})
 	var result: Dictionary
 	var started_at := Time.get_ticks_msec()
+	var map_revision_key := _map_revision_key(name, input)
+	var is_map_write := MAP_WRITE_TOOLS.has(name)
 
 	FrontendLogger.debug(editor_interface, "ToolExecutor", "Executing front tool.", {
 		"tool": name,
 		"id": str(tool_call.get("id", "")),
 	})
+
+	if is_map_write:
+		_inject_map_write_metadata(input, tool_call)
+		var revision_error := _validate_map_write_revision(input, map_revision_key)
+		if not revision_error.is_empty():
+			return AgentDTO.tool_result(
+				str(tool_call.get("id", "")),
+				str(tool_call.get("frame_id", "")),
+				"error",
+				revision_error,
+				str(revision_error.get("error_code", "map_revision_conflict"))
+			)
+		_begin_map_write_batch(name, input, tool_call, map_revision_key)
 
 	match name:
 		"read_class_docs", "read_class_info", "get_class_info":
@@ -228,6 +284,11 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			FrontendLogger.warn(editor_interface, "ToolExecutor", "Unknown front tool requested.", {"tool": name})
 			return AgentDTO.error_result(tool_call, "Unknown front tool: " + name, "unknown_front_tool")
 
+	if is_map_write:
+		result = _finish_map_write_batch(name, input, result, map_revision_key)
+	elif MAP_READ_TOOLS.has(name):
+		_attach_map_revision(result, map_revision_key)
+
 	var elapsed_ms := Time.get_ticks_msec() - started_at
 	if bool(result.get("ok", true)):
 		FrontendLogger.info(editor_interface, "ToolExecutor", "Front tool applied.", {
@@ -258,6 +319,152 @@ func execute(tool_call: Dictionary) -> Dictionary:
 		result,
 		str(result.get("error_code", "front_tool_failed"))
 	)
+
+
+func _map_revision_key(tool_name: String, input: Dictionary) -> String:
+	var target_path := str(input.get("target_path", "")).strip_edges()
+	if target_path != "":
+		return target_path
+	var parent_path := str(input.get("parent_path", "")).strip_edges()
+	if parent_path != "":
+		return parent_path
+	match tool_name:
+		"write_resource_registry":
+			return "res://.ai_agent_service/map_agent/resource_registry.json"
+		"save_map_blueprint", "apply_map_blueprint":
+			return "res://.ai_agent_service/map_agent/blueprints"
+		"compact_spatial_index":
+			return "res://.ai_agent_service/map_agent/spatial_index.json"
+		_:
+			return "__selected_map__"
+
+
+func _current_map_revision(key: String) -> int:
+	_ensure_map_revisions_loaded()
+	return int(_map_revisions.get(key, 0))
+
+
+func _ensure_map_revisions_loaded() -> void:
+	if _map_revisions_loaded:
+		return
+	_map_revisions_loaded = true
+	_map_revisions.clear()
+	var absolute := ProjectSettings.globalize_path(MAP_REVISIONS_PATH)
+	if not FileAccess.file_exists(absolute):
+		return
+	var text := FileAccess.get_file_as_string(absolute)
+	var parsed = JSON.parse_string(text)
+	if not (parsed is Dictionary):
+		return
+	for key in parsed.keys():
+		var value = parsed.get(key, 0)
+		if value is int or value is float:
+			_map_revisions[str(key)] = int(value)
+
+
+func _save_map_revisions() -> void:
+	_ensure_map_revisions_loaded()
+	var absolute := ProjectSettings.globalize_path(MAP_REVISIONS_PATH)
+	var base_dir := absolute.get_base_dir()
+	DirAccess.make_dir_recursive_absolute(base_dir)
+	var file := FileAccess.open(absolute, FileAccess.WRITE)
+	if file == null:
+		FrontendLogger.warn(editor_interface, "ToolExecutor", "Failed to persist map revisions.", {
+			"path": MAP_REVISIONS_PATH,
+			"error": FileAccess.get_open_error(),
+		})
+		return
+	file.store_string(JSON.stringify(_map_revisions, "\t"))
+
+
+func _validate_map_write_revision(input: Dictionary, key: String) -> Dictionary:
+	if not input.has("expected_revision"):
+		return {
+			"ok": false,
+			"error_code": "expected_revision_required",
+			"message": "map write requires expected_revision",
+			"actual_revision": _current_map_revision(key),
+		}
+	var expected_revision = input.get("expected_revision")
+	if not (expected_revision is int):
+		return {
+			"ok": false,
+			"error_code": "expected_revision_required",
+			"message": "expected_revision must be an integer",
+			"actual_revision": _current_map_revision(key),
+		}
+	var actual_revision := _current_map_revision(key)
+	if int(expected_revision) != actual_revision:
+		return {
+			"ok": false,
+			"error_code": "map_revision_conflict",
+			"expected_revision": int(expected_revision),
+			"actual_revision": actual_revision,
+			"message": "map changed since this plan was made; re-read the affected region before writing",
+		}
+	return {}
+
+
+func _inject_map_write_metadata(input: Dictionary, tool_call: Dictionary) -> void:
+	if not input.has("frame_id"):
+		input["frame_id"] = str(tool_call.get("frame_id", ""))
+	if not input.has("worker"):
+		input["worker"] = str(tool_call.get("agent", "map-agent"))
+	if not input.has("mode"):
+		input["mode"] = "write_one_batch"
+	if not input.has("task_summary"):
+		input["task_summary"] = str(input.get("summary", input.get("objective", ""))).strip_edges()
+
+
+func _begin_map_write_batch(tool_name: String, input: Dictionary, tool_call: Dictionary, key: String) -> void:
+	if undo_manager == null:
+		return
+	if undo_manager.has_method("has_active_batch") and bool(undo_manager.has_active_batch()):
+		undo_manager.commit_batch()
+	var description := _map_write_undo_description(tool_name, input, tool_call, key)
+	undo_manager.begin_batch(description)
+
+
+func _finish_map_write_batch(tool_name: String, input: Dictionary, result: Dictionary, key: String) -> Dictionary:
+	var ok := bool(result.get("ok", true))
+	if ok:
+		var previous_revision := _current_map_revision(key)
+		var next_revision := previous_revision + 1
+		_map_revisions[key] = next_revision
+		_save_map_revisions()
+		result["expected_revision"] = int(input.get("expected_revision", previous_revision))
+		result["previous_map_revision"] = previous_revision
+		result["map_revision"] = next_revision
+		result["write_batch_id"] = str(input.get("write_batch_id", ""))
+		result["worker"] = str(input.get("worker", ""))
+		result["mode"] = str(input.get("mode", ""))
+		result["pipeline_template"] = str(input.get("pipeline_template", ""))
+		result["frame_id"] = str(input.get("frame_id", ""))
+		result["delegate_group_id"] = str(input.get("delegate_group_id", ""))
+		if undo_manager != null:
+			undo_manager.commit_batch()
+	else:
+		result["map_revision"] = _current_map_revision(key)
+		if undo_manager != null:
+			undo_manager.abort_batch()
+	return result
+
+
+func _attach_map_revision(result: Dictionary, key: String) -> void:
+	if not bool(result.get("ok", true)):
+		return
+	result["map_revision"] = _current_map_revision(key)
+
+
+func _map_write_undo_description(tool_name: String, input: Dictionary, tool_call: Dictionary, key: String) -> String:
+	var worker := str(input.get("worker", tool_call.get("agent", "map-agent"))).strip_edges()
+	var frame_id := str(input.get("frame_id", tool_call.get("frame_id", ""))).strip_edges()
+	var batch_id := str(input.get("write_batch_id", "")).strip_edges()
+	var mode := str(input.get("mode", "write_one_batch")).strip_edges()
+	var summary := str(input.get("task_summary", tool_name)).strip_edges()
+	if summary == "":
+		summary = tool_name + " " + key
+	return "AI map edit [worker=%s frame=%s batch=%s mode=%s]: %s" % [worker, frame_id, batch_id, mode, summary.left(80)]
 
 
 func _result_artifacts(result: Dictionary) -> Array:

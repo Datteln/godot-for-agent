@@ -71,6 +71,7 @@ from app.orchestrator.agent import (
     resolve_thinking_budget,
     run_turn,
 )
+from app.orchestrator.map_workers import MAP_WRITE_TOOL_NAMES
 from app.output_styles.catalog import OutputStyleCatalog
 from app.permissions.engine import make_session_allow_grant
 from app.prompt.builder import LayeredPrompt, build_system_prompt
@@ -347,26 +348,10 @@ _HISTORY_FRONT_RUN_TOOLS = frozenset(
 _HISTORY_FRONT_TOOLS = (
     _HISTORY_FRONT_READ_TOOLS | _HISTORY_FRONT_SCENE_EDIT_TOOLS | _HISTORY_FRONT_RUN_TOOLS
 )
-_MAP_COMPLETION_TOOL_NAMES = frozenset(
-    {
-        "edit_map",
-        "paint_terrain_connect",
-        "place_map_objects",
-        "repair_map_region",
-        "repair_layer_coverage",
-        "validate_map_region",
-        "validate_layer_coverage",
-    }
+_MAP_VALIDATION_TOOL_NAMES = frozenset(
+    {"validate_map_region", "validate_layer_coverage", "validate_object_placements"}
 )
-_MAP_WRITE_TOOL_NAMES = frozenset(
-    {
-        "edit_map",
-        "paint_terrain_connect",
-        "place_map_objects",
-        "repair_map_region",
-        "repair_layer_coverage",
-    }
-)
+_MAP_COMPLETION_TOOL_NAMES = MAP_WRITE_TOOL_NAMES | _MAP_VALIDATION_TOOL_NAMES
 _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
     {
         "agent_reasoning_delta",
@@ -561,11 +546,20 @@ def _map_completion_blocker(
     if tool_name not in _MAP_COMPLETION_TOOL_NAMES:
         return None
     result_dict = result if isinstance(result, dict) else {}
+    target = str(result_dict.get("target", result_dict.get("target_path", "")))
+    revision = result_dict.get("map_revision")
+    revision_value = (
+        revision if isinstance(revision, int) and not isinstance(revision, bool) else None
+    )
+    pipeline_template = str(result_dict.get("pipeline_template", ""))
     if status != "applied":
         return {
             "tool": tool_name,
             "reason": error_code or status,
             "issues": [str(error_code or status)],
+            "target": target,
+            "required_revision": revision_value,
+            "pipeline_template": pipeline_template,
         }
 
     issues = result_dict.get("issues")
@@ -579,20 +573,143 @@ def _map_completion_blocker(
             "tool": tool_name,
             "reason": "blocking_completion",
             "issues": normalized_issues or ["map tool reported blocking_completion=true"],
+            "target": target,
+            "required_revision": revision_value,
+            "pipeline_template": pipeline_template,
         }
     if result_dict.get("completion_allowed") is False:
         return {
             "tool": tool_name,
             "reason": "completion_not_allowed",
             "issues": normalized_issues or ["map tool reported completion_allowed=false"],
+            "target": target,
+            "required_revision": revision_value,
+            "pipeline_template": pipeline_template,
         }
-    if tool_name in _MAP_WRITE_TOOL_NAMES and result_dict.get("completion_allowed") is not True:
+    if tool_name in MAP_WRITE_TOOL_NAMES and result_dict.get("completion_allowed") is not True:
         return {
             "tool": tool_name,
             "reason": "map_write_requires_validation",
-            "issues": ["map write applied but no successful validation has cleared completion"],
+            "issues": [
+                "map write applied but no successful same-revision validation has cleared completion"
+            ],
+            "target": target,
+            "required_revision": revision_value,
+            "pipeline_template": pipeline_template,
         }
     return None
+
+
+def _same_map_target(blocker: dict[str, Any], target: str) -> bool:
+    """判断阻断项是否属于同一地图目标。"""
+    blocker_target = str(blocker.get("target", ""))
+    return blocker_target == "" or target == "" or blocker_target == target
+
+
+def _blocker_revision(blocker: dict[str, Any]) -> int | None:
+    """读取阻断项要求的 map revision。"""
+    value = blocker.get("required_revision")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _clear_validation_blockers(
+    blockers: list[dict[str, Any]], target: str, revision: int | None
+) -> list[dict[str, Any]]:
+    """清除已被同 revision validate_map_region 覆盖的写后校验阻断。"""
+    validation_reasons = {
+        "map_write_requires_validation",
+        "completion_not_allowed",
+        "blocking_completion",
+    }
+    remaining: list[dict[str, Any]] = []
+    for blocker in blockers:
+        if blocker.get("reason") not in validation_reasons:
+            remaining.append(blocker)
+            continue
+        blocker_revision = _blocker_revision(blocker)
+        if _same_map_target(blocker, target) and (
+            revision is None or blocker_revision is None or revision >= blocker_revision
+        ):
+            continue
+        remaining.append(blocker)
+    return remaining
+
+
+def _has_review_blocker(blockers: list[dict[str, Any]], target: str, revision: int | None) -> bool:
+    """判断是否已有同目标同版本的 reviewer 阻断。"""
+    for blocker in blockers:
+        if blocker.get("reason") != "map_review_required":
+            continue
+        if not _same_map_target(blocker, target):
+            continue
+        blocker_revision = _blocker_revision(blocker)
+        if revision is None or blocker_revision is None or revision == blocker_revision:
+            return True
+    return False
+
+
+def _review_required_blocker(tool_name: str, target: str, revision: int | None) -> dict[str, Any]:
+    """生成验证通过后的视觉复核阻断项。"""
+    return {
+        "tool": tool_name,
+        "reason": "map_review_required",
+        "issues": ["same-revision validation passed; reviewer visual check is still required"],
+        "target": target,
+        "required_revision": revision,
+    }
+
+
+def _schedule_revision_conflict_reader(
+    session: Session,
+    frame: Frame,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    result: Any,
+) -> None:
+    """在 revision 冲突后自动压入 map-reader-agent 重读帧。"""
+    result_dict = result if isinstance(result, dict) else {}
+    target = str(tool_args.get("target_path", result_dict.get("target_path", "")))
+    region = tool_args.get("region", tool_args.get("rect", result_dict.get("region")))
+    task_payload = {
+        "reason": "map_revision_conflict",
+        "failed_tool": tool_name,
+        "target_path": target,
+        "region": region,
+        "expected_revision": result_dict.get("expected_revision"),
+        "actual_revision": result_dict.get("actual_revision"),
+        "instruction": (
+            "重读冲突区域并只输出 map_worker_result_v1 JSON；"
+            "不要写入，next_stage 设为 planner 或 validator。"
+        ),
+    }
+    try:
+        reader = get_agent("map-reader-agent", set(REGISTRY))
+    except KeyError:
+        frame.messages.append(
+            {
+                "role": "user",
+                "content": "map_revision_conflict：map-reader-agent 未注册，请先手动重读冲突区域。",
+            }
+        )
+        return
+    task_text = json.dumps(task_payload, ensure_ascii=False)
+    child = Frame(
+        id=session.new_frame_id(),
+        agent=reader,
+        messages=[
+            {"role": "system", "content": reader.prompt},
+            {"role": "user", "content": task_text},
+        ],
+        parent_id=frame.id,
+        depth=frame.depth + 1,
+        history_anchor_frame_id=frame.history_anchor_frame_id or frame.id,
+        history_anchor_message_index=(
+            frame.history_anchor_message_index
+            if frame.history_anchor_message_index is not None
+            else len(frame.messages)
+        ),
+    )
+    session.agent_stack.append(child)
 
 
 def _map_completion_gate_text(blockers: list[dict[str, Any]]) -> str:
@@ -2647,14 +2764,44 @@ class QueryEngine:
             blocker = _map_completion_blocker(
                 tool_name, result.status, result_for_gate, result.error_code
             )
-            if tool_name == "validate_map_region" and isinstance(result_for_gate, dict):
+            if tool_name in _MAP_VALIDATION_TOOL_NAMES and isinstance(result_for_gate, dict):
                 if result_for_gate.get("completion_allowed") is True:
-                    session.map_completion_blockers.clear()
+                    target = str(result_for_gate.get("target", tool_args.get("target_path", "")))
+                    revision = result_for_gate.get("map_revision")
+                    revision_value = (
+                        revision
+                        if isinstance(revision, int) and not isinstance(revision, bool)
+                        else None
+                    )
+                    session.map_completion_blockers = _clear_validation_blockers(
+                        session.map_completion_blockers,
+                        target,
+                        revision_value,
+                    )
+                    if not _has_review_blocker(
+                        session.map_completion_blockers,
+                        target,
+                        revision_value,
+                    ):
+                        session.map_completion_blockers.append(
+                            _review_required_blocker(tool_name, target, revision_value)
+                        )
                 elif blocker is not None:
                     session.map_completion_blockers = [blocker]
             elif blocker is not None:
                 session.map_completion_blockers = [blocker]
             frame.messages.append(_tool_message(result.tool_use_id, payload, is_error=is_error))
+            if (
+                tool_name in MAP_WRITE_TOOL_NAMES
+                and str(result.error_code) == "map_revision_conflict"
+            ):
+                _schedule_revision_conflict_reader(
+                    session,
+                    frame,
+                    tool_name,
+                    tool_args,
+                    result_for_gate,
+                )
             logger.info(
                 "Tool result appended session=%s turn_id=%s tool=%s status=%s frame=%s",
                 session.session_id,
@@ -3152,9 +3299,7 @@ class QueryEngine:
         """在已持有会话锁时执行压缩；不要在未持锁路径直接调用。"""
         session = self._store.get_or_create(session_id, self.available_tools)
         trigger: Literal["manual", "auto"] = "auto" if triggered_by == "auto" else "manual"
-        summary_use_llm = (
-            self._settings.compact_summary_use_llm if use_llm is None else use_llm
-        )
+        summary_use_llm = self._settings.compact_summary_use_llm if use_llm is None else use_llm
         logger.info(
             "Compacting session session=%s keep_recent=%d triggered_by=%s",
             session_id,

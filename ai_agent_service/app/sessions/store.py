@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, CompactSnapshot, Frame
+from app.orchestrator.map_workers import restore_project_agent
 from app.permissions.engine import SessionAllowGrant
 from app.storage.atomic import atomic_write_json
 
@@ -193,12 +194,26 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
         frame: 待序列化的帧。
 
     Returns:
-        仅含 JSON 原生类型的字典；`agent` 只保留 `agent_name`，恢复时
-        重新从内置 agent 注册表解析，避免持久化大段 prompt 文本。
+        仅含 JSON 原生类型的字典；内置 agent 只保留 `agent_name`，恢复时
+        重新从注册表解析。一次性 project agent 额外保存必要定义。
     """
     return {
         "id": frame.id,
         "agent_name": frame.agent.name,
+        "project_agent": (
+            {
+                "name": frame.agent.name,
+                "description": frame.agent.description,
+                "prompt": frame.agent.prompt,
+                "tools": frame.agent.tools or [],
+                "model": frame.agent.model,
+                "effort": frame.agent.effort,
+                "max_turns": frame.agent.max_turns,
+                "edit_map_max_turns": frame.agent.edit_map_max_turns,
+            }
+            if frame.agent.source == "project"
+            else None
+        ),
         "messages": frame.messages,
         "parent_id": frame.parent_id,
         "pending_delegate_call_id": frame.pending_delegate_call_id,
@@ -238,7 +253,12 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
     Returns:
         恢复后的 `Frame`。
     """
-    agent = get_agent(data["agent_name"], available_tools)
+    project_agent = data.get("project_agent")
+    agent = (
+        restore_project_agent(project_agent, available_tools)
+        if isinstance(project_agent, dict)
+        else get_agent(data["agent_name"], available_tools)
+    )
     status = data.get("status", "running")
     raw_snapshot = data.get("compact_snapshot")
     compact_snapshot: CompactSnapshot | None = None

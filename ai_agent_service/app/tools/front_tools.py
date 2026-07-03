@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.tools.registry import ToolDef, register
+from app.orchestrator.map_workers import pipeline_template_ids
+from app.tools.registry import ToolDef, register as _register_tool
 
 
 def _object_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -18,6 +19,56 @@ def _object_schema(properties: dict[str, Any], required: list[str] | None = None
         "properties": properties,
         "required": required or [],
     }
+
+
+def _worker_spec_schema() -> dict[str, Any]:
+    """返回动态地图 worker 的参数 schema。"""
+    return _object_schema(
+        {
+            "name": {"type": "string"},
+            "objective": {"type": "string"},
+            "mode": {
+                "type": "string",
+                "enum": [
+                    "read_only",
+                    "propose_only",
+                    "write_one_batch",
+                    "review_only",
+                    "repair_propose",
+                    "repair_write_one_batch",
+                ],
+            },
+            "allowed_tools": {"type": "array", "items": {"type": "string"}},
+            "output_schema": {"type": "string", "enum": ["map_worker_result_v1"]},
+            "pipeline_template": {"type": "string", "enum": list(pipeline_template_ids())},
+            "stage_id": {"type": "string"},
+            "max_turns": {"type": "integer", "minimum": 1, "maximum": 12},
+        },
+        ["name", "objective", "mode", "allowed_tools", "output_schema"],
+    )
+
+
+def register(tool: ToolDef) -> None:
+    """注册前端工具，并给地图写工具补齐版本字段 schema。"""
+    if tool.domain == "map" and tool.writes_project:
+        parameters = tool.schema.get("parameters")
+        if isinstance(parameters, dict):
+            properties = parameters.setdefault("properties", {})
+            if isinstance(properties, dict):
+                properties.setdefault(
+                    "expected_revision",
+                    {
+                        "type": "integer",
+                        "description": (
+                            "Current map_revision returned by the latest read/validate tool. "
+                            "The frontend rejects stale writes with map_revision_conflict."
+                        ),
+                    },
+                )
+            required = parameters.setdefault("required", [])
+            if isinstance(required, list) and "expected_revision" not in required:
+                required.append("expected_revision")
+    _register_tool(tool)
 
 
 def register_front_tools() -> None:
@@ -40,11 +91,19 @@ def register_front_tools() -> None:
                     {
                         "agent": {
                             "type": "string",
-                            "description": "Specialist agent name, e.g. programming-agent.",
+                            "description": "Specialist agent name, e.g. programming-agent. For dynamic map workers use map-worker.",
                         },
                         "task": {
                             "type": "string",
                             "description": "Focused task for the child agent.",
+                        },
+                        "worker_spec": {
+                            "description": (
+                                "Optional dynamic map worker spec. Only map-agent may use this. "
+                                "Fields include name, objective, mode, allowed_tools, output_schema, "
+                                "pipeline_template, stage_id, max_turns."
+                            ),
+                            **_worker_spec_schema(),
                         },
                     },
                     ["agent", "task"],
@@ -76,6 +135,10 @@ def register_front_tools() -> None:
                                 {
                                     "agent": {"type": "string"},
                                     "task": {"type": "string"},
+                                    "worker_spec": {
+                                        "description": "Optional dynamic map worker spec, allowed only for map-agent tasks.",
+                                        **_worker_spec_schema(),
+                                    },
                                 },
                                 ["agent", "task"],
                             ),
@@ -532,8 +595,14 @@ def register_front_tools() -> None:
                 "description": "Run `git diff` (optionally --staged, optionally scoped to one path) and return its output. Fixed, read-only command.",
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "Optional relative path to scope the diff to."},
-                        "staged": {"type": "boolean", "description": "Show staged changes instead of the working tree."},
+                        "path": {
+                            "type": "string",
+                            "description": "Optional relative path to scope the diff to.",
+                        },
+                        "staged": {
+                            "type": "boolean",
+                            "description": "Show staged changes instead of the working tree.",
+                        },
                     },
                 ),
             },
@@ -559,9 +628,18 @@ def register_front_tools() -> None:
                 ),
                 "parameters": _object_schema(
                     {
-                        "preset": {"type": "string", "description": "Export preset name, from list_export_presets."},
-                        "output_path": {"type": "string", "description": "Project-relative output file path."},
-                        "debug": {"type": "boolean", "description": "Export a debug build instead of release."},
+                        "preset": {
+                            "type": "string",
+                            "description": "Export preset name, from list_export_presets.",
+                        },
+                        "output_path": {
+                            "type": "string",
+                            "description": "Project-relative output file path.",
+                        },
+                        "debug": {
+                            "type": "boolean",
+                            "description": "Export a debug build instead of release.",
+                        },
                         "timeout_ms": {
                             "type": "integer",
                             "description": "Requested timeout; frontend clamps it to the configured local limit.",
@@ -673,7 +751,10 @@ def register_front_tools() -> None:
                 "description": "Delete a node from the currently edited scene. The scene root cannot be deleted.",
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "NodePath to the node, relative to the scene root."},
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath to the node, relative to the scene root.",
+                        },
                     },
                     ["path"],
                 ),
@@ -693,7 +774,10 @@ def register_front_tools() -> None:
                 "description": "Move a node to a new parent within the currently edited scene, preserving the node and its children.",
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "NodePath to the node, relative to the scene root."},
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath to the node, relative to the scene root.",
+                        },
                         "new_parent_path": {
                             "type": "string",
                             "description": "NodePath of the new parent, relative to the scene root, or '.' for root.",
@@ -717,7 +801,10 @@ def register_front_tools() -> None:
                 "description": "Rename a node within the currently edited scene. The scene root cannot be renamed.",
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "NodePath to the node, relative to the scene root."},
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath to the node, relative to the scene root.",
+                        },
                         "name": {"type": "string", "description": "New node name."},
                     },
                     ["path", "name"],
@@ -749,8 +836,14 @@ def register_front_tools() -> None:
                             "type": "string",
                             "description": "NodePath of the parent, relative to the scene root, or '.' for root.",
                         },
-                        "scene_path": {"type": "string", "description": "Relative .tscn/.scn path to instantiate."},
-                        "name": {"type": "string", "description": "Optional name override for the new instance root."},
+                        "scene_path": {
+                            "type": "string",
+                            "description": "Relative .tscn/.scn path to instantiate.",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Optional name override for the new instance root.",
+                        },
                         "position": {
                             "type": "object",
                             "description": "Optional local position relative to the parent: x/y for a Node2D root, x/y/z for a Node3D root (z defaults to 0).",
@@ -781,8 +874,14 @@ def register_front_tools() -> None:
                 "description": "Duplicate a node and its children, optionally overriding the duplicate's local 2D/3D position.",
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "NodePath to duplicate, relative to the scene root."},
-                        "name": {"type": "string", "description": "Optional name override for the duplicate."},
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath to duplicate, relative to the scene root.",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Optional name override for the duplicate.",
+                        },
                         "position": {
                             "type": "object",
                             "description": "Optional local position relative to the parent: x/y for Node2D, x/y/z for Node3D (z defaults to 0).",
@@ -813,10 +912,22 @@ def register_front_tools() -> None:
                 "description": "Connect a node's signal to a method on another node (or the same node), persisted with the scene.",
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "NodePath of the signal source, relative to the scene root."},
-                        "signal": {"type": "string", "description": "Signal name on the source node."},
-                        "target_path": {"type": "string", "description": "NodePath of the target, relative to the scene root."},
-                        "method": {"type": "string", "description": "Method name on the target node to call."},
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath of the signal source, relative to the scene root.",
+                        },
+                        "signal": {
+                            "type": "string",
+                            "description": "Signal name on the source node.",
+                        },
+                        "target_path": {
+                            "type": "string",
+                            "description": "NodePath of the target, relative to the scene root.",
+                        },
+                        "method": {
+                            "type": "string",
+                            "description": "Method name on the target node to call.",
+                        },
                     },
                     ["path", "signal", "target_path", "method"],
                 ),
@@ -836,10 +947,22 @@ def register_front_tools() -> None:
                 "description": "Disconnect a previously connected signal between two nodes in the currently edited scene.",
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "NodePath of the signal source, relative to the scene root."},
-                        "signal": {"type": "string", "description": "Signal name on the source node."},
-                        "target_path": {"type": "string", "description": "NodePath of the target, relative to the scene root."},
-                        "method": {"type": "string", "description": "Method name on the target node."},
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath of the signal source, relative to the scene root.",
+                        },
+                        "signal": {
+                            "type": "string",
+                            "description": "Signal name on the source node.",
+                        },
+                        "target_path": {
+                            "type": "string",
+                            "description": "NodePath of the target, relative to the scene root.",
+                        },
+                        "method": {
+                            "type": "string",
+                            "description": "Method name on the target node.",
+                        },
                     },
                     ["path", "signal", "target_path", "method"],
                 ),
@@ -859,7 +982,10 @@ def register_front_tools() -> None:
                 "description": "Add a node to a scene group (for batch lookup, collision categorization, etc.).",
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "NodePath, relative to the scene root."},
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath, relative to the scene root.",
+                        },
                         "group": {"type": "string", "description": "Group name."},
                     },
                     ["path", "group"],
@@ -880,7 +1006,10 @@ def register_front_tools() -> None:
                 "description": "Remove a node from a scene group.",
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "NodePath, relative to the scene root."},
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath, relative to the scene root.",
+                        },
                         "group": {"type": "string", "description": "Group name."},
                     },
                     ["path", "group"],
@@ -901,7 +1030,12 @@ def register_front_tools() -> None:
                 "name": "list_node_groups",
                 "description": "List the groups a node currently belongs to.",
                 "parameters": _object_schema(
-                    {"path": {"type": "string", "description": "NodePath, relative to the scene root."}},
+                    {
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath, relative to the scene root.",
+                        }
+                    },
                     ["path"],
                 ),
             },
@@ -920,7 +1054,12 @@ def register_front_tools() -> None:
                 "name": "list_node_signals",
                 "description": "List the signals a node can emit, for wiring up with connect_signal.",
                 "parameters": _object_schema(
-                    {"path": {"type": "string", "description": "NodePath, relative to the scene root."}},
+                    {
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath, relative to the scene root.",
+                        }
+                    },
                     ["path"],
                 ),
             },
@@ -939,7 +1078,12 @@ def register_front_tools() -> None:
                 "name": "list_node_methods",
                 "description": "List the public methods a node exposes, for wiring up with connect_signal.",
                 "parameters": _object_schema(
-                    {"path": {"type": "string", "description": "NodePath, relative to the scene root."}},
+                    {
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath, relative to the scene root.",
+                        }
+                    },
                     ["path"],
                 ),
             },
@@ -1006,12 +1150,18 @@ def register_front_tools() -> None:
                                         "description": "Signal connection expectations for this source node.",
                                         "items": _object_schema(
                                             {
-                                                "signal": {"type": "string", "description": "Signal name on the source node."},
+                                                "signal": {
+                                                    "type": "string",
+                                                    "description": "Signal name on the source node.",
+                                                },
                                                 "target_path": {
                                                     "type": "string",
                                                     "description": "Target NodePath relative to the scene root. Defaults to the source path.",
                                                 },
-                                                "method": {"type": "string", "description": "Target method name."},
+                                                "method": {
+                                                    "type": "string",
+                                                    "description": "Target method name.",
+                                                },
                                                 "connected": {
                                                     "type": "boolean",
                                                     "description": "Whether the connection should exist. Defaults to true.",
@@ -1127,8 +1277,15 @@ def register_front_tools() -> None:
                 ),
                 "parameters": _object_schema(
                     {
-                        "mode": {"type": "string", "enum": ["2d", "3d"], "description": "Which editor viewport to capture."},
-                        "viewport_index": {"type": "integer", "description": "3D viewport index, if multiple are open."},
+                        "mode": {
+                            "type": "string",
+                            "enum": ["2d", "3d"],
+                            "description": "Which editor viewport to capture.",
+                        },
+                        "viewport_index": {
+                            "type": "integer",
+                            "description": "3D viewport index, if multiple are open.",
+                        },
                         "output_path": {
                             "type": "string",
                             "description": "Optional project-relative output path; defaults to a temp user:// location.",
@@ -1144,8 +1301,8 @@ def register_front_tools() -> None:
                         "focus_region": {
                             "type": "object",
                             "description": (
-                                "Map cell-coordinate rect to frame before capturing, e.g. {\"x\":0,\"y\":0,"
-                                "\"width\":20,\"height\":10}. Requires target_path to identify the map node. "
+                                'Map cell-coordinate rect to frame before capturing, e.g. {"x":0,"y":0,'
+                                '"width":20,"height":10}. Requires target_path to identify the map node. '
                                 "Use the same region you just passed to edit_map/validate_map_region so the "
                                 "screenshot actually shows what you changed."
                             ),
@@ -1190,7 +1347,10 @@ def register_front_tools() -> None:
                 ),
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "Relative scene path, for example scenes/level_2.tscn."},
+                        "path": {
+                            "type": "string",
+                            "description": "Relative scene path, for example scenes/level_2.tscn.",
+                        },
                     },
                     ["path"],
                 ),
@@ -1209,7 +1369,12 @@ def register_front_tools() -> None:
                 "name": "bake_navigation_mesh",
                 "description": "Bake the navigation mesh/polygon for a NavigationRegion2D or NavigationRegion3D node.",
                 "parameters": _object_schema(
-                    {"path": {"type": "string", "description": "NodePath to the NavigationRegion2D/3D, relative to the scene root."}},
+                    {
+                        "path": {
+                            "type": "string",
+                            "description": "NodePath to the NavigationRegion2D/3D, relative to the scene root.",
+                        }
+                    },
                     ["path"],
                 ),
             },
@@ -1235,7 +1400,9 @@ def register_front_tools() -> None:
                             "type": "string",
                             "description": "Setting key, for example rendering/textures/canvas_textures/default_texture_filter.",
                         },
-                        "value": {"description": "JSON value to assign, or null to clear the override."},
+                        "value": {
+                            "description": "JSON value to assign, or null to clear the override."
+                        },
                     },
                     ["key", "value"],
                 ),
@@ -1255,7 +1422,12 @@ def register_front_tools() -> None:
                 "name": "read_project_setting",
                 "description": "Read a single project setting's current value (project.godot).",
                 "parameters": _object_schema(
-                    {"key": {"type": "string", "description": "Setting key, for example application/run/main_scene."}},
+                    {
+                        "key": {
+                            "type": "string",
+                            "description": "Setting key, for example application/run/main_scene.",
+                        }
+                    },
                     ["key"],
                 ),
             },
@@ -1291,8 +1463,14 @@ def register_front_tools() -> None:
                 "description": "Register a script or scene as an autoload singleton.",
                 "parameters": _object_schema(
                     {
-                        "name": {"type": "string", "description": "Autoload identifier, used as the global singleton name."},
-                        "path": {"type": "string", "description": "Relative .gd/.tscn/.cs path to autoload."},
+                        "name": {
+                            "type": "string",
+                            "description": "Autoload identifier, used as the global singleton name.",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Relative .gd/.tscn/.cs path to autoload.",
+                        },
                         "enabled": {"type": "boolean", "description": "Defaults to true."},
                     },
                     ["name", "path"],
@@ -1362,7 +1540,17 @@ def register_front_tools() -> None:
                             "type": "array",
                             "items": {
                                 "type": "string",
-                                "enum": ["left", "right", "middle", "wheel_up", "wheel_down", "wheel_left", "wheel_right", "xbutton1", "xbutton2"],
+                                "enum": [
+                                    "left",
+                                    "right",
+                                    "middle",
+                                    "wheel_up",
+                                    "wheel_down",
+                                    "wheel_left",
+                                    "wheel_right",
+                                    "xbutton1",
+                                    "xbutton2",
+                                ],
                             },
                         },
                     },
@@ -1586,12 +1774,26 @@ def register_front_tools() -> None:
                         "cells": {
                             "type": "array",
                             "description": "Cell coordinates to convert to world coordinates.",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                         "world": {
                             "type": "array",
                             "description": "World coordinates to convert to cell coordinates.",
-                            "items": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"},
+                                    "z": {"type": "number"},
+                                },
+                            },
                         },
                     },
                     [],
@@ -1645,19 +1847,54 @@ def register_front_tools() -> None:
                             "items": {"type": "string"},
                             "description": "Optional saved blueprint names to compose into the generated structure.",
                         },
-                        "start": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
-                        "goal": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                        "start": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                            },
+                        },
+                        "goal": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                            },
+                        },
                         "waypoints": {
                             "type": "array",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                         "entrances": {
                             "type": "array",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                         "exits": {
                             "type": "array",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                     },
                     [],
@@ -1837,12 +2074,20 @@ def register_front_tools() -> None:
                         "frontier": {
                             "type": "object",
                             "description": "Optional known reachable frontier cell {x,y[,z]}; platformer can auto-sample it from the left boundary.",
-                            "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}},
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                            },
                         },
                         "start": {
                             "type": "object",
                             "description": "Optional real player/unit start. When provided, plan_reachable_map_growth first computes rightmost_frontier from real map reachability.",
-                            "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}},
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                            },
                         },
                         "frontier_type": {"type": "string"},
                         "walkable_is_filled": {"type": "boolean"},
@@ -1921,7 +2166,11 @@ def register_front_tools() -> None:
                         "start": {
                             "type": "object",
                             "description": "Real player/unit start cell {x,y[,z]} in map coordinates.",
-                            "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}},
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                            },
                         },
                         "walkable_is_filled": {
                             "type": "boolean",
@@ -1989,7 +2238,14 @@ def register_front_tools() -> None:
                         "exclude": {
                             "type": "array",
                             "description": "Exact cells to exclude from sampling.",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                     },
                     ["width", "height"],
@@ -2357,12 +2613,29 @@ def register_front_tools() -> None:
         "kind": {"type": "string"},
         "anchor": {
             "type": "string",
-            "enum": ["bottom_center", "bottom_left", "bottom_right", "top_center", "top_left", "top_right", "center"],
+            "enum": [
+                "bottom_center",
+                "bottom_left",
+                "bottom_right",
+                "top_center",
+                "top_left",
+                "top_right",
+                "center",
+            ],
             "description": "How the object footprint is aligned to the input cell; defaults to bottom_center.",
         },
         "surface_type": {
             "type": "string",
-            "enum": ["ground", "wall", "water_surface", "water", "air", "room_center", "branch_end", "path_edge"],
+            "enum": [
+                "ground",
+                "wall",
+                "water_surface",
+                "water",
+                "air",
+                "room_center",
+                "branch_end",
+                "path_edge",
+            ],
         },
         "footprint_width": {"type": "integer", "minimum": 1},
         "footprint_height": {"type": "integer", "minimum": 1},
@@ -2763,17 +3036,38 @@ def register_front_tools() -> None:
                         "waypoints": {
                             "type": "array",
                             "description": "Optional ordered cells that the path must pass through.",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                         "entrances": {
                             "type": "array",
                             "description": "Optional entrance cells; each entrance must reach at least one exit.",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                         "exits": {
                             "type": "array",
                             "description": "Optional exit cells used with entrances.",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                         "walkable_is_filled": {
                             "type": "boolean",
@@ -2929,15 +3223,36 @@ def register_front_tools() -> None:
                         },
                         "waypoints": {
                             "type": "array",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                         "entrances": {
                             "type": "array",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                         "exits": {
                             "type": "array",
-                            "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "z": {"type": "integer"},
+                                },
+                            },
                         },
                         "walkable_is_filled": {"type": "boolean"},
                         "movement_model": {
@@ -2945,12 +3260,36 @@ def register_front_tools() -> None:
                             "enum": ["grid", "leap", "free"],
                             "description": "Must match the movement_model used in validate_map_region. 'leap' bridges gaps by filling the support row beneath the path.",
                         },
-                        "max_horizontal_gap": {"type": "integer", "minimum": 1, "description": "leap: max horizontal jump distance in cells."},
-                        "max_rise": {"type": "integer", "minimum": 0, "description": "leap: max jump height gain in cells."},
-                        "max_fall": {"type": "integer", "minimum": 0, "description": "leap: max drop in cells treated as reachable."},
-                        "max_step": {"type": "integer", "minimum": 1, "description": "free: max single-move distance in cells."},
-                        "gravity_axis": {"type": "string", "enum": ["x", "y", "z"], "description": "Optional 'down' axis override; must match validate_map_region."},
-                        "gravity_sign": {"type": "integer", "enum": [-1, 1], "description": "Sign of the gravity axis; used with gravity_axis."},
+                        "max_horizontal_gap": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "leap: max horizontal jump distance in cells.",
+                        },
+                        "max_rise": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "leap: max jump height gain in cells.",
+                        },
+                        "max_fall": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "leap: max drop in cells treated as reachable.",
+                        },
+                        "max_step": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "free: max single-move distance in cells.",
+                        },
+                        "gravity_axis": {
+                            "type": "string",
+                            "enum": ["x", "y", "z"],
+                            "description": "Optional 'down' axis override; must match validate_map_region.",
+                        },
+                        "gravity_sign": {
+                            "type": "integer",
+                            "enum": [-1, 1],
+                            "description": "Sign of the gravity axis; used with gravity_axis.",
+                        },
                         "repair_overlaps": {
                             "type": "boolean",
                             "description": "Move duplicate indexed objects to nearby free cells; start/goal not required.",
@@ -3010,8 +3349,14 @@ def register_front_tools() -> None:
                         "width": {"type": "integer", "minimum": 1},
                         "height": {"type": "integer", "minimum": 1},
                         "depth": {"type": "integer", "minimum": 1},
-                        "seed": {"type": "integer", "description": "Noise seed for reproducibility."},
-                        "frequency": {"type": "number", "description": "Noise frequency; defaults to 0.05."},
+                        "seed": {
+                            "type": "integer",
+                            "description": "Noise seed for reproducibility.",
+                        },
+                        "frequency": {
+                            "type": "number",
+                            "description": "Noise frequency; defaults to 0.05.",
+                        },
                         "noise_type": {
                             "type": "string",
                             "enum": [
@@ -3142,8 +3487,14 @@ def register_front_tools() -> None:
                         },
                         "target_path": {"type": "string"},
                         "map_layer": {"type": "integer"},
-                        "x": {"type": "integer", "description": "Destination origin x for the blueprint."},
-                        "y": {"type": "integer", "description": "Destination origin y for the blueprint."},
+                        "x": {
+                            "type": "integer",
+                            "description": "Destination origin x for the blueprint.",
+                        },
+                        "y": {
+                            "type": "integer",
+                            "description": "Destination origin y for the blueprint.",
+                        },
                         "z": {"type": "integer", "description": "Destination origin z (3D only)."},
                         "update_spatial_index": {
                             "type": "boolean",
@@ -3238,7 +3589,10 @@ def register_front_tools() -> None:
                 ),
                 "parameters": _object_schema(
                     {
-                        "image_path": {"type": "string", "description": "Relative or res:// image path."},
+                        "image_path": {
+                            "type": "string",
+                            "description": "Relative or res:// image path.",
+                        },
                         "origin_x": {"type": "integer"},
                         "origin_y": {"type": "integer"},
                         "max_width": {"type": "integer"},
@@ -3372,7 +3726,12 @@ def register_front_tools() -> None:
                 "name": "read_resource",
                 "description": "Read the exported/storable properties of any .tres/.res resource file.",
                 "parameters": _object_schema(
-                    {"path": {"type": "string", "description": "Relative or res:// resource path."}},
+                    {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative or res:// resource path.",
+                        }
+                    },
                     ["path"],
                 ),
             },
@@ -3398,7 +3757,7 @@ def register_front_tools() -> None:
                         "value": {
                             "description": (
                                 "JSON value to assign. To attach another resource (e.g. a Shader on a "
-                                "ShaderMaterial), pass {\"_resource_path\": \"res://...\"} instead of a raw value."
+                                'ShaderMaterial), pass {"_resource_path": "res://..."} instead of a raw value.'
                             ),
                         },
                     },
@@ -3423,9 +3782,18 @@ def register_front_tools() -> None:
                 ),
                 "parameters": _object_schema(
                     {
-                        "player_path": {"type": "string", "description": "NodePath to the AnimationPlayer, relative to the scene root."},
-                        "animation": {"type": "string", "description": "Animation name within the library."},
-                        "library": {"type": "string", "description": "AnimationLibrary name; defaults to the unnamed default library."},
+                        "player_path": {
+                            "type": "string",
+                            "description": "NodePath to the AnimationPlayer, relative to the scene root.",
+                        },
+                        "animation": {
+                            "type": "string",
+                            "description": "Animation name within the library.",
+                        },
+                        "library": {
+                            "type": "string",
+                            "description": "AnimationLibrary name; defaults to the unnamed default library.",
+                        },
                         "track_path": {
                             "type": "string",
                             "description": "NodePath:property being animated, relative to the AnimationPlayer's root node, e.g. Sprite2D:position.",
@@ -3440,7 +3808,9 @@ def register_front_tools() -> None:
                             "items": _object_schema(
                                 {
                                     "time": {"type": "number"},
-                                    "value": {"description": "JSON value matching the animated property's type."},
+                                    "value": {
+                                        "description": "JSON value matching the animated property's type."
+                                    },
                                     "transition": {"type": "number"},
                                 },
                                 ["time", "value"],
@@ -3469,9 +3839,18 @@ def register_front_tools() -> None:
                 ),
                 "parameters": _object_schema(
                     {
-                        "material_path": {"type": "string", "description": "Relative output path for the ShaderMaterial, e.g. materials/glow.tres."},
-                        "shader_path": {"type": "string", "description": "Relative output path for the shader source, e.g. shaders/glow.gdshader."},
-                        "shader_code": {"type": "string", "description": "Complete .gdshader source code."},
+                        "material_path": {
+                            "type": "string",
+                            "description": "Relative output path for the ShaderMaterial, e.g. materials/glow.tres.",
+                        },
+                        "shader_path": {
+                            "type": "string",
+                            "description": "Relative output path for the shader source, e.g. shaders/glow.gdshader.",
+                        },
+                        "shader_code": {
+                            "type": "string",
+                            "description": "Complete .gdshader source code.",
+                        },
                     },
                     ["material_path", "shader_path", "shader_code"],
                 ),

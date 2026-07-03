@@ -18,6 +18,15 @@ func begin_batch(description: String) -> void:
 	_active = true
 
 
+func has_active_batch() -> bool:
+	return _active
+
+
+func set_batch_description(description: String) -> void:
+	if _active:
+		_batch_desc = description
+
+
 func record_file_write(path: String, before_text: String, after_text: String, before_exists: bool = true) -> Error:
 	if not _active:
 		begin_batch("AI file changes")
