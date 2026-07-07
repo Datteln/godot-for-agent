@@ -774,6 +774,72 @@ def _schedule_revision_conflict_reader(
     session.agent_stack.append(child)
 
 
+def _pop_last_assistant_final(session: Session) -> None:
+    """移除刚被完成门拦截的 assistant final，避免错误完成陈述进入后续上下文。"""
+    frame = session.top_frame()
+    if frame is None or not frame.messages:
+        return
+    last = frame.messages[-1]
+    if last.get("role") == "assistant" and not last.get("tool_calls"):
+        frame.messages.pop()
+
+
+def _schedule_map_reviewer_if_required(session: Session) -> bool:
+    """把 map_review_required 阻断转换为 reviewer 子帧继续执行。"""
+    frame = session.top_frame()
+    if frame is None or frame.agent.name == "map-reviewer-agent":
+        return False
+    blocker = next(
+        (
+            item
+            for item in session.map_completion_blockers
+            if item.get("reason") == "map_review_required"
+        ),
+        None,
+    )
+    if blocker is None:
+        return False
+    try:
+        reviewer = get_agent("map-reviewer-agent", set(REGISTRY))
+    except KeyError:
+        return False
+    _pop_last_assistant_final(session)
+    task_payload = {
+        "reason": "map_review_required",
+        "target_path": str(blocker.get("target", "")),
+        "required_revision": blocker.get("required_revision"),
+        "instruction": (
+            "继续完成地图视觉复核，不要结束任务。使用 capture_viewport_screenshot "
+            "检查当前地图；必要时用 describe_map_region/validate_map_region 复核。"
+            "只输出 map_worker_result_v1 JSON，stage='reviewer'，"
+            "并在 validation.completion_allowed 中给出是否允许完成。"
+        ),
+    }
+    child = Frame(
+        id=session.new_frame_id(),
+        agent=reviewer,
+        messages=[
+            {"role": "system", "content": reviewer.prompt},
+            {"role": "user", "content": json.dumps(task_payload, ensure_ascii=False)},
+        ],
+        parent_id=frame.id,
+        depth=frame.depth + 1,
+        history_anchor_frame_id=frame.history_anchor_frame_id or frame.id,
+        history_anchor_message_index=(
+            frame.history_anchor_message_index
+            if frame.history_anchor_message_index is not None
+            else len(frame.messages)
+        ),
+    )
+    session.agent_stack.append(child)
+    return True
+
+
+def _has_map_review_required(blockers: list[dict[str, Any]]) -> bool:
+    """判断完成门阻断里是否包含待视觉复核项。"""
+    return any(item.get("reason") == "map_review_required" for item in blockers)
+
+
 def _map_completion_gate_text(blockers: list[dict[str, Any]]) -> str:
     """生成地图完成门拦截后的最终回复文本。"""
     issue_lines: list[str] = []
@@ -2552,6 +2618,37 @@ class QueryEngine:
             if latest_by_path:
                 await self._run_verify(
                     session, security, list(latest_by_path.values()), model_override
+                )
+                step = await run_turn(
+                    session=session,
+                    llm=self._llm,
+                    security=security,
+                    tool_ctx=ToolContext(
+                        security=security,
+                        session_id=session.session_id,
+                        skill_catalog=self._skill_catalog,
+                        rag_index_path=self._settings.resolved_rag_index_path(),
+                    ),
+                    max_turns=self._settings.max_turns,
+                    session_allow=session.session_allow,
+                    agent_prompt_factory=build_child_agent_prompt,
+                    model_selector=self._model_for_effort,
+                    model_override=model_override,
+                    thinking_budget_selector=self._thinking_budget_for_effort,
+                    event_callback=emit_verify_turn_event,
+                    cache_engine=self._cache_engine,
+                    cache_metrics=self._cache_metrics,
+                    context_token_limit=self._settings.auto_compact_token_threshold,
+                )
+                response = _step_to_response(step)
+        if (
+            isinstance(response, ChatFinalResponse)
+            and _has_map_review_required(session.map_completion_blockers)
+        ):
+            if _schedule_map_reviewer_if_required(session):
+                logger.info(
+                    "Map completion gate scheduled reviewer continuation session=%s",
+                    session.session_id,
                 )
                 step = await run_turn(
                     session=session,
