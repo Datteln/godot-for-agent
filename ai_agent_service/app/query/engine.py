@@ -840,6 +840,63 @@ def _has_map_review_required(blockers: list[dict[str, Any]]) -> bool:
     return any(item.get("reason") == "map_review_required" for item in blockers)
 
 
+def _has_only_map_review_required(blockers: list[dict[str, Any]]) -> bool:
+    """Return true when visual review is the only remaining map completion blocker."""
+    return bool(blockers) and all(
+        item.get("reason") == "map_review_required" for item in blockers
+    )
+
+
+def _format_map_completion_blockers_for_prompt(blockers: list[dict[str, Any]]) -> str:
+    """Build a compact, model-facing blocker list for a continuation turn."""
+    lines: list[str] = []
+    for index, blocker in enumerate(blockers[:5], start=1):
+        tool = str(blocker.get("tool", "map tool"))
+        reason = str(blocker.get("reason", "blocked"))
+        target = str(blocker.get("target", ""))
+        revision = blocker.get("required_revision")
+        issues = blocker.get("issues", [])
+        issue_text = ""
+        if isinstance(issues, list) and issues:
+            issue_text = "; ".join(str(issue) for issue in issues[:4] if str(issue).strip())
+        parts = [f"{index}. tool={tool}", f"reason={reason}"]
+        if target:
+            parts.append(f"target={target}")
+        if isinstance(revision, int) and not isinstance(revision, bool):
+            parts.append(f"map_revision={revision}")
+        if issue_text:
+            parts.append(f"issues={issue_text}")
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
+def _schedule_map_completion_continuation(session: Session) -> bool:
+    """Turn a blocked final answer into another root-agent work step."""
+    frame = session.top_frame()
+    if frame is None:
+        return False
+    _pop_last_assistant_final(session)
+    blocker_text = _format_map_completion_blockers_for_prompt(session.map_completion_blockers)
+    frame.messages.append(
+        {
+            "role": "user",
+            "content": (
+                "MAP_COMPLETION_GATE_BLOCKED\n"
+                "Your previous response attempted to finish the map task, but the service "
+                "completion gate is still blocked. Do not summarize or answer final yet.\n\n"
+                f"Current blockers:\n{blocker_text}\n\n"
+                "Continue the task now. Pick the next concrete repair/verification action and "
+                "call the appropriate tool. If the blocker came from validate_map_region, fix "
+                "the reported region with small map edits or object changes, then run "
+                "validate_map_region again. If visual review is still needed, capture or inspect "
+                "the map and then validate again. Only final-answer after a same-revision result "
+                "has completion_allowed=true and no blocking_completion blockers remain."
+            ),
+        }
+    )
+    return True
+
+
 def _map_completion_gate_text(blockers: list[dict[str, Any]]) -> str:
     """生成地图完成门拦截后的最终回复文本。"""
     issue_lines: list[str] = []
@@ -2641,37 +2698,53 @@ class QueryEngine:
                     context_token_limit=self._settings.auto_compact_token_threshold,
                 )
                 response = _step_to_response(step)
-        if (
+        map_gate_continuations = 0
+        while (
             isinstance(response, ChatFinalResponse)
-            and _has_map_review_required(session.map_completion_blockers)
+            and session.map_completion_blockers
+            and map_gate_continuations < 3
         ):
-            if _schedule_map_reviewer_if_required(session):
-                logger.info(
-                    "Map completion gate scheduled reviewer continuation session=%s",
-                    session.session_id,
-                )
-                step = await run_turn(
-                    session=session,
-                    llm=self._llm,
+            scheduled = False
+            if _has_only_map_review_required(session.map_completion_blockers):
+                scheduled = _schedule_map_reviewer_if_required(session)
+                if scheduled:
+                    logger.info(
+                        "Map completion gate scheduled reviewer continuation session=%s",
+                        session.session_id,
+                    )
+            if not scheduled:
+                scheduled = _schedule_map_completion_continuation(session)
+                if scheduled:
+                    logger.info(
+                        "Map completion gate scheduled repair continuation session=%s blockers=%d",
+                        session.session_id,
+                        len(session.map_completion_blockers),
+                    )
+            if not scheduled:
+                break
+            map_gate_continuations += 1
+            step = await run_turn(
+                session=session,
+                llm=self._llm,
+                security=security,
+                tool_ctx=ToolContext(
                     security=security,
-                    tool_ctx=ToolContext(
-                        security=security,
-                        session_id=session.session_id,
-                        skill_catalog=self._skill_catalog,
-                        rag_index_path=self._settings.resolved_rag_index_path(),
-                    ),
-                    max_turns=self._settings.max_turns,
-                    session_allow=session.session_allow,
-                    agent_prompt_factory=build_child_agent_prompt,
-                    model_selector=self._model_for_effort,
-                    model_override=model_override,
-                    thinking_budget_selector=self._thinking_budget_for_effort,
-                    event_callback=emit_verify_turn_event,
-                    cache_engine=self._cache_engine,
-                    cache_metrics=self._cache_metrics,
-                    context_token_limit=self._settings.auto_compact_token_threshold,
-                )
-                response = _step_to_response(step)
+                    session_id=session.session_id,
+                    skill_catalog=self._skill_catalog,
+                    rag_index_path=self._settings.resolved_rag_index_path(),
+                ),
+                max_turns=self._settings.max_turns,
+                session_allow=session.session_allow,
+                agent_prompt_factory=build_child_agent_prompt,
+                model_selector=self._model_for_effort,
+                model_override=model_override,
+                thinking_budget_selector=self._thinking_budget_for_effort,
+                event_callback=emit_verify_turn_event,
+                cache_engine=self._cache_engine,
+                cache_metrics=self._cache_metrics,
+                context_token_limit=self._settings.auto_compact_token_threshold,
+            )
+            response = _step_to_response(step)
         if isinstance(response, ChatToolCallsResponse):
             self._emit(
                 session.session_id,

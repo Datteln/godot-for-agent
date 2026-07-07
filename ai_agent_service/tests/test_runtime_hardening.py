@@ -18,10 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from app.config import AppSettings
+from app.agents.types import AgentDefinition, Frame
 from app.events.store import EventStore
 from app.llm.provider import AssistantTurn, LLMProvider
 from app.memory.store import MemoryStore
-from app.query.engine import QueryEngine
+from app.orchestrator.agent import _requires_create_plan_before_map_delegate
+from app.query.engine import QueryEngine, _schedule_map_completion_continuation
 from app.recovery.pointer import RecoveryPointerStore
 from app.sessions.store import Session, SessionStore, _safe_filename, session_from_dict
 from app.storage.atomic import atomic_write_json
@@ -96,6 +98,91 @@ class SessionFilenameTests(unittest.TestCase):
             store.save(Session(session_id="abc-123"))
             restored = SessionStore(Path(tmp)).get_or_create("abc-123", set())
             self.assertEqual(restored.session_id, "abc-123")
+
+
+class MapCompletionContinuationTests(unittest.TestCase):
+    def test_blocked_final_is_converted_to_continuation_prompt(self) -> None:
+        agent = AgentDefinition(
+            name="map-agent",
+            source="bundled",
+            description="",
+            prompt="",
+        )
+        session = Session(
+            session_id="map-session",
+            agent_stack=[
+                Frame(
+                    id="f1",
+                    agent=agent,
+                    messages=[
+                        {"role": "system", "content": "system"},
+                        {"role": "assistant", "content": "done"},
+                    ],
+                )
+            ],
+            map_completion_blockers=[
+                {
+                    "tool": "validate_map_region",
+                    "reason": "blocking_completion",
+                    "issues": ["platformer design has overly tall solid columns"],
+                    "target": "TileMap",
+                    "required_revision": 82,
+                }
+            ],
+        )
+
+        self.assertTrue(_schedule_map_completion_continuation(session))
+        frame = session.top_frame()
+        assert frame is not None
+        self.assertEqual([message["role"] for message in frame.messages], ["system", "user"])
+        self.assertIn("MAP_COMPLETION_GATE_BLOCKED", frame.messages[-1]["content"])
+        self.assertIn("overly tall solid columns", frame.messages[-1]["content"])
+        self.assertIn("Do not summarize or answer final yet", frame.messages[-1]["content"])
+
+
+class MapPlanningProtocolTests(unittest.TestCase):
+    def test_complex_map_delegate_requires_visible_plan_first(self) -> None:
+        agent = AgentDefinition(
+            name="coordinator",
+            source="bundled",
+            description="",
+            prompt="",
+        )
+        frame = Frame(id="f1", agent=agent, messages=[])
+        session = Session(session_id="map-session", agent_stack=[frame])
+        args = {
+            "agent": "map-agent",
+            "task": (
+                "请将当前关卡向右扩展约 40 格，设计一条可通关路线，"
+                "包含阶梯、悬浮平台、两个陷阱坑、5 枚金币、树和终点区域。"
+            ),
+        }
+
+        self.assertTrue(
+            _requires_create_plan_before_map_delegate(session, frame, "delegate", args)
+        )
+
+    def test_existing_plan_allows_map_delegate(self) -> None:
+        agent = AgentDefinition(
+            name="coordinator",
+            source="bundled",
+            description="",
+            prompt="",
+        )
+        frame = Frame(id="f1", agent=agent, messages=[])
+        session = Session(
+            session_id="map-session",
+            agent_stack=[frame],
+            pending_plan={"summary": "plan", "steps": [], "next_step_index": 0},
+        )
+        args = {
+            "agent": "map-agent",
+            "task": "扩展关卡并规划可通关路线，放置金币和终点区域。",
+        }
+
+        self.assertFalse(
+            _requires_create_plan_before_map_delegate(session, frame, "delegate", args)
+        )
 
 
 class _BlockingLLMProvider(LLMProvider):

@@ -976,6 +976,77 @@ def _append_create_plan_protocol_errors(frame: Frame, calls: list[Any]) -> None:
         )
 
 
+_COMPLEX_MAP_DELEGATION_KEYWORDS = (
+    "扩展",
+    "生成",
+    "设计",
+    "关卡",
+    "路线",
+    "通关",
+    "平台",
+    "阶梯",
+    "悬浮",
+    "陷阱",
+    "金币",
+    "树",
+    "终点",
+    "预览",
+    "确认",
+    "批量",
+    "decorate",
+    "decoration",
+    "extend",
+    "expansion",
+    "level",
+    "route",
+    "platform",
+    "coin",
+    "preview",
+)
+
+
+def _is_complex_map_delegation_task(task: str) -> bool:
+    """Heuristically detect map tasks that need a visible create_plan first."""
+    normalized = task.lower()
+    hits = sum(1 for keyword in _COMPLEX_MAP_DELEGATION_KEYWORDS if keyword in normalized)
+    return hits >= 2
+
+
+def _map_agent_targets_from_delegate_call(tool_name: str, args: dict[str, Any]) -> list[str]:
+    """Return map-agent task texts from delegate/delegate_many args."""
+    if tool_name == "delegate":
+        if args.get("agent") == "map-agent" and isinstance(args.get("task"), str):
+            return [str(args["task"])]
+        return []
+    if tool_name != "delegate_many":
+        return []
+    raw_tasks = args.get("tasks")
+    if not isinstance(raw_tasks, list):
+        return []
+    tasks: list[str] = []
+    for item in raw_tasks:
+        if not isinstance(item, dict):
+            continue
+        if item.get("agent") == "map-agent" and isinstance(item.get("task"), str):
+            tasks.append(str(item["task"]))
+    return tasks
+
+
+def _requires_create_plan_before_map_delegate(
+    session: Session,
+    frame: Frame,
+    tool_name: str,
+    args: dict[str, Any],
+) -> bool:
+    """Require coordinator to create a visible plan before complex map delegation."""
+    if frame.agent.name != "coordinator" or session.pending_plan is not None:
+        return False
+    return any(
+        _is_complex_map_delegation_task(task)
+        for task in _map_agent_targets_from_delegate_call(tool_name, args)
+    )
+
+
 def _append_map_write_protocol_errors(frame: Frame, calls: list[Any]) -> bool:
     """校验地图写工具单轮协议，失败时补工具错误并要求模型重试。"""
     write_calls = [call for call in calls if is_map_write_tool(call.name)]
@@ -2089,6 +2160,25 @@ async def run_turn(
                 frame.messages.append(parse_error)
                 continue
             assert args is not None
+
+            if _requires_create_plan_before_map_delegate(session, frame, call.name, args):
+                logger.warning(
+                    "Delegate rejected: complex map task requires create_plan first session=%s frame=%s agent=%s tool=%s",
+                    session.session_id,
+                    frame.id,
+                    frame.agent.name,
+                    call.name,
+                )
+                frame.messages.append(
+                    _tool_message(
+                        call.id,
+                        "复杂地图任务必须先调用 create_plan 生成用户可见计划；"
+                        "本轮委派未执行。请下一轮只调用 create_plan，"
+                        "计划步骤应包含读取地图上下文、规划可达路线、预览/确认、小批写入、验证和截图复核。",
+                        is_error=True,
+                    )
+                )
+                continue
 
             decision = check(tool, args, permission_ctx)
             if decision == "deny":
