@@ -29,6 +29,21 @@ const MAP_WRITE_TOOLS := {
 	"paint_from_image_grid": true,
 }
 
+const MAP_REVISION_GUARDED_TOOLS := {
+	"edit_map": true,
+	"paint_terrain_connect": true,
+	"place_map_objects": true,
+	"repair_placements": true,
+	"repair_layer_coverage": true,
+	"repair_map_region": true,
+	"compact_spatial_index": true,
+	"save_map_blueprint": true,
+	"apply_map_blueprint": true,
+	"ensure_standard_map_layers": true,
+	"fill_rect": true,
+	"paint_from_image_grid": true,
+}
+
 const MAP_READ_TOOLS := {
 	"describe_tilemap_selection": true,
 	"describe_map_context": true,
@@ -88,10 +103,25 @@ func remember_server_file_read(path: String) -> bool:
 func execute(tool_call: Dictionary) -> Dictionary:
 	var name := str(tool_call.get("name", ""))
 	var input: Dictionary = tool_call.get("input", {})
-	var result: Dictionary
+	var result = null
 	var started_at := Time.get_ticks_msec()
 	var map_revision_key := _map_revision_key(name, input)
 	var is_map_write := MAP_WRITE_TOOLS.has(name)
+	var requires_map_revision := MAP_REVISION_GUARDED_TOOLS.has(name)
+
+	# ── 排查日志：记录原始 tool_call 结构 ──
+	var _raw_id := tool_call.get("id", "")
+	var _raw_frame_id := tool_call.get("frame_id", "")
+	FrontendLogger.info(editor_interface, "ToolExecutor", "execute() entry — raw tool_call inspection.", {
+		"tool": name,
+		"call_keys": tool_call.keys(),
+		"id_present": tool_call.has("id"),
+		"id_value": str(_raw_id),
+		"id_type": type_string(typeof(_raw_id)),
+		"frame_id_present": tool_call.has("frame_id"),
+		"frame_id_value": str(_raw_frame_id),
+		"frame_id_type": type_string(typeof(_raw_frame_id)),
+	})
 
 	FrontendLogger.debug(editor_interface, "ToolExecutor", "Executing front tool.", {
 		"tool": name,
@@ -100,15 +130,16 @@ func execute(tool_call: Dictionary) -> Dictionary:
 
 	if is_map_write:
 		_inject_map_write_metadata(input, tool_call)
-		var revision_error := _validate_map_write_revision(input, map_revision_key)
-		if not revision_error.is_empty():
-			return AgentDTO.tool_result(
-				str(tool_call.get("id", "")),
-				str(tool_call.get("frame_id", "")),
-				"error",
-				revision_error,
-				str(revision_error.get("error_code", "map_revision_conflict"))
-			)
+		if requires_map_revision:
+			var revision_error := _validate_map_write_revision(input, map_revision_key)
+			if not revision_error.is_empty():
+				return AgentDTO.tool_result(
+					str(tool_call.get("id", "")),
+					str(tool_call.get("frame_id", "")),
+					"error",
+					revision_error,
+					str(revision_error.get("error_code", "map_revision_conflict"))
+				)
 		_begin_map_write_batch(name, input, tool_call, map_revision_key)
 
 	match name:
@@ -284,20 +315,47 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			FrontendLogger.warn(editor_interface, "ToolExecutor", "Unknown front tool requested.", {"tool": name})
 			return AgentDTO.error_result(tool_call, "Unknown front tool: " + name, "unknown_front_tool")
 
-	if is_map_write:
+	if not (result is Dictionary):
+		FrontendLogger.warn(editor_interface, "ToolExecutor", "Front tool returned invalid payload.", {
+			"tool": name,
+			"result_type": typeof(result),
+		})
+		result = {
+			"ok": false,
+			"message": "Front tool returned an invalid non-dictionary result.",
+			"error_code": "invalid_front_tool_result",
+			"result_type": typeof(result),
+		}
+
+	if requires_map_revision:
 		result = _finish_map_write_batch(name, input, result, map_revision_key)
+	elif is_map_write:
+		result = _finish_aux_write_batch(name, input, result)
 	elif MAP_READ_TOOLS.has(name):
 		_attach_map_revision(result, map_revision_key)
 
 	var elapsed_ms := Time.get_ticks_msec() - started_at
+	# ── 排查日志：记录即将传给 AgentDTO 的元数据 ──
+	var _dto_tool_use_id := str(tool_call.get("id", ""))
+	var _dto_frame_id := str(tool_call.get("frame_id", ""))
+	FrontendLogger.info(editor_interface, "ToolExecutor", "execute() exit — DTO metadata check.", {
+		"tool": name,
+		"ok": result.get("ok", true),
+		"dto_tool_use_id": _dto_tool_use_id,
+		"dto_tool_use_id_empty": _dto_tool_use_id.strip_edges() == "",
+		"dto_frame_id": _dto_frame_id,
+		"dto_frame_id_empty": _dto_frame_id.strip_edges() == "",
+		"result_keys": result.keys() if result is Dictionary else "NOT_A_DICT",
+		"elapsed_ms": elapsed_ms,
+	})
 	if bool(result.get("ok", true)):
 		FrontendLogger.info(editor_interface, "ToolExecutor", "Front tool applied.", {
 			"tool": name,
 			"elapsed_ms": elapsed_ms,
 		})
 		return AgentDTO.tool_result(
-			str(tool_call.get("id", "")),
-			str(tool_call.get("frame_id", "")),
+			_dto_tool_use_id,
+			_dto_frame_id,
 			"applied",
 			result,
 			"",
@@ -386,6 +444,9 @@ func _validate_map_write_revision(input: Dictionary, key: String) -> Dictionary:
 			"actual_revision": _current_map_revision(key),
 		}
 	var expected_revision = input.get("expected_revision")
+	if expected_revision is float and float(int(expected_revision)) == expected_revision:
+		expected_revision = int(expected_revision)
+		input["expected_revision"] = expected_revision
 	if not (expected_revision is int):
 		return {
 			"ok": false,
@@ -398,9 +459,12 @@ func _validate_map_write_revision(input: Dictionary, key: String) -> Dictionary:
 		return {
 			"ok": false,
 			"error_code": "map_revision_conflict",
+			"target_path": key,
 			"expected_revision": int(expected_revision),
 			"actual_revision": actual_revision,
+			"next_expected_revision": actual_revision,
 			"message": "map changed since this plan was made; re-read the affected region before writing",
+			"hint": "Call describe_map_region on the affected region, then retry with expected_revision=actual_revision.",
 		}
 	return {}
 
@@ -445,6 +509,20 @@ func _finish_map_write_batch(tool_name: String, input: Dictionary, result: Dicti
 			undo_manager.commit_batch()
 	else:
 		result["map_revision"] = _current_map_revision(key)
+		if undo_manager != null:
+			undo_manager.abort_batch()
+	return result
+
+
+func _finish_aux_write_batch(_tool_name: String, input: Dictionary, result: Dictionary) -> Dictionary:
+	if bool(result.get("ok", true)):
+		result["write_batch_id"] = str(input.get("write_batch_id", ""))
+		result["worker"] = str(input.get("worker", ""))
+		result["mode"] = str(input.get("mode", ""))
+		result["frame_id"] = str(input.get("frame_id", ""))
+		if undo_manager != null:
+			undo_manager.commit_batch()
+	else:
 		if undo_manager != null:
 			undo_manager.abort_batch()
 	return result

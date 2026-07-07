@@ -2430,6 +2430,27 @@ func _request_model():
 
 
 func _ensure_tool_result_for_call(call: Dictionary, result: Dictionary) -> Dictionary:
+	# ── 排查日志：记录所有字段值 ──
+	var _dbg_tool_use_id := str(result.get("tool_use_id", ""))
+	var _dbg_frame_id := str(result.get("frame_id", ""))
+	var _dbg_status := str(result.get("status", ""))
+	var _empty_fields: Array = []
+	if _dbg_tool_use_id.strip_edges() == "":
+		_empty_fields.append("tool_use_id")
+	if _dbg_frame_id.strip_edges() == "":
+		_empty_fields.append("frame_id")
+	if _dbg_status.strip_edges() == "":
+		_empty_fields.append("status")
+	FrontendLogger.info(editor_interface, "ChatPanel", "_ensure_tool_result metadata snapshot.", {
+		"tool": str(call.get("name", "")),
+		"call_id": str(call.get("id", "")),
+		"call_frame_id": str(call.get("frame_id", "")),
+		"result_tool_use_id": _dbg_tool_use_id,
+		"result_frame_id": _dbg_frame_id,
+		"result_status": _dbg_status,
+		"empty_fields": _empty_fields,
+		"result_keys": result.keys(),
+	})
 	for key in ["tool_use_id", "frame_id", "status"]:
 		if str(result.get(key, "")).strip_edges() == "":
 			FrontendLogger.warn(editor_interface, "ChatPanel", "Tool executor returned an invalid result; converting to error result.", {
@@ -2437,6 +2458,10 @@ func _ensure_tool_result_for_call(call: Dictionary, result: Dictionary) -> Dicti
 				"tool_use_id": str(call.get("id", "")),
 				"frame_id": str(call.get("frame_id", "")),
 				"result_keys": result.keys(),
+				"empty_fields": _empty_fields,
+				"result_tool_use_id": _dbg_tool_use_id,
+				"result_frame_id": _dbg_frame_id,
+				"result_status": _dbg_status,
 			})
 			return AgentDTO.error_result(
 				call,

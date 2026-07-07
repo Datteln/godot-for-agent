@@ -355,106 +355,108 @@ class OpenAICompatibleProvider:
             temperature,
             thinking_budget,
         )
-        try:
-            stream = await self._client.chat.completions.create(
-                model=model,
-                messages=request_messages,  # type: ignore[arg-type]
-                tools=tools or None,  # type: ignore[arg-type]
-                tool_choice="auto" if tools else None,
-                temperature=temperature,
-                extra_body=extra_body,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
-        except (APIConnectionError, APITimeoutError, httpx.TransportError) as exc:
-            logger.warning("LLM connection error error_type=%s", type(exc).__name__)
-            raise LLMError(f"无法连接大模型端点：{exc}") from exc
-        except APIStatusError as exc:
-            logger.warning("LLM status error status_code=%s", exc.status_code)
-            raise LLMError(
-                f"大模型端点返回错误（{exc.status_code}）：{exc.message}",
-                status_code=exc.status_code,
-            ) from exc
-
-        role = "assistant"
-        content_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        tool_calls_acc: dict[int, dict[str, Any]] = {}
-        finish_reason: str | None = None
-        last_content_emit = 0.0
-        last_reasoning_emit = 0.0
         emitted_content_len = 0
         emitted_reasoning_len = 0
-        reasoning_tokens: int | None = None
-        cached_tokens: int | None = None
-        cache_creation_tokens: int | None = None
-        total_input_tokens: int | None = None
+        max_stream_attempts = 5
+        for stream_attempt in range(1, max_stream_attempts + 1):
+            role = "assistant"
+            content_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            tool_calls_acc: dict[int, dict[str, Any]] = {}
+            finish_reason: str | None = None
+            last_content_emit = 0.0
+            last_reasoning_emit = 0.0
+            reasoning_tokens: int | None = None
+            cached_tokens: int | None = None
+            cache_creation_tokens: int | None = None
+            total_input_tokens: int | None = None
 
-        try:
-            async for chunk in stream:
-                chunk_usage = getattr(chunk, "usage", None)
-                chunk_reasoning_tokens = _reasoning_tokens_from_usage(chunk_usage)
-                if chunk_reasoning_tokens is not None:
-                    reasoning_tokens = chunk_reasoning_tokens
-                # usage 在流式响应里通常只出现在末尾一个 chunk，但部分端点会在
-                # 多个 chunk 重复/分段报告；用 max 累积而非直接覆盖，避免后到的
-                # 0/缺省值把先前已读到的真实计数清掉。
-                chunk_cached, chunk_total, chunk_cache_creation = _cache_tokens_from_usage(chunk_usage)
-                cached_tokens = _max_token_count(cached_tokens, chunk_cached)
-                total_input_tokens = _max_token_count(total_input_tokens, chunk_total)
-                cache_creation_tokens = _max_token_count(cache_creation_tokens, chunk_cache_creation)
-                if not chunk.choices:
-                    continue
-                choice = chunk.choices[0]
-                if choice.finish_reason:
-                    finish_reason = choice.finish_reason
-                delta = choice.delta
-                if delta is None:
-                    continue
-                if delta.role:
-                    role = delta.role
-                if delta.content:
-                    content_parts.append(delta.content)
-                    now = time.monotonic()
-                    if on_delta is not None and now - last_content_emit >= _DELTA_MIN_INTERVAL_S:
-                        content_text = "".join(content_parts)
-                        delta_text = content_text[emitted_content_len:]
-                        emitted_content_len = len(content_text)
-                        last_content_emit = now
-                        on_delta("content", delta_text, None)
-                reasoning_piece = getattr(delta, "reasoning_content", None)
-                if reasoning_piece:
-                    reasoning_parts.append(reasoning_piece)
-                    now = time.monotonic()
-                    if on_delta is not None and now - last_reasoning_emit >= _DELTA_MIN_INTERVAL_S:
-                        reasoning_text = "".join(reasoning_parts)
-                        delta_text = reasoning_text[emitted_reasoning_len:]
-                        emitted_reasoning_len = len(reasoning_text)
-                        last_reasoning_emit = now
-                        on_delta("reasoning", delta_text, None)
-                for tool_call_delta in delta.tool_calls or []:
-                    entry = tool_calls_acc.setdefault(
-                        tool_call_delta.index,
-                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            try:
+                stream = await self._client.chat.completions.create(
+                    model=model,
+                    messages=request_messages,  # type: ignore[arg-type]
+                    tools=tools or None,  # type: ignore[arg-type]
+                    tool_choice="auto" if tools else None,
+                    temperature=temperature,
+                    extra_body=extra_body,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
+                async for chunk in stream:
+                    chunk_usage = getattr(chunk, "usage", None)
+                    chunk_reasoning_tokens = _reasoning_tokens_from_usage(chunk_usage)
+                    if chunk_reasoning_tokens is not None:
+                        reasoning_tokens = chunk_reasoning_tokens
+                    # usage 在流式响应里通常只出现在末尾一个 chunk，但部分端点会在
+                    # 多个 chunk 重复/分段报告；用 max 累积而非直接覆盖，避免后到的
+                    # 0/缺省值把先前已读到的真实计数清掉。
+                    chunk_cached, chunk_total, chunk_cache_creation = _cache_tokens_from_usage(chunk_usage)
+                    cached_tokens = _max_token_count(cached_tokens, chunk_cached)
+                    total_input_tokens = _max_token_count(total_input_tokens, chunk_total)
+                    cache_creation_tokens = _max_token_count(cache_creation_tokens, chunk_cache_creation)
+                    if not chunk.choices:
+                        continue
+                    choice = chunk.choices[0]
+                    if choice.finish_reason:
+                        finish_reason = choice.finish_reason
+                    delta = choice.delta
+                    if delta is None:
+                        continue
+                    if delta.role:
+                        role = delta.role
+                    if delta.content:
+                        content_parts.append(delta.content)
+                        now = time.monotonic()
+                        if on_delta is not None and now - last_content_emit >= _DELTA_MIN_INTERVAL_S:
+                            content_text = "".join(content_parts)
+                            delta_text = content_text[emitted_content_len:]
+                            emitted_content_len = max(emitted_content_len, len(content_text))
+                            last_content_emit = now
+                            if delta_text:
+                                on_delta("content", delta_text, None)
+                    reasoning_piece = getattr(delta, "reasoning_content", None)
+                    if reasoning_piece:
+                        reasoning_parts.append(reasoning_piece)
+                        now = time.monotonic()
+                        if on_delta is not None and now - last_reasoning_emit >= _DELTA_MIN_INTERVAL_S:
+                            reasoning_text = "".join(reasoning_parts)
+                            delta_text = reasoning_text[emitted_reasoning_len:]
+                            emitted_reasoning_len = max(emitted_reasoning_len, len(reasoning_text))
+                            last_reasoning_emit = now
+                            if delta_text:
+                                on_delta("reasoning", delta_text, None)
+                    for tool_call_delta in delta.tool_calls or []:
+                        entry = tool_calls_acc.setdefault(
+                            tool_call_delta.index,
+                            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                        )
+                        if tool_call_delta.id:
+                            entry["id"] = tool_call_delta.id
+                        if tool_call_delta.type:
+                            entry["type"] = tool_call_delta.type
+                        if tool_call_delta.function:
+                            if tool_call_delta.function.name:
+                                entry["function"]["name"] += tool_call_delta.function.name
+                            if tool_call_delta.function.arguments:
+                                entry["function"]["arguments"] += tool_call_delta.function.arguments
+                break
+            except (APIConnectionError, APITimeoutError, httpx.TransportError) as exc:
+                if stream_attempt < max_stream_attempts:
+                    logger.warning(
+                        "LLM stream connection error; reconnecting attempt=%d/%d error_type=%s",
+                        stream_attempt + 1,
+                        max_stream_attempts,
+                        type(exc).__name__,
                     )
-                    if tool_call_delta.id:
-                        entry["id"] = tool_call_delta.id
-                    if tool_call_delta.type:
-                        entry["type"] = tool_call_delta.type
-                    if tool_call_delta.function:
-                        if tool_call_delta.function.name:
-                            entry["function"]["name"] += tool_call_delta.function.name
-                        if tool_call_delta.function.arguments:
-                            entry["function"]["arguments"] += tool_call_delta.function.arguments
-        except (APIConnectionError, APITimeoutError, httpx.TransportError) as exc:
-            logger.warning("LLM stream connection error error_type=%s", type(exc).__name__)
-            raise LLMError(f"大模型流式响应中断：{exc}") from exc
-        except APIStatusError as exc:
-            logger.warning("LLM stream status error status_code=%s", exc.status_code)
-            raise LLMError(
-                f"大模型端点返回错误（{exc.status_code}）：{exc.message}",
-                status_code=exc.status_code,
-            ) from exc
+                    continue
+                logger.warning("LLM stream connection error error_type=%s", type(exc).__name__)
+                raise LLMError(f"大模型流式响应中断：{exc}") from exc
+            except APIStatusError as exc:
+                logger.warning("LLM stream status error status_code=%s", exc.status_code)
+                raise LLMError(
+                    f"大模型端点返回错误（{exc.status_code}）：{exc.message}",
+                    status_code=exc.status_code,
+                ) from exc
 
         content = "".join(content_parts) or None
         reasoning = "".join(reasoning_parts) or None

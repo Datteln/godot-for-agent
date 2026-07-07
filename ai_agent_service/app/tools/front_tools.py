@@ -2450,15 +2450,15 @@ def register_front_tools() -> None:
                             "type": "integer",
                             "minimum": 1,
                             "description": (
-                                "Required self-check: the number of cells this batch is supposed to write. If it "
-                                "does not match what the operations actually produce, the call is rejected with "
-                                "error_code 'cell_count_mismatch' and nothing is written. Always set it to your "
-                                "declared coverage (sum of width*height[*depth] per op) so a miscounted inclusive "
-                                "range — e.g. meaning x=85..87 but only emitting 85 and 86 — is caught immediately."
+                                "Optional self-check: the number of cells this batch is supposed to write. "
+                                "If provided and does not match the actual cell count, a warning is included "
+                                "in the result but the operation still executes normally. You can safely omit "
+                                "this field to avoid calculation errors; the frontend uses the actual cell count "
+                                "from the operations themselves."
                             ),
                         },
                     },
-                    ["operations", "expected_cells"],
+                    ["operations"],
                 ),
             },
         )
@@ -2992,7 +2992,7 @@ def register_front_tools() -> None:
                     "allowed after a validation with real route endpoints/waypoints (or entrances/exits) passes and "
                     "`completion_allowed=true`. Oversized validation returns `blocking_completion=true` and must be "
                     "split into route segments instead of being ignored. HARD LIMIT: the region width*height (*depth) "
-                    "must be <= 400 cells per call; a larger region is rejected with error_code='region_too_large'. "
+                    "must be <= 800 cells per call; a larger region is rejected with error_code='region_too_large'. "
                     "Plan for this BEFORE calling — split a long route into segments and validate each with its own "
                     "start/goal, keeping each segment's support row inside its region, rather than sending one big "
                     "region and reacting to the error."

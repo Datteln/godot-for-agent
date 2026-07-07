@@ -42,6 +42,7 @@ MAP_WRITE_TOOL_NAMES = frozenset(
         "paint_from_image_grid",
     }
 )
+MAP_REVISION_GUARDED_TOOL_NAMES = MAP_WRITE_TOOL_NAMES - frozenset({"write_resource_registry"})
 MAP_WORKER_MODES = frozenset(
     {
         "read_only",
@@ -172,6 +173,11 @@ def is_map_write_tool(name: str) -> bool:
     return name in MAP_WRITE_TOOL_NAMES
 
 
+def requires_map_revision(name: str) -> bool:
+    """判断地图写工具是否必须携带地图版本号。"""
+    return name in MAP_REVISION_GUARDED_TOOL_NAMES
+
+
 def is_map_worker_write_mode(mode: Any) -> bool:
     """判断 worker mode 是否属于地图写入 mode。"""
     return mode in MAP_WORKER_WRITE_MODES
@@ -224,8 +230,10 @@ def pipeline_required_parameters(template_id: str) -> tuple[str, ...]:
     return template.required_parameters if template is not None else ()
 
 
-def validate_map_write_args(args: dict[str, Any]) -> str | None:
+def validate_map_write_args(name: str, args: dict[str, Any]) -> str | None:
     """校验地图写工具必需的批次与版本字段。"""
+    if not requires_map_revision(name):
+        return None
     expected_revision = args.get("expected_revision")
     if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
         return "地图写工具必须提供整数 expected_revision"
@@ -321,12 +329,26 @@ def _dynamic_map_worker_prompt(spec: dict[str, Any], tools: list[str]) -> str:
         "- 严格执行 objective，不扩大范围。\n"
         "- can_delegate=false；禁止调用 delegate、delegate_many、create_plan。\n"
         "- 非写入 mode 禁止写地图；写入 mode 同一轮只能调用一个地图写工具。\n"
-        "- 地图写工具必须携带 expected_revision；write_batch_id/worker/frame/mode 由服务层补齐。\n"
+        "- 改地图区域的写工具必须携带 expected_revision；write_batch_id/worker/frame/mode 由服务层补齐。\n"
         "- 写入后必须把 next_stage 设为 validator 或 reviewer，不得直接宣布完成。\n"
         "- 最终只输出 JSON，schema 为 map_worker_result_v1。\n"
         "- JSON 至少包含 stage、worker、mode、objective、target_path、map_layer、"
         "map_revision、region、summary、facts、proposed_batches、write_results、"
-        "validation、missing_inputs、risks、next_stage。"
+        "validation、missing_inputs、risks、next_stage。\n\n"
+        "【错误恢复规则】\n"
+        "1. map_revision_conflict（地图已变更）：\n"
+        "   - 服务层会自动触发 map-reader-agent 重读冲突区域\n"
+        "   - 重读结果会包含 next_expected_revision 字段\n"
+        "   - 你必须从重读结果中提取 next_expected_revision 值，作为下一次写入的 expected_revision\n"
+        "   - 禁止使用旧的 expected_revision 值重试\n"
+        "2. cell_count_mismatch（预期格数不符）：\n"
+        "   - 错误信息会告诉你实际应该写多少格（actual_cells）\n"
+        "   - 计算公式：x=A..B 的列数是 (B - A + 1)，不是 (B - A)\n"
+        "   - 示例：x=64..86 是 23 列，y=21..23 是 3 行，总计 23×3=69 格\n"
+        "   - 重试时必须把 expected_cells 设为错误信息中的 actual_cells 值\n"
+        "3. 连续失败处理：\n"
+        "   - 如果同一类型错误连续出现 2 次，必须切换策略或提前终止\n"
+        "   - 禁止用相同参数盲目重试第 3 次\n"
     )
 
 

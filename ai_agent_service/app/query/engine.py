@@ -71,7 +71,7 @@ from app.orchestrator.agent import (
     resolve_thinking_budget,
     run_turn,
 )
-from app.orchestrator.map_workers import MAP_WRITE_TOOL_NAMES
+from app.orchestrator.map_workers import MAP_REVISION_GUARDED_TOOL_NAMES
 from app.output_styles.catalog import OutputStyleCatalog
 from app.permissions.engine import make_session_allow_grant
 from app.prompt.builder import LayeredPrompt, build_system_prompt
@@ -351,7 +351,7 @@ _HISTORY_FRONT_TOOLS = (
 _MAP_VALIDATION_TOOL_NAMES = frozenset(
     {"validate_map_region", "validate_layer_coverage", "validate_object_placements"}
 )
-_MAP_COMPLETION_TOOL_NAMES = MAP_WRITE_TOOL_NAMES | _MAP_VALIDATION_TOOL_NAMES
+_MAP_COMPLETION_TOOL_NAMES = MAP_REVISION_GUARDED_TOOL_NAMES | _MAP_VALIDATION_TOOL_NAMES
 _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
     {
         "agent_reasoning_delta",
@@ -586,7 +586,10 @@ def _map_completion_blocker(
             "required_revision": revision_value,
             "pipeline_template": pipeline_template,
         }
-    if tool_name in MAP_WRITE_TOOL_NAMES and result_dict.get("completion_allowed") is not True:
+    if (
+        tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
+        and result_dict.get("completion_allowed") is not True
+    ):
         return {
             "tool": tool_name,
             "reason": "map_write_requires_validation",
@@ -659,6 +662,64 @@ def _review_required_blocker(tool_name: str, target: str, revision: int | None) 
     }
 
 
+def _map_region_from_write_args(
+    tool_args: dict[str, Any], result_dict: dict[str, Any]
+) -> dict[str, int] | None:
+    """从地图写工具参数中推导需要重读的区域。"""
+    region = tool_args.get("region", tool_args.get("rect", result_dict.get("region")))
+    if isinstance(region, dict):
+        return {
+            str(key): int(value)
+            for key, value in region.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+
+    operations = tool_args.get("operations")
+    if not isinstance(operations, list):
+        return None
+
+    min_x: int | None = None
+    min_y: int | None = None
+    max_x: int | None = None
+    max_y: int | None = None
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        x_value = operation.get("to_x", operation.get("x"))
+        y_value = operation.get("to_y", operation.get("y"))
+        if (
+            not isinstance(x_value, int)
+            or isinstance(x_value, bool)
+            or not isinstance(y_value, int)
+            or isinstance(y_value, bool)
+        ):
+            continue
+        width = operation.get("width", 1)
+        height = operation.get("height", 1)
+        if (
+            not isinstance(width, int)
+            or isinstance(width, bool)
+            or not isinstance(height, int)
+            or isinstance(height, bool)
+        ):
+            continue
+        op_max_x = x_value + max(width, 1) - 1
+        op_max_y = y_value + max(height, 1) - 1
+        min_x = x_value if min_x is None else min(min_x, x_value)
+        min_y = y_value if min_y is None else min(min_y, y_value)
+        max_x = op_max_x if max_x is None else max(max_x, op_max_x)
+        max_y = op_max_y if max_y is None else max(max_y, op_max_y)
+
+    if min_x is None or min_y is None or max_x is None or max_y is None:
+        return None
+    return {
+        "x": min_x,
+        "y": min_y,
+        "width": max_x - min_x + 1,
+        "height": max_y - min_y + 1,
+    }
+
+
 def _schedule_revision_conflict_reader(
     session: Session,
     frame: Frame,
@@ -669,7 +730,7 @@ def _schedule_revision_conflict_reader(
     """在 revision 冲突后自动压入 map-reader-agent 重读帧。"""
     result_dict = result if isinstance(result, dict) else {}
     target = str(tool_args.get("target_path", result_dict.get("target_path", "")))
-    region = tool_args.get("region", tool_args.get("rect", result_dict.get("region")))
+    region = _map_region_from_write_args(tool_args, result_dict)
     task_payload = {
         "reason": "map_revision_conflict",
         "failed_tool": tool_name,
@@ -677,6 +738,7 @@ def _schedule_revision_conflict_reader(
         "region": region,
         "expected_revision": result_dict.get("expected_revision"),
         "actual_revision": result_dict.get("actual_revision"),
+        "next_expected_revision": result_dict.get("actual_revision"),
         "instruction": (
             "重读冲突区域并只输出 map_worker_result_v1 JSON；"
             "不要写入，next_stage 设为 planner 或 validator。"
@@ -2792,7 +2854,7 @@ class QueryEngine:
                 session.map_completion_blockers = [blocker]
             frame.messages.append(_tool_message(result.tool_use_id, payload, is_error=is_error))
             if (
-                tool_name in MAP_WRITE_TOOL_NAMES
+                tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
                 and str(result.error_code) == "map_revision_conflict"
             ):
                 _schedule_revision_conflict_reader(
@@ -2801,6 +2863,22 @@ class QueryEngine:
                     tool_name,
                     tool_args,
                     result_for_gate,
+                )
+            # cell_count_mismatch 时自动注入恢复指引，避免 LLM 盲目重试
+            if str(result.error_code) == "cell_count_mismatch":
+                actual_cells = None
+                if isinstance(result_for_gate, dict):
+                    actual_cells = result_for_gate.get("actual_cells")
+                hint = (
+                    "【cell_count_mismatch 恢复指引】\n"
+                    "- 计算公式：x=A..B 的列数 = (B - A + 1)，不是 (B - A)\n"
+                    "- 示例：x=64..86 是 23 列，y=21..23 是 3 行，总计 23×3=69 格\n"
+                )
+                if actual_cells is not None:
+                    hint += f"- 重试时必须把 expected_cells 设为 {actual_cells}\n"
+                hint += "- 禁止用相同参数重试第 3 次，必须切换策略或提前终止\n"
+                frame.messages.append(
+                    {"role": "user", "content": hint}
                 )
             logger.info(
                 "Tool result appended session=%s turn_id=%s tool=%s status=%s frame=%s",

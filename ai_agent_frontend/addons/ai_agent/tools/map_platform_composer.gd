@@ -470,6 +470,10 @@ static func _ability_defaulted_keys(input: Dictionary) -> Array:
 
 static func _entry_anchor_from_input(input: Dictionary) -> Dictionary:
 	var raw = input.get("entry_anchor", {})
+	if not (raw is Dictionary) or (raw as Dictionary).is_empty():
+		raw = input.get("frontier", {})
+	if raw is Dictionary and (raw as Dictionary).get("cell", {}) is Dictionary:
+		raw = (raw as Dictionary).get("cell", {})
 	if not (raw is Dictionary):
 		return {}
 	return {"x": int((raw as Dictionary).get("x", 0)), "y": int((raw as Dictionary).get("y", 0))}

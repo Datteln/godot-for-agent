@@ -1002,7 +1002,7 @@ def _append_map_write_protocol_errors(frame: Frame, calls: list[Any]) -> bool:
             frame.messages.append(parse_error)
             return True
         assert args is not None
-        error = validate_map_write_args(args)
+        error = validate_map_write_args(call.name, args)
         if error is not None:
             frame.messages.append(_tool_message(call.id, error, is_error=True))
             return True

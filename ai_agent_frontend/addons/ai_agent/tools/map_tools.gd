@@ -12,27 +12,21 @@ const MapPlatformComposer = preload("res://addons/ai_agent/tools/map_platform_co
 const MapReachableGrowth = preload("res://addons/ai_agent/tools/map_reachable_growth.gd")
 
 const MAX_EDITED_CELLS := 100000
-const MAX_EDIT_MAP_BATCH_CELLS := 200
+const MAX_EDIT_MAP_BATCH_CELLS := 2000
 const MAX_THIN_NON_BLANKET_FILL_WIDTH := 12
-const MAX_DESCRIBED_CELLS := 400
-## describe_map_region 是纯内存读取（一次循环读完整片区域），400 只是响应体大小的策略上限，
-## 不是 IO 成本。超过 400 但不超过这个上限时直接自动整片返回（标 auto_served），模型无需自己
+const MAX_DESCRIBED_CELLS := 800
+## describe_map_region 是纯内存读取（一次循环读完整片区域），800 只是响应体大小的策略上限，
+## 不是 IO 成本。超过 800 但不超过这个上限时直接自动整片返回（标 auto_served），模型无需自己
 ## 分块多次查询；只有超过这个上限才回退成 region_too_large + suggested_regions。
 const MAX_AUTOSERVED_DESCRIBED_CELLS := 1600
 const MAX_NOISE_CELLS := 4096
 ## 空间索引整份读出/整份重写，条目数上限防止它随使用无限膨胀、拖慢每次 edit_map。
 ## 到顶后仍允许更新/删除已有坐标，只拒绝新增坐标，并在结果里给出 warning。
 const MAX_SPATIAL_INDEX_ENTRIES := 20000
-## 地图 agent 运行期生成的数据统一落在项目下的 res://.ai_agent_service/map_agent 里，
-## 不再写进 addons（避免污染插件目录，也方便整目录清理）。读取时仍兼容旧的 addons 路径，
-## 以免历史项目里已有的语义表/索引被孤立。
+## 地图 agent 运行期生成的数据统一落在 Godot 项目的 res://.ai_agent_service/map_agent 里，
+## 不再写进 addons（避免污染插件目录，也方便整目录清理）。
 const MAP_DATA_DIR := "res://.ai_agent_service/map_agent"
-const RESOURCE_REGISTRY_WRITE_PATH := "res://.ai_agent_service/map_agent/resource_registry.json"
-const RESOURCE_REGISTRY_PATHS := [
-	"res://.ai_agent_service/map_agent/resource_registry.json",
-	"res://addons/map_agent/data/resource_registry.json",
-	"res://addons/ai_agent/data/resource_registry.json",
-]
+const RESOURCE_REGISTRY_PATH := "res://.ai_agent_service/map_agent/resource_registry.json"
 const SPATIAL_INDEX_PATH := "res://.ai_agent_service/map_agent/spatial_index.json"
 const BLUEPRINTS_DIR := "res://.ai_agent_service/map_agent/blueprints"
 
@@ -91,6 +85,7 @@ static func _validate_edit_map_batch_shape(operations: Array, dimension: int) ->
 				"error_code": "map_edit_batch_too_large",
 				"cells": cells,
 				"max_cells": MAX_EDIT_MAP_BATCH_CELLS,
+				"hint": "Retry with smaller edit_map calls whose total expected_cells is <= max_cells.",
 			}, "map_edit_batch_too_large")
 		if str(operation.get("action", "")) == "fill" and dimension == 2 and not _is_blanket_layer_operation(operation):
 			var width := max(1, int(operation.get("width", 1)))
@@ -110,6 +105,7 @@ static func _validate_edit_map_batch_shape(operations: Array, dimension: int) ->
 			"error_code": "map_edit_batch_too_large",
 			"cells": total_cells,
 			"max_cells": MAX_EDIT_MAP_BATCH_CELLS,
+			"hint": "Retry with smaller edit_map calls whose total expected_cells is <= max_cells.",
 		}, "map_edit_batch_too_large")
 	return {"ok": true}
 
@@ -166,7 +162,7 @@ static func describe_map_context(input: Dictionary, editor_interface: EditorInte
 	for node in found:
 		maps.append(_describe_map_node(root, node))
 
-	var registry := _read_first_json_resource(RESOURCE_REGISTRY_PATHS)
+	var registry := _read_json_resource(RESOURCE_REGISTRY_PATH)
 	var spatial_index := _read_json_resource(SPATIAL_INDEX_PATH)
 	var entries_2d := _count_index_entries(spatial_index.get("data", {}).get("2d", {}))
 	var entries_3d := _count_index_entries(spatial_index.get("data", {}).get("3d", {}))
@@ -283,23 +279,17 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 					"error_code": "map_edit_too_large"
 				}
 
-	# 调用方可声明 expected_cells（这一批本应写多少格）。不符就拒绝、且此时还没动任何瓦片——
-	# 把"心里想的是 x=85..87 三列、手却只写了 85/86 两列"这类 off-by-one 在落地前当场拦下，
-	# 而不是等后面 validate_map_region 绕一大圈才发现漏了一格。
+	# 调用方可声明 expected_cells（这一批本应写多少格）。不符时只发警告、不阻断写入——
+	# 操作的坐标和宽高由 LLM 明确指定，实际格数由操作本身决定；expected_cells 只是自校验，
+	# 不应该因为 LLM 算术错误（如 146 vs 149）就硬拒绝导致反复重试耗尽 max_turns。
+	var cell_count_warning := ""
 	if input.has("expected_cells"):
 		var expected_cells := int(input.get("expected_cells"))
 		if expected_cells != after.size():
-			return _merge_map_completion_blocker({
-				"ok": false,
-				"message": (
-					"expected_cells=%d but these operations write %d cells; the batch does not match the " +
-					"declared coverage. Re-check inclusive ranges (x=A..B spans B-A+1 columns) before retrying. " +
-					"No tiles were written."
-				) % [expected_cells, after.size()],
-				"error_code": "cell_count_mismatch",
-				"expected_cells": expected_cells,
-				"actual_cells": after.size(),
-			}, "cell_count_mismatch")
+			cell_count_warning = (
+				"expected_cells=%d but operations actually write %d cells " +
+				"(LLM self-check mismatch; operations executed as specified)."
+			) % [expected_cells, after.size()]
 
 	# 先写空间索引，再动瓦片：如果索引写盘失败，此时还没有任何瓦片落入 Undo 批次，
 	# 可以直接返回错误而不留下"已改了瓦片却报失败"的半截状态（否则模型会拿着失败结果
@@ -336,6 +326,8 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 	}
 	if not coverage_gaps.is_empty():
 		result["coverage_gap_warning"] = "One or more full-coverage layers (background/sky/water etc.) now fall short of this map's overall extent. Extend them to match before treating this edit as finished."
+	if cell_count_warning != "":
+		result["cell_count_warning"] = cell_count_warning
 	return result
 
 
@@ -728,7 +720,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 	if (objects_value as Array).size() > 128:
 		return {"ok": false, "message": "at most 128 objects are allowed", "error_code": "map_object_batch_too_large"}
 	var allowed_bounds := _bounds_from_input(input, dimension)
-	var registry := _read_first_json_resource(RESOURCE_REGISTRY_PATHS)
+	var registry := _read_json_resource(RESOURCE_REGISTRY_PATH)
 	var registry_data: Dictionary = registry.get("data", {}) if registry.get("data", {}) is Dictionary else {}
 	var occupied := _object_occupancy_from_spatial_index(str(target_result.get("path", "")), dimension)
 	var blocked_cells := _blocked_object_cells_from_spatial_index(str(target_result.get("path", "")), dimension)
@@ -1144,6 +1136,7 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		"dimension": dimension,
 		"map_layer": map_layer if target.get_class() == "TileMap" else null,
 		"cells": cells,
+		"atlas_summary": _atlas_summary(cells, dimension),
 	}
 	if requested_cells > MAX_DESCRIBED_CELLS:
 		# 这次区域大于单块上限，但工具已自动整片读完返回；告知模型不必再自己分块查询。
@@ -1229,15 +1222,60 @@ static func _describe_tilemap_layers(target: Node) -> Array:
 	var layers: Array = []
 	var count: int = target.get_layers_count()
 	for layer_index in range(count):
+		var used_cells: Array = target.call("get_used_cells", layer_index)
 		layers.append({
 			"index": layer_index,
 			"name": str(target.get_layer_name(layer_index)),
 			"enabled": bool(target.is_layer_enabled(layer_index)),
+			"cell_count": used_cells.size(),
 			# 这一层瓦片实际铺到哪——背景/天空这类"毯式"图层扩图时要不要跟着扩，
 			# 直接看这个范围跟其它层比是不是已经跟不上，不用再去猜。
-			"used_bounds": _used_bounds_2d(target.call("get_used_cells", layer_index)),
+			"used_bounds": _used_bounds_2d(used_cells),
 		})
 	return layers
+
+
+## 将图层信息格式化为 LLM 友好的文本，便于快速理解并选择正确的图层
+static func _format_layers_for_llm(layers: Array) -> String:
+	var lines: Array[String] = []
+	for layer in layers:
+		var index: int = layer.get("index", 0)
+		var name: String = str(layer.get("name", ""))
+		var enabled: bool = bool(layer.get("enabled", true))
+		var cell_count: int = int(layer.get("cell_count", 0))
+		var bounds: Dictionary = layer.get("used_bounds", {})
+
+		var status := "enabled" if enabled else "disabled"
+		var bounds_str := ""
+		if bounds.is_empty():
+			bounds_str = "empty (no tiles)"
+		else:
+			bounds_str = "x=%d..%d, y=%d..%d" % [
+				int(bounds.get("min_x", 0)),
+				int(bounds.get("max_x", 0)),
+				int(bounds.get("min_y", 0)),
+				int(bounds.get("max_y", 0))
+			]
+
+		lines.append("  - map_layer=%d: name='%s', status=%s, cells=%d, bounds=%s" % [
+			index, name, status, cell_count, bounds_str
+		])
+
+	return "\n".join(lines)
+
+
+static func _suggest_foreground_layer(layers: Array) -> Dictionary:
+	var best: Dictionary = {}
+	var best_cells := -1
+	for layer in layers:
+		var name := str(layer.get("name", "")).to_lower()
+		var cells := int(layer.get("cell_count", 0))
+		if cells <= 0 or name.find("background") >= 0 or name.find("bg") >= 0:
+			continue
+		if cells > best_cells:
+			best = layer
+			best_cells = cells
+	return best
 
 
 ## 把 `_read_map_cell` 里的 Vector2i/Vector3i 折算成 JSON 可序列化的 `{x,y[,z]}`。
@@ -1270,17 +1308,29 @@ static func _resolve_map_target(
 	var layer_count: int = node.get_layers_count()
 	if layer_count <= 1:
 		return result
+
+	# TileMap 有多层时，必须让 LLM 明确选择图层，不能自动推断——
+	# 背景/天空和主地形往往在不同层，自动选错会导致静默写错层。
+	var layers := _describe_tilemap_layers(node)
+	var suggested := _suggest_foreground_layer(layers)
+	var suggestion_text := ""
+	if not suggested.is_empty():
+		suggestion_text = "\nLikely foreground/collision layer for platform validation/editing: map_layer=%d (name='%s')." % [
+			int(suggested.get("index", 0)),
+			str(suggested.get("name", "")),
+		]
 	return {
 		"ok": false,
 		"message": (
-			"Target TileMap '%s' has %d layers and no map_layer was given; map_layer cannot " +
-			"silently default to 0 here because background/decoration and real collision ground " +
-			"are often on different layers. Call describe_map_region on this target_path first, " +
-			"pick the right layer from the returned 'layers' list, then retry with that map_layer."
-		) % [str(result.get("path", "")), layer_count],
+			"Target TileMap '%s' has %d layers and no map_layer was given. " +
+			"You must explicitly specify map_layer in your next call. " +
+			"Available layers:\n%s\n" +
+			"Retry the same operation with map_layer set to the index of the layer you want to edit.%s"
+		) % [str(result.get("path", "")), layer_count, _format_layers_for_llm(layers), suggestion_text],
 		"error_code": "map_layer_required_for_multilayer_tilemap",
 		"target": str(result.get("path", "")),
-		"layers": _describe_tilemap_layers(node),
+		"layers": layers,
+		"suggested_map_layer": int(suggested.get("index", -1)),
 	}
 
 
@@ -1290,9 +1340,28 @@ static func _resolve_map_target_unchecked(input: Dictionary, editor_interface: E
 		return {"ok": false, "message": "No scene is currently being edited", "error_code": "no_edited_scene"}
 	var requested_path := str(input.get("target_path", "")).strip_edges()
 	if requested_path != "":
+		requested_path = _normalize_map_target_path(root, requested_path)
 		var requested := root if requested_path == "." else root.get_node_or_null(NodePath(requested_path))
 		if requested == null:
-			return {"ok": false, "message": "Map node was not found: " + requested_path, "error_code": "map_not_found"}
+			# 精确路径找不到时，尝试按节点名在所有地图节点中模糊匹配
+			var fuzzy := _fuzzy_match_map_node(root, requested_path)
+			if fuzzy != null:
+				var fuzzy_path := str(root.get_path_to(fuzzy["node"]))
+				return {"ok": true, "node": fuzzy["node"], "path": fuzzy_path, "fuzzy_matched": true, "original": requested_path}
+			var candidates := _map_node_paths(root)
+			# 如果路径看起来像类名而非节点路径，给出更明确的提示
+			var hint := "Use a path from describe_map_context.maps[].path; do not use class names like 'TileMapLayer' as target_path."
+			if requested_path in ["TileMapLayer", "TileMap", "GridMap"]:
+				hint = ("target_path must be a node path (e.g. 'Level/Ground'), not a class name. " +
+					"Call describe_map_context first to get the correct path from maps[].path. " +
+					"Available map nodes: " + str(candidates))
+			return {
+				"ok": false,
+				"message": "Map node was not found: " + requested_path,
+				"error_code": "map_not_found",
+				"candidates": candidates,
+				"hint": hint,
+			}
 		if not _is_map_node(requested):
 			return {
 				"ok": false,
@@ -1322,11 +1391,54 @@ static func _is_map_node(node: Node) -> bool:
 	return node.get_class() in ["TileMapLayer", "TileMap", "GridMap"]
 
 
+static func _normalize_map_target_path(root: Node, requested_path: String) -> String:
+	var root_prefix := str(root.name) + "/"
+	if requested_path.begins_with(root_prefix):
+		return requested_path.substr(root_prefix.length())
+	return requested_path
+
+
+static func _map_node_paths(root: Node) -> Array[String]:
+	var found: Array = []
+	_collect_map_nodes(root, found)
+	var candidates: Array[String] = []
+	for node in found:
+		candidates.append(str(root.get_path_to(node)))
+	return candidates
+
+
 static func _collect_map_nodes(node: Node, out: Array) -> void:
 	if _is_map_node(node):
 		out.append(node)
 	for child in node.get_children():
 		_collect_map_nodes(child, out)
+
+
+## 在所有地图节点中按名称做模糊匹配，返回第一个命中的节点或 null。
+## 优先精确匹配节点名，其次忽略大小写，最后匹配子串。
+## 只有一个地图节点时直接返回，避免 LLM 不知道路径时也能工作。
+static func _fuzzy_match_map_node(root: Node, query: String) -> Variant:
+	var found: Array = []
+	_collect_map_nodes(root, found)
+	if found.is_empty():
+		return null
+	var query_lower := query.to_lower()
+	# 第一轮：精确匹配节点名
+	for node in found:
+		if str(node.name) == query:
+			return {"node": node}
+	# 第二轮：精确匹配节点名（忽略大小写）
+	for node in found:
+		if str(node.name).to_lower() == query_lower:
+			return {"node": node}
+	# 第三轮：如果只有一个地图节点，直接返回
+	if found.size() == 1:
+		return {"node": found[0]}
+	# 第四轮：节点名包含查询字符串
+	for node in found:
+		if str(node.name).to_lower().find(query_lower) != -1:
+			return {"node": node}
+	return null
 
 
 static func _build_map_operation(
@@ -1442,7 +1554,7 @@ static func _apply_registry_fallback_to_operation(operation: Dictionary, dimensi
 
 
 static func _registry_entry_for_resource_input(input: Dictionary) -> Dictionary:
-	var registry := _read_first_json_resource(RESOURCE_REGISTRY_PATHS)
+	var registry := _read_json_resource(RESOURCE_REGISTRY_PATH)
 	var registry_data: Dictionary = registry.get("data", {}) if registry.get("data", {}) is Dictionary else {}
 	var resource_key := str(input.get("resource", input.get("resource_key", ""))).strip_edges()
 	var fallback_key := str(input.get("fallback_resource", input.get("fallback_resource_key", ""))).strip_edges()
@@ -1526,14 +1638,6 @@ static func _describe_map_node(root: Node, node: Node) -> Dictionary:
 			var tile_size: Vector2i = tile_set.tile_size
 			result["tile_size"] = {"x": tile_size.x, "y": tile_size.y}
 	return result
-
-
-static func _read_first_json_resource(paths: Array) -> Dictionary:
-	for path in paths:
-		var parsed := _read_json_resource(str(path))
-		if bool(parsed.get("exists", false)):
-			return parsed
-	return {"exists": false, "paths_checked": paths, "data": {}}
 
 
 static func _read_json_resource(path: String) -> Dictionary:
@@ -1649,6 +1753,7 @@ static func _maybe_update_spatial_index(
 	var added := 0
 	var removed := 0
 	var hit_cap := false
+	var registry_warnings := _spatial_registry_warnings(after_cells, dimension)
 	for value in after_cells:
 		if not (value is Dictionary):
 			continue
@@ -1693,7 +1798,66 @@ static func _maybe_update_spatial_index(
 	}
 	if hit_cap:
 		result["warning"] = "spatial index reached the %d-entry cap; new coordinates were skipped — clear it or stop passing update_spatial_index" % MAX_SPATIAL_INDEX_ENTRIES
+	if not registry_warnings.is_empty():
+		result["warnings"] = registry_warnings
 	return result
+
+
+static func _spatial_registry_warnings(after_cells: Array, dimension: int) -> Array:
+	if dimension != 2:
+		return []
+	var registry := _read_json_resource(RESOURCE_REGISTRY_PATH)
+	var registry_data: Dictionary = registry.get("data", {}) if registry.get("data", {}) is Dictionary else {}
+	if registry_data.is_empty():
+		return []
+	var warnings: Array = []
+	var seen := {}
+	for value in after_cells:
+		if not (value is Dictionary):
+			continue
+		var cell: Dictionary = value
+		if not cell.has("atlas_coords"):
+			continue
+		var resource_key := str(cell.get("resource", cell.get("resource_key", ""))).strip_edges()
+		if resource_key == "" or seen.has(resource_key):
+			continue
+		var entry = registry_data.get(resource_key, {})
+		if not (entry is Dictionary):
+			continue
+		var expected := _registry_2d_tile_signature(entry)
+		if expected.is_empty():
+			continue
+		var atlas: Vector2i = cell["atlas_coords"]
+		var actual := {"source_id": int(cell.get("source_id", -1)), "atlas_x": atlas.x, "atlas_y": atlas.y}
+		if int(expected.get("source_id", actual["source_id"])) == actual["source_id"] \
+				and int(expected.get("atlas_x", actual["atlas_x"])) == actual["atlas_x"] \
+				and int(expected.get("atlas_y", actual["atlas_y"])) == actual["atlas_y"]:
+			continue
+		seen[resource_key] = true
+		warnings.append({
+			"type": "resource_registry_mismatch",
+			"resource": resource_key,
+			"registry": expected,
+			"actual": actual,
+			"hint": "真实写入以 edit_map/describe_map_region 的 source_id+atlas_coords 为准；resource_registry/spatial_index 语义只作提示。",
+		})
+	return warnings
+
+
+static func _registry_2d_tile_signature(entry: Dictionary) -> Dictionary:
+	var atlas_value = entry.get("atlas_coords", {})
+	var atlas_x = entry.get("atlas_x", null)
+	var atlas_y = entry.get("atlas_y", null)
+	if atlas_value is Dictionary:
+		atlas_x = (atlas_value as Dictionary).get("x", atlas_x)
+		atlas_y = (atlas_value as Dictionary).get("y", atlas_y)
+	if atlas_x == null or atlas_y == null:
+		return {}
+	return {
+		"source_id": int(entry.get("source_id", 0)),
+		"atlas_x": int(atlas_x),
+		"atlas_y": int(atlas_y),
+	}
 
 
 static func _index_coord_key(coords: Vector3i, dimension: int) -> String:
@@ -1704,6 +1868,112 @@ static func _is_empty_cell(target: Node, cell: Dictionary) -> bool:
 	if target.get_class() == "GridMap":
 		return int(cell.get("item", -1)) == -1
 	return int(cell.get("source_id", -1)) == -1
+
+
+static func _atlas_summary(cells: Array, dimension: int) -> Array:
+	if dimension != 2:
+		return []
+	var counts := {}
+	for value in cells:
+		if not (value is Dictionary):
+			continue
+		var cell: Dictionary = value
+		if int(cell.get("source_id", -1)) == -1:
+			continue
+		var atlas = cell.get("atlas_coords", {})
+		if not (atlas is Dictionary):
+			continue
+		var key := "%d:%d,%d" % [
+			int(cell.get("source_id", -1)),
+			int((atlas as Dictionary).get("x", -1)),
+			int((atlas as Dictionary).get("y", -1)),
+		]
+		counts[key] = int(counts.get(key, 0)) + 1
+	var summary: Array = []
+	for key in counts.keys():
+		var parts := str(key).split(":")
+		var atlas_parts := str(parts[1]).split(",") if parts.size() > 1 else PackedStringArray(["-1", "-1"])
+		summary.append({
+			"source_id": int(parts[0]),
+			"atlas_coords": {"x": int(atlas_parts[0]), "y": int(atlas_parts[1])},
+			"count": int(counts[key]),
+		})
+	summary.sort_custom(func(a, b): return int(a.get("count", 0)) > int(b.get("count", 0)))
+	return summary
+
+
+static func _spatial_entry_stale_for_cell(entry: Dictionary, cell: Dictionary, dimension: int) -> Dictionary:
+	if dimension != 2:
+		return {"checked": false}
+	if not entry.has("source_id") or not entry.has("atlas_coords"):
+		return {"checked": false}
+	var expected := _entry_2d_tile_signature(entry)
+	var actual := _cell_2d_tile_signature(cell)
+	if expected.is_empty() or actual.is_empty():
+		return {"checked": false}
+	var stale := int(expected.get("source_id", -1)) != int(actual.get("source_id", -1)) \
+			or int(expected.get("atlas_x", -1)) != int(actual.get("atlas_x", -1)) \
+			or int(expected.get("atlas_y", -1)) != int(actual.get("atlas_y", -1))
+	return {
+		"checked": true,
+		"stale": stale,
+		"index": expected,
+		"actual": actual,
+	}
+
+
+static func _spatial_entry_stale_for_index_hit(
+	editor_interface: EditorInterface,
+	target_cache: Dictionary,
+	target_path: String,
+	dimension: int,
+	map_layer: int,
+	entry: Dictionary
+) -> Dictionary:
+	if editor_interface == null or dimension != 2:
+		return {"checked": false}
+	if not (entry.get("coords", {}) is Dictionary):
+		return {"checked": false}
+	var cache_key := "%s:%d" % [target_path, map_layer]
+	var target_result: Dictionary
+	if target_cache.has(cache_key):
+		target_result = target_cache[cache_key]
+	else:
+		target_result = _resolve_map_target({"target_path": target_path, "map_layer": map_layer}, editor_interface)
+		target_cache[cache_key] = target_result
+	if not bool(target_result.get("ok", false)):
+		return {"checked": false, "target_error": target_result}
+	var coords := MapValidator.coord_from_input(entry.get("coords", {}), dimension)
+	var actual_cell := _read_map_cell(target_result["node"], coords, dimension, map_layer)
+	return _spatial_entry_stale_for_cell(entry, actual_cell, dimension)
+
+
+static func _entry_2d_tile_signature(entry: Dictionary) -> Dictionary:
+	var atlas = entry.get("atlas_coords", {})
+	if not (atlas is Dictionary):
+		return {}
+	return {
+		"source_id": int(entry.get("source_id", -1)),
+		"atlas_x": int((atlas as Dictionary).get("x", -1)),
+		"atlas_y": int((atlas as Dictionary).get("y", -1)),
+	}
+
+
+static func _cell_2d_tile_signature(cell: Dictionary) -> Dictionary:
+	var atlas = cell.get("atlas_coords", {})
+	if atlas is Vector2i:
+		return {
+			"source_id": int(cell.get("source_id", -1)),
+			"atlas_x": (atlas as Vector2i).x,
+			"atlas_y": (atlas as Vector2i).y,
+		}
+	if atlas is Dictionary:
+		return {
+			"source_id": int(cell.get("source_id", -1)),
+			"atlas_x": int((atlas as Dictionary).get("x", -1)),
+			"atlas_y": int((atlas as Dictionary).get("y", -1)),
+		}
+	return {}
 
 
 static func _apply_spatial_metadata_to_cell(target_path: String, coords: Vector3i, dimension: int, cell: Dictionary) -> void:
@@ -1721,6 +1991,11 @@ static func _apply_spatial_metadata_to_cell(target_path: String, coords: Vector3
 		return
 	var entry = (target_entries as Dictionary).get(_index_coord_key(coords, dimension), {})
 	if not (entry is Dictionary):
+		return
+	var stale := _spatial_entry_stale_for_cell(entry, cell, dimension)
+	if bool(stale.get("checked", false)) and bool(stale.get("stale", false)):
+		cell["_spatial_index_stale"] = true
+		cell["_spatial_index_stale_detail"] = stale
 		return
 	for key in ["resource", "resource_key", "semantic_layer", "tags", "cost"]:
 		if (entry as Dictionary).has(key):
@@ -1862,6 +2137,10 @@ static func _resolve_object_parent(input: Dictionary, root: Node, map_node: Node
 	var found := _find_first_node_named(root, wanted_name)
 	if found != null:
 		return {"ok": true, "node": found}
+	if dimension == 2 and map_node.get_parent() is Node2D:
+		return {"ok": true, "node": map_node.get_parent(), "fallback_parent": true}
+	if dimension == 3 and map_node.get_parent() is Node3D:
+		return {"ok": true, "node": map_node.get_parent(), "fallback_parent": true}
 	return {
 		"ok": false,
 		"message": "No object parent found; call ensure_standard_map_layers first or pass parent_path",
@@ -2977,18 +3256,12 @@ static func write_resource_registry(input: Dictionary, _editor_interface: Editor
 		}
 	var entries: Dictionary = entries_value
 	var replace := bool(input.get("replace", false))
-	# before_text 取写入路径自身的当前内容，保证 Undo 能按字节还原。首次写入且非覆盖时，
-	# 尝试从旧 addons 路径迁移已有语义表，避免历史内容被孤立。
-	var before_text := _read_text_file(RESOURCE_REGISTRY_WRITE_PATH)
+	var before_text := _read_text_file(RESOURCE_REGISTRY_PATH)
 	var data: Dictionary = {}
 	if before_text != "":
 		var parsed = JSON.parse_string(before_text)
 		if parsed is Dictionary:
 			data = (parsed as Dictionary).duplicate(true)
-	elif not replace:
-		var legacy := _read_first_json_resource(RESOURCE_REGISTRY_PATHS)
-		if legacy.get("data", {}) is Dictionary:
-			data = (legacy.get("data", {}) as Dictionary).duplicate(true)
 	if replace:
 		data = {}
 	for key in entries.keys():
@@ -2997,12 +3270,12 @@ static func write_resource_registry(input: Dictionary, _editor_interface: Editor
 			return {"ok": false, "message": "entry '%s' must be an object" % str(key), "error_code": "invalid_entry"}
 		data[str(key)] = entry
 	var after_text := JSON.stringify(data, "\t")
-	var write_result := _write_json_file(RESOURCE_REGISTRY_WRITE_PATH, before_text, after_text, undo_manager)
+	var write_result := _write_json_file(RESOURCE_REGISTRY_PATH, before_text, after_text, undo_manager)
 	if not bool(write_result.get("ok", false)):
 		return write_result
 	return {
 		"ok": true,
-		"path": RESOURCE_REGISTRY_WRITE_PATH,
+		"path": RESOURCE_REGISTRY_PATH,
 		"keys": data.keys(),
 		"written_keys": entries.keys(),
 		"replaced": replace,
@@ -3011,7 +3284,7 @@ static func write_resource_registry(input: Dictionary, _editor_interface: Editor
 
 ## 按 tag / 语义层 / 资源 key / 坐标范围检索空间索引，定位"左上角的树""村庄道路"这类语义对象，
 ## 支撑局部删除/替换，避免全量重绘。纯读，不需确认。
-static func query_spatial_index(input: Dictionary, _editor_interface: EditorInterface) -> Dictionary:
+static func query_spatial_index(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	var parsed := _read_json_resource(SPATIAL_INDEX_PATH)
 	var dimension := 3 if str(input.get("dimension", "2d")) == "3d" else 2
 	var branch_key := "3d" if dimension == 3 else "2d"
@@ -3032,12 +3305,16 @@ static func query_spatial_index(input: Dictionary, _editor_interface: EditorInte
 	var want_resource := str(input.get("resource", input.get("resource_key", ""))).strip_edges()
 	var want_layer := str(input.get("semantic_layer", "")).strip_edges()
 	var target_filter := str(input.get("target_path", "")).strip_edges()
+	var map_layer := int(input.get("map_layer", 0))
 	var has_region := input.has("x") or input.has("y") or input.has("z") \
 		or input.has("width") or input.has("height") or input.has("depth")
 	var region := _region_bounds(input)
 	var limit := max(1, int(input.get("limit", 200)))
 
 	var matches: Array = []
+	var stale_entries := 0
+	var checked_entries := 0
+	var target_cache := {}
 	for target_path in branch.keys():
 		if target_filter != "" and str(target_path) != target_filter:
 			continue
@@ -3053,6 +3330,13 @@ static func query_spatial_index(input: Dictionary, _editor_interface: EditorInte
 			if has_region and not _entry_in_region(entry, region, dimension):
 				continue
 			var hit := (entry as Dictionary).duplicate(true)
+			var stale := _spatial_entry_stale_for_index_hit(editor_interface, target_cache, str(target_path), dimension, map_layer, hit)
+			if bool(stale.get("checked", false)):
+				checked_entries += 1
+				if bool(stale.get("stale", false)):
+					stale_entries += 1
+					hit["_spatial_index_stale"] = true
+					hit["_spatial_index_stale_detail"] = stale
 			hit["target_path"] = str(target_path)
 			hit["coord_key"] = str(coord_key)
 			matches.append(hit)
@@ -3060,7 +3344,7 @@ static func query_spatial_index(input: Dictionary, _editor_interface: EditorInte
 				break
 		if matches.size() >= limit:
 			break
-	return {
+	var result := {
 		"ok": true,
 		"dimension": dimension,
 		"matches": matches,
@@ -3069,6 +3353,12 @@ static func query_spatial_index(input: Dictionary, _editor_interface: EditorInte
 		"index_entries": _count_index_entries(data.get("2d", {})) + _count_index_entries(data.get("3d", {})),
 		"max_entries": MAX_SPATIAL_INDEX_ENTRIES,
 	}
+	if checked_entries > 0:
+		result["checked_entries"] = checked_entries
+		result["stale_entries"] = stale_entries
+	if stale_entries > 0:
+		result["stale_warning"] = "%d spatial index entries no longer match real source_id/atlas_coords; call describe_map_region and trust the real cells before editing." % stale_entries
+	return result
 
 
 ## 把自然语言地图请求解析成结构化意图，并生成只读布局计划/操作草案。
@@ -3111,17 +3401,21 @@ static func plan_platform_level(input: Dictionary, editor_interface: EditorInter
 		return context
 	var platform_input := input.duplicate(true)
 	platform_input["mode"] = "2d"
+	_ensure_entry_anchor_from_frontier(platform_input)
 	if bool(platform_input.get("connect_from_existing", true)):
-		var anchor_result := _platform_entry_anchor(platform_input, editor_interface)
-		if bool(anchor_result.get("ok", false)):
-			platform_input["entry_anchor"] = anchor_result.get("entry_anchor", {})
-			platform_input["entry_support"] = anchor_result.get("entry_support", {})
-			platform_input["entry_sample"] = anchor_result
+		if _has_coord_dict(platform_input.get("entry_anchor", {})):
+			platform_input["entry_sample"] = {"ok": true, "entry_anchor": platform_input["entry_anchor"], "source": str(platform_input.get("entry_anchor_source", "entry_anchor"))}
 		else:
-			# 没扫描到左侧已有落脚点：让 composer 把 edit_map_batches 结构性清空，
-			# 而不是只靠 prompt 提醒 agent "没有 entry_anchor 就别执行"。
-			platform_input["entry_anchor_scan_failed"] = true
-			platform_input["entry_sample"] = anchor_result
+			var anchor_result := _platform_entry_anchor(platform_input, editor_interface)
+			if bool(anchor_result.get("ok", false)):
+				platform_input["entry_anchor"] = anchor_result.get("entry_anchor", {})
+				platform_input["entry_support"] = anchor_result.get("entry_support", {})
+				platform_input["entry_sample"] = anchor_result
+			else:
+				# 没扫描到左侧已有落脚点：让 composer 把 edit_map_batches 结构性清空，
+				# 而不是只靠 prompt 提醒 agent "没有 entry_anchor 就别执行"。
+				platform_input["entry_anchor_scan_failed"] = true
+				platform_input["entry_sample"] = anchor_result
 	return MapPlatformComposer.plan_platform_level(platform_input, context)
 
 
@@ -3140,8 +3434,9 @@ static func plan_reachable_map_growth(input: Dictionary, editor_interface: Edito
 		growth_input["reachable_frontier"] = frontier_result
 		if profile in ["platform", "platformer", "side_scroller", "side-scroller"]:
 			growth_input["entry_anchor"] = frontier_result.get("rightmost_frontier", {})
+	_ensure_entry_anchor_from_frontier(growth_input)
 	if profile in ["platform", "platformer", "side_scroller", "side-scroller"] and bool(growth_input.get("connect_from_existing", true)):
-		if not growth_input.has("frontier"):
+		if not _has_coord_dict(growth_input.get("entry_anchor", {})):
 			var anchor_result := _platform_entry_anchor(growth_input, editor_interface)
 			if bool(anchor_result.get("ok", false)):
 				growth_input["entry_anchor"] = anchor_result.get("entry_anchor", {})
@@ -3151,6 +3446,25 @@ static func plan_reachable_map_growth(input: Dictionary, editor_interface: Edito
 				growth_input["entry_anchor_scan_failed"] = true
 				growth_input["entry_sample"] = anchor_result
 	return MapReachableGrowth.plan_growth(growth_input, context)
+
+
+static func _ensure_entry_anchor_from_frontier(input: Dictionary) -> void:
+	if _has_coord_dict(input.get("entry_anchor", {})):
+		return
+	var frontier = input.get("frontier", {})
+	if frontier is Dictionary and (frontier as Dictionary).get("cell", {}) is Dictionary:
+		frontier = (frontier as Dictionary).get("cell", {})
+	if not _has_coord_dict(frontier):
+		return
+	input["entry_anchor"] = {
+		"x": int((frontier as Dictionary).get("x", 0)),
+		"y": int((frontier as Dictionary).get("y", 0)),
+	}
+	input["entry_anchor_source"] = "frontier"
+
+
+static func _has_coord_dict(value) -> bool:
+	return value is Dictionary and (value as Dictionary).has("x") and (value as Dictionary).has("y")
 
 
 ## Read the real map and compute all cells reachable from a real player/unit start.
@@ -3285,28 +3599,47 @@ static func _platform_entry_anchor(input: Dictionary, editor_interface: EditorIn
 	var dimension := 2
 	var map_layer := int(input.get("map_layer", 0))
 	var region_x := int(input.get("x", 0))
-	var sample_width := max(3, int(input.get("entry_sample_width", 12)))
+	var sample_width: int = maxi(3, int(input.get("entry_sample_width", 24)))
 	var sample_x := int(input.get("entry_sample_x", region_x - sample_width))
 	var sample_y := int(input.get("entry_sample_y", input.get("y", 0)))
-	var sample_height := max(4, int(input.get("entry_sample_height", input.get("height", 20))))
+	var sample_height: int = maxi(4, int(input.get("entry_sample_height", maxi(30, int(input.get("height", 20))))))
 	var best_support := Vector3i(-2147483648, 0, 0)
+	var non_empty_cells := 0
+	var blocked_above_cells := 0
+	var blocked_above_examples: Array = []
 	for y_offset in range(sample_height):
 		for x_offset in range(sample_width):
 			var coords := Vector3i(sample_x + x_offset, sample_y + y_offset, 0)
 			var cell := _read_map_cell(target, coords, dimension, map_layer)
 			if _is_empty_cell(target, cell):
 				continue
+			non_empty_cells += 1
 			var above := _read_map_cell(target, coords + Vector3i(0, -1, 0), dimension, map_layer)
 			if not _is_empty_cell(target, above):
+				blocked_above_cells += 1
+				if blocked_above_examples.size() < 8:
+					blocked_above_examples.append({"support": {"x": coords.x, "y": coords.y}, "blocked_above": {"x": coords.x, "y": coords.y - 1}})
 				continue
 			if coords.x > best_support.x or (coords.x == best_support.x and coords.y < best_support.y):
 				best_support = coords
 	if best_support.x == -2147483648:
+		var suggested_width: int = sample_width * 2
+		var suggested_height: int = sample_height * 2
 		return {
 			"ok": false,
 			"message": "no reachable surface found in the left boundary sample",
 			"error_code": "platform_entry_anchor_not_found",
 			"sample_rect": {"x": sample_x, "y": sample_y, "width": sample_width, "height": sample_height},
+			"non_empty_cells": non_empty_cells,
+			"blocked_above_cells": blocked_above_cells,
+			"blocked_above_examples": blocked_above_examples,
+			"suggested_entry_sample": {
+				"x": sample_x - sample_width,
+				"y": sample_y - int(sample_height / 2),
+				"width": suggested_width,
+				"height": suggested_height,
+			},
+			"hint": "If you already know the real rightmost foothold, pass it as frontier or entry_anchor; otherwise retry with suggested_entry_sample_*.",
 		}
 	return {
 		"ok": true,
