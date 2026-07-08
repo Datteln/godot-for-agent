@@ -71,7 +71,7 @@ from app.orchestrator.agent import (
     resolve_thinking_budget,
     run_turn,
 )
-from app.orchestrator.map_workers import MAP_REVISION_GUARDED_TOOL_NAMES
+from app.orchestrator.map_workers import MAP_REVISION_GUARDED_TOOL_NAMES, MAP_WRITE_TOOL_NAMES
 from app.output_styles.catalog import OutputStyleCatalog
 from app.permissions.engine import make_session_allow_grant
 from app.prompt.builder import LayeredPrompt, build_system_prompt
@@ -421,6 +421,24 @@ _MAP_VALIDATION_TOOL_NAMES = frozenset(
     {"validate_map_region", "validate_layer_coverage", "validate_object_placements"}
 )
 _MAP_COMPLETION_TOOL_NAMES = MAP_REVISION_GUARDED_TOOL_NAMES | _MAP_VALIDATION_TOOL_NAMES
+_MAP_REGION_READ_GUARDED_TOOL_NAMES = (
+    MAP_WRITE_TOOL_NAMES
+    | _MAP_VALIDATION_TOOL_NAMES
+    | frozenset(
+        {
+            "plan_map_layout",
+            "plan_map_algorithms",
+            "plan_platform_level",
+            "plan_reachable_map_growth",
+            "compute_reachable_frontier",
+            "convert_map_coords",
+            "find_placement_anchors",
+            "query_spatial_index",
+            "sample_poisson_points",
+            "sample_noise_grid",
+        }
+    )
+) - frozenset({"write_resource_registry", "ensure_standard_map_layers"})
 _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
     {
         "agent_reasoning_delta",
@@ -878,6 +896,212 @@ def _map_region_from_write_args(
         "width": max_x - min_x + 1,
         "height": max_y - min_y + 1,
     }
+
+
+def _direct_region_from_args(tool_args: dict[str, Any]) -> dict[str, int] | None:
+    """从直接区域字段中提取地图区域。"""
+    required = ("x", "y", "width", "height")
+    if any(
+        not isinstance(tool_args.get(key), int) or isinstance(tool_args.get(key), bool)
+        for key in required
+    ):
+        return None
+    region = {key: int(tool_args[key]) for key in required}
+    if isinstance(tool_args.get("z"), int) and not isinstance(tool_args.get("z"), bool):
+        region["z"] = int(tool_args["z"])
+    if isinstance(tool_args.get("depth"), int) and not isinstance(tool_args.get("depth"), bool):
+        region["depth"] = int(tool_args["depth"])
+    return region
+
+
+def _entry_sample_region_from_args(tool_args: dict[str, Any]) -> dict[str, int] | None:
+    """从平台规划 entry_sample 字段中提取真实边界采样区域。"""
+    mapping = {
+        "x": "entry_sample_x",
+        "y": "entry_sample_y",
+        "width": "entry_sample_width",
+        "height": "entry_sample_height",
+    }
+    if any(
+        not isinstance(tool_args.get(source), int) or isinstance(tool_args.get(source), bool)
+        for source in mapping.values()
+    ):
+        return None
+    return {target: int(tool_args[source]) for target, source in mapping.items()}
+
+
+def _points_region(points: Any) -> dict[str, int] | None:
+    """从对象/单元点列表推导最小包围区域。"""
+    if not isinstance(points, list):
+        return None
+    min_x: int | None = None
+    min_y: int | None = None
+    max_x: int | None = None
+    max_y: int | None = None
+    for item in points:
+        if not isinstance(item, dict):
+            continue
+        x_value = item.get("x")
+        y_value = item.get("y")
+        if (
+            not isinstance(x_value, int)
+            or isinstance(x_value, bool)
+            or not isinstance(y_value, int)
+            or isinstance(y_value, bool)
+        ):
+            continue
+        min_x = x_value if min_x is None else min(min_x, x_value)
+        min_y = y_value if min_y is None else min(min_y, y_value)
+        max_x = x_value if max_x is None else max(max_x, x_value)
+        max_y = y_value if max_y is None else max(max_y, y_value)
+    if min_x is None or min_y is None or max_x is None or max_y is None:
+        return None
+    return {"x": min_x, "y": min_y, "width": max_x - min_x + 1, "height": max_y - min_y + 1}
+
+
+def _map_region_from_tool_args(tool_name: str, tool_args: dict[str, Any]) -> dict[str, int] | None:
+    """从地图工具入参推导它依赖的真实地图区域。"""
+    if tool_name in {"plan_platform_level", "plan_reachable_map_growth"}:
+        entry_region = _entry_sample_region_from_args(tool_args)
+        if entry_region is not None:
+            return entry_region
+    direct_region = _direct_region_from_args(tool_args)
+    if direct_region is not None:
+        return direct_region
+    write_region = _map_region_from_write_args(tool_args, {})
+    if write_region is not None:
+        return write_region
+    for key in ("objects", "cells", "path_cells", "route_cells", "frontier_cells"):
+        region = _points_region(tool_args.get(key))
+        if region is not None:
+            return region
+    return None
+
+
+def _map_region_read_signature(tool_name: str, tool_args: dict[str, Any]) -> str | None:
+    """生成地图区域读取签名，用于约束地图工具先读区域。"""
+    region = _map_region_from_tool_args(tool_name, tool_args)
+    if region is None:
+        return None
+    target = tool_args.get("target_path", "")
+    if not isinstance(target, str):
+        target = ""
+    map_layer = tool_args.get("map_layer", tool_args.get("ground_map_layer", 0))
+    if not isinstance(map_layer, int) or isinstance(map_layer, bool):
+        map_layer = 0
+    z_value = region.get("z", 0)
+    depth = region.get("depth", 1)
+    return "|".join(
+        str(value)
+        for value in (
+            target,
+            map_layer,
+            region["x"],
+            region["y"],
+            z_value,
+            region["width"],
+            region["height"],
+            depth,
+        )
+    )
+
+
+def _remember_latest_map_region_read(
+    session: Session,
+    tool_args: dict[str, Any],
+    result: Any,
+) -> None:
+    """记录最近读过的地图区域，避免 frontier 计算在未读区域上猜 start。"""
+    signature = _map_region_read_signature("describe_map_region", tool_args)
+    if signature is None:
+        return
+    revision = _map_revision_from_result(result) if isinstance(result, dict) else None
+    if revision is None:
+        return
+    session.latest_map_region_reads[signature] = revision
+    while len(session.latest_map_region_reads) > 64:
+        first_key = next(iter(session.latest_map_region_reads))
+        del session.latest_map_region_reads[first_key]
+
+
+def _map_tool_region_read_current(session: Session, call: FrontToolCallDTO) -> bool:
+    """判断地图工具依赖的区域是否已按当前 revision 读取。"""
+    signature = _map_region_read_signature(call.name, call.input)
+    if signature is None:
+        return True
+    read_revision = session.latest_map_region_reads.get(signature)
+    if read_revision is None:
+        return False
+    target = call.input.get("target_path")
+    if not isinstance(target, str) or not target:
+        return True
+    latest_revision = session.latest_map_revisions.get(target)
+    return latest_revision is not None and read_revision == latest_revision
+
+
+def _map_region_read_call_for_tool(call: FrontToolCallDTO) -> FrontToolCallDTO | None:
+    """把地图工具调用转换为同一区域的 describe_map_region 调用。"""
+    region = _map_region_from_tool_args(call.name, call.input)
+    if region is None:
+        return None
+    read_input: dict[str, Any] = {"__auto_map_state_read": True}
+    for key in ("target_path", "map_layer", "ground_map_layer"):
+        if key in call.input:
+            read_input["map_layer" if key == "ground_map_layer" else key] = call.input[key]
+    read_input.update(region)
+    return FrontToolCallDTO(
+        id=f"{call.id}__map_region_read",
+        name="describe_map_region",
+        input=read_input,
+        needs_confirm=False,
+        frame_id=call.frame_id,
+        agent=call.agent,
+        render_kind="json",
+    )
+
+
+def _defer_map_tool_for_region_read(
+    session: Session,
+    response: ChatToolCallsResponse,
+) -> ChatToolCallsResponse:
+    """强制依赖真实地图区域的工具在同一区域 describe_map_region 之后执行。"""
+    guarded_call = next(
+        (call for call in response.calls if call.name in _MAP_REGION_READ_GUARDED_TOOL_NAMES),
+        None,
+    )
+    if guarded_call is None:
+        return response
+    if _map_tool_region_read_current(session, guarded_call):
+        return response
+    read_call = _map_region_read_call_for_tool(guarded_call)
+    if read_call is None:
+        return response
+    replacement = ChatToolCallsResponse(
+        turn_id=response.turn_id,
+        text="先读取真实地图区域，再执行地图计算/编辑工具。",
+        calls=[read_call],
+    )
+    _replace_last_assistant_tool_calls(session, replacement.text, replacement.calls)
+    session.set_pending(
+        replacement.turn_id,
+        [read_call.id],
+        {
+            read_call.id: {
+                "name": read_call.name,
+                "input": read_call.input,
+                "frame_id": read_call.frame_id,
+                "agent": read_call.agent,
+            }
+        },
+    )
+    logger.info(
+        "Deferred map tool for region read session=%s tool=%s target=%s read_call=%s",
+        session.session_id,
+        guarded_call.name,
+        guarded_call.input.get("target_path"),
+        read_call.id,
+    )
+    return replacement
 
 
 def _needs_map_state_read_before_write(session: Session, call: FrontToolCallDTO) -> bool:
@@ -3098,6 +3322,7 @@ class QueryEngine:
         )
         response = _step_to_response(step)
         if isinstance(response, ChatToolCallsResponse):
+            response = _defer_map_tool_for_region_read(session, response)
             response = _defer_map_write_for_state_read(session, response)
             response = _defer_map_validation_for_state_read(session, response)
         if isinstance(response, ChatFinalResponse) and session.pending_verify_candidates:
@@ -3139,6 +3364,7 @@ class QueryEngine:
                 )
                 response = _step_to_response(step)
                 if isinstance(response, ChatToolCallsResponse):
+                    response = _defer_map_tool_for_region_read(session, response)
                     response = _defer_map_write_for_state_read(session, response)
                     response = _defer_map_validation_for_state_read(session, response)
         map_gate_continuations = 0
@@ -3189,6 +3415,7 @@ class QueryEngine:
             )
             response = _step_to_response(step)
             if isinstance(response, ChatToolCallsResponse):
+                response = _defer_map_tool_for_region_read(session, response)
                 response = _defer_map_write_for_state_read(session, response)
                 response = _defer_map_validation_for_state_read(session, response)
         if isinstance(response, ChatToolCallsResponse):
@@ -3440,6 +3667,8 @@ class QueryEngine:
                 }
             result_for_gate = payload.get("result") if isinstance(payload, dict) else None
             _remember_latest_map_revision(session, tool_args, result_for_gate)
+            if tool_name == "describe_map_region":
+                _remember_latest_map_region_read(session, tool_args, result_for_gate)
             blocker = _map_completion_blocker(
                 tool_name, result.status, result_for_gate, result.error_code
             )

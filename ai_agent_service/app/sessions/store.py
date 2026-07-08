@@ -59,6 +59,8 @@ class Session:
             服务层下发地图写工具前用它覆盖过期的 `expected_revision`。
         latest_map_layers: 最近一次地图工具确认的 target_path → map_layer；服务层在
             地图写工具漏传 `map_layer` 时补齐，不覆盖显式入参。
+        latest_map_region_reads: 最近已读取过的地图区域签名 → map_revision；
+            用于要求地图计算/编辑工具先读取真实区域，且旧 revision 会重新读取。
         pending_map_write_after_read: 因缺少 map state 而挂起的一次地图写调用；
             自动读到 `map_layer`/`map_revision` 后恢复下发。
         pending_map_validation_after_read: 因缺少 `map_layer` 而挂起的一次地图校验调用；
@@ -86,6 +88,7 @@ class Session:
     map_completion_blockers: list[dict[str, Any]] = field(default_factory=list)
     latest_map_revisions: dict[str, int] = field(default_factory=dict)
     latest_map_layers: dict[str, int] = field(default_factory=dict)
+    latest_map_region_reads: dict[str, int] = field(default_factory=dict)
     pending_map_write_after_read: dict[str, Any] | None = None
     pending_map_validation_after_read: dict[str, Any] | None = None
     history_event_counter: int = 0
@@ -334,6 +337,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "map_completion_blockers": session.map_completion_blockers,
         "latest_map_revisions": session.latest_map_revisions,
         "latest_map_layers": session.latest_map_layers,
+        "latest_map_region_reads": session.latest_map_region_reads,
         "pending_map_write_after_read": session.pending_map_write_after_read,
         "pending_map_validation_after_read": session.pending_map_validation_after_read,
         "history_event_counter": session.history_event_counter,
@@ -444,6 +448,11 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         latest_map_layers={
             str(key): value
             for key, value in _as_dict(data.get("latest_map_layers")).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        },
+        latest_map_region_reads={
+            str(key): value
+            for key, value in _as_dict(data.get("latest_map_region_reads")).items()
             if isinstance(value, int) and not isinstance(value, bool)
         },
         pending_map_write_after_read=(
