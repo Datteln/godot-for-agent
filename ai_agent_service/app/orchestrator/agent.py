@@ -37,6 +37,7 @@ from app.sessions.store import Session
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY, ToolDef, tools_for
 from app.orchestrator.map_workers import (
+    MAP_WRITE_TOOL_NAMES,
     build_dynamic_map_worker,
     is_map_worker_write_mode,
     is_map_write_tool,
@@ -1088,10 +1089,15 @@ _MAP_FOLLOWUP_AGENT_NAMES = frozenset({"map-validator-agent", "map-reviewer-agen
 
 def _has_pending_map_write_validation(session: Session) -> bool:
     """判断当前会话是否有写后必须验证的地图阻断。"""
-    return any(
-        blocker.get("reason") == "map_write_requires_validation"
-        for blocker in session.map_completion_blockers
-    )
+    for blocker in session.map_completion_blockers:
+        reason = blocker.get("reason")
+        if reason in {"map_write_requires_validation", "map_review_required"}:
+            return True
+        if reason in {"blocking_completion", "completion_not_allowed"} and blocker.get(
+            "tool"
+        ) in MAP_WRITE_TOOL_NAMES:
+            return True
+    return False
 
 
 def _pending_pipeline_templates(session: Session) -> set[str]:
@@ -1099,7 +1105,13 @@ def _pending_pipeline_templates(session: Session) -> set[str]:
     return {
         str(blocker.get("pipeline_template", ""))
         for blocker in session.map_completion_blockers
-        if blocker.get("reason") == "map_write_requires_validation"
+        if (
+            blocker.get("reason") == "map_write_requires_validation"
+            or (
+                blocker.get("reason") in {"blocking_completion", "completion_not_allowed"}
+                and blocker.get("tool") in MAP_WRITE_TOOL_NAMES
+            )
+        )
         and str(blocker.get("pipeline_template", ""))
     }
 

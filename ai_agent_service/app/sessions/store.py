@@ -65,6 +65,8 @@ class Session:
             自动读到 `map_layer`/`map_revision` 后恢复下发。
         pending_map_validation_after_read: 因缺少 `map_layer` 而挂起的一次地图校验调用；
             自动读到图层后恢复下发。
+        pending_map_tool_after_read: 因缺少真实地图区域上下文而挂起的一次地图工具调用；
+            自动读完同一区域后恢复下发，避免 LLM 读完后凭记忆重试。
         rag_context: 当前用户提问检索到的 RAG 上下文（分层 prompt 的 L3 段），
             在新用户消息到达时刷新、在工具结果回填等同一轮的后续请求里复用，
             使该段在整轮 agent 循环内保持稳定、可被缓存（§16.1 RAG 段缓存）。
@@ -91,6 +93,7 @@ class Session:
     latest_map_region_reads: dict[str, int] = field(default_factory=dict)
     pending_map_write_after_read: dict[str, Any] | None = None
     pending_map_validation_after_read: dict[str, Any] | None = None
+    pending_map_tool_after_read: dict[str, Any] | None = None
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
@@ -340,6 +343,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "latest_map_region_reads": session.latest_map_region_reads,
         "pending_map_write_after_read": session.pending_map_write_after_read,
         "pending_map_validation_after_read": session.pending_map_validation_after_read,
+        "pending_map_tool_after_read": session.pending_map_tool_after_read,
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
         "rag_context": session.rag_context,
@@ -463,6 +467,11 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         pending_map_validation_after_read=(
             data.get("pending_map_validation_after_read")
             if isinstance(data.get("pending_map_validation_after_read"), dict)
+            else None
+        ),
+        pending_map_tool_after_read=(
+            data.get("pending_map_tool_after_read")
+            if isinstance(data.get("pending_map_tool_after_read"), dict)
             else None
         ),
         history_event_counter=history_event_counter,

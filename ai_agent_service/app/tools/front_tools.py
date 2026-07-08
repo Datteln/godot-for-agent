@@ -2375,14 +2375,14 @@ def register_front_tools() -> None:
                                     "depth": {"type": "integer", "minimum": 1},
                                     "source_id": {
                                         "type": "integer",
-                                        "description": "2D TileSet source id for fill.",
+                                        "description": "2D TileSet source id for fill. Raw ids are rejected unless resolved through a registered resource.",
                                     },
                                     "atlas_x": {"type": "integer"},
                                     "atlas_y": {"type": "integer"},
                                     "alternative_tile": {"type": "integer"},
                                     "item": {
                                         "type": "integer",
-                                        "description": "3D MeshLibrary item id for fill.",
+                                        "description": "3D MeshLibrary item id for fill. Raw ids are rejected unless resolved through a registered resource.",
                                     },
                                     "orientation": {
                                         "type": "integer",
@@ -2412,6 +2412,30 @@ def register_front_tools() -> None:
                                     "cost": {
                                         "type": "number",
                                         "description": "Optional traversal cost copied into the spatial index.",
+                                    },
+                                    "visual_group_id": {
+                                        "type": "string",
+                                        "description": (
+                                            "Optional stable id for one visible instance made from one or more tile cells "
+                                            "(for example tree_01). Cells with the same id are summarized together in "
+                                            "the edit result and spatial index."
+                                        ),
+                                    },
+                                    "instance_id": {
+                                        "type": "string",
+                                        "description": "Alias for visual_group_id.",
+                                    },
+                                    "instance_kind": {
+                                        "type": "string",
+                                        "description": "Optional visible instance kind such as tree, bush, sign, trap, building.",
+                                    },
+                                    "required_cells": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "description": (
+                                            "Minimum cells expected for this visual_group_id. If the group writes fewer "
+                                            "cells, edit_map returns a visual_group_warning."
+                                        ),
                                     },
                                     "from_x": {"type": "integer"},
                                     "from_y": {"type": "integer"},
@@ -2455,6 +2479,15 @@ def register_front_tools() -> None:
                                 "in the result but the operation still executes normally. You can safely omit "
                                 "this field to avoid calculation errors; the frontend uses the actual cell count "
                                 "from the operations themselves."
+                            ),
+                        },
+                        "expected_visual_groups": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": (
+                                "Optional expected count of visible instances represented by operation "
+                                "visual_group_id/instance_id values. Use for decoration/object goals so completion "
+                                "is checked by instance count, not just total cells."
                             ),
                         },
                     },
@@ -2570,6 +2603,15 @@ def register_front_tools() -> None:
                                     "z": {"type": "integer"},
                                     "semantic_layer": {"type": "string"},
                                     "tags": {"type": "array", "items": {"type": "string"}},
+                                    "visual_group_id": {
+                                        "type": "string",
+                                        "description": "Optional stable id for this visible object instance.",
+                                    },
+                                    "instance_id": {"type": "string", "description": "Alias for visual_group_id."},
+                                    "instance_kind": {
+                                        "type": "string",
+                                        "description": "Optional visible object kind such as tree, coin, enemy, sign.",
+                                    },
                                 },
                             },
                         },
@@ -2881,6 +2923,18 @@ def register_front_tools() -> None:
                         "semantic_layer": {
                             "type": "string",
                             "description": "Match entries on this logical layer (ground, water, road, ...).",
+                        },
+                        "map_layer": {
+                            "type": "integer",
+                            "description": "Restrict 2D matches to one TileMap layer when entries record map_layer.",
+                        },
+                        "visual_group_id": {
+                            "type": "string",
+                            "description": "Match entries belonging to this visible instance/group id.",
+                        },
+                        "instance_id": {
+                            "type": "string",
+                            "description": "Alias for visual_group_id.",
                         },
                         "target_path": {
                             "type": "string",
@@ -3397,19 +3451,54 @@ def register_front_tools() -> None:
                     "(grass, wall, river, elf_house, ...) to real TileSet/MeshLibrary/PackedScene references "
                     "so future tasks resolve resources instead of guessing ids. Entries merge by key by "
                     "default; set replace=true to overwrite the whole table. Each write is previewed and "
-                    "undoable. Only record resources you have verified exist via describe_map_context or "
-                    "describe_map_region."
+                    "undoable. Entries are validated as resource contracts; only record resources you have "
+                    "verified exist via describe_map_context or describe_map_region."
                 ),
                 "parameters": _object_schema(
                     {
                         "entries": {
                             "type": "object",
                             "description": (
-                                "Object mapping each resource key to its definition object (display_name, "
-                                "mode, target, source_id/atlas_coords, terrain_set/terrain, mesh_library_item "
-                                "or scene_path, tags, cost, ...). Values are stored verbatim."
+                                "Object mapping each resource key to its definition object. Each entry must "
+                                "declare kind and either 2D source_id+atlas_coords/atlas_x+atlas_y, 3D item/"
+                                "mesh_library_item, or scene_path. footprint defaults to 1x1 and required_cells "
+                                "defaults to footprint area."
                             ),
-                            "additionalProperties": {"type": "object"},
+                            "additionalProperties": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"type": "string"},
+                                    "display_name": {"type": "string"},
+                                    "mode": {"type": "string", "enum": ["2d", "3d"]},
+                                    "target": {"type": "string"},
+                                    "source_id": {"type": "integer"},
+                                    "atlas_x": {"type": "integer"},
+                                    "atlas_y": {"type": "integer"},
+                                    "atlas_coords": {
+                                        "type": "object",
+                                        "properties": {
+                                            "x": {"type": "integer"},
+                                            "y": {"type": "integer"},
+                                        },
+                                    },
+                                    "item": {"type": "integer"},
+                                    "mesh_library_item": {"type": "integer"},
+                                    "scene_path": {"type": "string"},
+                                    "footprint": {
+                                        "type": "object",
+                                        "properties": {
+                                            "width": {"type": "integer", "minimum": 1},
+                                            "height": {"type": "integer", "minimum": 1},
+                                            "depth": {"type": "integer", "minimum": 1},
+                                        },
+                                    },
+                                    "required_cells": {"type": "integer", "minimum": 1},
+                                    "visual_group_id": {"type": "string"},
+                                    "tags": {"type": "array", "items": {"type": "string"}},
+                                    "cost": {"type": "number"},
+                                },
+                                "required": ["kind"],
+                            },
                         },
                         "replace": {
                             "type": "boolean",

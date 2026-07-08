@@ -238,6 +238,9 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 			return {"ok": false, "message": "each operation must be an object", "error_code": "invalid_operation"}
 		var operation: Dictionary = operation_value
 		var resolved_resource_entry := _apply_registry_fallback_to_operation(operation, dimension)
+		var resource_contract_check := _validate_operation_resource_contract(operation, resolved_resource_entry, dimension)
+		if not bool(resource_contract_check.get("ok", true)):
+			return resource_contract_check
 		var resolved_scene_path := str(resolved_resource_entry.get("scene_path", "")).strip_edges()
 		if resolved_scene_path != "":
 			# 语义表里这个资源是按 scene_path（对象/PackedScene）登记的，不是瓦片——用 edit_map
@@ -324,6 +327,15 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		"layer_coverage_gaps": coverage_gaps,
 		"message": "Map edited through Godot native APIs; serialized map data was not modified directly."
 	}
+	var visual_groups := _summarize_visual_groups_from_cells(after)
+	if int(visual_groups.get("count", 0)) > 0:
+		result["visual_groups"] = visual_groups
+		var expected_groups := int(input.get("expected_visual_groups", input.get("expected_instances", -1)))
+		if expected_groups >= 0 and expected_groups != int(visual_groups.get("count", 0)):
+			result["visual_group_warning"] = "expected_visual_groups=%d but this batch wrote %d visual groups; read back the region before treating decoration/object goals as complete." % [expected_groups, int(visual_groups.get("count", 0))]
+		var incomplete_groups: Array = visual_groups.get("incomplete", [])
+		if not incomplete_groups.is_empty():
+			result["visual_group_warning"] = "one or more visual groups wrote fewer cells than their required_cells; read back and repair before completion."
 	if not coverage_gaps.is_empty():
 		result["coverage_gap_warning"] = "One or more full-coverage layers (background/sky/water etc.) now fall short of this map's overall extent. Extend them to match before treating this edit as finished."
 	if cell_count_warning != "":
@@ -759,7 +771,23 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 				"coords": MapValidator.coord_payload(coords, dimension),
 				"blocking_entry": blocked_cells[coord_key],
 			}
-		var placement_profile := _placement_profile_from_spec(object_spec, input)
+		var resource_key := str(object_spec.get("resource", object_spec.get("resource_key", ""))).strip_edges()
+		var resource_def: Dictionary = _registry_entry_with_fallback(registry_data, resource_key, str(object_spec.get("fallback_resource", "")))
+		if resource_def.has("_resolved_resource"):
+			resource_key = str(resource_def.get("_resolved_resource", resource_key))
+		if not resource_def.is_empty():
+			var object_contract_check := _validate_resource_contract_shape(resource_key, resource_def)
+			if not bool(object_contract_check.get("ok", false)):
+				return object_contract_check
+		var profile_fallback := input.duplicate(true)
+		for key in resource_def.keys():
+			if not profile_fallback.has(key):
+				profile_fallback[key] = resource_def[key]
+		if resource_def.has("required_cells") and not object_spec.has("required_cells"):
+			object_spec["required_cells"] = int(resource_def.get("required_cells", 1))
+		if resource_def.has("kind") and not object_spec.has("instance_kind"):
+			object_spec["instance_kind"] = str(resource_def.get("kind", ""))
+		var placement_profile := _placement_profile_from_spec(object_spec, profile_fallback)
 		var placement_check := _validate_single_object_placement(
 			map_node,
 			str(target_result.get("path", "")),
@@ -774,10 +802,6 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 		)
 		if not bool(placement_check.get("ok", true)):
 			return _with_placement_retry_hint(placement_check)
-		var resource_key := str(object_spec.get("resource", object_spec.get("resource_key", ""))).strip_edges()
-		var resource_def: Dictionary = _registry_entry_with_fallback(registry_data, resource_key, str(object_spec.get("fallback_resource", "")))
-		if resource_def.has("_resolved_resource"):
-			resource_key = str(resource_def.get("_resolved_resource", resource_key))
 		var scene_path := PathUtils.to_res_path(str(object_spec.get("scene_path", resource_def.get("scene_path", ""))))
 		if scene_path == "" or not (scene_path.ends_with(".tscn") or scene_path.ends_with(".scn")):
 			return {"ok": false, "message": "object requires a .tscn/.scn scene_path or resource registry entry", "error_code": "missing_scene_path", "resource": resource_key}
@@ -797,7 +821,16 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 		node.name = _object_instance_name(object_spec, resource_key, scene_path)
 		_apply_object_position(node, map_node, coords, dimension)
 		_apply_object_metadata(node, object_spec, resource_key, scene_path, coords, dimension)
-		prepared.append({"node": node, "coords": coords, "scene_path": scene_path, "resource": resource_key, "spec": object_spec})
+		prepared.append({
+			"node": node,
+			"coords": coords,
+			"scene_path": scene_path,
+			"resource": resource_key,
+			"spec": object_spec,
+			"dimension": dimension,
+			"map_layer": map_layer_for_placement(input),
+			"visual_group_id": _visual_group_id_from_data(object_spec),
+		})
 		planned[coord_key] = true
 	var parent_path_for_index := str(root.get_path_to(parent)) if parent != root else "."
 	var index_result := _maybe_update_object_spatial_index(input, undo_manager, str(target_result.get("path", "")), parent_path_for_index, dimension, prepared)
@@ -818,6 +851,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 		"parent_path": str(root.get_path_to(parent)) if parent != root else ".",
 		"dimension": dimension,
 		"objects": prepared.size(),
+		"instance_summary": _summarize_object_instances(prepared),
 		"paths": paths,
 		"spatial_index": index_result,
 	}
@@ -1521,7 +1555,10 @@ static func _build_map_operation(
 
 
 static func _copy_operation_metadata(operation: Dictionary, cell: Dictionary) -> void:
-	for key in ["resource", "resource_key", "semantic_layer", "tags", "cost"]:
+	for key in [
+		"resource", "resource_key", "semantic_layer", "tags", "cost",
+		"visual_group_id", "instance_id", "instance_kind", "required_cells",
+	]:
 		if operation.has(key):
 			cell[key] = operation[key]
 
@@ -1532,6 +1569,10 @@ static func _apply_registry_fallback_to_operation(operation: Dictionary, dimensi
 		return resource_entry
 	if resource_entry.has("_resolved_resource") and not operation.has("resource"):
 		operation["resource"] = str(resource_entry.get("_resolved_resource", ""))
+	if resource_entry.has("kind") and not operation.has("instance_kind"):
+		operation["instance_kind"] = str(resource_entry.get("kind", ""))
+	if resource_entry.has("required_cells") and not operation.has("required_cells"):
+		operation["required_cells"] = int(resource_entry.get("required_cells", 1))
 	if dimension == 3:
 		if not operation.has("item") and resource_entry.has("item"):
 			operation["item"] = int(resource_entry.get("item", -1))
@@ -1551,6 +1592,55 @@ static func _apply_registry_fallback_to_operation(operation: Dictionary, dimensi
 			if not operation.has("atlas_y"):
 				operation["atlas_y"] = int((atlas as Dictionary).get("y", -1))
 	return resource_entry
+
+
+static func _validate_operation_resource_contract(operation: Dictionary, resource_entry: Dictionary, dimension: int) -> Dictionary:
+	var action := str(operation.get("action", "fill"))
+	if action == "erase" or action == "copy":
+		return {"ok": true}
+	var resource_key := str(operation.get("resource", operation.get("resource_key", ""))).strip_edges()
+	if resource_key == "":
+		if dimension == 3 and operation.has("item") and int(operation.get("item", -1)) >= 0:
+			return {"ok": false, "message": "raw GridMap item ids are not allowed in edit_map fill; register the verified resource first and use resource/resource_key.", "error_code": "unregistered_map_resource"}
+		if dimension == 2 and operation.has("source_id") and operation.has("atlas_x") and operation.has("atlas_y") and int(operation.get("source_id", -1)) >= 0:
+			return {"ok": false, "message": "raw TileSet atlas ids are not allowed in edit_map fill; register the verified resource first and use resource/resource_key.", "error_code": "unregistered_map_resource"}
+		return {"ok": true}
+	if resource_entry.is_empty():
+		return {
+			"ok": false,
+			"message": "resource '%s' is not registered; call write_resource_registry from verified map data before using atlas/item ids." % resource_key,
+			"error_code": "unregistered_map_resource",
+			"resource": resource_key,
+		}
+	var shape_check := _validate_resource_contract_shape(resource_key, resource_entry)
+	if not bool(shape_check.get("ok", false)):
+		return shape_check
+	if int(resource_entry.get("required_cells", 1)) > 1 and _visual_group_id_from_data(operation) == "":
+		return {
+			"ok": false,
+			"message": "resource '%s' requires visual_group_id/instance_id because required_cells=%d" % [resource_key, int(resource_entry.get("required_cells", 1))],
+			"error_code": "missing_visual_group_id",
+			"resource": resource_key,
+		}
+	if dimension == 3:
+		if not resource_entry.has("item") and not resource_entry.has("mesh_library_item"):
+			return {"ok": false, "message": "registered resource '%s' has no item/mesh_library_item" % resource_key, "error_code": "invalid_resource_contract", "resource": resource_key}
+		return {"ok": true}
+	if not resource_entry.has("source_id"):
+		return {"ok": false, "message": "registered resource '%s' has no source_id" % resource_key, "error_code": "invalid_resource_contract", "resource": resource_key}
+	if _registry_2d_tile_signature(resource_entry).is_empty():
+		return {"ok": false, "message": "registered resource '%s' has no atlas_coords/atlas_x/atlas_y" % resource_key, "error_code": "invalid_resource_contract", "resource": resource_key}
+	return {"ok": true}
+
+
+static func _validate_resource_contract_shape(resource_key: String, resource_entry: Dictionary) -> Dictionary:
+	if not resource_entry.has("kind") or str(resource_entry.get("kind", "")).strip_edges() == "":
+		return {"ok": false, "message": "registered resource '%s' must declare kind; rewrite it with write_resource_registry from verified map data" % resource_key, "error_code": "invalid_resource_contract", "resource": resource_key}
+	if not (resource_entry.get("footprint", null) is Dictionary):
+		return {"ok": false, "message": "registered resource '%s' must declare footprint; rewrite it with write_resource_registry from verified map data" % resource_key, "error_code": "invalid_resource_contract", "resource": resource_key}
+	if not resource_entry.has("required_cells"):
+		return {"ok": false, "message": "registered resource '%s' must declare required_cells; rewrite it with write_resource_registry from verified map data" % resource_key, "error_code": "invalid_resource_contract", "resource": resource_key}
+	return {"ok": true}
 
 
 static func _registry_entry_for_resource_input(input: Dictionary) -> Dictionary:
@@ -1758,15 +1848,31 @@ static func _maybe_update_spatial_index(
 		if not (value is Dictionary):
 			continue
 		var cell: Dictionary = value
-		var key := _index_coord_key(cell.get("coords", Vector3i.ZERO), dimension)
+		var key := _spatial_tile_index_key(cell, dimension)
+		var legacy_key := _index_coord_key(cell.get("coords", Vector3i.ZERO), dimension)
+		var existing_key := ""
+		if target_index.has(key):
+			existing_key = key
+		elif target_index.has(legacy_key):
+			existing_key = legacy_key
 		if _is_empty_cell(target, cell):
-			if target_index.has(key):
-				target_index.erase(key)
+			if existing_key != "":
+				target_index.erase(existing_key)
 				total_entries -= 1
 				removed += 1
-		elif target_index.has(key):
+			if legacy_key != key and target_index.has(legacy_key):
+				target_index.erase(legacy_key)
+				total_entries -= 1
+				removed += 1
+		elif existing_key != "":
 			# 原地更新已有坐标，不增加体量。
 			target_index[key] = _describe_safe_cell(cell, dimension)
+			if existing_key != key:
+				target_index.erase(existing_key)
+			elif legacy_key != key and target_index.has(legacy_key):
+				target_index.erase(legacy_key)
+				total_entries -= 1
+				removed += 1
 		elif total_entries >= MAX_SPATIAL_INDEX_ENTRIES:
 			# 已到上限，拒绝再写入新坐标，避免文件无限膨胀。
 			hit_cap = true
@@ -1844,6 +1950,43 @@ static func _spatial_registry_warnings(after_cells: Array, dimension: int) -> Ar
 	return warnings
 
 
+static func _visual_group_id_from_data(data: Dictionary) -> String:
+	var visual_group_id := str(data.get("visual_group_id", "")).strip_edges()
+	if visual_group_id != "":
+		return visual_group_id
+	return str(data.get("instance_id", "")).strip_edges()
+
+
+static func _summarize_visual_groups_from_cells(cells: Array) -> Dictionary:
+	var by_id := {}
+	for value in cells:
+		if not (value is Dictionary):
+			continue
+		var cell: Dictionary = value
+		var group_id := _visual_group_id_from_data(cell)
+		if group_id == "":
+			continue
+		if not by_id.has(group_id):
+			by_id[group_id] = {
+				"id": group_id,
+				"kind": str(cell.get("instance_kind", "")),
+				"cells": 0,
+				"required_cells": int(cell.get("required_cells", 0)),
+			}
+		var group: Dictionary = by_id[group_id]
+		group["cells"] = int(group.get("cells", 0)) + 1
+		group["required_cells"] = max(int(group.get("required_cells", 0)), int(cell.get("required_cells", 0)))
+	var groups: Array = []
+	var incomplete: Array = []
+	for group_id in by_id.keys():
+		var group: Dictionary = by_id[group_id]
+		groups.append(group)
+		var required_cells := int(group.get("required_cells", 0))
+		if required_cells > 0 and int(group.get("cells", 0)) < required_cells:
+			incomplete.append(group)
+	return {"count": groups.size(), "groups": groups, "incomplete": incomplete}
+
+
 static func _registry_2d_tile_signature(entry: Dictionary) -> Dictionary:
 	var atlas_value = entry.get("atlas_coords", {})
 	var atlas_x = entry.get("atlas_x", null)
@@ -1862,6 +2005,16 @@ static func _registry_2d_tile_signature(entry: Dictionary) -> Dictionary:
 
 static func _index_coord_key(coords: Vector3i, dimension: int) -> String:
 	return "%d,%d,%d" % [coords.x, coords.y, coords.z] if dimension == 3 else "%d,%d" % [coords.x, coords.y]
+
+
+static func _index_layer_coord_key(coords: Vector3i, dimension: int, map_layer: int) -> String:
+	if dimension == 3:
+		return _index_coord_key(coords, dimension)
+	return "layer:%d:%s" % [map_layer, _index_coord_key(coords, dimension)]
+
+
+static func _spatial_tile_index_key(cell: Dictionary, dimension: int) -> String:
+	return _index_layer_coord_key(cell.get("coords", Vector3i.ZERO), dimension, int(cell.get("map_layer", 0)))
 
 
 static func _is_empty_cell(target: Node, cell: Dictionary) -> bool:
@@ -1934,6 +2087,7 @@ static func _spatial_entry_stale_for_index_hit(
 		return {"checked": false}
 	if not (entry.get("coords", {}) is Dictionary):
 		return {"checked": false}
+	map_layer = int(entry.get("map_layer", map_layer))
 	var cache_key := "%s:%d" % [target_path, map_layer]
 	var target_result: Dictionary
 	if target_cache.has(cache_key):
@@ -1989,7 +2143,10 @@ static func _apply_spatial_metadata_to_cell(target_path: String, coords: Vector3
 	var target_entries = (branch as Dictionary).get(target_path, {})
 	if not (target_entries is Dictionary):
 		return
-	var entry = (target_entries as Dictionary).get(_index_coord_key(coords, dimension), {})
+	var layer_key := _index_layer_coord_key(coords, dimension, int(cell.get("map_layer", 0)))
+	var entry = (target_entries as Dictionary).get(layer_key, {})
+	if not (entry is Dictionary):
+		entry = (target_entries as Dictionary).get(_index_coord_key(coords, dimension), {})
 	if not (entry is Dictionary):
 		return
 	var stale := _spatial_entry_stale_for_cell(entry, cell, dimension)
@@ -2198,6 +2355,36 @@ static func _apply_object_metadata(
 		node.set_meta("map_agent_semantic_layer", str(object_spec.get("semantic_layer", "")))
 	if object_spec.has("tags"):
 		node.set_meta("map_agent_tags", object_spec.get("tags", []))
+	for key in ["visual_group_id", "instance_id", "instance_kind"]:
+		if object_spec.has(key):
+			node.set_meta("map_agent_" + key, str(object_spec.get(key, "")))
+
+
+static func _summarize_object_instances(prepared: Array) -> Dictionary:
+	var instances: Array = []
+	for item_value in prepared:
+		if not (item_value is Dictionary):
+			continue
+		var item: Dictionary = item_value
+		var spec: Dictionary = item.get("spec", {})
+		var group_id := str(item.get("visual_group_id", ""))
+		var node_name := ""
+		if item.get("node", null) is Node:
+			var node: Node = item.get("node")
+			node_name = node.name
+		instances.append({
+			"id": group_id if group_id != "" else node_name,
+			"kind": str(spec.get("instance_kind", spec.get("semantic_layer", "object"))),
+			"resource": str(item.get("resource", "")),
+			"scene_path": str(item.get("scene_path", "")),
+			"coords": MapValidator.coord_payload(item.get("coords", Vector3i.ZERO), int(item.get("dimension", 2))),
+		})
+	return {
+		"requested_instances": prepared.size(),
+		"written_instances": prepared.size(),
+		"failed_instances": [],
+		"instances": instances,
+	}
 
 
 static func map_layer_for_placement(input: Dictionary) -> int:
@@ -2265,6 +2452,13 @@ static func _placement_profile_from_spec(spec: Dictionary, fallback: Dictionary)
 			profile["surface_type"] = "air"
 			profile["footprint_width"] = 1
 			profile["footprint_height"] = 1
+	var footprint_value = spec.get("footprint", fallback.get("footprint", {}))
+	if footprint_value is Dictionary:
+		var footprint: Dictionary = footprint_value
+		profile["footprint_width"] = max(1, int(footprint.get("width", profile["footprint_width"])))
+		profile["footprint_height"] = max(1, int(footprint.get("height", profile["footprint_height"])))
+		if footprint.has("depth"):
+			profile["footprint_depth"] = max(1, int(footprint.get("depth", 1)))
 	profile["anchor"] = str(spec.get("anchor", fallback.get("anchor", profile["anchor"]))).to_lower()
 	profile["surface_type"] = str(spec.get("surface_type", fallback.get("surface_type", profile["surface_type"]))).to_lower()
 	if profile["surface_type"] in ["water", "water_surface"]:
@@ -3032,10 +3226,14 @@ static func _maybe_update_object_spatial_index(
 			"resource": str(item.get("resource", "")),
 			"resource_key": str(item.get("resource", "")),
 			"parent_path": parent_path,
+			"map_layer": int(item.get("map_layer", input.get("map_layer", 0))),
 			"node_name": indexed_node_name,
 			"semantic_layer": str(spec.get("semantic_layer", "object")),
 			"tags": spec.get("tags", []),
 		}
+		for metadata_key in ["visual_group_id", "instance_id", "instance_kind"]:
+			if spec.has(metadata_key):
+				target_index[key][metadata_key] = str(spec.get(metadata_key, ""))
 		if not existed:
 			added += 1
 			total_entries += 1
@@ -3278,7 +3476,10 @@ static func write_resource_registry(input: Dictionary, _editor_interface: Editor
 		var entry = entries[key]
 		if not (entry is Dictionary):
 			return {"ok": false, "message": "entry '%s' must be an object" % str(key), "error_code": "invalid_entry"}
-		data[str(key)] = entry
+		var contract_check := _normalize_resource_registry_entry(str(key), entry)
+		if not bool(contract_check.get("ok", false)):
+			return contract_check
+		data[str(key)] = contract_check.get("entry", {})
 	var after_text := JSON.stringify(data, "\t")
 	var write_result := _write_json_file(RESOURCE_REGISTRY_PATH, before_text, after_text, undo_manager)
 	if not bool(write_result.get("ok", false)):
@@ -3290,6 +3491,40 @@ static func write_resource_registry(input: Dictionary, _editor_interface: Editor
 		"written_keys": entries.keys(),
 		"replaced": replace,
 	}
+
+
+static func _normalize_resource_registry_entry(key: String, entry_value: Dictionary) -> Dictionary:
+	var entry := entry_value.duplicate(true)
+	var kind := str(entry.get("kind", "")).strip_edges()
+	if kind == "":
+		return {"ok": false, "message": "resource '%s' must declare kind" % key, "error_code": "invalid_resource_contract", "resource": key}
+	entry["kind"] = kind
+	var footprint = entry.get("footprint", {})
+	if footprint == null or (footprint is Dictionary and (footprint as Dictionary).is_empty()):
+		footprint = {"width": 1, "height": 1}
+	if not (footprint is Dictionary):
+		return {"ok": false, "message": "resource '%s' footprint must be an object" % key, "error_code": "invalid_resource_contract", "resource": key}
+	var footprint_dict: Dictionary = footprint
+	var width := max(1, int(footprint_dict.get("width", 1)))
+	var height := max(1, int(footprint_dict.get("height", 1)))
+	var depth := max(1, int(footprint_dict.get("depth", 1)))
+	var normalized_footprint := {"width": width, "height": height}
+	if footprint_dict.has("depth"):
+		normalized_footprint["depth"] = depth
+	entry["footprint"] = normalized_footprint
+	entry["required_cells"] = max(1, int(entry.get("required_cells", width * height * depth)))
+	if entry.has("visual_group_id") and str(entry.get("visual_group_id", "")).strip_edges() == "":
+		return {"ok": false, "message": "resource '%s' visual_group_id must be non-empty when provided" % key, "error_code": "invalid_resource_contract", "resource": key}
+	if entry.has("scene_path"):
+		return {"ok": true, "entry": entry}
+	var mode := str(entry.get("mode", "2d")).strip_edges()
+	if mode == "3d":
+		if not entry.has("item") and not entry.has("mesh_library_item"):
+			return {"ok": false, "message": "3D resource '%s' must declare item or mesh_library_item" % key, "error_code": "invalid_resource_contract", "resource": key}
+		return {"ok": true, "entry": entry}
+	if not entry.has("source_id") or _registry_2d_tile_signature(entry).is_empty():
+		return {"ok": false, "message": "2D resource '%s' must declare source_id and atlas_coords/atlas_x/atlas_y" % key, "error_code": "invalid_resource_contract", "resource": key}
+	return {"ok": true, "entry": entry}
 
 
 ## 按 tag / 语义层 / 资源 key / 坐标范围检索空间索引，定位"左上角的树""村庄道路"这类语义对象，
@@ -3314,8 +3549,10 @@ static func query_spatial_index(input: Dictionary, editor_interface: EditorInter
 	var want_tags: Array = input.get("tags", []) if input.get("tags", []) is Array else []
 	var want_resource := str(input.get("resource", input.get("resource_key", ""))).strip_edges()
 	var want_layer := str(input.get("semantic_layer", "")).strip_edges()
+	var want_visual_group := str(input.get("visual_group_id", input.get("instance_id", ""))).strip_edges()
 	var target_filter := str(input.get("target_path", "")).strip_edges()
 	var map_layer := int(input.get("map_layer", 0))
+	var has_map_layer_filter := input.has("map_layer")
 	var has_region := input.has("x") or input.has("y") or input.has("z") \
 		or input.has("width") or input.has("height") or input.has("depth")
 	var region := _region_bounds(input)
@@ -3335,7 +3572,9 @@ static func query_spatial_index(input: Dictionary, editor_interface: EditorInter
 			var entry = cells[coord_key]
 			if not (entry is Dictionary):
 				continue
-			if not _entry_matches(entry, want_tags, want_resource, want_layer):
+			if not _entry_matches(entry, want_tags, want_resource, want_layer, want_visual_group):
+				continue
+			if has_map_layer_filter and dimension == 2 and int((entry as Dictionary).get("map_layer", -1)) != map_layer:
 				continue
 			if has_region and not _entry_in_region(entry, region, dimension):
 				continue
@@ -4353,13 +4592,17 @@ static func _is_blocked_index_entry(entry: Dictionary) -> bool:
 	return tags is Array and ((tags as Array).has("water") or (tags as Array).has("blocked") or (tags as Array).has("obstacle"))
 
 
-static func _entry_matches(entry: Dictionary, want_tags: Array, want_resource: String, want_layer: String) -> bool:
+static func _entry_matches(entry: Dictionary, want_tags: Array, want_resource: String, want_layer: String, want_visual_group: String = "") -> bool:
 	if want_resource != "":
 		var entry_resource := str(entry.get("resource", entry.get("resource_key", "")))
 		if entry_resource != want_resource:
 			return false
 	if want_layer != "" and str(entry.get("semantic_layer", "")) != want_layer:
 		return false
+	if want_visual_group != "":
+		var entry_group := _visual_group_id_from_data(entry)
+		if entry_group != want_visual_group:
+			return false
 	if not want_tags.is_empty():
 		var entry_tags = entry.get("tags", [])
 		if not (entry_tags is Array):

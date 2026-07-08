@@ -1065,6 +1065,8 @@ def _defer_map_tool_for_region_read(
     response: ChatToolCallsResponse,
 ) -> ChatToolCallsResponse:
     """强制依赖真实地图区域的工具在同一区域 describe_map_region 之后执行。"""
+    if session.pending_map_tool_after_read is not None:
+        return response
     guarded_call = next(
         (call for call in response.calls if call.name in _MAP_REGION_READ_GUARDED_TOOL_NAMES),
         None,
@@ -1076,6 +1078,7 @@ def _defer_map_tool_for_region_read(
     read_call = _map_region_read_call_for_tool(guarded_call)
     if read_call is None:
         return response
+    session.pending_map_tool_after_read = {"call": guarded_call.model_dump()}
     replacement = ChatToolCallsResponse(
         turn_id=response.turn_id,
         text="先读取真实地图区域，再执行地图计算/编辑工具。",
@@ -1102,6 +1105,68 @@ def _defer_map_tool_for_region_read(
         read_call.id,
     )
     return replacement
+
+
+def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsResponse | None:
+    """自动读完地图区域后恢复此前挂起的地图工具调用。"""
+    pending = session.pending_map_tool_after_read
+    if not isinstance(pending, dict):
+        return None
+    raw_call = pending.get("call")
+    if not isinstance(raw_call, dict):
+        session.pending_map_tool_after_read = None
+        return None
+    call = FrontToolCallDTO.model_validate(raw_call)
+    target = call.input.get("target_path")
+    target_path = target if isinstance(target, str) else ""
+    latest_revision = session.latest_map_revisions.get(target_path)
+    latest_layer = session.latest_map_layers.get(target_path)
+    restored_input = dict(call.input)
+
+    if call.name in MAP_REVISION_GUARDED_TOOL_NAMES:
+        if not target_path or latest_revision is None:
+            session.pending_map_tool_after_read = None
+            _append_map_state_read_error(
+                session,
+                call.name,
+                target_path,
+                "expected_revision",
+            )
+            return None
+        restored_input["expected_revision"] = latest_revision
+    if "map_layer" not in restored_input and latest_layer is not None:
+        restored_input["map_layer"] = latest_layer
+    if call.name in _MAP_VALIDATION_TOOL_NAMES and "map_layer" not in restored_input:
+        session.pending_map_tool_after_read = None
+        _append_map_state_read_error(session, call.name, target_path, "map_layer")
+        return None
+
+    restored_call = call.model_copy(update={"input": restored_input})
+    text = "已读取真实地图区域，继续执行挂起的地图工具调用。"
+    turn_id = session.new_turn_id()
+    session.pending_map_tool_after_read = None
+    _append_assistant_tool_calls(session, text, [restored_call])
+    session.set_pending(
+        turn_id,
+        [restored_call.id],
+        {
+            restored_call.id: {
+                "name": restored_call.name,
+                "input": restored_call.input,
+                "frame_id": restored_call.frame_id,
+                "agent": restored_call.agent,
+            }
+        },
+    )
+    logger.info(
+        "Resumed pending map tool after region read session=%s tool=%s target=%s revision=%s layer=%s",
+        session.session_id,
+        restored_call.name,
+        target_path,
+        latest_revision,
+        restored_input.get("map_layer"),
+    )
+    return ChatToolCallsResponse(turn_id=turn_id, text=text, calls=[restored_call])
 
 
 def _needs_map_state_read_before_write(session: Session, call: FrontToolCallDTO) -> bool:
@@ -3186,6 +3251,20 @@ class QueryEngine:
                 return result_error
             if verify_candidates:
                 session.pending_verify_candidates.extend(verify_candidates)
+            resumed_map_tool = _resume_pending_map_tool_after_read(session)
+            if resumed_map_tool is not None:
+                self._emit(
+                    session.session_id,
+                    "tool_calls",
+                    {"turn_id": resumed_map_tool.turn_id, "count": len(resumed_map_tool.calls)},
+                )
+                logger.info(
+                    "Resumed pending map tool after region read session=%s turn_id=%s count=%d",
+                    session.session_id,
+                    resumed_map_tool.turn_id,
+                    len(resumed_map_tool.calls),
+                )
+                return resumed_map_tool
             resumed_write = _resume_pending_map_write_after_read(session)
             if resumed_write is not None:
                 self._emit(
