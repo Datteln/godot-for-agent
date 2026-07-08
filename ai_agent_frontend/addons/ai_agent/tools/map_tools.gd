@@ -2205,7 +2205,17 @@ static func map_layer_for_placement(input: Dictionary) -> int:
 
 
 static func _placement_profile_from_spec(spec: Dictionary, fallback: Dictionary) -> Dictionary:
-	var kind := str(spec.get("placement_kind", spec.get("kind", fallback.get("placement_kind", fallback.get("kind", ""))))).to_lower()
+	var kind := ""
+	for key in ["placement_kind", "kind", "resource", "resource_key"]:
+		if spec.has(key) and str(spec.get(key, "")).strip_edges() != "":
+			kind = str(spec.get(key, "")).strip_edges()
+			break
+	if kind == "":
+		for key in ["placement_kind", "kind", "resource", "resource_key"]:
+			if fallback.has(key) and str(fallback.get(key, "")).strip_edges() != "":
+				kind = str(fallback.get(key, "")).strip_edges()
+				break
+	kind = kind.to_lower()
 	var profile := {
 		"name": kind if kind != "" else "generic",
 		"anchor": "bottom_center",

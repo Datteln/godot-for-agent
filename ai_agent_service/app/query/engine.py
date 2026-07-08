@@ -149,6 +149,75 @@ def _step_to_response(step: StepResult) -> ChatResponse:
     raise TypeError(f"未知编排结果类型：{type(step)!r}")
 
 
+def _raw_tool_call(call: FrontToolCallDTO) -> dict[str, Any]:
+    """生成可写入 agent 历史的 assistant tool_call。"""
+    return {
+        "id": call.id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            "arguments": json.dumps(call.input, ensure_ascii=False),
+        },
+    }
+
+
+def _replace_last_assistant_tool_calls(
+    session: Session,
+    text: str | None,
+    calls: list[FrontToolCallDTO],
+) -> None:
+    """把最近一次 assistant tool_calls 替换为服务层改写后的调用。"""
+    frame = session.top_frame()
+    if frame is None or not frame.messages:
+        return
+    message = frame.messages[-1]
+    if message.get("role") != "assistant":
+        return
+    message["content"] = text
+    message["tool_calls"] = [_raw_tool_call(call) for call in calls]
+
+
+def _append_assistant_tool_calls(
+    session: Session,
+    text: str,
+    calls: list[FrontToolCallDTO],
+) -> None:
+    """追加一条服务层恢复出的 assistant tool_calls 消息。"""
+    frame = session.top_frame()
+    if frame is None:
+        return
+    frame.messages.append(
+        {
+            "role": "assistant",
+            "content": text,
+            "tool_calls": [_raw_tool_call(call) for call in calls],
+        }
+    )
+
+
+def _append_map_state_read_error(
+    session: Session,
+    tool_name: str,
+    target: str,
+    required_state: str,
+) -> None:
+    """向 LLM 追加自动读状态失败后的可恢复错误消息。"""
+    frame = session.top_frame()
+    if frame is None:
+        return
+    frame.messages.append(
+        {
+            "role": "user",
+            "content": (
+                "出错：自动读取没有拿到需要的 state，"
+                f"无法恢复挂起的 {tool_name} 调用。"
+                f"target_path={target}，缺少 {required_state}。"
+                "请重新 describe_map_region 或显式指定 map_layer/expected_revision。"
+            ),
+        }
+    )
+
+
 def _tool_message(tool_call_id: str, result: Any, *, is_error: bool = False) -> dict[str, Any]:
     """构造 OpenAI `role=tool` 消息。"""
     body: Any = {"error": result} if is_error else result
@@ -539,6 +608,97 @@ def _front_tool_error_message(result: dict[str, Any]) -> str:
     return "Unknown error"
 
 
+def _map_revision_from_result(result: dict[str, Any]) -> int | None:
+    """从地图工具结果中提取最新可用的地图版本号。"""
+    for key in ("map_revision", "actual_revision", "next_expected_revision"):
+        value = result.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _preferred_map_layer_from_layers(layers: Any) -> int | None:
+    """从 legacy TileMap 图层列表中选一个更像前景/碰撞层的图层。"""
+    if not isinstance(layers, list):
+        return None
+    ranked_keywords = ("mid", "foreground", "front", "ground", "collision")
+    fallback: int | None = None
+    for layer in layers:
+        if not isinstance(layer, dict):
+            continue
+        index = layer.get("index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            continue
+        if fallback is None:
+            fallback = index
+        name = str(layer.get("name", "")).lower()
+        if any(keyword in name for keyword in ranked_keywords):
+            return index
+    return fallback
+
+
+def _map_layer_from_result(result: dict[str, Any], *, prefer_layers: bool = False) -> int | None:
+    """从地图工具结果中提取最新确认或建议的地图图层。"""
+    if prefer_layers:
+        preferred = _preferred_map_layer_from_layers(result.get("layers"))
+        if preferred is not None:
+            return preferred
+    for key in ("map_layer", "suggested_map_layer"):
+        value = result.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _map_target_from_result(tool_args: dict[str, Any], result: dict[str, Any]) -> str:
+    """从工具入参与结果中提取地图目标路径。"""
+    for key in ("target_path", "target"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            return value
+    value = tool_args.get("target_path")
+    return value if isinstance(value, str) else ""
+
+
+def _remember_latest_map_revision(
+    session: Session,
+    tool_args: dict[str, Any],
+    result: Any,
+) -> None:
+    """记录最近一次地图工具返回的 revision/layer，供下一次写入补齐 stale 入参。"""
+    if not isinstance(result, dict):
+        return
+    revision = _map_revision_from_result(result)
+    map_layer = _map_layer_from_result(
+        result,
+        prefer_layers=bool(tool_args.get("__auto_map_state_read", False)),
+    )
+    target = _map_target_from_result(tool_args, result)
+    if not target:
+        return
+    if revision is not None:
+        previous = session.latest_map_revisions.get(target)
+        if previous is None or revision > previous:
+            session.latest_map_revisions[target] = revision
+            logger.info(
+                "Latest map revision updated session=%s target=%s previous=%s current=%s",
+                session.session_id,
+                target,
+                previous,
+                revision,
+            )
+    if map_layer is not None:
+        previous_layer = session.latest_map_layers.get(target)
+        session.latest_map_layers[target] = map_layer
+        logger.info(
+            "Latest map layer updated session=%s target=%s previous=%s current=%s",
+            session.session_id,
+            target,
+            previous_layer,
+            map_layer,
+        )
+
+
 def _map_completion_blocker(
     tool_name: str, status: str, result: Any, error_code: str | None
 ) -> dict[str, Any] | None:
@@ -718,6 +878,252 @@ def _map_region_from_write_args(
         "width": max_x - min_x + 1,
         "height": max_y - min_y + 1,
     }
+
+
+def _needs_map_state_read_before_write(session: Session, call: FrontToolCallDTO) -> bool:
+    """判断地图写工具是否需要先自动读取 map_layer/map_revision。"""
+    if call.name not in MAP_REVISION_GUARDED_TOOL_NAMES:
+        return False
+    target = call.input.get("target_path")
+    if not isinstance(target, str) or not target:
+        return False
+    missing_revision = target not in session.latest_map_revisions
+    missing_layer = "map_layer" not in call.input and target not in session.latest_map_layers
+    return missing_revision or missing_layer
+
+
+def _map_state_read_call_for_write(
+    session: Session,
+    write_call: FrontToolCallDTO,
+) -> FrontToolCallDTO:
+    """为挂起的地图写调用构造自动状态读取调用。"""
+    target = str(write_call.input.get("target_path", ""))
+    read_input: dict[str, Any] = {
+        "target_path": target,
+        "__auto_map_state_read": True,
+    }
+    latest_layer = session.latest_map_layers.get(target)
+    if latest_layer is not None:
+        read_input["map_layer"] = latest_layer
+    region = _map_region_from_write_args(write_call.input, {})
+    if region is not None:
+        read_input.update(region)
+    return FrontToolCallDTO(
+        id=f"{write_call.id}__map_state_read",
+        name="describe_map_region",
+        input=read_input,
+        needs_confirm=False,
+        frame_id=write_call.frame_id,
+        agent=write_call.agent,
+        render_kind="json",
+    )
+
+
+def _defer_map_write_for_state_read(
+    session: Session,
+    response: ChatToolCallsResponse,
+) -> ChatToolCallsResponse:
+    """把缺少地图状态的写调用挂起，先返回自动 describe_map_region。"""
+    if session.pending_map_write_after_read is not None:
+        return response
+    write_call = next(
+        (call for call in response.calls if _needs_map_state_read_before_write(session, call)),
+        None,
+    )
+    if write_call is None:
+        return response
+    read_call = _map_state_read_call_for_write(session, write_call)
+    session.pending_map_write_after_read = {"call": write_call.model_dump()}
+    replacement = ChatToolCallsResponse(
+        turn_id=response.turn_id,
+        text="先读取地图当前状态，再恢复挂起的地图写入。",
+        calls=[read_call],
+    )
+    _replace_last_assistant_tool_calls(session, replacement.text, replacement.calls)
+    session.set_pending(
+        replacement.turn_id,
+        [read_call.id],
+        {
+            read_call.id: {
+                "name": read_call.name,
+                "input": read_call.input,
+                "frame_id": read_call.frame_id,
+                "agent": read_call.agent,
+            }
+        },
+    )
+    logger.info(
+        "Deferred map write for state read session=%s write_tool=%s target=%s read_call=%s",
+        session.session_id,
+        write_call.name,
+        write_call.input.get("target_path"),
+        read_call.id,
+    )
+    return replacement
+
+
+def _resume_pending_map_write_after_read(session: Session) -> ChatToolCallsResponse | None:
+    """自动读完 map state 后恢复此前挂起的地图写调用。"""
+    pending = session.pending_map_write_after_read
+    if not isinstance(pending, dict):
+        return None
+    raw_call = pending.get("call")
+    if not isinstance(raw_call, dict):
+        session.pending_map_write_after_read = None
+        return None
+    write_call = FrontToolCallDTO.model_validate(raw_call)
+    target = write_call.input.get("target_path")
+    if not isinstance(target, str) or not target:
+        session.pending_map_write_after_read = None
+        return None
+    latest_revision = session.latest_map_revisions.get(target)
+    latest_layer = session.latest_map_layers.get(target)
+    if latest_revision is None or ("map_layer" not in write_call.input and latest_layer is None):
+        missing = []
+        if latest_revision is None:
+            missing.append("expected_revision")
+        if "map_layer" not in write_call.input and latest_layer is None:
+            missing.append("map_layer")
+        session.pending_map_write_after_read = None
+        _append_map_state_read_error(session, write_call.name, target, "/".join(missing))
+        return None
+    restored_input = dict(write_call.input)
+    restored_input["expected_revision"] = latest_revision
+    if "map_layer" not in restored_input and latest_layer is not None:
+        restored_input["map_layer"] = latest_layer
+    restored_call = write_call.model_copy(update={"input": restored_input})
+    text = "已读取地图当前状态，继续执行挂起的地图写入。"
+    turn_id = session.new_turn_id()
+    session.pending_map_write_after_read = None
+    _append_assistant_tool_calls(session, text, [restored_call])
+    session.set_pending(
+        turn_id,
+        [restored_call.id],
+        {
+            restored_call.id: {
+                "name": restored_call.name,
+                "input": restored_call.input,
+                "frame_id": restored_call.frame_id,
+                "agent": restored_call.agent,
+            }
+        },
+    )
+    logger.info(
+        "Resumed pending map write after state read session=%s tool=%s target=%s revision=%s layer=%s",
+        session.session_id,
+        restored_call.name,
+        target,
+        latest_revision,
+        restored_input.get("map_layer"),
+    )
+    return ChatToolCallsResponse(turn_id=turn_id, text=text, calls=[restored_call])
+
+
+def _needs_map_state_read_before_validation(session: Session, call: FrontToolCallDTO) -> bool:
+    """判断地图校验工具是否需要先自动读取 map_layer。"""
+    if call.name not in _MAP_VALIDATION_TOOL_NAMES:
+        return False
+    target = call.input.get("target_path")
+    return (
+        isinstance(target, str)
+        and bool(target)
+        and "map_layer" not in call.input
+        and target not in session.latest_map_layers
+    )
+
+
+def _defer_map_validation_for_state_read(
+    session: Session,
+    response: ChatToolCallsResponse,
+) -> ChatToolCallsResponse:
+    """把缺少图层的地图校验调用挂起，先返回自动 describe_map_region。"""
+    if (
+        session.pending_map_write_after_read is not None
+        or session.pending_map_validation_after_read is not None
+    ):
+        return response
+    validation_call = next(
+        (call for call in response.calls if _needs_map_state_read_before_validation(session, call)),
+        None,
+    )
+    if validation_call is None:
+        return response
+    read_call = _map_state_read_call_for_write(session, validation_call)
+    session.pending_map_validation_after_read = {"call": validation_call.model_dump()}
+    replacement = ChatToolCallsResponse(
+        turn_id=response.turn_id,
+        text="先读取地图图层状态，再恢复挂起的地图校验。",
+        calls=[read_call],
+    )
+    _replace_last_assistant_tool_calls(session, replacement.text, replacement.calls)
+    session.set_pending(
+        replacement.turn_id,
+        [read_call.id],
+        {
+            read_call.id: {
+                "name": read_call.name,
+                "input": read_call.input,
+                "frame_id": read_call.frame_id,
+                "agent": read_call.agent,
+            }
+        },
+    )
+    logger.info(
+        "Deferred map validation for state read session=%s validation_tool=%s target=%s read_call=%s",
+        session.session_id,
+        validation_call.name,
+        validation_call.input.get("target_path"),
+        read_call.id,
+    )
+    return replacement
+
+
+def _resume_pending_map_validation_after_read(session: Session) -> ChatToolCallsResponse | None:
+    """自动读完 map layer 后恢复此前挂起的地图校验调用。"""
+    pending = session.pending_map_validation_after_read
+    if not isinstance(pending, dict):
+        return None
+    raw_call = pending.get("call")
+    if not isinstance(raw_call, dict):
+        session.pending_map_validation_after_read = None
+        return None
+    validation_call = FrontToolCallDTO.model_validate(raw_call)
+    target = validation_call.input.get("target_path")
+    if not isinstance(target, str) or not target:
+        session.pending_map_validation_after_read = None
+        return None
+    latest_layer = session.latest_map_layers.get(target)
+    if latest_layer is None:
+        session.pending_map_validation_after_read = None
+        _append_map_state_read_error(session, validation_call.name, target, "map_layer")
+        return None
+    restored_input = dict(validation_call.input)
+    restored_input.setdefault("map_layer", latest_layer)
+    restored_call = validation_call.model_copy(update={"input": restored_input})
+    text = "已读取地图图层状态，继续执行挂起的地图校验。"
+    turn_id = session.new_turn_id()
+    session.pending_map_validation_after_read = None
+    _append_assistant_tool_calls(session, text, [restored_call])
+    session.set_pending(
+        turn_id,
+        [restored_call.id],
+        {
+            restored_call.id: {
+                "name": restored_call.name,
+                "input": restored_call.input,
+                "frame_id": restored_call.frame_id,
+                "agent": restored_call.agent,
+            }
+        },
+    )
+    logger.info(
+        "Resumed pending map validation after state read session=%s tool=%s target=%s layer=%s",
+        session.session_id,
+        restored_call.name,
+        target,
+        restored_input.get("map_layer"),
+    )
+    return ChatToolCallsResponse(turn_id=turn_id, text=text, calls=[restored_call])
 
 
 def _schedule_revision_conflict_reader(
@@ -2556,6 +2962,37 @@ class QueryEngine:
                 return result_error
             if verify_candidates:
                 session.pending_verify_candidates.extend(verify_candidates)
+            resumed_write = _resume_pending_map_write_after_read(session)
+            if resumed_write is not None:
+                self._emit(
+                    session.session_id,
+                    "tool_calls",
+                    {"turn_id": resumed_write.turn_id, "count": len(resumed_write.calls)},
+                )
+                logger.info(
+                    "Resumed pending map write after state read session=%s turn_id=%s count=%d",
+                    session.session_id,
+                    resumed_write.turn_id,
+                    len(resumed_write.calls),
+                )
+                return resumed_write
+            resumed_validation = _resume_pending_map_validation_after_read(session)
+            if resumed_validation is not None:
+                self._emit(
+                    session.session_id,
+                    "tool_calls",
+                    {
+                        "turn_id": resumed_validation.turn_id,
+                        "count": len(resumed_validation.calls),
+                    },
+                )
+                logger.info(
+                    "Resumed pending map validation after state read session=%s turn_id=%s count=%d",
+                    session.session_id,
+                    resumed_validation.turn_id,
+                    len(resumed_validation.calls),
+                )
+                return resumed_validation
         else:
             if session.pending_turn_id is not None:
                 logger.warning(
@@ -2660,6 +3097,9 @@ class QueryEngine:
             context_token_limit=self._settings.auto_compact_token_threshold,
         )
         response = _step_to_response(step)
+        if isinstance(response, ChatToolCallsResponse):
+            response = _defer_map_write_for_state_read(session, response)
+            response = _defer_map_validation_for_state_read(session, response)
         if isinstance(response, ChatFinalResponse) and session.pending_verify_candidates:
             final_frame = session.top_frame()
             if final_frame is not None and final_frame.messages:
@@ -2698,6 +3138,9 @@ class QueryEngine:
                     context_token_limit=self._settings.auto_compact_token_threshold,
                 )
                 response = _step_to_response(step)
+                if isinstance(response, ChatToolCallsResponse):
+                    response = _defer_map_write_for_state_read(session, response)
+                    response = _defer_map_validation_for_state_read(session, response)
         map_gate_continuations = 0
         while (
             isinstance(response, ChatFinalResponse)
@@ -2745,6 +3188,9 @@ class QueryEngine:
                 context_token_limit=self._settings.auto_compact_token_threshold,
             )
             response = _step_to_response(step)
+            if isinstance(response, ChatToolCallsResponse):
+                response = _defer_map_write_for_state_read(session, response)
+                response = _defer_map_validation_for_state_read(session, response)
         if isinstance(response, ChatToolCallsResponse):
             self._emit(
                 session.session_id,
@@ -2993,6 +3439,7 @@ class QueryEngine:
                     "result": result.result,
                 }
             result_for_gate = payload.get("result") if isinstance(payload, dict) else None
+            _remember_latest_map_revision(session, tool_args, result_for_gate)
             blocker = _map_completion_blocker(
                 tool_name, result.status, result_for_gate, result.error_code
             )

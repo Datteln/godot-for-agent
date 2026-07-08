@@ -55,6 +55,14 @@ class Session:
             用于防止 Verify 与 LLM 修复之间死循环。
         map_completion_blockers: 地图编辑任务的阻断完成原因；前端地图工具回传
             `blocking_completion` 或尚未通过路线校验时写入，最终回复前清空或拦截。
+        latest_map_revisions: 最近一次地图读/写/验证工具返回的 target_path → map_revision；
+            服务层下发地图写工具前用它覆盖过期的 `expected_revision`。
+        latest_map_layers: 最近一次地图工具确认的 target_path → map_layer；服务层在
+            地图写工具漏传 `map_layer` 时补齐，不覆盖显式入参。
+        pending_map_write_after_read: 因缺少 map state 而挂起的一次地图写调用；
+            自动读到 `map_layer`/`map_revision` 后恢复下发。
+        pending_map_validation_after_read: 因缺少 `map_layer` 而挂起的一次地图校验调用；
+            自动读到图层后恢复下发。
         rag_context: 当前用户提问检索到的 RAG 上下文（分层 prompt 的 L3 段），
             在新用户消息到达时刷新、在工具结果回填等同一轮的后续请求里复用，
             使该段在整轮 agent 循环内保持稳定、可被缓存（§16.1 RAG 段缓存）。
@@ -76,6 +84,10 @@ class Session:
     verify_retry_count: dict[str, int] = field(default_factory=dict)
     pending_verify_candidates: list[dict[str, Any]] = field(default_factory=list)
     map_completion_blockers: list[dict[str, Any]] = field(default_factory=list)
+    latest_map_revisions: dict[str, int] = field(default_factory=dict)
+    latest_map_layers: dict[str, int] = field(default_factory=dict)
+    pending_map_write_after_read: dict[str, Any] | None = None
+    pending_map_validation_after_read: dict[str, Any] | None = None
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
@@ -320,6 +332,10 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "verify_retry_count": session.verify_retry_count,
         "pending_verify_candidates": session.pending_verify_candidates,
         "map_completion_blockers": session.map_completion_blockers,
+        "latest_map_revisions": session.latest_map_revisions,
+        "latest_map_layers": session.latest_map_layers,
+        "pending_map_write_after_read": session.pending_map_write_after_read,
+        "pending_map_validation_after_read": session.pending_map_validation_after_read,
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
         "rag_context": session.rag_context,
@@ -420,6 +436,26 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
             for item in _as_list(data.get("map_completion_blockers"))
             if isinstance(item, dict)
         ],
+        latest_map_revisions={
+            str(key): value
+            for key, value in _as_dict(data.get("latest_map_revisions")).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        },
+        latest_map_layers={
+            str(key): value
+            for key, value in _as_dict(data.get("latest_map_layers")).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        },
+        pending_map_write_after_read=(
+            data.get("pending_map_write_after_read")
+            if isinstance(data.get("pending_map_write_after_read"), dict)
+            else None
+        ),
+        pending_map_validation_after_read=(
+            data.get("pending_map_validation_after_read")
+            if isinstance(data.get("pending_map_validation_after_read"), dict)
+            else None
+        ),
         history_event_counter=history_event_counter,
         history_events=history_events,
         rag_context=str(data.get("rag_context", "")),

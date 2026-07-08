@@ -1205,6 +1205,7 @@ def _description_field(description: str, key: str) -> str:
 
 def _with_map_write_metadata(
     *,
+    session: Session,
     frame: Frame,
     call_id: str,
     tool_name: str,
@@ -1214,6 +1215,37 @@ def _with_map_write_metadata(
     if not is_map_write_tool(tool_name):
         return args
     enriched = dict(args)
+    target_path = str(enriched.get("target_path", ""))
+    latest_revision = session.latest_map_revisions.get(target_path)
+    supplied_revision = enriched.get("expected_revision")
+    supplied_revision_is_int = isinstance(supplied_revision, int) and not isinstance(
+        supplied_revision, bool
+    )
+    if (
+        latest_revision is not None
+        and (not supplied_revision_is_int or latest_revision > supplied_revision)
+    ):
+        logger.info(
+            "Overriding stale map expected_revision session=%s frame=%s tool=%s target=%s supplied=%s latest=%s",
+            session.session_id,
+            frame.id,
+            tool_name,
+            target_path,
+            supplied_revision,
+            latest_revision,
+        )
+        enriched["expected_revision"] = latest_revision
+    latest_layer = session.latest_map_layers.get(target_path)
+    if latest_layer is not None and "map_layer" not in enriched:
+        logger.info(
+            "Filling missing map_layer session=%s frame=%s tool=%s target=%s map_layer=%s",
+            session.session_id,
+            frame.id,
+            tool_name,
+            target_path,
+            latest_layer,
+        )
+        enriched["map_layer"] = latest_layer
     enriched.setdefault("write_batch_id", f"b-{call_id}")
     enriched.setdefault("worker", frame.agent.name)
     enriched.setdefault("mode", "write_one_batch")
@@ -2301,6 +2333,7 @@ async def run_turn(
                 continue
             assert args is not None
             args = _with_map_write_metadata(
+                session=session,
                 frame=frame,
                 call_id=call.id,
                 tool_name=tool.name,
