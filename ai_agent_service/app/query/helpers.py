@@ -1173,9 +1173,12 @@ def _remember_latest_map_revision(
     if not isinstance(result, dict):
         return
     revision = _map_revision_from_result(result)
+    prefer_layers = bool(tool_args.get("__auto_map_state_read")) and not any(
+        key in tool_args for key in ("map_layer", "ground_map_layer")
+    )
     map_layer = _map_layer_from_result(
         result,
-        prefer_layers=bool(tool_args.get("__auto_map_state_read", False)),
+        prefer_layers=prefer_layers,
     )
     target = _map_target_from_result(tool_args, result)
     if not target:
@@ -1501,7 +1504,7 @@ def _remember_latest_map_region_read(
     normalized_args = dict(tool_args)
     if isinstance(result, dict):
         target = _map_target_from_result(tool_args, result)
-        layer = _map_layer_from_result(result, prefer_layers=False)
+        layer = _map_layer_from_result(result)
         if target:
             normalized_args["target_path"] = target
         if layer is not None:
@@ -1627,6 +1630,13 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
     target_path = target if isinstance(target, str) else ""
     latest_revision = session.latest_map_revisions.get(target_path)
     latest_layer = session.latest_map_layers.get(target_path)
+    if (
+        call.name
+        in {"plan_platform_level", "plan_reachable_map_growth", "compute_reachable_frontier"}
+        and latest_layer is not None
+        and "map_layer" not in restored_input
+    ):
+        restored_input["map_layer"] = latest_layer
 
     if call.name in MAP_REVISION_GUARDED_TOOL_NAMES:
         if not target_path or latest_revision is None:

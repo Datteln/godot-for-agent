@@ -3769,13 +3769,15 @@ static func compute_reachable_frontier(input: Dictionary, editor_interface: Edit
 	if not MapValidator.in_region(start, region):
 		return {"ok": false, "message": "start is outside the frontier region", "error_code": "start_out_of_region"}
 	if not MapValidator.is_standable(filled, start, region, movement):
-		return {
+		var failure := MapValidator._foothold_failure(filled, start, region, movement, "start")
+		failure.merge({
 			"ok": false,
 			"message": "start is not standable under the requested movement model",
 			"error_code": "start_not_standable",
 			"start": MapValidator.coord_payload(start, dimension),
 			"movement_model": movement.get("model", "grid"),
-		}
+		}, true)
+		return failure
 	var max_returned := max(1, int(input.get("max_returned_cells", 256)))
 	var visited := {}
 	var queue: Array = [start]

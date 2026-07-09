@@ -476,8 +476,8 @@ func _connect_signals() -> void:
 	_recovery_prompt.accepted_recovery.connect(_on_recovery_accepted)
 	_recovery_prompt.rejected_recovery.connect(_on_recovery_rejected)
 	_scroll.get_v_scroll_bar().value_changed.connect(_on_scroll_value_changed)
-	_scroll.get_v_scroll_bar().button_down.connect(_on_scrollbar_button_down)
-	_scroll.get_v_scroll_bar().button_up.connect(_on_scrollbar_button_up)
+	_scroll.scroll_started.connect(_on_scrollbar_button_down)
+	_scroll.scroll_ended.connect(_on_scrollbar_button_up)
 	if service != null:
 		service.service_started.connect(_on_service_started)
 		service.service_failed.connect(_on_service_failed)

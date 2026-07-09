@@ -236,14 +236,26 @@ static func _motif_for_progress(progress: float, index: int, seed: int) -> Strin
 
 static func _build_jump_graph(platforms: Array, ability: Dictionary) -> Dictionary:
 	var edges: Array = []
-	var unreachable: Array = []
+	var required_unreachable: Array = []
+	var optional_unreachable: Array = []
 	for i in range(platforms.size()):
 		for j in range(i + 1, mini(platforms.size(), i + 4)):
 			var edge := _jump_edge(platforms[i], platforms[j], ability)
+			edge["required"] = j == i + 1
 			edges.append(edge)
 			if not bool(edge.get("reachable", false)):
-				unreachable.append(edge)
-	return {"nodes": platforms.size(), "edges": edges, "unreachable_edges": unreachable, "passed": unreachable.is_empty()}
+				if bool(edge.get("required", false)):
+					required_unreachable.append(edge)
+				else:
+					optional_unreachable.append(edge)
+	return {
+		"nodes": platforms.size(),
+		"edges": edges,
+		"unreachable_edges": required_unreachable,
+		"required_unreachable_edges": required_unreachable,
+		"optional_unreachable_edges": optional_unreachable,
+		"passed": required_unreachable.is_empty(),
+	}
 
 
 static func _jump_edge(from_platform: Dictionary, to_platform: Dictionary, ability: Dictionary) -> Dictionary:
