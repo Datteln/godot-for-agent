@@ -15,6 +15,7 @@ const MAX_EDITED_CELLS := 100000
 const MAX_EDIT_MAP_BATCH_CELLS := 2000
 const MAX_THIN_NON_BLANKET_FILL_WIDTH := 12
 const MAX_DESCRIBED_CELLS := 800
+const DEFAULT_DESCRIBE_RETURNED_CELLS := 120
 ## describe_map_region 是纯内存读取（一次循环读完整片区域），800 只是响应体大小的策略上限，
 ## 不是 IO 成本。超过 800 但不超过这个上限时直接自动整片返回（标 auto_served），模型无需自己
 ## 分块多次查询；只有超过这个上限才回退成 region_too_large + suggested_regions。
@@ -1144,6 +1145,10 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	var width := max(1, int(input.get("width", 1)))
 	var height := max(1, int(input.get("height", 1)))
 	var depth := max(1, int(input.get("depth", 1))) if dimension == 3 else 1
+	var cells_format := str(input.get("cells_format", "summary_only")).to_lower()
+	if not ["summary_only", "non_empty_only", "full"].has(cells_format):
+		return {"ok": false, "message": "cells_format must be summary_only, non_empty_only, or full", "error_code": "invalid_cells_format"}
+	var max_returned_cells := max(1, int(input.get("max_returned_cells", DEFAULT_DESCRIBE_RETURNED_CELLS)))
 	var requested_cells: int = width * height * depth
 	if requested_cells > MAX_AUTOSERVED_DESCRIBED_CELLS:
 		# 超出自动整片返回的上限：回退成切好的 suggested_regions，模型照着逐块读即可，不用自己推拆分。
@@ -1157,11 +1162,23 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		}
 
 	var cells: Array = []
+	var returned_cells: Array = []
+	var non_empty_count := 0
 	for z_offset in range(depth):
 		for y_offset in range(height):
 			for x_offset in range(width):
 				var coords := origin + Vector3i(x_offset, y_offset, z_offset)
-				cells.append(_describe_safe_cell(_read_map_cell(target, coords, dimension, map_layer), dimension))
+				var described := _describe_safe_cell(_read_map_cell(target, coords, dimension, map_layer), dimension)
+				cells.append(described)
+				var is_non_empty := _described_cell_is_non_empty(described, dimension)
+				if is_non_empty:
+					non_empty_count += 1
+				if cells_format == "full":
+					if returned_cells.size() < max_returned_cells:
+						returned_cells.append(described)
+				elif cells_format == "non_empty_only" and is_non_empty:
+					if returned_cells.size() < max_returned_cells:
+						returned_cells.append(described)
 
 	var result := {
 		"ok": true,
@@ -1169,13 +1186,18 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		"type": target.get_class(),
 		"dimension": dimension,
 		"map_layer": map_layer if target.get_class() == "TileMap" else null,
-		"cells": cells,
+		"cells_format": cells_format,
+		"cells_total": requested_cells,
+		"cells_returned": returned_cells.size(),
+		"cells_omitted": max(0, requested_cells - returned_cells.size()) if cells_format == "full" else max(0, non_empty_count - returned_cells.size()),
+		"non_empty_count": non_empty_count,
 		"atlas_summary": _atlas_summary(cells, dimension),
 	}
+	if cells_format != "summary_only":
+		result["cells"] = returned_cells
 	if requested_cells > MAX_DESCRIBED_CELLS:
 		# 这次区域大于单块上限，但工具已自动整片读完返回；告知模型不必再自己分块查询。
 		result["auto_served"] = true
-		result["cells_returned"] = requested_cells
 	if target is Node2D:
 		var position_2d := (target as Node2D).position
 		result["node_position"] = {"x": position_2d.x, "y": position_2d.y}
@@ -1321,6 +1343,12 @@ static func _describe_safe_cell(cell: Dictionary, dimension: int) -> Dictionary:
 		var atlas: Vector2i = safe["atlas_coords"]
 		safe["atlas_coords"] = {"x": atlas.x, "y": atlas.y}
 	return safe
+
+
+static func _described_cell_is_non_empty(cell: Dictionary, dimension: int) -> bool:
+	if dimension == 3:
+		return int(cell.get("item", -1)) != -1
+	return int(cell.get("source_id", -1)) != -1
 
 
 ## 写入/校验类工具传 require_explicit_map_layer=true：legacy TileMap 常见同时挂多个互不遮挡的

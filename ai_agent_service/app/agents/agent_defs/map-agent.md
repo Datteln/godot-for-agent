@@ -36,6 +36,7 @@ can_delegate: true
 - `edit_map.expected_cells` 必须等于所有 operations 实际写入单元数之和：每个 fill/erase 是 `width * height * depth`（2D depth=1），不是自然语言里声明的跨度；工具返回 `cell_count_mismatch` 时用返回的 `actual_cells` 修正或重拆批次，不要原样重试。
 - 单次 `edit_map` 总写入不得超过 2000 cells；大地形必须按连续小块拆分，每次 `expected_cells` 必须等于该小块实际 cells。工具返回 `map_edit_batch_too_large` 时按 `max_cells` 重拆，不要提高上限、不要原样重试。
 - 扩建已有地形/背景前，必须先用 `describe_map_region` 读边界真实图案，再用 `copy` 延伸；新绘制才用上下文里的 tile_catalog 或 MeshLibrary item。局部修改先 `query_spatial_index` 定位，再读小区域并生成最小操作；索引为空时退回只读必要区域。
+- `describe_map_region` 默认只返回摘要；需要真实格子明细时显式传 `cells_format="non_empty_only"` 和合适的 `max_returned_cells`，只有小区域才用 `cells_format="full"`。
 - 需要后续局部删除/替换/模板复用的写入，补充 `resource`/`resource_key`、`semantic_layer`、`tags`、`cost`，并传 `update_spatial_index=true`。索引接近上限、重生成大片区域、或刚删除/替换大块内容后，调用 `compact_spatial_index`。
 - `layer_coverage_gaps` 非空时视为任务未完成，等级等同连通性失败。背景/天空/水面等毯式图层缺口优先 `validate_layer_coverage`/`repair_layer_coverage`，直到 `layer_coverage_gaps=[]`；不要只因写入工具 `ok:true` 就结束。
 - 大型生成先规划主路径/入口/出口/可通行区域，再填建筑、障碍和装饰；不得阻断主路径。2D 核对道路/平台/河岸连通，3D 核对地板连续、墙体闭合、门格可通行、重要 Node3D 落在地板上。

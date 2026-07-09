@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import logging
+import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,10 +88,19 @@ from app.skills.catalog import SkillCatalog
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
 from app.tools.server_tools.read_file import read_file_handler
+from app.storage.atomic import atomic_write_json
 from app.verify.syntax_check import run_syntax_check
 
 logger = logging.getLogger(__name__)
 _MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
+_MAP_CONTEXT_MAX_TARGETS = 8
+_MAP_CONTEXT_MAX_REGIONS_PER_LAYER = 24
+_MAP_CONTEXT_MAX_SUMMARY_CHARS = 2048
+_MAP_CONTEXT_MAX_TOTAL_CHARS = 262_144
+_MAP_ATLAS_SUMMARY_LIMIT = 12
+_MAP_MATCH_SUMMARY_LIMIT = 12
+_MAP_ARTIFACT_MAX_FILES_PER_SESSION = 128
+_MAP_ARTIFACT_MAX_BYTES_PER_SESSION = 100 * 1024 * 1024
 
 
 def _normalize_model_override(model: str | None) -> str | None:
@@ -676,6 +686,261 @@ def _map_target_from_result(tool_args: dict[str, Any], result: dict[str, Any]) -
             return value
     value = tool_args.get("target_path")
     return value if isinstance(value, str) else ""
+
+
+def _safe_artifact_name(value: str) -> str:
+    """把任意字符串转成可作为 artifact 文件名片段的短标识。"""
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+    if cleaned:
+        return cleaned[:80]
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _json_char_size(value: Any) -> int:
+    """粗略计算 JSON 值序列化后的字符长度。"""
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _region_summary_from_value(value: Any) -> dict[str, Any]:
+    """从工具结果里抽取标准 region 字段。"""
+    if not isinstance(value, dict):
+        return {}
+    region = value.get("region")
+    if isinstance(region, dict):
+        return dict(region)
+    keys = ("x", "y", "z", "width", "height", "depth")
+    return {key: value[key] for key in keys if key in value}
+
+
+def _top_atlas_summary(value: Any, limit: int = _MAP_ATLAS_SUMMARY_LIMIT) -> Any:
+    """截取 atlas_summary 的前 N 项，避免完整瓦片分布进入 history。"""
+    if isinstance(value, list):
+        return value[:limit]
+    if not isinstance(value, dict):
+        return value
+    items = list(value.items())
+    try:
+        items.sort(
+            key=lambda item: int(item[1].get("count", item[1]))
+            if isinstance(item[1], dict)
+            else int(item[1]),
+            reverse=True,
+        )
+    except (TypeError, ValueError):
+        pass
+    return {str(key): entry for key, entry in items[:limit]}
+
+
+def _map_result_summary(
+    tool_name: str,
+    result: dict[str, Any],
+    artifact_ref: str | None,
+) -> dict[str, Any]:
+    """把大型地图工具结果压缩成可进入 LLM history 的小摘要。"""
+    if tool_name == "capture_viewport_screenshot":
+        keep_keys = (
+            "ok",
+            "path",
+            "absolute_path",
+            "width",
+            "height",
+            "focus",
+            "semantic_description",
+            "semantic",
+            "message",
+            "error_code",
+        )
+        summary = {key: result[key] for key in keep_keys if key in result}
+        for key in ("semantic_description", "semantic", "message"):
+            if isinstance(summary.get(key), str):
+                summary[key] = _truncate_text(str(summary[key]), _MAP_CONTEXT_MAX_SUMMARY_CHARS)
+        for key in ("rendered_nodes", "nodes_missing_visual_resource"):
+            value = result.get(key)
+            if isinstance(value, list):
+                summary[key] = value[:_MAP_MATCH_SUMMARY_LIMIT]
+                summary[f"{key}_omitted"] = max(0, len(value) - _MAP_MATCH_SUMMARY_LIMIT)
+        if artifact_ref is not None:
+            summary["artifact_ref"] = artifact_ref
+        return summary
+
+    if tool_name == "describe_map_region":
+        cells = result.get("cells", [])
+        summary: dict[str, Any] = {
+            "ok": result.get("ok", True),
+            "target": result.get("target", result.get("target_path")),
+            "target_path": result.get("target_path", result.get("target")),
+            "type": result.get("type"),
+            "dimension": result.get("dimension"),
+            "map_layer": result.get("map_layer"),
+            "map_revision": result.get("map_revision"),
+            "region": _region_summary_from_value(result),
+            "used_bounds": result.get("used_bounds"),
+            "layers": result.get("layers"),
+            "cells_format": result.get("cells_format"),
+            "cells_total": result.get("cells_total"),
+            "cells_returned": result.get("cells_returned"),
+            "non_empty_count": result.get("non_empty_count")
+            if "non_empty_count" in result
+            else (len(cells) if isinstance(cells, list) else result.get("cells")),
+            "cells_omitted": result.get("cells_omitted")
+            if "cells_omitted" in result
+            else (isinstance(cells, list) and bool(cells)),
+            "artifact_ref": artifact_ref,
+        }
+        if "atlas_summary" in result:
+            summary["atlas_summary_top"] = _top_atlas_summary(result.get("atlas_summary"))
+            summary["atlas_summary_omitted"] = True
+        for key in (
+            "message",
+            "warning",
+            "warnings",
+            "stale_warning",
+            "suggested_map_layer",
+            "next_expected_revision",
+        ):
+            if key in result:
+                summary[key] = result[key]
+        return {key: value for key, value in summary.items() if value is not None}
+
+    if tool_name == "query_spatial_index":
+        matches = result.get("matches", [])
+        summary = dict(result)
+        if isinstance(matches, list):
+            summary["matches"] = matches[:_MAP_MATCH_SUMMARY_LIMIT]
+            summary["matches_omitted"] = max(0, len(matches) - _MAP_MATCH_SUMMARY_LIMIT)
+        if artifact_ref is not None:
+            summary["artifact_ref"] = artifact_ref
+        return summary
+
+    if tool_name in _MAP_VALIDATION_TOOL_NAMES:
+        keep_keys = (
+            "ok",
+            "passed",
+            "completion_allowed",
+            "blocking_completion",
+            "target",
+            "target_path",
+            "map_layer",
+            "map_revision",
+            "region",
+            "issues",
+            "structured_issues",
+            "message",
+        )
+        summary = {key: result[key] for key in keep_keys if key in result}
+        if artifact_ref is not None:
+            summary["artifact_ref"] = artifact_ref
+        return summary
+
+    return result
+
+
+def _history_payload_for_front_tool(
+    tool_name: str,
+    payload: dict[str, Any],
+    artifact_ref: str | None,
+) -> dict[str, Any]:
+    """生成写入 agent tool history 的瘦 payload。"""
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return payload
+    if tool_name not in {
+        "capture_viewport_screenshot",
+        "describe_map_region",
+        "query_spatial_index",
+        "validate_map_region",
+        "validate_layer_coverage",
+        "validate_object_placements",
+    }:
+        return payload
+    slim = dict(payload)
+    slim["result"] = _map_result_summary(tool_name, result, artifact_ref)
+    return slim
+
+
+def _trim_text_fields(value: Any, max_chars: int = _MAP_CONTEXT_MAX_SUMMARY_CHARS) -> Any:
+    """递归截断 map_context_state 摘要中的长字符串字段。"""
+    if isinstance(value, str):
+        return _truncate_text(value, max_chars)
+    if isinstance(value, dict):
+        return {str(key): _trim_text_fields(item, max_chars) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_trim_text_fields(item, max_chars) for item in value[:_MAP_MATCH_SUMMARY_LIMIT]]
+    return value
+
+
+def _update_map_context_state(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    result: Any,
+    artifact_ref: str | None,
+) -> None:
+    """维护每 session 地图小索引；只保存摘要和 artifact_ref。"""
+    if tool_name != "describe_map_region" or not isinstance(result, dict):
+        return
+    target = _map_target_from_result(tool_args, result)
+    if not target:
+        return
+    layer = _map_layer_from_result(result, prefer_layers=True)
+    layer_key = str(layer if layer is not None else tool_args.get("map_layer", "default"))
+    state = session.map_context_state
+    targets = state.setdefault("targets", {})
+    if not isinstance(targets, dict):
+        targets = {}
+        state["targets"] = targets
+    if target not in targets and len(targets) >= _MAP_CONTEXT_MAX_TARGETS:
+        targets.pop(next(iter(targets)))
+    target_state = targets.setdefault(target, {"layers": {}})
+    if not isinstance(target_state, dict):
+        target_state = {"layers": {}}
+        targets[target] = target_state
+    revision = _map_revision_from_result(result)
+    if revision is not None:
+        target_state["latest_revision"] = revision
+    layers = target_state.setdefault("layers", {})
+    if not isinstance(layers, dict):
+        layers = {}
+        target_state["layers"] = layers
+    layer_state = layers.setdefault(layer_key, {"recent_regions": []})
+    if not isinstance(layer_state, dict):
+        layer_state = {"recent_regions": []}
+        layers[layer_key] = layer_state
+    if "used_bounds" in result:
+        layer_state["used_bounds"] = result.get("used_bounds")
+    entry = _trim_text_fields(
+        _map_result_summary("describe_map_region", result, artifact_ref),
+        _MAP_CONTEXT_MAX_SUMMARY_CHARS,
+    )
+    regions = layer_state.setdefault("recent_regions", [])
+    if not isinstance(regions, list):
+        regions = []
+        layer_state["recent_regions"] = regions
+    regions.append(entry)
+    del regions[: max(0, len(regions) - _MAP_CONTEXT_MAX_REGIONS_PER_LAYER)]
+    while _json_char_size(state) > _MAP_CONTEXT_MAX_TOTAL_CHARS:
+        removed = False
+        for target_item in list(targets.values()):
+            if not isinstance(target_item, dict):
+                continue
+            layer_items = target_item.get("layers", {})
+            if not isinstance(layer_items, dict):
+                continue
+            for layer_item in layer_items.values():
+                if not isinstance(layer_item, dict):
+                    continue
+                recent = layer_item.get("recent_regions", [])
+                if isinstance(recent, list) and recent:
+                    recent.pop(0)
+                    removed = True
+                    break
+            if removed:
+                break
+        if not removed:
+            break
 
 
 def _remember_latest_map_revision(
@@ -2882,9 +3147,10 @@ def _history_context_used_tokens(session: Session, events: list[Event]) -> int:
             continue
         if used >= 0:
             return used
-    return max(
+    local_estimate = max(
         (estimate_message_tokens(frame.messages) for frame in session.agent_stack), default=0
     )
+    return max(session.latest_context_used_tokens, local_estimate)
 
 
 def _pending_anchor_index(frame: Frame, pending_ids: set[str]) -> int | None:
@@ -3036,6 +3302,111 @@ class QueryEngine:
     def available_tools(self) -> set[str]:
         """当前工具注册表里的可见工具名集合。"""
         return set(REGISTRY)
+
+    def _map_artifact_path(self, session_id: str, tool_name: str, result: dict[str, Any]) -> Path:
+        """构造地图 raw artifact 的项目内路径。"""
+        target = str(result.get("target_path", result.get("target", "map")))
+        revision = result.get("map_revision", result.get("actual_revision", "unknown"))
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "tool": tool_name,
+                    "target": target,
+                    "revision": revision,
+                    "region": _region_summary_from_value(result),
+                    "size": _json_char_size(result),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return (
+            self._settings.project_root
+            / ".ai_agent_service"
+            / "artifacts"
+            / _safe_artifact_name(session_id)
+            / f"{_safe_artifact_name(tool_name)}-{digest}.json"
+        )
+
+    def _store_map_artifact(
+        self,
+        session_id: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        result: Any,
+    ) -> str | None:
+        """把大型地图工具 raw result 写入本地 artifact，返回相对路径引用。"""
+        if tool_name not in {
+            "describe_map_region",
+            "query_spatial_index",
+            "validate_map_region",
+            "validate_layer_coverage",
+            "validate_object_placements",
+        }:
+            return None
+        if not isinstance(result, dict):
+            return None
+        if tool_name == "describe_map_region" and not (
+            isinstance(result.get("cells"), list) or "atlas_summary" in result
+        ):
+            return None
+        if tool_name == "query_spatial_index" and not isinstance(result.get("matches"), list):
+            return None
+        if tool_name in _MAP_VALIDATION_TOOL_NAMES and _json_char_size(result) < 8_000:
+            return None
+        path = self._map_artifact_path(session_id, tool_name, result)
+        try:
+            atomic_write_json(
+                path,
+                {
+                    "tool": tool_name,
+                    "input": tool_args,
+                    "result": result,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            self._cleanup_map_artifacts(path.parent)
+        except OSError as exc:
+            logger.warning(
+                "Failed to write map artifact session=%s tool=%s path=%s error=%s",
+                session_id,
+                tool_name,
+                path,
+                exc,
+            )
+            return None
+        try:
+            return str(path.relative_to(self._settings.project_root)).replace("\\", "/")
+        except ValueError:
+            return str(path)
+
+    def _cleanup_map_artifacts(self, session_dir: Path) -> None:
+        """按 LRU 清理单个 session 的地图 artifact 文件。"""
+        try:
+            files = [path for path in session_dir.iterdir() if path.is_file()]
+        except OSError:
+            return
+        stats: list[tuple[Path, float, int]] = []
+        for path in files:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            stats.append((path, stat.st_mtime, stat.st_size))
+        stats.sort(key=lambda item: item[1], reverse=True)
+        total = 0
+        for index, (path, _mtime, size) in enumerate(stats):
+            total += size
+            if (
+                index < _MAP_ARTIFACT_MAX_FILES_PER_SESSION
+                and total <= _MAP_ARTIFACT_MAX_BYTES_PER_SESSION
+            ):
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                logger.debug("Failed to prune map artifact path=%s", path)
 
     def session_history(self, session_id: str, limit: int = 200) -> SessionHistoryResponse:
         """Return frontend-renderable history for a persisted session."""
@@ -3697,6 +4068,7 @@ class QueryEngine:
                 tool_args = {}
             tool = REGISTRY.get(tool_name)
             payload: Any
+            map_artifact_ref: str | None = None
             if result.status == "applied":
                 applied_result = result.result
                 if (
@@ -3709,6 +4081,19 @@ class QueryEngine:
                     applied_result = await self._enrich_front_image_result(
                         tool_name, applied_result, security
                     )
+                    map_artifact_ref = self._store_map_artifact(
+                        session.session_id,
+                        tool_name,
+                        tool_args,
+                        applied_result,
+                    )
+                    _update_map_context_state(
+                        session,
+                        tool_name,
+                        tool_args,
+                        applied_result,
+                        map_artifact_ref,
+                    )
                 if result.grant_session_allow and tool is not None:
                     session.session_allow.add(make_session_allow_grant(tool, tool_args))
                     logger.info(
@@ -3717,10 +4102,13 @@ class QueryEngine:
                         tool.name,
                         frame.id,
                     )
+                artifact_refs = list(result.artifact_refs)
+                if map_artifact_ref is not None:
+                    artifact_refs.append(map_artifact_ref)
                 payload = {
                     "status": result.status,
                     "result": applied_result,
-                    "artifact_refs": result.artifact_refs,
+                    "artifact_refs": artifact_refs,
                     "grant_session_allow": result.grant_session_allow,
                 }
                 if (
@@ -3777,7 +4165,14 @@ class QueryEngine:
                     session.map_completion_blockers = [blocker]
             elif blocker is not None:
                 session.map_completion_blockers = [blocker]
-            frame.messages.append(_tool_message(result.tool_use_id, payload, is_error=is_error))
+            history_payload = (
+                _history_payload_for_front_tool(tool_name, payload, map_artifact_ref)
+                if isinstance(payload, dict)
+                else payload
+            )
+            frame.messages.append(
+                _tool_message(result.tool_use_id, history_payload, is_error=is_error)
+            )
             if (
                 tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
                 and str(result.error_code) == "map_revision_conflict"
@@ -4206,9 +4601,12 @@ class QueryEngine:
             帧分别处理，这里只需判断"值不值得调用一次"。
         """
         threshold = self._settings.auto_compact_token_threshold
-        return any(
-            estimate_message_tokens(frame.messages) > threshold for frame in session.agent_stack
+        local_estimate = max(
+            (estimate_message_tokens(frame.messages) for frame in session.agent_stack),
+            default=0,
         )
+        effective_tokens = max(local_estimate, session.latest_context_used_tokens)
+        return session.force_compact_next_turn or effective_tokens > threshold
 
     async def compact(
         self,
@@ -4438,6 +4836,8 @@ class QueryEngine:
                 }
             )
 
+        session.latest_context_used_tokens = estimated_tokens_after
+        session.force_compact_next_turn = False
         try:
             self._store.save(session)
         except Exception:
@@ -4508,6 +4908,15 @@ class QueryEngine:
         )
         if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
             session = self._store.get_or_create(session_id, self.available_tools)
+            if event_type == "context_usage":
+                try:
+                    used_tokens = int(payload.get("used_tokens", 0))
+                except (TypeError, ValueError):
+                    used_tokens = 0
+                if used_tokens > 0:
+                    session.latest_context_used_tokens = used_tokens
+                    if used_tokens >= self._settings.auto_compact_token_threshold:
+                        session.force_compact_next_turn = True
             session.record_history_event(event_type, payload)
         if self._events is None:
             return 0

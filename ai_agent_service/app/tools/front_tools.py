@@ -1706,7 +1706,10 @@ def register_front_tools() -> None:
                     "`used_bounds` (min_x/max_x/min_y/max_y, empty {} if the layer has no tiles) tells you how "
                     "far that layer's content actually reaches — compare a background/sky/water layer's bounds "
                     "against the foreground layer's to see whether the backdrop has fallen behind before you "
-                    "extend the level further. A larger-than-usual region is served whole automatically (the "
+                    "extend the level further. By default this returns summary counts/atlas distribution only "
+                    "(`cells_format=summary_only`) so large reads do not flood context; request "
+                    "`cells_format=non_empty_only` with `max_returned_cells` for precise occupied cells, or "
+                    "`cells_format=full` only for small regions where every cell is needed. A larger-than-usual region is served whole automatically (the "
                     "response carries `auto_served: true`), so you do NOT need to pre-split typical level-width "
                     "reads yourself. Only a region above the auto-serve ceiling fails with error_code "
                     "'region_too_large', and then it returns `suggested_regions`: smaller pre-split rectangles "
@@ -1735,6 +1738,21 @@ def register_front_tools() -> None:
                         "width": {"type": "integer", "minimum": 1},
                         "height": {"type": "integer", "minimum": 1},
                         "depth": {"type": "integer", "minimum": 1},
+                        "cells_format": {
+                            "type": "string",
+                            "enum": ["summary_only", "non_empty_only", "full"],
+                            "description": (
+                                "Return shape for tile details. Defaults to summary_only. Use non_empty_only "
+                                "for exact occupied cells before editing; use full only for small regions."
+                            ),
+                        },
+                        "max_returned_cells": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Maximum cells returned when cells_format is non_empty_only or full. Defaults to 120."
+                            ),
+                        },
                     },
                     [],
                 ),

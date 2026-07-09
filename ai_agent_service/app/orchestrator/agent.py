@@ -451,11 +451,12 @@ def _map_delegate_result_payload(done: Frame, text: str) -> dict[str, Any]:
     output_schema = _map_output_schema_for_frame(done)
     payload = _json_object_from_text(text)
     if payload is not None and output_schema == _MAP_OUTPUT_SCHEMA_V1:
+        slim_payload = _slim_map_delegate_value(payload)
         return {
             "agent": done.agent.name,
             "frame_id": done.id,
             "summary": str(payload.get("summary", "")),
-            "result": payload,
+            "result": slim_payload if isinstance(slim_payload, dict) else payload,
         }
     if output_schema == _MAP_OUTPUT_SCHEMA_V1:
         return {
@@ -582,6 +583,20 @@ _MAP_WORKER_RESULT_FIELDS = frozenset(
 )
 _MAP_WORKER_STAGES = frozenset({"reader", "planner", "writer", "validator", "repairer", "reviewer"})
 _MAP_OUTPUT_SCHEMA_V1 = "map_worker_result_v1"
+_MAP_DELEGATE_LIST_LIMIT = 12
+_MAP_DELEGATE_TEXT_LIMIT = 1200
+_MAP_DELEGATE_DROP_KEYS = frozenset(
+    {
+        "cells",
+        "full_cells",
+        "raw_cells",
+        "atlas_summary",
+        "matches",
+        "screenshot_base64",
+        "image_base64",
+        "data_url",
+    }
+)
 
 
 def _map_output_schema_for_frame(frame: Frame) -> str | None:
@@ -612,6 +627,24 @@ def _json_object_from_text(text: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             return None
     return value if isinstance(value, dict) else None
+
+
+def _slim_map_delegate_value(value: Any) -> Any:
+    """递归瘦身地图子任务结果，避免父 agent 继承大数组。"""
+    if isinstance(value, str):
+        return value if len(value) <= _MAP_DELEGATE_TEXT_LIMIT else value[:_MAP_DELEGATE_TEXT_LIMIT] + "..."
+    if isinstance(value, list):
+        return [_slim_map_delegate_value(item) for item in value[:_MAP_DELEGATE_LIST_LIMIT]]
+    if not isinstance(value, dict):
+        return value
+    slim: dict[str, Any] = {}
+    for key, item in value.items():
+        key_str = str(key)
+        if key_str in _MAP_DELEGATE_DROP_KEYS:
+            slim[f"{key_str}_omitted"] = True
+            continue
+        slim[key_str] = _slim_map_delegate_value(item)
+    return slim
 
 
 def _map_structured_output_error(frame: Frame, text: str) -> str | None:

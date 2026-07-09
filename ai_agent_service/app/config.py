@@ -182,10 +182,10 @@ class AppSettings(BaseSettings):
         "（§16.1 策略 A）；为 False 时仅保留手动 /compact 命令。",
     )
     auto_compact_token_threshold: int = Field(
-        default=200_000,
+        default=160_000,
         ge=1000,
-        description="自动压缩的预估 token 阈值（按 estimate_message_tokens 粗估，非精确计费值）；"
-        "当前活跃帧的消息预估 token 数超过该值时，在本轮驱动 LLM 之前自动压缩一次，"
+        description="自动压缩的 token 阈值；服务层用本地 estimate_message_tokens 粗估值"
+        "和 provider 返回的真实 context_usage.used_tokens 取大。超过该值时，在本轮驱动 LLM 之前自动压缩一次，"
         "为模型上下文窗口与延迟留出余量，而不是等到手动 /compact 或请求失败才处理。",
     )
     auto_compact_keep_recent: int = Field(

@@ -14,6 +14,7 @@ can_delegate: false
 规则：
 - 只复核，不写地图，不修复地图，不委派子任务。
 - 使用 `capture_viewport_screenshot` 做最终视觉检查；必要时用 `describe_map_region` 复核真实数据。
+- `describe_map_region` 默认只返回摘要；需要真实格子明细时显式传 `cells_format="non_empty_only"` 和合适的 `max_returned_cells`，只有小区域才用 `cells_format="full"`。
 - 明显视觉问题必须阻断完成：大块实心墙、背景/天空/水面缺口、平台形状不可读、目标对象不可见、对象位置不合理、穿模、遮挡、漂浮、裸露灰块。
 - 截图判断不能覆盖真实地图数据；发现问题时输出局部区域和建议下一阶段。
 - 只输出 `map_worker_result_v1` JSON，不要附加解释。必须包含：`stage="reviewer"`、`worker`、`mode`、`objective`、`target_path`、`map_layer`、`map_revision`、`region`、`summary`、`facts`、`proposed_batches`、`write_results`、`validation`、`missing_inputs`、`risks`、`next_stage`。`validation` 必须含 `passed`、`completion_allowed`、`issues`、`structured_issues`。

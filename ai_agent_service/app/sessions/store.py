@@ -67,6 +67,11 @@ class Session:
             自动读到图层后恢复下发。
         pending_map_tool_after_read: 因缺少真实地图区域上下文而挂起的一次地图工具调用；
             自动读完同一区域后恢复下发，避免 LLM 读完后凭记忆重试。
+        latest_context_used_tokens: provider 最近一次返回的真实上下文 token 用量；
+            自动压缩用它和本地估算取大，避免低估。
+        force_compact_next_turn: 最近一次 provider 用量超过阈值后置位；下一轮 LLM 前
+            强制 compact 一次。
+        map_context_state: 每 session 的地图小索引，只存摘要和 artifact_ref，不存 raw cells。
         rag_context: 当前用户提问检索到的 RAG 上下文（分层 prompt 的 L3 段），
             在新用户消息到达时刷新、在工具结果回填等同一轮的后续请求里复用，
             使该段在整轮 agent 循环内保持稳定、可被缓存（§16.1 RAG 段缓存）。
@@ -94,6 +99,9 @@ class Session:
     pending_map_write_after_read: dict[str, Any] | None = None
     pending_map_validation_after_read: dict[str, Any] | None = None
     pending_map_tool_after_read: dict[str, Any] | None = None
+    latest_context_used_tokens: int = 0
+    force_compact_next_turn: bool = False
+    map_context_state: dict[str, Any] = field(default_factory=dict)
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
@@ -344,6 +352,9 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "pending_map_write_after_read": session.pending_map_write_after_read,
         "pending_map_validation_after_read": session.pending_map_validation_after_read,
         "pending_map_tool_after_read": session.pending_map_tool_after_read,
+        "latest_context_used_tokens": session.latest_context_used_tokens,
+        "force_compact_next_turn": session.force_compact_next_turn,
+        "map_context_state": session.map_context_state,
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
         "rag_context": session.rag_context,
@@ -474,6 +485,9 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
             if isinstance(data.get("pending_map_tool_after_read"), dict)
             else None
         ),
+        latest_context_used_tokens=_as_int(data.get("latest_context_used_tokens")),
+        force_compact_next_turn=bool(data.get("force_compact_next_turn", False)),
+        map_context_state=_as_dict(data.get("map_context_state")),
         history_event_counter=history_event_counter,
         history_events=history_events,
         rag_context=str(data.get("rag_context", "")),
