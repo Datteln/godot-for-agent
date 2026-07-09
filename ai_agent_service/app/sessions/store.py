@@ -61,6 +61,8 @@ class Session:
             地图写工具漏传 `map_layer` 时补齐，不覆盖显式入参。
         latest_map_region_reads: 最近已读取过的地图区域签名 → map_revision；
             用于要求地图计算/编辑工具先读取真实区域，且旧 revision 会重新读取。
+        latest_map_region_summaries: 最近已读取过的地图区域签名 → 精简 describe_map_region 摘要；
+            用于阻止平台规划在空采样/错图层上继续执行。
         pending_map_write_after_read: 因缺少 map state 而挂起的一次地图写调用；
             自动读到 `map_layer`/`map_revision` 后恢复下发。
         pending_map_validation_after_read: 因缺少 `map_layer` 而挂起的一次地图校验调用；
@@ -96,6 +98,7 @@ class Session:
     latest_map_revisions: dict[str, int] = field(default_factory=dict)
     latest_map_layers: dict[str, int] = field(default_factory=dict)
     latest_map_region_reads: dict[str, int] = field(default_factory=dict)
+    latest_map_region_summaries: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_map_write_after_read: dict[str, Any] | None = None
     pending_map_validation_after_read: dict[str, Any] | None = None
     pending_map_tool_after_read: dict[str, Any] | None = None
@@ -351,6 +354,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "latest_map_revisions": session.latest_map_revisions,
         "latest_map_layers": session.latest_map_layers,
         "latest_map_region_reads": session.latest_map_region_reads,
+        "latest_map_region_summaries": session.latest_map_region_summaries,
         "pending_map_write_after_read": session.pending_map_write_after_read,
         "pending_map_validation_after_read": session.pending_map_validation_after_read,
         "pending_map_tool_after_read": session.pending_map_tool_after_read,
@@ -471,6 +475,11 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
             str(key): value
             for key, value in _as_dict(data.get("latest_map_region_reads")).items()
             if isinstance(value, int) and not isinstance(value, bool)
+        },
+        latest_map_region_summaries={
+            str(key): value
+            for key, value in _as_dict(data.get("latest_map_region_summaries")).items()
+            if isinstance(value, dict)
         },
         pending_map_write_after_read=(
             data.get("pending_map_write_after_read")

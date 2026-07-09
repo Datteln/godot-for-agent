@@ -366,6 +366,14 @@ _HISTORY_FRONT_TOOLS = (
 _MAP_VALIDATION_TOOL_NAMES = frozenset(
     {"validate_map_region", "validate_layer_coverage", "validate_object_placements"}
 )
+_MAP_OBJECT_PLACEMENT_TOOL_NAMES = frozenset(
+    {
+        "place_map_objects",
+        "find_placement_anchors",
+        "validate_object_placements",
+        "repair_placements",
+    }
+)
 _MAP_COMPLETION_TOOL_NAMES = MAP_REVISION_GUARDED_TOOL_NAMES | _MAP_VALIDATION_TOOL_NAMES
 _MAP_REGION_READ_GUARDED_TOOL_NAMES = (
     MAP_WRITE_TOOL_NAMES
@@ -890,6 +898,62 @@ def _map_result_summary(
             summary["artifact_ref"] = artifact_ref
         return summary
 
+    if tool_name in _MAP_OBJECT_PLACEMENT_TOOL_NAMES:
+        keep_keys = (
+            "ok",
+            "passed",
+            "changed",
+            "target",
+            "target_path",
+            "parent_path",
+            "dimension",
+            "map_layer",
+            "map_revision",
+            "region",
+            "message",
+            "error_code",
+            "coords",
+            "blocking_cell",
+            "support_cells",
+            "hint",
+            "failed_index",
+            "failed_object",
+            "batch_atomic",
+            "placement_profile",
+            "candidate_source",
+            "rejected_summary",
+        )
+        summary = {key: result[key] for key in keep_keys if key in result}
+        for key, limit in (
+            ("objects", 20),
+            ("paths", 40),
+            ("anchors", 24),
+            ("placements", 40),
+            ("issues", 40),
+            ("repair_plan", 24),
+            ("moved", 40),
+            ("plans", 24),
+        ):
+            value = result.get(key)
+            if isinstance(value, list):
+                summary[key] = _bounded_history_value(
+                    value[:limit],
+                    max_string_chars=4000,
+                    max_list_items=limit,
+                    max_dict_items=80,
+                )
+                summary[f"{key}_omitted"] = max(0, len(value) - limit)
+        if "instance_summary" in result:
+            summary["instance_summary"] = _bounded_history_value(
+                result["instance_summary"],
+                max_string_chars=4000,
+                max_list_items=40,
+                max_dict_items=80,
+            )
+        if artifact_ref is not None:
+            summary["artifact_ref"] = artifact_ref
+        return summary
+
     if tool_name in _MAP_VALIDATION_TOOL_NAMES:
         keep_keys = (
             "ok",
@@ -1053,6 +1117,9 @@ def _history_payload_for_front_tool(
         "validate_map_region",
         "validate_layer_coverage",
         "validate_object_placements",
+        "place_map_objects",
+        "find_placement_anchors",
+        "repair_placements",
     }:
         slim = dict(payload)
         slim["result"] = _map_result_summary(tool_name, result, artifact_ref)
@@ -1516,9 +1583,60 @@ def _remember_latest_map_region_read(
     if revision is None:
         return
     session.latest_map_region_reads[signature] = revision
+    if isinstance(result, dict):
+        session.latest_map_region_summaries[signature] = _map_result_summary(
+            "describe_map_region",
+            result,
+            None,
+        )
     while len(session.latest_map_region_reads) > 64:
         first_key = next(iter(session.latest_map_region_reads))
         del session.latest_map_region_reads[first_key]
+        session.latest_map_region_summaries.pop(first_key, None)
+
+
+def _latest_map_region_summary_for_call(
+    session: Session,
+    call: FrontToolCallDTO,
+) -> dict[str, Any] | None:
+    resolved_input = _resolved_map_tool_args(session, call.input)
+    signature = _map_region_read_signature(call.name, resolved_input)
+    if signature is None:
+        return None
+    summary = session.latest_map_region_summaries.get(signature)
+    return summary if isinstance(summary, dict) else None
+
+
+def _blocks_platform_plan_after_empty_region_read(
+    session: Session,
+    call: FrontToolCallDTO,
+) -> bool:
+    if call.name not in {"plan_platform_level", "plan_reachable_map_growth"}:
+        return False
+    summary = _latest_map_region_summary_for_call(session, call)
+    if summary is None:
+        return False
+    try:
+        non_empty_count = int(summary.get("non_empty_count", 0))
+    except (TypeError, ValueError):
+        non_empty_count = 0
+    if non_empty_count > 0:
+        return False
+    session.pending_map_tool_after_read = None
+    _append_map_state_read_error(
+        session,
+        call.name,
+        str(call.input.get("target_path", "")),
+        "non_empty_cells in the entry sample; choose the foreground map_layer or move/expand entry_sample_* before planning",
+    )
+    logger.info(
+        "Blocked platform plan after empty region read session=%s tool=%s target=%s layer=%s",
+        session.session_id,
+        call.name,
+        call.input.get("target_path"),
+        call.input.get("map_layer"),
+    )
+    return True
 
 
 def _map_tool_region_read_current(session: Session, call: FrontToolCallDTO) -> bool:
@@ -1704,6 +1822,9 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
         return ChatToolCallsResponse(turn_id=turn_id, text=text, calls=[read_call])
 
     text = "已读取真实地图区域，继续执行挂起的地图工具调用。"
+    if _blocks_platform_plan_after_empty_region_read(session, restored_call):
+        return None
+
     turn_id = session.new_turn_id()
     session.pending_map_tool_after_read = None
     _append_assistant_tool_calls(session, text, [restored_call])

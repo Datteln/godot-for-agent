@@ -2592,7 +2592,9 @@ def register_front_tools() -> None:
                     "Instantiate PackedScene map objects under ObjectLayer/PropsRoot (or parent_path) at map cell "
                     "coordinates. It resolves scene_path directly or from resource_registry entries, converts map "
                     "cell coordinates to local Node2D/Node3D positions, rejects overlaps by default using the "
-                    "spatial index, and can record placements back into the index. Previewed and undoable."
+                    "spatial index, and can record placements back into the index. The x/y coords are the object's "
+                    "empty footprint cell, not the solid ground cell; ground support is checked below the footprint. "
+                    "For coins use placement_kind='coin' or requires_support=false. Previewed and undoable."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2603,6 +2605,17 @@ def register_front_tools() -> None:
                         "parent_path": {
                             "type": "string",
                             "description": "Optional ObjectLayer/PropsRoot node path; inferred when omitted.",
+                        },
+                        "map_layer": {
+                            "type": "integer",
+                            "description": (
+                                "Legacy TileMap layer used to check footprint emptiness and support. Required for "
+                                "multi-layer TileMap; choose it from describe_map_region.layers."
+                            ),
+                        },
+                        "ground_map_layer": {
+                            "type": "integer",
+                            "description": "Alias for map_layer when validating object support on the foreground layer.",
                         },
                         "objects": {
                             "type": "array",
@@ -2619,6 +2632,40 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "placement_kind": {
+                                        "type": "string",
+                                        "description": "Object placement preset such as coin, enemy, npc, tree, chest.",
+                                    },
+                                    "kind": {"type": "string"},
+                                    "anchor": {
+                                        "type": "string",
+                                        "enum": [
+                                            "bottom_center",
+                                            "bottom_left",
+                                            "bottom_right",
+                                            "top_center",
+                                            "top_left",
+                                            "top_right",
+                                            "center",
+                                        ],
+                                    },
+                                    "surface_type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "ground",
+                                            "wall",
+                                            "water_surface",
+                                            "water",
+                                            "air",
+                                            "room_center",
+                                            "branch_end",
+                                            "path_edge",
+                                        ],
+                                    },
+                                    "footprint_width": {"type": "integer", "minimum": 1},
+                                    "footprint_height": {"type": "integer", "minimum": 1},
+                                    "requires_support": {"type": "boolean"},
+                                    "support_layers": {"type": "array", "items": {"type": "string"}},
                                     "semantic_layer": {"type": "string"},
                                     "tags": {"type": "array", "items": {"type": "string"}},
                                     "visual_group_id": {

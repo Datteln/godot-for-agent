@@ -738,10 +738,18 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 	var occupied := _object_occupancy_from_spatial_index(str(target_result.get("path", "")), dimension)
 	var blocked_cells := _blocked_object_cells_from_spatial_index(str(target_result.get("path", "")), dimension)
 	var planned := {}
+	var placement_map_layer := map_layer_for_placement(input)
 	var prepared: Array = []
-	for object_value in objects_value:
+	for object_index in range((objects_value as Array).size()):
+		var object_value = (objects_value as Array)[object_index]
 		if not (object_value is Dictionary):
-			return {"ok": false, "message": "each object must be an object", "error_code": "invalid_object"}
+			return _with_object_batch_failure(
+				{"ok": false, "message": "each object must be an object", "error_code": "invalid_object"},
+				object_index,
+				{},
+				placement_map_layer,
+				{}
+			)
 		var object_spec: Dictionary = object_value
 		var coords := Vector3i(
 			int(object_spec.get("x", 0)),
@@ -749,29 +757,29 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 			int(object_spec.get("z", 0)) if dimension == 3 else 0
 		)
 		if not _cell_within_bounds(coords, allowed_bounds):
-			return {
+			return _with_object_batch_failure({
 				"ok": false,
 				"message": "object placement would write outside allowed_bounds",
 				"error_code": "map_object_out_of_bounds",
 				"coords": MapValidator.coord_payload(coords, dimension),
 				"allowed_bounds": allowed_bounds,
-			}
+			}, object_index, object_spec, placement_map_layer, {})
 		var coord_key := MapValidator.coord_key(coords)
 		if not bool(input.get("allow_overlap", false)) and (occupied.has(coord_key) or planned.has(coord_key)):
-			return {
+			return _with_object_batch_failure({
 				"ok": false,
 				"message": "object placement overlaps an existing or planned object",
 				"error_code": "map_object_overlap",
 				"coords": MapValidator.coord_payload(coords, dimension),
-			}
+			}, object_index, object_spec, placement_map_layer, {})
 		if not bool(input.get("allow_on_blocked", false)) and blocked_cells.has(coord_key):
-			return {
+			return _with_object_batch_failure({
 				"ok": false,
 				"message": "object placement is on a blocked/water/obstacle cell",
 				"error_code": "map_object_blocked_cell",
 				"coords": MapValidator.coord_payload(coords, dimension),
 				"blocking_entry": blocked_cells[coord_key],
-			}
+			}, object_index, object_spec, placement_map_layer, {})
 		var resource_key := str(object_spec.get("resource", object_spec.get("resource_key", ""))).strip_edges()
 		var resource_def: Dictionary = _registry_entry_with_fallback(registry_data, resource_key, str(object_spec.get("fallback_resource", "")))
 		if resource_def.has("_resolved_resource"):
@@ -779,7 +787,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 		if not resource_def.is_empty():
 			var object_contract_check := _validate_resource_contract_shape(resource_key, resource_def)
 			if not bool(object_contract_check.get("ok", false)):
-				return object_contract_check
+				return _with_object_batch_failure(object_contract_check, object_index, object_spec, placement_map_layer, {})
 		var profile_fallback := input.duplicate(true)
 		for key in resource_def.keys():
 			if not profile_fallback.has(key):
@@ -793,7 +801,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 			map_node,
 			str(target_result.get("path", "")),
 			dimension,
-			map_layer_for_placement(input),
+			placement_map_layer,
 			coords,
 			placement_profile,
 			occupied,
@@ -802,23 +810,23 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 			input
 		)
 		if not bool(placement_check.get("ok", true)):
-			return _with_placement_retry_hint(placement_check)
+			return _with_object_batch_failure(placement_check, object_index, object_spec, placement_map_layer, placement_profile)
 		var scene_path := PathUtils.to_res_path(str(object_spec.get("scene_path", resource_def.get("scene_path", ""))))
 		if scene_path == "" or not (scene_path.ends_with(".tscn") or scene_path.ends_with(".scn")):
-			return {"ok": false, "message": "object requires a .tscn/.scn scene_path or resource registry entry", "error_code": "missing_scene_path", "resource": resource_key}
+			return _with_object_batch_failure({"ok": false, "message": "object requires a .tscn/.scn scene_path or resource registry entry", "error_code": "missing_scene_path", "resource": resource_key}, object_index, object_spec, placement_map_layer, placement_profile)
 		if not FileAccess.file_exists(scene_path):
-			return {"ok": false, "message": "scene file not found: " + scene_path, "error_code": "scene_not_found"}
+			return _with_object_batch_failure({"ok": false, "message": "scene file not found: " + scene_path, "error_code": "scene_not_found"}, object_index, object_spec, placement_map_layer, placement_profile)
 		var packed = load(scene_path)
 		if not (packed is PackedScene):
-			return {"ok": false, "message": "Failed to load as PackedScene: " + scene_path, "error_code": "load_failed"}
+			return _with_object_batch_failure({"ok": false, "message": "Failed to load as PackedScene: " + scene_path, "error_code": "load_failed"}, object_index, object_spec, placement_map_layer, placement_profile)
 		var instance := (packed as PackedScene).instantiate()
 		if not (instance is Node):
-			return {"ok": false, "message": "PackedScene did not instantiate a Node: " + scene_path, "error_code": "instantiate_failed"}
+			return _with_object_batch_failure({"ok": false, "message": "PackedScene did not instantiate a Node: " + scene_path, "error_code": "instantiate_failed"}, object_index, object_spec, placement_map_layer, placement_profile)
 		var node: Node = instance
 		if dimension == 2 and not (node is Node2D):
-			return {"ok": false, "message": "2D map object must instantiate a Node2D scene: " + scene_path, "error_code": "object_type_mismatch"}
+			return _with_object_batch_failure({"ok": false, "message": "2D map object must instantiate a Node2D scene: " + scene_path, "error_code": "object_type_mismatch"}, object_index, object_spec, placement_map_layer, placement_profile)
 		if dimension == 3 and not (node is Node3D):
-			return {"ok": false, "message": "3D map object must instantiate a Node3D scene: " + scene_path, "error_code": "object_type_mismatch"}
+			return _with_object_batch_failure({"ok": false, "message": "3D map object must instantiate a Node3D scene: " + scene_path, "error_code": "object_type_mismatch"}, object_index, object_spec, placement_map_layer, placement_profile)
 		node.name = _object_instance_name(object_spec, resource_key, scene_path)
 		_apply_object_position(node, map_node, coords, dimension)
 		_apply_object_metadata(node, object_spec, resource_key, scene_path, coords, dimension)
@@ -829,7 +837,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 			"resource": resource_key,
 			"spec": object_spec,
 			"dimension": dimension,
-			"map_layer": map_layer_for_placement(input),
+			"map_layer": placement_map_layer,
 			"visual_group_id": _visual_group_id_from_data(object_spec),
 		})
 		planned[coord_key] = true
@@ -1365,7 +1373,8 @@ static func _resolve_map_target(
 	if not require_explicit_map_layer or not bool(result.get("ok", false)):
 		return result
 	var node: Node = result["node"]
-	if node.get_class() != "TileMap" or input.has("map_layer"):
+	var has_explicit_layer := input.has("map_layer") or input.has("ground_map_layer")
+	if node.get_class() != "TileMap" or has_explicit_layer:
 		return result
 	var layer_count: int = node.get_layers_count()
 	if layer_count <= 1:
@@ -2421,16 +2430,16 @@ static func map_layer_for_placement(input: Dictionary) -> int:
 
 static func _placement_profile_from_spec(spec: Dictionary, fallback: Dictionary) -> Dictionary:
 	var kind := ""
-	for key in ["placement_kind", "kind", "resource", "resource_key"]:
+	for key in ["placement_kind", "kind", "resource", "resource_key", "scene_path"]:
 		if spec.has(key) and str(spec.get(key, "")).strip_edges() != "":
 			kind = str(spec.get(key, "")).strip_edges()
 			break
 	if kind == "":
-		for key in ["placement_kind", "kind", "resource", "resource_key"]:
+		for key in ["placement_kind", "kind", "resource", "resource_key", "scene_path"]:
 			if fallback.has(key) and str(fallback.get(key, "")).strip_edges() != "":
 				kind = str(fallback.get(key, "")).strip_edges()
 				break
-	kind = kind.to_lower()
+	kind = _placement_kind_token(kind)
 	var profile := {
 		"name": kind if kind != "" else "generic",
 		"anchor": "bottom_center",
@@ -2514,12 +2523,26 @@ static func _placement_profile_from_spec(spec: Dictionary, fallback: Dictionary)
 	profile["reachability_point"] = str(spec.get("reachability_point", fallback.get("reachability_point", profile["reachability_point"]))).to_lower()
 	profile["interaction_offset"] = _coord_dict_from_value(spec.get("interaction_offset", fallback.get("interaction_offset", profile["interaction_offset"])), dimension_from_profile(fallback))
 	profile["entrance_offset"] = _coord_dict_from_value(spec.get("entrance_offset", fallback.get("entrance_offset", profile["entrance_offset"])), dimension_from_profile(fallback))
+	if kind == "coin":
+		profile["surface_type"] = "air"
+		profile["requires_support"] = false
+		profile["footprint_width"] = 1
+		profile["footprint_height"] = 1
 	return profile
 
 
 ## 摆放被拒绝时直接在返回结果里带上下一步动作，而不是只在 prompt 里要求模型"记得改用
 ## find_placement_anchors"——错误发生的当下就给出具体指引，比期望模型从一堆铁律里
 ## 翻出对应那条更可靠。
+static func _placement_kind_token(value: String) -> String:
+	var token := value.strip_edges().to_lower()
+	if token.begins_with("res://") or token.ends_with(".tscn") or token.ends_with(".scn"):
+		token = token.get_file().get_basename()
+	if token == "coins":
+		return "coin"
+	return token
+
+
 const _PLACEMENT_RETRY_HINT := "Do not retry with another guessed coordinate. Call find_placement_anchors (same target_path/profile/region) to get a real legal anchor, or validate_object_placements to check a specific candidate."
 
 static func _with_placement_retry_hint(check: Dictionary) -> Dictionary:
@@ -2533,9 +2556,27 @@ static func _with_placement_retry_hint(check: Dictionary) -> Dictionary:
 		"placement_clearance_blocked",
 		"placement_protected_cell",
 	]
-	if str(check.get("error_code", "")) in retryable_codes:
-		check["hint"] = _PLACEMENT_RETRY_HINT
+	var error_code := str(check.get("error_code", ""))
+	if error_code in retryable_codes:
+		var prefix := ""
+		if error_code == "placement_cell_not_empty":
+			prefix = "The input coords are the object's footprint cell, not the ground/support cell. For an object standing on terrain, use the empty cell above the solid support cell; for coins use placement_kind='coin' or requires_support=false. "
+		elif error_code == "placement_missing_support":
+			prefix = "The footprint is empty but there is no solid support below it on the checked map_layer. For floating coins use placement_kind='coin' or requires_support=false; for ground objects choose an empty cell directly above real terrain. "
+		check["hint"] = prefix + _PLACEMENT_RETRY_HINT
 	return check
+
+
+static func _with_object_batch_failure(check: Dictionary, object_index: int, object_spec: Dictionary, map_layer: int, profile: Dictionary) -> Dictionary:
+	var enriched := check.duplicate(true)
+	enriched["failed_index"] = object_index
+	enriched["failed_object"] = object_spec.duplicate(true)
+	enriched["map_layer"] = map_layer
+	enriched["batch_atomic"] = true
+	enriched["message"] = str(enriched.get("message", "")) + " (no objects were placed from this batch)"
+	if not profile.is_empty():
+		enriched["placement_profile"] = profile.duplicate(true)
+	return _with_placement_retry_hint(enriched)
 
 
 static func _validate_single_object_placement(
@@ -3512,13 +3553,39 @@ static func write_resource_registry(input: Dictionary, _editor_interface: Editor
 	var write_result := _write_json_file(RESOURCE_REGISTRY_PATH, before_text, after_text, undo_manager)
 	if not bool(write_result.get("ok", false)):
 		return write_result
+	var invalid_existing_keys := _invalid_resource_registry_keys(data)
 	return {
 		"ok": true,
 		"path": RESOURCE_REGISTRY_PATH,
 		"keys": data.keys(),
 		"written_keys": entries.keys(),
+		"invalid_existing_keys": invalid_existing_keys,
+		"warning": "registry still has invalid entries; rewrite these keys before using them in edit_map" if not invalid_existing_keys.is_empty() else "",
 		"replaced": replace,
 	}
+
+
+static func _invalid_resource_registry_keys(data: Dictionary) -> Array:
+	var invalid: Array = []
+	for key in data.keys():
+		var entry = data.get(key, {})
+		if not (entry is Dictionary):
+			invalid.append(str(key))
+			continue
+		var entry_dict: Dictionary = entry
+		if not bool(_validate_resource_contract_shape(str(key), entry_dict).get("ok", false)):
+			invalid.append(str(key))
+			continue
+		if entry_dict.has("scene_path"):
+			continue
+		var mode := str(entry_dict.get("mode", "2d")).strip_edges()
+		if mode == "3d":
+			if not entry_dict.has("item") and not entry_dict.has("mesh_library_item"):
+				invalid.append(str(key))
+			continue
+		if not entry_dict.has("source_id") or _registry_2d_tile_signature(entry_dict).is_empty():
+			invalid.append(str(key))
+	return invalid
 
 
 static func _normalize_resource_registry_entry(key: String, entry_value: Dictionary) -> Dictionary:

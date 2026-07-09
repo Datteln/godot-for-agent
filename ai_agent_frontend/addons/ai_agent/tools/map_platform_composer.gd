@@ -11,6 +11,7 @@ static func plan_platform_level(input: Dictionary, context: Dictionary = {}) -> 
 	var ground_y := int(input.get("ground_y", int(region["y"]) + int(region["height"]) / 2))
 	var seed := int(input.get("seed", 0))
 	var entry_anchor := _entry_anchor_from_input(input)
+	var requires_entry_anchor := bool(input.get("connect_from_existing", true))
 	if not entry_anchor.is_empty() and not input.has("ground_y"):
 		ground_y = int(entry_anchor.get("y", ground_y - 1)) + 1
 	var route := _build_critical_route(region, ground_y, ability, seed, entry_anchor)
@@ -25,7 +26,7 @@ static func plan_platform_level(input: Dictionary, context: Dictionary = {}) -> 
 	# 三种"不该执行 edit_map_batches"的情况在这里直接清空批次，而不是只在 prompt 里告诉
 	# agent "别执行"——后者只是建议，前者让误执行在数据层面就不可能发生。
 	var blocked_reason := ""
-	if bool(input.get("entry_anchor_scan_failed", false)):
+	if bool(input.get("entry_anchor_scan_failed", false)) or (requires_entry_anchor and entry_anchor.is_empty()):
 		blocked_reason = "entry_anchor_not_found"
 	elif not bool(jump_graph.get("passed", true)):
 		blocked_reason = "jump_graph_failed"
@@ -486,7 +487,7 @@ static func _entry_anchor_from_input(input: Dictionary) -> Dictionary:
 		raw = input.get("frontier", {})
 	if raw is Dictionary and (raw as Dictionary).get("cell", {}) is Dictionary:
 		raw = (raw as Dictionary).get("cell", {})
-	if not (raw is Dictionary):
+	if not (raw is Dictionary) or (raw as Dictionary).is_empty():
 		return {}
 	return {"x": int((raw as Dictionary).get("x", 0)), "y": int((raw as Dictionary).get("y", 0))}
 

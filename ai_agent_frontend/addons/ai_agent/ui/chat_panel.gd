@@ -1451,11 +1451,12 @@ func _handle_final(response: Dictionary) -> void:
 			_append_log_stream_message(render_text)
 			_indent_current_text = false
 		# 无论走流式还是非流式路径，都在 _process 中连续多帧强制滚动到底部，
-		# 等待 fit_content RichTextLabel 完成复杂 Markdown（表格、代码块）的布局计算
-		_auto_scroll = true
-		_force_scroll_once = true
-		_do_scroll_to_bottom()
-		_post_final_scroll_frames = 10
+		# 等待 fit_content RichTextLabel 完成复杂 Markdown（表格、代码块）的布局计算。
+		# 但如果用户已主动上滚浏览历史，尊重用户意图，不强制拉回底部。
+		if _auto_scroll:
+			_force_scroll_once = true
+			_do_scroll_to_bottom()
+			_post_final_scroll_frames = 10
 	else:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "Skipped duplicate final response.", {"key_len": assistant_key.length()})
 		_discard_stream_message()
@@ -2198,7 +2199,7 @@ func _handle_event(event: Dictionary) -> void:
 			# 已被同步关闭而在 _on_reasoning_delta 里当成"迟到"丢弃（日志里 55 次 IGNORED 即此）。
 			# call_deferred 在本帧 idle flush 时才运行，那时批内的 reasoning_delta 都已同步应用完。
 			call_deferred("_close_reasoning_for_boundary_event", event)
-		var force_milestone_scroll := _MILESTONE_EVENT_TYPES.has(event_type)
+		var force_milestone_scroll := _MILESTONE_EVENT_TYPES.has(event_type) and _auto_scroll
 		if force_milestone_scroll:
 			_force_scroll_once = true
 		var rendered_description := _render_event_description(event)
@@ -2972,6 +2973,8 @@ func _scroll_to_bottom() -> void:
 	_trim_message_list()
 	if not _auto_scroll and not _force_scroll_once:
 		return
+	# 立即清除一次性标记，防止后续同一帧内其他调用再次绕过守卫
+	_force_scroll_once = false
 	if _scroll_request_pending:
 		return
 	_scroll_request_pending = true
@@ -3020,9 +3023,8 @@ func _scroll_to_bottom_deferred() -> void:
 	_scroll_request_pending = false
 	if _scroll == null:
 		return
-	if not _auto_scroll and not _force_scroll_once:
+	if not _auto_scroll:
 		return
-	_force_scroll_once = false
 	_do_scroll_to_bottom()
 
 
