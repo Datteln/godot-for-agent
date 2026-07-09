@@ -101,6 +101,13 @@ _MAP_ATLAS_SUMMARY_LIMIT = 12
 _MAP_MATCH_SUMMARY_LIMIT = 12
 _MAP_ARTIFACT_MAX_FILES_PER_SESSION = 128
 _MAP_ARTIFACT_MAX_BYTES_PER_SESSION = 100 * 1024 * 1024
+_HISTORY_TOOL_MAX_JSON_CHARS = 80_000
+_HISTORY_TOOL_MAX_STRING_CHARS = 16_000
+_HISTORY_TOOL_MAX_LIST_ITEMS = 80
+_HISTORY_TOOL_MAX_DICT_ITEMS = 120
+_HISTORY_TOOL_DROP_KEYS = frozenset(
+    {"data_url", "base64", "image_base64", "screenshot_base64", "binary", "bytes"}
+)
 
 
 def _normalize_model_override(model: str | None) -> str | None:
@@ -231,6 +238,7 @@ def _append_map_state_read_error(
 def _tool_message(tool_call_id: str, result: Any, *, is_error: bool = False) -> dict[str, Any]:
     """构造 OpenAI `role=tool` 消息。"""
     body: Any = {"error": result} if is_error else result
+    body = _bounded_tool_message_body(body)
     content = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
@@ -704,6 +712,78 @@ def _json_char_size(value: Any) -> int:
         return len(str(value))
 
 
+def _summarize_history_text(text: str, max_chars: int = _HISTORY_TOOL_MAX_STRING_CHARS) -> str:
+    """保留长文本的开头和结尾，中间省略以控制 history 体积。"""
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    omitted = len(text) - max_chars
+    return text[:head] + f"\n... ({omitted} chars omitted for history) ...\n" + text[-tail:]
+
+
+def _bounded_history_value(
+    value: Any,
+    *,
+    max_string_chars: int = _HISTORY_TOOL_MAX_STRING_CHARS,
+    max_list_items: int = _HISTORY_TOOL_MAX_LIST_ITEMS,
+    max_dict_items: int = _HISTORY_TOOL_MAX_DICT_ITEMS,
+) -> Any:
+    """递归压缩任意工具结果，作为写入 LLM history 的最后防线。"""
+    if isinstance(value, str):
+        return _summarize_history_text(value, max_string_chars)
+    if isinstance(value, list):
+        bounded = [
+            _bounded_history_value(
+                item,
+                max_string_chars=max_string_chars,
+                max_list_items=max_list_items,
+                max_dict_items=max_dict_items,
+            )
+            for item in value[:max_list_items]
+        ]
+        omitted = len(value) - max_list_items
+        if omitted > 0:
+            bounded.append({"history_omitted_items": omitted})
+        return bounded
+    if not isinstance(value, dict):
+        return value
+    bounded_dict: dict[str, Any] = {}
+    for index, (key, item) in enumerate(value.items()):
+        key_str = str(key)
+        if key_str in _HISTORY_TOOL_DROP_KEYS:
+            bounded_dict[f"{key_str}_omitted_for_history"] = True
+            continue
+        if index >= max_dict_items:
+            bounded_dict["history_omitted_keys"] = len(value) - max_dict_items
+            break
+        bounded_dict[key_str] = _bounded_history_value(
+            item,
+            max_string_chars=max_string_chars,
+            max_list_items=max_list_items,
+            max_dict_items=max_dict_items,
+        )
+    return bounded_dict
+
+
+def _bounded_tool_message_body(body: Any) -> Any:
+    """限制单条 tool message 的最大体积，避免新工具绕过专用摘要。"""
+    if isinstance(body, str):
+        return _summarize_history_text(body, _HISTORY_TOOL_MAX_JSON_CHARS)
+    if _json_char_size(body) <= _HISTORY_TOOL_MAX_JSON_CHARS:
+        return body
+    bounded = _bounded_history_value(body)
+    if _json_char_size(bounded) <= _HISTORY_TOOL_MAX_JSON_CHARS:
+        return bounded
+    return {
+        "history_truncated": True,
+        "summary": _summarize_history_text(
+            json.dumps(bounded, ensure_ascii=False, default=str),
+            _HISTORY_TOOL_MAX_JSON_CHARS,
+        ),
+    }
+
+
 def _region_summary_from_value(value: Any) -> dict[str, Any]:
     """从工具结果里抽取标准 region 字段。"""
     if not isinstance(value, dict):
@@ -838,6 +918,130 @@ def _map_result_summary(
     return result
 
 
+def _front_tool_result_summary(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+    """为非地图前端工具生成有界 history 摘要。"""
+    if tool_name in {
+        "run_system_command",
+        "execute_gd_script",
+        "run_tests",
+        "run_headless_self_test",
+        "git_diff",
+        "git_status",
+        "export_project",
+    }:
+        keep_keys = (
+            "ok",
+            "status",
+            "exit_code",
+            "pid",
+            "path",
+            "shell",
+            "working_directory",
+            "timeout_ms",
+            "output_truncated",
+            "error_code",
+            "message",
+        )
+        summary = {key: result[key] for key in keep_keys if key in result}
+        output = result.get("output")
+        if isinstance(output, str) and output:
+            summary["output"] = _summarize_history_text(output, 24_000)
+            summary["output_omitted_for_history"] = len(output) > 24_000
+        return summary
+
+    if tool_name == "read_class_docs":
+        summary = {
+            key: result[key]
+            for key in ("source", "class_name", "parent", "path", "base", "load_error")
+            if key in result
+        }
+        for key, limit in (("methods", 40), ("properties", 50), ("signals", 30)):
+            value = result.get(key)
+            if isinstance(value, list):
+                summary[key] = _bounded_history_value(value[:limit], max_string_chars=2000)
+                summary[f"{key}_omitted"] = max(0, len(value) - limit)
+        constants = result.get("constants")
+        if isinstance(constants, dict):
+            items = list(constants.items())
+            summary["constants"] = {str(key): value for key, value in items[:80]}
+            summary["constants_omitted"] = max(0, len(items) - 80)
+        return summary
+
+    if tool_name == "read_image_metadata":
+        keep_keys = (
+            "ok",
+            "path",
+            "absolute_path",
+            "width",
+            "height",
+            "format",
+            "message",
+            "error_code",
+            "semantic_description",
+            "semantic",
+        )
+        summary = {key: result[key] for key in keep_keys if key in result}
+        colors = result.get("dominant_colors")
+        if isinstance(colors, list):
+            summary["dominant_colors"] = colors[:16]
+            summary["dominant_colors_omitted"] = max(0, len(colors) - 16)
+        for key in ("semantic_description", "semantic", "message"):
+            if isinstance(summary.get(key), str):
+                summary[key] = _truncate_text(str(summary[key]), _MAP_CONTEXT_MAX_SUMMARY_CHARS)
+        return summary
+
+    if tool_name == "read_resource":
+        summary = {
+            key: result[key]
+            for key in ("ok", "path", "type", "script_path", "message", "error_code")
+            if key in result
+        }
+        properties = result.get("properties")
+        if isinstance(properties, dict):
+            summary["properties"] = _bounded_history_value(
+                properties,
+                max_string_chars=2000,
+                max_list_items=30,
+                max_dict_items=80,
+            )
+        return summary
+
+    if tool_name in {"read_scene_tree", "read_runtime_state"}:
+        return _bounded_history_value(
+            result,
+            max_string_chars=2000,
+            max_list_items=60,
+            max_dict_items=100,
+        )
+
+    if tool_name == "validate_scene_state":
+        summary = {
+            key: result[key]
+            for key in ("ok", "passed", "failed", "message", "error_code")
+            if key in result
+        }
+        results = result.get("results")
+        if isinstance(results, list):
+            summary["results"] = _bounded_history_value(
+                results[:40],
+                max_string_chars=2000,
+                max_list_items=40,
+                max_dict_items=80,
+            )
+            summary["results_omitted"] = max(0, len(results) - 40)
+        return summary
+
+    if tool_name == "read_debugger_errors":
+        items = result.get("items")
+        summary = {"ok": result.get("ok", True)}
+        if isinstance(items, list):
+            summary["items"] = _bounded_history_value(items[:30], max_string_chars=4000)
+            summary["items_omitted"] = max(0, len(items) - 30)
+        return summary
+
+    return _bounded_history_value(result)
+
+
 def _history_payload_for_front_tool(
     tool_name: str,
     payload: dict[str, Any],
@@ -846,8 +1050,8 @@ def _history_payload_for_front_tool(
     """生成写入 agent tool history 的瘦 payload。"""
     result = payload.get("result")
     if not isinstance(result, dict):
-        return payload
-    if tool_name not in {
+        return _bounded_tool_message_body(payload)
+    if tool_name in {
         "capture_viewport_screenshot",
         "describe_map_region",
         "query_spatial_index",
@@ -855,9 +1059,31 @@ def _history_payload_for_front_tool(
         "validate_layer_coverage",
         "validate_object_placements",
     }:
-        return payload
-    slim = dict(payload)
-    slim["result"] = _map_result_summary(tool_name, result, artifact_ref)
+        slim = dict(payload)
+        slim["result"] = _map_result_summary(tool_name, result, artifact_ref)
+        return _bounded_tool_message_body(slim)
+    if tool_name in {
+        "run_system_command",
+        "execute_gd_script",
+        "run_tests",
+        "run_headless_self_test",
+        "git_diff",
+        "git_status",
+        "export_project",
+        "read_scene_tree",
+        "read_runtime_state",
+        "read_class_docs",
+        "read_image_metadata",
+        "read_resource",
+        "validate_scene_state",
+        "read_debugger_errors",
+    } or _json_char_size(result) > _HISTORY_TOOL_MAX_JSON_CHARS:
+        slim = dict(payload)
+        slim["result"] = _front_tool_result_summary(tool_name, result)
+        return _bounded_tool_message_body(slim)
+    slim = _bounded_tool_message_body(payload)
+    if isinstance(slim, dict):
+        return slim
     return slim
 
 

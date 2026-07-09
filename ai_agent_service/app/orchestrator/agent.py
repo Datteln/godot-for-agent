@@ -282,6 +282,95 @@ async def _invoke_server_tool(
         return str(exc), True
 
 
+_TOOL_HISTORY_MAX_JSON_CHARS = 80_000
+_TOOL_HISTORY_MAX_STRING_CHARS = 16_000
+_TOOL_HISTORY_MAX_LIST_ITEMS = 80
+_TOOL_HISTORY_MAX_DICT_ITEMS = 120
+_TOOL_HISTORY_DROP_KEYS = frozenset(
+    {"data_url", "base64", "image_base64", "screenshot_base64", "binary", "bytes"}
+)
+
+
+def _json_char_size(value: Any) -> int:
+    """粗略计算 JSON 值序列化后的字符长度。"""
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _summarize_history_text(text: str, max_chars: int = _TOOL_HISTORY_MAX_STRING_CHARS) -> str:
+    """保留长文本的开头和结尾，中间省略以控制 history 体积。"""
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    omitted = len(text) - max_chars
+    return text[:head] + f"\n... ({omitted} chars omitted for history) ...\n" + text[-tail:]
+
+
+def _bounded_history_value(
+    value: Any,
+    *,
+    max_string_chars: int = _TOOL_HISTORY_MAX_STRING_CHARS,
+    max_list_items: int = _TOOL_HISTORY_MAX_LIST_ITEMS,
+    max_dict_items: int = _TOOL_HISTORY_MAX_DICT_ITEMS,
+) -> Any:
+    """递归压缩任意 server/delegate 工具结果，作为写入 history 的最后防线。"""
+    if isinstance(value, str):
+        return _summarize_history_text(value, max_string_chars)
+    if isinstance(value, list):
+        bounded = [
+            _bounded_history_value(
+                item,
+                max_string_chars=max_string_chars,
+                max_list_items=max_list_items,
+                max_dict_items=max_dict_items,
+            )
+            for item in value[:max_list_items]
+        ]
+        omitted = len(value) - max_list_items
+        if omitted > 0:
+            bounded.append({"history_omitted_items": omitted})
+        return bounded
+    if not isinstance(value, dict):
+        return value
+    bounded_dict: dict[str, Any] = {}
+    for index, (key, item) in enumerate(value.items()):
+        key_str = str(key)
+        if key_str in _TOOL_HISTORY_DROP_KEYS:
+            bounded_dict[f"{key_str}_omitted_for_history"] = True
+            continue
+        if index >= max_dict_items:
+            bounded_dict["history_omitted_keys"] = len(value) - max_dict_items
+            break
+        bounded_dict[key_str] = _bounded_history_value(
+            item,
+            max_string_chars=max_string_chars,
+            max_list_items=max_list_items,
+            max_dict_items=max_dict_items,
+        )
+    return bounded_dict
+
+
+def _bounded_tool_message_body(body: Any) -> Any:
+    """限制单条 tool message 的最大体积，避免工具结果撑爆上下文。"""
+    if isinstance(body, str):
+        return _summarize_history_text(body, _TOOL_HISTORY_MAX_JSON_CHARS)
+    if _json_char_size(body) <= _TOOL_HISTORY_MAX_JSON_CHARS:
+        return body
+    bounded = _bounded_history_value(body)
+    if _json_char_size(bounded) <= _TOOL_HISTORY_MAX_JSON_CHARS:
+        return bounded
+    return {
+        "history_truncated": True,
+        "summary": _summarize_history_text(
+            json.dumps(bounded, ensure_ascii=False, default=str),
+            _TOOL_HISTORY_MAX_JSON_CHARS,
+        ),
+    }
+
+
 def _tool_message(tool_call_id: str, result: Any, *, is_error: bool = False) -> dict[str, Any]:
     """构造一条 OpenAI `role=tool` 消息。
 
@@ -294,6 +383,7 @@ def _tool_message(tool_call_id: str, result: Any, *, is_error: bool = False) -> 
         可直接 `append` 进 `frame.messages` 的消息字典。
     """
     body: Any = {"error": result} if is_error else result
+    body = _bounded_tool_message_body(body)
     content = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
@@ -455,7 +545,7 @@ def _map_delegate_result_payload(done: Frame, text: str) -> dict[str, Any]:
         return {
             "agent": done.agent.name,
             "frame_id": done.id,
-            "summary": str(payload.get("summary", "")),
+            "summary": _summarize_history_text(str(payload.get("summary", "")), 4000),
             "result": slim_payload if isinstance(slim_payload, dict) else payload,
         }
     if output_schema == _MAP_OUTPUT_SCHEMA_V1:
@@ -471,7 +561,7 @@ def _map_delegate_result_payload(done: Frame, text: str) -> dict[str, Any]:
     return {
         "agent": done.agent.name,
         "frame_id": done.id,
-        "summary": text,
+        "summary": _summarize_history_text(text),
     }
 
 
