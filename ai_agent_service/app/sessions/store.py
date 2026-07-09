@@ -247,6 +247,7 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
         "status": frame.status,
         "depth": frame.depth,
         "active_deferred_tools": sorted(frame.active_deferred_tools),
+        "search_tools_noop_count": frame.search_tools_noop_count,
         "history_anchor_frame_id": frame.history_anchor_frame_id,
         "history_anchor_message_index": frame.history_anchor_message_index,
         "compact_snapshot": (
@@ -314,6 +315,7 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
         status=status,
         depth=data.get("depth", 0),
         active_deferred_tools=set(data.get("active_deferred_tools", [])),
+        search_tools_noop_count=_as_int(data.get("search_tools_noop_count")),
         history_anchor_frame_id=data.get("history_anchor_frame_id"),
         history_anchor_message_index=data.get("history_anchor_message_index"),
         compact_snapshot=compact_snapshot,

@@ -140,6 +140,7 @@ class Frame:
         depth: 帧深度，根帧为 0，供 `MAX_DEPTH` 防御性约束使用（M2+）。
         active_deferred_tools: 本帧通过 `search_tools` 激活的 deferred 工具名；
             只在本帧内生效，不提升权限、不跨 agent 继承。
+        search_tools_noop_count: 本帧连续未激活新工具的 `search_tools` 次数。
         compact_snapshot: 当前帧最近一次有效压缩的持久化快照；未压缩时为 None。
     """
 
@@ -152,6 +153,7 @@ class Frame:
     status: Literal["running", "suspended", "done"] = "running"
     depth: int = 0
     active_deferred_tools: set[str] = field(default_factory=set)
+    search_tools_noop_count: int = 0
     history_anchor_frame_id: str | None = None
     history_anchor_message_index: int | None = None
     compact_snapshot: CompactSnapshot | None = None

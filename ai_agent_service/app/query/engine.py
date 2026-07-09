@@ -871,8 +871,18 @@ def _map_result_summary(
             "artifact_ref": artifact_ref,
         }
         if "atlas_summary" in result:
-            summary["atlas_summary_top"] = _top_atlas_summary(result.get("atlas_summary"))
+            atlas_summary = _top_atlas_summary(result.get("atlas_summary"))
+            summary["atlas_summary"] = atlas_summary
+            summary["atlas_summary_top"] = atlas_summary
             summary["atlas_summary_omitted"] = True
+        if artifact_ref is not None and (
+            result.get("cells_omitted")
+            or result.get("cells_returned") != result.get("cells_total")
+        ):
+            summary["exact_cells_hint"] = (
+                "需要精确 cell 坐标/atlas 时，调用 read_file 读取 artifact_ref；"
+                "不要从 cells_total/non_empty_count/atlas_summary 推断具体坐标。"
+            )
         for key in (
             "message",
             "warning",
@@ -1535,7 +1545,11 @@ def _map_region_read_call_for_tool(call: FrontToolCallDTO) -> FrontToolCallDTO |
     region = _map_region_from_tool_args(call.name, call.input)
     if region is None:
         return None
-    read_input: dict[str, Any] = {"__auto_map_state_read": True}
+    read_input: dict[str, Any] = {
+        "__auto_map_state_read": True,
+        "cells_format": "non_empty_only",
+        "max_returned_cells": 120,
+    }
     for key in ("target_path", "map_layer", "ground_map_layer"):
         if key in call.input:
             read_input["map_layer" if key == "ground_map_layer" else key] = call.input[key]

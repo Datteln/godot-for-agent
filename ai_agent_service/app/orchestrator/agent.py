@@ -48,6 +48,7 @@ from app.orchestrator.map_workers import (
 MAX_AGENT_DEPTH = 4
 EVENT_TEXT_PREVIEW_CHARS = 24_000
 EVENT_MATCH_PREVIEW_ITEMS = 20
+NOOP_SEARCH_TOOLS_HINT_THRESHOLD = 2
 
 logger = logging.getLogger(__name__)
 
@@ -768,6 +769,70 @@ def _map_structured_output_error(frame: Frame, text: str) -> str | None:
     return None
 
 
+def _map_stage_for_frame(frame: Frame) -> str:
+    """根据地图 agent/frame 名称推断结构化收尾阶段。"""
+    name = frame.agent.name
+    if name == "map-planner-agent":
+        return "planner"
+    if name == "map-validator-agent":
+        return "validator"
+    if name == "map-reviewer-agent":
+        return "reviewer"
+    if "write_one_batch" in frame.agent.prompt:
+        return "writer"
+    if "repair" in frame.agent.prompt or "repair" in name:
+        return "repairer"
+    return "reader"
+
+
+def _frame_objective(frame: Frame) -> str:
+    """取子帧第一条用户消息作为 objective。"""
+    for message in frame.messages:
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return frame.agent.description or frame.agent.name
+
+
+def _map_frame_exhausted_payload(frame: Frame, limit_label: str, limit: int) -> str:
+    """为地图子帧预算耗尽生成合法的部分结果 JSON。"""
+    issue = f"子 agent 达到自身{limit_label}上限（{limit}），已返回部分读取/执行结果。"
+    payload = {
+        "stage": _map_stage_for_frame(frame),
+        "worker": frame.agent.name,
+        "mode": "partial",
+        "objective": _frame_objective(frame),
+        "target_path": "",
+        "map_layer": None,
+        "map_revision": None,
+        "region": {},
+        "summary": issue,
+        "facts": [],
+        "proposed_batches": [],
+        "write_results": [],
+        "validation": {
+            "passed": False,
+            "completion_allowed": False,
+            "issues": [issue],
+            "structured_issues": [
+                {
+                    "code": "frame_turns_exhausted",
+                    "limit_label": limit_label,
+                    "limit": limit,
+                    "agent": frame.agent.name,
+                }
+            ],
+        },
+        "missing_inputs": [
+            "需要父 agent 基于已返回的工具结果继续拆分任务，或用更具体的 target_path/map_layer/region 重新委派。"
+        ],
+        "risks": ["本子阶段未完整收敛，不能作为完成依据。"],
+        "next_stage": "replan",
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _payload_revision(payload: dict[str, Any]) -> int | None:
     """读取结构化地图结果里的 map_revision。"""
     value = payload.get("map_revision")
@@ -1021,10 +1086,17 @@ async def _handle_frame_turns_exhausted(
         limit_label,
         limit,
     )
+    text = (
+        _map_frame_exhausted_payload(frame, limit_label, limit)
+        if _map_output_schema_for_frame(frame) == _MAP_OUTPUT_SCHEMA_V1
+        else (
+            f"子 agent「{frame.agent.name}」已达到自身{limit_label}上限（{limit}），"
+            "任务未完成，已强制收尾。以上为已执行步骤记录，请据此判断是否需要重新拆分任务或继续委派。"
+        )
+    )
     await _finish_frame(
         session,
-        f"子 agent「{frame.agent.name}」已达到自身{limit_label}上限（{limit}），"
-        "任务未完成，已强制收尾。以上为已执行步骤记录，请据此判断是否需要重新拆分任务或继续委派。",
+        text,
         prompt_factory,
         event_callback,
     )
@@ -2614,6 +2686,15 @@ async def run_turn(
                 }
                 frame.active_deferred_tools.update(activated)
                 result["activated_tools"] = sorted(activated)
+                if activated:
+                    frame.search_tools_noop_count = 0
+                else:
+                    frame.search_tools_noop_count += 1
+                    if frame.search_tools_noop_count >= NOOP_SEARCH_TOOLS_HINT_THRESHOLD:
+                        result["no_more_tools_hint"] = (
+                            "search_tools 连续没有激活新工具；若已有足够事实，请输出结果，"
+                            "缺失内容写入 missing_inputs。"
+                        )
                 logger.info(
                     "Deferred tools activated session=%s frame=%s tools=%s",
                     session.session_id,
