@@ -235,6 +235,40 @@ def _append_map_state_read_error(
     )
 
 
+def _append_platform_planning_failure_hint(
+    session: Session,
+    tool_name: str,
+    result: dict[str, Any],
+) -> None:
+    """平台规划失败时追加恢复指引，避免继续执行空规划。"""
+    if tool_name not in {"plan_platform_level", "plan_reachable_map_growth"}:
+        return
+    blocked_reason = result.get("blocked_reason")
+    edit_batches = result.get("edit_map_batches")
+    jump_graph = result.get("jump_graph")
+    jump_failed = isinstance(jump_graph, dict) and jump_graph.get("passed") is False
+    empty_batches = isinstance(edit_batches, list) and not edit_batches
+    if blocked_reason not in {"entry_anchor_not_found", "jump_graph_failed"} and not (
+        jump_failed or (blocked_reason and empty_batches)
+    ):
+        return
+    frame = session.top_frame()
+    if frame is None:
+        return
+    frame.messages.append(
+        {
+            "role": "user",
+            "content": (
+                "出错：平台扩图规划失败，禁止执行空 edit_map_batches。"
+                f"blocked_reason={blocked_reason or 'unknown'}。"
+                "请先 describe_map_region 读取正确 target_path/map_layer 的连接边界；"
+                "若没有满足 min_landing_width 的连续可站立入口，先用小批地图修复"
+                "补入口 landing，validate_map_region(movement_model='leap') 通过后再重新规划。"
+            ),
+        }
+    )
+
+
 def _tool_message(tool_call_id: str, result: Any, *, is_error: bool = False) -> dict[str, Any]:
     """构造 OpenAI `role=tool` 消息。"""
     body: Any = {"error": result} if is_error else result
@@ -694,6 +728,63 @@ def _map_target_from_result(tool_args: dict[str, Any], result: dict[str, Any]) -
             return value
     value = tool_args.get("target_path")
     return value if isinstance(value, str) else ""
+
+
+def _single_known_map_target(session: Session) -> str:
+    """返回当前会话唯一已知地图目标；多目标时不猜。"""
+    targets: set[str] = set(session.latest_map_revisions) | set(session.latest_map_layers)
+    state_targets = session.map_context_state.get("targets")
+    if isinstance(state_targets, dict):
+        targets.update(str(target) for target in state_targets if str(target))
+    return next(iter(targets)) if len(targets) == 1 else ""
+
+
+def _resolved_map_tool_args(session: Session, tool_args: dict[str, Any]) -> dict[str, Any]:
+    """用会话里已确认的地图目标和图层补齐工具参数。"""
+    resolved = dict(tool_args)
+    target = resolved.get("target_path")
+    if not isinstance(target, str) or not target:
+        target = _single_known_map_target(session)
+        if target:
+            resolved["target_path"] = target
+    layer = resolved.get("map_layer", resolved.get("ground_map_layer"))
+    if isinstance(layer, int) and not isinstance(layer, bool):
+        resolved["map_layer"] = layer
+        return resolved
+    if isinstance(target, str) and target:
+        latest_layer = session.latest_map_layers.get(target)
+        if latest_layer is not None:
+            resolved["map_layer"] = latest_layer
+    return resolved
+
+
+def _map_tool_requires_map_layer(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> bool:
+    """判断地图工具是否必须带 2D map_layer。"""
+    if tool_name in {"plan_platform_level", "plan_reachable_map_growth", "compute_reachable_frontier"}:
+        return True
+    if "map_layer" in tool_args or "ground_map_layer" in tool_args:
+        return True
+    target = tool_args.get("target_path")
+    return isinstance(target, str) and target in session.latest_map_layers
+
+
+def _map_tool_missing_required_context(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> str:
+    """返回地图工具执行前仍缺少的关键上下文字段。"""
+    if _map_region_from_tool_args(tool_name, tool_args) is None:
+        return ""
+    if not isinstance(tool_args.get("target_path"), str) or not tool_args.get("target_path"):
+        return "target_path"
+    if _map_tool_requires_map_layer(session, tool_name, tool_args) and "map_layer" not in tool_args:
+        return "map_layer"
+    return ""
 
 
 def _safe_artifact_name(value: str) -> str:
@@ -1487,9 +1578,9 @@ def _map_region_read_signature(tool_name: str, tool_args: dict[str, Any]) -> str
     target = tool_args.get("target_path", "")
     if not isinstance(target, str):
         target = ""
-    map_layer = tool_args.get("map_layer", tool_args.get("ground_map_layer", 0))
+    map_layer = tool_args.get("map_layer", tool_args.get("ground_map_layer"))
     if not isinstance(map_layer, int) or isinstance(map_layer, bool):
-        map_layer = 0
+        return None
     z_value = region.get("z", 0)
     depth = region.get("depth", 1)
     return "|".join(
@@ -1513,7 +1604,15 @@ def _remember_latest_map_region_read(
     result: Any,
 ) -> None:
     """记录最近读过的地图区域，避免 frontier 计算在未读区域上猜 start。"""
-    signature = _map_region_read_signature("describe_map_region", tool_args)
+    normalized_args = dict(tool_args)
+    if isinstance(result, dict):
+        target = _map_target_from_result(tool_args, result)
+        layer = _map_layer_from_result(result, prefer_layers=False)
+        if target:
+            normalized_args["target_path"] = target
+        if layer is not None:
+            normalized_args["map_layer"] = layer
+    signature = _map_region_read_signature("describe_map_region", normalized_args)
     if signature is None:
         return
     revision = _map_revision_from_result(result) if isinstance(result, dict) else None
@@ -1527,22 +1626,29 @@ def _remember_latest_map_region_read(
 
 def _map_tool_region_read_current(session: Session, call: FrontToolCallDTO) -> bool:
     """判断地图工具依赖的区域是否已按当前 revision 读取。"""
-    signature = _map_region_read_signature(call.name, call.input)
+    resolved_input = _resolved_map_tool_args(session, call.input)
+    if _map_tool_missing_required_context(session, call.name, resolved_input):
+        return False
+    signature = _map_region_read_signature(call.name, resolved_input)
     if signature is None:
         return True
     read_revision = session.latest_map_region_reads.get(signature)
     if read_revision is None:
         return False
-    target = call.input.get("target_path")
+    target = resolved_input.get("target_path")
     if not isinstance(target, str) or not target:
         return True
     latest_revision = session.latest_map_revisions.get(target)
     return latest_revision is not None and read_revision == latest_revision
 
 
-def _map_region_read_call_for_tool(call: FrontToolCallDTO) -> FrontToolCallDTO | None:
+def _map_region_read_call_for_tool(
+    session: Session,
+    call: FrontToolCallDTO,
+) -> FrontToolCallDTO | None:
     """把地图工具调用转换为同一区域的 describe_map_region 调用。"""
-    region = _map_region_from_tool_args(call.name, call.input)
+    resolved_input = _resolved_map_tool_args(session, call.input)
+    region = _map_region_from_tool_args(call.name, resolved_input)
     if region is None:
         return None
     read_input: dict[str, Any] = {
@@ -1551,8 +1657,8 @@ def _map_region_read_call_for_tool(call: FrontToolCallDTO) -> FrontToolCallDTO |
         "max_returned_cells": 120,
     }
     for key in ("target_path", "map_layer", "ground_map_layer"):
-        if key in call.input:
-            read_input["map_layer" if key == "ground_map_layer" else key] = call.input[key]
+        if key in resolved_input:
+            read_input["map_layer" if key == "ground_map_layer" else key] = resolved_input[key]
     read_input.update(region)
     return FrontToolCallDTO(
         id=f"{call.id}__map_region_read",
@@ -1580,7 +1686,7 @@ def _defer_map_tool_for_region_read(
         return response
     if _map_tool_region_read_current(session, guarded_call):
         return response
-    read_call = _map_region_read_call_for_tool(guarded_call)
+    read_call = _map_region_read_call_for_tool(session, guarded_call)
     if read_call is None:
         return response
     session.pending_map_tool_after_read = {"call": guarded_call.model_dump()}
@@ -1622,11 +1728,11 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
         session.pending_map_tool_after_read = None
         return None
     call = FrontToolCallDTO.model_validate(raw_call)
-    target = call.input.get("target_path")
+    restored_input = _resolved_map_tool_args(session, call.input)
+    target = restored_input.get("target_path")
     target_path = target if isinstance(target, str) else ""
     latest_revision = session.latest_map_revisions.get(target_path)
     latest_layer = session.latest_map_layers.get(target_path)
-    restored_input = dict(call.input)
 
     if call.name in MAP_REVISION_GUARDED_TOOL_NAMES:
         if not target_path or latest_revision is None:
@@ -1641,12 +1747,58 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
         restored_input["expected_revision"] = latest_revision
     if "map_layer" not in restored_input and latest_layer is not None:
         restored_input["map_layer"] = latest_layer
+    missing_context = _map_tool_missing_required_context(session, call.name, restored_input)
+    if missing_context:
+        session.pending_map_tool_after_read = None
+        _append_map_state_read_error(
+            session,
+            call.name,
+            target_path,
+            missing_context,
+        )
+        return None
     if call.name in _MAP_VALIDATION_TOOL_NAMES and "map_layer" not in restored_input:
         session.pending_map_tool_after_read = None
         _append_map_state_read_error(session, call.name, target_path, "map_layer")
         return None
 
     restored_call = call.model_copy(update={"input": restored_input})
+    if not _map_tool_region_read_current(session, restored_call):
+        read_call = _map_region_read_call_for_tool(session, restored_call)
+        if read_call is None:
+            session.pending_map_tool_after_read = None
+            _append_map_state_read_error(
+                session,
+                call.name,
+                target_path,
+                "target_path/map_layer/region_context",
+            )
+            return None
+        text = "已确认地图图层，继续读取带图层的真实地图区域。"
+        turn_id = session.new_turn_id()
+        _append_assistant_tool_calls(session, text, [read_call])
+        session.set_pending(
+            turn_id,
+            [read_call.id],
+            {
+                read_call.id: {
+                    "name": read_call.name,
+                    "input": read_call.input,
+                    "frame_id": read_call.frame_id,
+                    "agent": read_call.agent,
+                }
+            },
+        )
+        logger.info(
+            "Continuing pending map tool region read session=%s tool=%s target=%s layer=%s read_call=%s",
+            session.session_id,
+            restored_call.name,
+            target_path,
+            restored_input.get("map_layer"),
+            read_call.id,
+        )
+        return ChatToolCallsResponse(turn_id=turn_id, text=text, calls=[read_call])
+
     text = "已读取真实地图区域，继续执行挂起的地图工具调用。"
     turn_id = session.new_turn_id()
     session.pending_map_tool_after_read = None
@@ -4413,6 +4565,8 @@ class QueryEngine:
             frame.messages.append(
                 _tool_message(result.tool_use_id, history_payload, is_error=is_error)
             )
+            if isinstance(result_for_gate, dict):
+                _append_platform_planning_failure_hint(session, tool_name, result_for_gate)
             if (
                 tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
                 and str(result.error_code) == "map_revision_conflict"
