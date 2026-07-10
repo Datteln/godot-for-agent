@@ -9,6 +9,9 @@ const EventFormatter = preload("res://addons/ai_agent/ui/event_formatter.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 const ChatPanelText = preload("res://addons/ai_agent/ui/chat_panel_text.gd")
 const ChatPanelTheme = preload("res://addons/ai_agent/ui/chat_panel_theme.gd")
+const ChatMessageStore = preload("res://addons/ai_agent/ui/chat_message_store.gd")
+const ChatNodeFactory = preload("res://addons/ai_agent/ui/chat_node_factory.gd")
+const ChatVirtualScroller = preload("res://addons/ai_agent/ui/chat_virtual_scroller.gd")
 const InlineToolConfirmation = preload("res://addons/ai_agent/ui/inline_tool_confirmation.gd")
 const LogEntryRenderer = preload("res://addons/ai_agent/ui/log_entry_renderer.gd")
 const MarkdownRenderer = preload("res://addons/ai_agent/ui/markdown_renderer.gd")
@@ -23,7 +26,7 @@ const STREAM_RENDER_INTERVAL_MS := 120
 const REASONING_RENDER_INTERVAL_MS := 250
 const EVENT_DRAIN_BATCH_SIZE := 24
 const EVENT_DRAIN_TIME_BUDGET_MS := 6
-const MAX_MESSAGE_LIST_CHILDREN := 240
+const MAX_MESSAGE_LIST_CHILDREN := 50
 const MAX_LIVE_RENDER_CHARS := 60000
 const MAX_MESSAGE_RENDER_CHARS := 90000
 const MAX_REASONING_RENDER_CHARS := 30000
@@ -78,6 +81,9 @@ var _selection_signature := ""
 var _last_selection_refresh_ms := 0
 var _message_context_popup: PopupMenu
 var _message_context_source: RichTextLabel
+var _message_store: ChatMessageStore
+var _node_factory: ChatNodeFactory
+var _virtual_scroller: ChatVirtualScroller
 var _send_btn: Button
 var _stop_btn: Button
 var _new_session_btn: Button
@@ -124,6 +130,7 @@ var _pending_final_received_ms: int = -1
 var _stream_key := ""
 var _stream_row: Control
 var _stream_content_rich: RichTextLabel
+var _stream_message_index := -1
 var _stream_started_ms: int = -1
 var _stream_display_text := ""
 var _stream_text_dirty := false
@@ -131,6 +138,7 @@ var _stream_last_render_ms := 0
 var _reasoning_key := ""
 var _reasoning_toggle: Button
 var _reasoning_detail_rich: RichTextLabel
+var _reasoning_message_index := -1
 var _reasoning_text := ""
 var _reasoning_started_ms: int = -1
 var _reasoning_token_count: int = 0
@@ -436,6 +444,7 @@ func _build_children() -> void:
 	_log_renderer.theme_colors = _theme_colors
 	_log_renderer.editor_interface = editor_interface
 	_log_renderer.rich_text_setup = _configure_message_rich_text
+	_initialize_virtual_messages()
 
 
 func _ensure_log_renderer() -> void:
@@ -445,6 +454,18 @@ func _ensure_log_renderer() -> void:
 	_log_renderer.theme_colors = _theme_colors
 	_log_renderer.editor_interface = editor_interface
 	_log_renderer.rich_text_setup = _configure_message_rich_text
+
+
+func _initialize_virtual_messages() -> void:
+	if _message_store != null:
+		return
+	_message_store = ChatMessageStore.new()
+	_node_factory = ChatNodeFactory.new()
+	_node_factory.log_renderer = _log_renderer
+	_node_factory.theme_colors = _theme_colors
+	_node_factory.rich_text_setup = _configure_message_rich_text
+	_virtual_scroller = ChatVirtualScroller.new()
+	_virtual_scroller.setup(_scroll, _message_list, _message_store, _node_factory)
 
 
 func _connect_signals() -> void:
@@ -485,6 +506,8 @@ func _connect_signals() -> void:
 
 func _refresh_theme_colors() -> void:
 	ChatPanelTheme.refresh_theme_colors(self, editor_interface, _theme_colors)
+	if _node_factory != null:
+		_node_factory.theme_colors = _theme_colors
 
 
 func _refresh_live_theme_overrides() -> void:
@@ -1399,8 +1422,7 @@ func _append_history_thought_item(text: String) -> void:
 	var newline := stripped.find("\n")
 	var header := stripped if newline == -1 else stripped.substr(0, newline)
 	var detail := "" if newline == -1 else stripped.substr(newline + 1).strip_edges()
-	_log_renderer.append_history_thought_entry(_message_list, header, detail)
-	_scroll_to_bottom()
+	_queue_message({"type": "history_thought", "header": header, "detail": detail, "estimated_height": _estimate_text_height(text)})
 
 
 func _handle_final(response: Dictionary) -> void:
@@ -1438,18 +1460,10 @@ func _handle_final(response: Dictionary) -> void:
 	if not _live_response_keys.has(assistant_key):
 		_live_response_keys[assistant_key] = true
 		_rendered_assistant_keys[assistant_key] = true
-		if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-			_stream_content_rich.clear()
-			_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(
-				_limit_render_text(render_text, MAX_MESSAGE_RENDER_CHARS),
-				_theme_colors
-			))
-			_finish_streaming()
-		else:
-			_discard_stream_message()
-			_indent_current_text = true
-			_append_log_stream_message(render_text)
-			_indent_current_text = false
+		_discard_stream_message()
+		_indent_current_text = true
+		_append_log_stream_message(render_text)
+		_indent_current_text = false
 		# 无论走流式还是非流式路径，都在 _process 中连续多帧强制滚动到底部，
 		# 等待 fit_content RichTextLabel 完成复杂 Markdown（表格、代码块）的布局计算。
 		# 但如果用户已主动上滚浏览历史，尊重用户意图，不强制拉回底部。
@@ -1522,7 +1536,7 @@ func _handle_session_history(response: Dictionary) -> void:
 	# 不再向历史时间线注入一条并不存在的系统消息。
 	if not response.has("blocks") and not items.is_empty():
 		_append_message("system", _ui("history_restored") % str(items.size()))
-	elif blocks.is_empty() and items.is_empty() and _message_list.get_child_count() == 0:
+	elif blocks.is_empty() and items.is_empty() and _message_store.size() == 0:
 		_append_message("system", _ui("switch_session_empty"))
 	_auto_scroll = saved_auto_scroll
 	_force_scroll_once = true
@@ -1564,12 +1578,13 @@ func _render_history_block(block: Dictionary) -> void:
 		"error":
 			_render_message_block("error", str(block.get("text", "")))
 		"log_text":
-			_log_renderer.append_history_text_entry(
-				_message_list,
-				str(block.get("text", "")),
-				bool(block.get("marker", false)),
-				bool(block.get("indent", false))
-			)
+			_queue_message({
+				"type": "history_text",
+				"text": str(block.get("text", "")),
+				"marker": bool(block.get("marker", false)),
+				"indent": bool(block.get("indent", false)),
+				"estimated_height": _estimate_text_height(str(block.get("text", ""))),
+			})
 		"log_read":
 			_append_log_stream_message(
 				"Read %s (lines %d-%d)" % [
@@ -1592,15 +1607,16 @@ func _render_history_block(block: Dictionary) -> void:
 			if edit_after_text != "":
 				var ext := str(block.get("path", "")).get_extension().to_lower()
 				var lang := "gdscript" if ext == "gd" else ("python" if ext == "py" else "")
-				_log_renderer.append_history_code_entry(_message_list, edit_after_text, lang, true)
+				_queue_message({"type": "history_code", "text": edit_after_text, "language": lang, "indent": true, "estimated_height": _estimate_text_height(edit_after_text)})
 		"node_tree":
 			_render_history_node_tree(block)
 		"thought":
-			_log_renderer.append_history_thought_entry(
-				_message_list,
-				str(block.get("header", "Thought")),
-				str(block.get("detail", ""))
-			)
+			_queue_message({
+				"type": "history_thought",
+				"header": str(block.get("header", "Thought")),
+				"detail": str(block.get("detail", "")),
+				"estimated_height": _estimate_text_height(str(block.get("detail", ""))),
+			})
 		"plan_created":
 			_render_history_plan_created(block)
 		"step_started":
@@ -1890,8 +1906,7 @@ func _show_pending_results_notice() -> void:
 	reset_btn.pressed.connect(_on_reset)
 	actions.add_child(reset_btn)
 
-	_message_list.add_child(row)
-	_scroll_to_bottom()
+	_queue_external_message(row, 120.0)
 
 
 func _discard_pending_results() -> void:
@@ -2349,7 +2364,7 @@ func _update_output_styles(styles: Array) -> void:
 
 func _show_inline_confirmation(calls: Array) -> void:
 	_inline_confirm.show(_message_list, calls, _ui_table(), _theme_colors, _on_inline_apply, _on_inline_reject)
-	_trim_message_list()
+	_sync_virtual_messages()
 	# 确保确认面板出现时自动滚动到底部，让用户看到需要操作的内容
 	_auto_scroll = true
 	_force_scroll_once = true
@@ -2660,7 +2675,7 @@ func _ensure_reasoning_entry(key: String) -> void:
 	var toggle := _log_renderer.make_workflow_toggle(_format_reasoning_header(), _theme_color("muted_text"))
 	var detail_rich := _log_renderer.append_collapsible(body, toggle, "", "✻")
 
-	_message_list.add_child(body)
+	_reasoning_message_index = _queue_external_message(body, 72.0, true)
 	_reasoning_toggle = toggle
 	_reasoning_detail_rich = detail_rich
 	_scroll_to_bottom()
@@ -2702,7 +2717,7 @@ func _ensure_stream_message(key: String, indent := false) -> void:
 
 	var content_rich := _log_renderer.make_log_rich_text("", null, "", indent)
 
-	_message_list.add_child(content_rich)
+	_stream_message_index = _queue_external_message(content_rich, 64.0, true)
 	_stream_row = content_rich
 	_stream_content_rich = content_rich
 	_scroll_to_bottom()
@@ -2714,6 +2729,7 @@ func _finish_streaming() -> void:
 	_stream_key = ""
 	_stream_row = null
 	_stream_content_rich = null
+	_stream_message_index = -1
 	_stream_started_ms = -1
 	_stream_display_text = ""
 	_stream_text_dirty = false
@@ -2728,9 +2744,16 @@ func _finish_reasoning_stream() -> void:
 		_reasoning_toggle.text = "✻  " + finished_header + " ✓"
 	if _reasoning_key != "":
 		_reasoning_delta_text_by_key.erase(_reasoning_key)
+	var finished_header := _format_reasoning_header() + " ✓" if _reasoning_started_ms >= 0 else "Thought"
+	var finished_text := _reasoning_text
+	if _reasoning_message_index >= 0:
+		_remove_queued_message(_reasoning_message_index)
+		if finished_text.strip_edges() != "":
+			_queue_message({"type": "history_thought", "header": finished_header, "detail": finished_text, "estimated_height": _estimate_text_height(finished_text)})
 	_reasoning_key = ""
 	_reasoning_toggle = null
 	_reasoning_detail_rich = null
+	_reasoning_message_index = -1
 	_reasoning_text = ""
 	_reasoning_started_ms = -1
 	_reasoning_token_count = 0
@@ -2789,8 +2812,8 @@ func _coerce_stream_message_index(value: Variant) -> int:
 
 
 func _discard_stream_message() -> void:
-	if _stream_row != null and is_instance_valid(_stream_row):
-		_stream_row.queue_free()
+	if _stream_message_index >= 0:
+		_remove_queued_message(_stream_message_index)
 	_finish_streaming()
 
 
@@ -2799,8 +2822,8 @@ func _discard_stream_message() -> void:
 ## 直接丢弃——这样用户能看到模型在工具调用之间的说明/思考文字。
 func _finalize_stream_as_persistent() -> void:
 	var text := _stream_display_text
-	if _stream_row != null and is_instance_valid(_stream_row):
-		_stream_row.queue_free()
+	if _stream_message_index >= 0:
+		_remove_queued_message(_stream_message_index)
 	if text.strip_edges() != "":
 		_indent_current_text = true
 		_append_log_stream_message(text, null, true)
@@ -2835,30 +2858,7 @@ func _append_message(role: String, text: String, color = null) -> void:
 		_append_log_stream_message(text, color, role != "assistant")
 		return
 
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
-	if role == "user":
-		var spacer := Control.new()
-		spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		spacer.size_flags_stretch_ratio = 0.35
-		row.add_child(spacer)
-
-	var panel := _log_renderer.make_message_panel(role)
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	panel.size_flags_stretch_ratio = 0.65 if role == "user" else 1.0
-	panel.custom_minimum_size = Vector2(320, 0) if role == "user" else Vector2(0, 0)
-	row.add_child(panel)
-
-	var body := VBoxContainer.new()
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	panel.add_child(body)
-
-	var rich := _log_renderer.make_rich_text(_limit_render_text(text, MAX_MESSAGE_RENDER_CHARS), color)
-	body.add_child(rich)
-
-	_message_list.add_child(row)
-	_scroll_to_bottom()
+	_queue_message({"type": "message", "role": role, "text": _limit_render_text(text, MAX_MESSAGE_RENDER_CHARS), "color": color, "estimated_height": _estimate_text_height(text)})
 
 
 func _message_fingerprint(text: String) -> String:
@@ -2867,14 +2867,14 @@ func _message_fingerprint(text: String) -> String:
 
 func _append_log_stream_message(text: String, color = null, mark_text: bool = false) -> void:
 	_ensure_log_renderer()
-	_log_renderer.append_log_stream_message(
-		_message_list,
-		_limit_render_text(text, MAX_MESSAGE_RENDER_CHARS),
-		color,
-		mark_text,
-		_indent_current_text
-	)
-	_scroll_to_bottom()
+	_queue_message({
+		"type": "log",
+		"text": _limit_render_text(text, MAX_MESSAGE_RENDER_CHARS),
+		"color": color,
+		"mark_text": mark_text,
+		"indent": _indent_current_text,
+		"estimated_height": _estimate_text_height(text),
+	})
 
 
 ## `preview`/`diff_stats` 仅在调用方已经为这个 call 渲染过 diff 预览时传入
@@ -2951,26 +2951,42 @@ func _append_tool_result_panel(call: Dictionary, result: Dictionary, preview: Co
 		"name": name, "status": status, "status_text": status_text
 	})
 
-	_message_list.add_child(content)
-	_scroll_to_bottom()
+	_queue_external_message(content, 120.0)
 
 
 func _clear_messages() -> void:
 	_clear_pending_final_pair()
-	_finish_streaming()
-	_finish_reasoning_stream()
 	_rendered_assistant_keys.clear()
 	_live_response_keys.clear()
 	_closed_stream_keys.clear()
-	_closed_reasoning_keys.clear()   # 新增
+	_closed_reasoning_keys.clear()
 	_stream_delta_text_by_key.clear()
 	_reasoning_delta_text_by_key.clear()
-	for child in _message_list.get_children():
-		child.queue_free()
+	_stream_key = ""
+	_stream_row = null
+	_stream_content_rich = null
+	_stream_message_index = -1
+	_stream_started_ms = -1
+	_stream_display_text = ""
+	_stream_text_dirty = false
+	_stream_last_render_ms = 0
+	_reasoning_key = ""
+	_reasoning_toggle = null
+	_reasoning_detail_rich = null
+	_reasoning_message_index = -1
+	_reasoning_text = ""
+	_reasoning_started_ms = -1
+	_reasoning_token_count = 0
+	_reasoning_text_dirty = false
+	_reasoning_last_render_ms = 0
+	if _virtual_scroller != null:
+		_virtual_scroller.clear()
+	if _message_store != null:
+		_message_store.clear()
 
 
 func _scroll_to_bottom() -> void:
-	_trim_message_list()
+	_sync_virtual_messages()
 	if not _auto_scroll and not _force_scroll_once:
 		return
 	# 立即清除一次性标记，防止后续同一帧内其他调用再次绕过守卫
@@ -2981,13 +2997,43 @@ func _scroll_to_bottom() -> void:
 	call_deferred("_scroll_to_bottom_deferred")
 
 
-func _trim_message_list() -> void:
-	if _message_list == null:
+func _sync_virtual_messages() -> void:
+	if _virtual_scroller != null:
+		_virtual_scroller.sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, _auto_scroll or _force_scroll_once)
+
+
+func _queue_message(data: Dictionary) -> int:
+	_initialize_virtual_messages()
+	var index := _message_store.add_message(data)
+	_virtual_scroller.notify_message_added(index, _auto_scroll or _force_scroll_once)
+	_scroll_to_bottom()
+	return index
+
+
+func _queue_external_message(node: Control, estimated_height: float, keep_visible := false) -> int:
+	return _queue_message({
+		"type": "external",
+		"external": true,
+		"node": node,
+		"keep_visible": keep_visible,
+		"estimated_height": estimated_height,
+	})
+
+
+func _remove_queued_message(index: int) -> void:
+	if index < 0 or _virtual_scroller == null:
 		return
-	while _message_list.get_child_count() > MAX_MESSAGE_LIST_CHILDREN:
-		var child := _message_list.get_child(0)
-		_message_list.remove_child(child)
-		child.queue_free()
+	_virtual_scroller.remove_message(index)
+	if _stream_message_index > index:
+		_stream_message_index -= 1
+	if _reasoning_message_index > index:
+		_reasoning_message_index -= 1
+
+
+func _estimate_text_height(text: String) -> float:
+	var line_count := max(1, text.count("\n") + 1)
+	var wrap_lines := int(ceil(float(text.length()) / 90.0))
+	return 30.0 + float(max(line_count, wrap_lines)) * 22.0
 
 
 func _on_scroll_value_changed(value: float) -> void:
@@ -3009,6 +3055,8 @@ func _on_scroll_value_changed(value: float) -> void:
 		# 用户主动向上滚动——无论是否正在流式输出，都尊重用户意图。
 		_auto_scroll = false
 		_user_scrolled_up_ms = Time.get_ticks_msec()
+	if _virtual_scroller != null:
+		_virtual_scroller.on_scroll_changed(value)
 
 
 func _on_scrollbar_button_down() -> void:
