@@ -32,7 +32,6 @@ from app.api.schemas import (
     ChatToolCallsResponse,
     FrontToolCallDTO,
     InterruptResponse,
-    SessionHistoryItemDTO,
     SessionHistoryResponse,
     ToolResult,
 )
@@ -138,10 +137,7 @@ from app.query.helpers import (
     _has_only_map_review_required,
     _has_review_blocker,
     _history_context_used_tokens,
-    _history_items_for_events,
-    _history_items_for_frame,
     _history_payload_for_front_tool,
-    _history_text_fingerprint,
     _json_char_size,
     _map_completion_blocker,
     _map_completion_gate_text,
@@ -163,6 +159,7 @@ from app.query.helpers import (
     _tool_message,
     _update_map_context_state,
 )
+from app.query.history_to_events import blocks_to_pseudo_events
 
 
 class QueryEngine:
@@ -355,23 +352,16 @@ class QueryEngine:
             recent_frames = session.agent_stack
             recent_events = events
         blocks = _structured_session_history(recent_frames, recent_events)
-        items: list[SessionHistoryItemDTO] = []
-        for frame in recent_frames:
-            items.extend(_history_items_for_frame(frame))
-        seen = {_history_text_fingerprint(item.text) for item in items}
-        if recent_events:
-            items.extend(_history_items_for_events(recent_events, seen))
-        if limit > 0 and len(items) > limit:
-            items = items[-limit:]
         if limit > 0 and len(blocks) > limit:
             blocks = blocks[-limit:]
+        pseudo_events = blocks_to_pseudo_events(blocks)
         logger.info(
-            "Session history requested session=%s frames=%d/%d items=%d blocks=%d pending=%s",
+            "Session history requested session=%s frames=%d/%d blocks=%d events=%d pending=%s",
             session_id,
             len(recent_frames),
             len(session.agent_stack),
-            len(items),
             len(blocks),
+            len(pseudo_events),
             session.pending_turn_id is not None,
         )
         return SessionHistoryResponse(
@@ -380,8 +370,7 @@ class QueryEngine:
             pending_turn_id=session.pending_turn_id,
             context_used_tokens=_history_context_used_tokens(session, events),
             context_token_limit=self._settings.auto_compact_token_threshold,
-            items=items,
-            blocks=blocks,
+            pseudo_events=pseudo_events,
         )
 
     async def submit_user_turn(self, request: ChatRequest) -> ChatResponse:

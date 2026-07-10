@@ -69,6 +69,8 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 			return ""
 		"delegate_start":
 			return ui_text.get("event_delegate", "Task(%s)") % _format_delegate_args(payload)
+		"delegate_result":
+			return _title_with_body("Delegate result: %s" % str(payload.get("agent", "delegate")), str(payload.get("summary", "")))
 		"cache_hit":
 			return _format_cache_hit_event(payload, ui_text)
 		"agent_model_fallback":

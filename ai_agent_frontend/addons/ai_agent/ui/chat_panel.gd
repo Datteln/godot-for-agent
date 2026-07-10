@@ -1494,6 +1494,8 @@ func _handle_session_history(response: Dictionary) -> void:
 	var items: Array = raw_items if raw_items is Array else []
 	var raw_blocks: Variant = response.get("blocks", [])
 	var blocks: Array = raw_blocks if raw_blocks is Array else []
+	var raw_pseudo_events: Variant = response.get("pseudo_events", [])
+	var pseudo_events: Array = raw_pseudo_events if raw_pseudo_events is Array else []
 	var session_id := str(response.get("session_id", ""))
 	# 响应 session_id 与当前不符说明是切换会话后迟到的过期响应，直接丢弃。
 	if session_id != "" and session_id != _current_session_id():
@@ -1504,8 +1506,9 @@ func _handle_session_history(response: Dictionary) -> void:
 		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Restoring session history.", {
 		"session_id": session_id,
-		"count": blocks.size() if response.has("blocks") else items.size(),
-		"structured": response.has("blocks")
+		"count": pseudo_events.size() if not pseudo_events.is_empty() else (blocks.size() if response.has("blocks") else items.size()),
+		"structured": response.has("blocks"),
+		"pseudo_events": not pseudo_events.is_empty()
 	})
 	_clear_messages()
 	_update_context_usage_status(
@@ -1522,7 +1525,11 @@ func _handle_session_history(response: Dictionary) -> void:
 			state_store.set_value("current_turn_id", _http_client.current_turn_id)
 	var saved_auto_scroll := _auto_scroll
 	_auto_scroll = false
-	if response.has("blocks"):
+	if not pseudo_events.is_empty():
+		for event in pseudo_events:
+			if event is Dictionary:
+				_handle_event(event)
+	elif response.has("blocks"):
 		for block in blocks:
 			if block is Dictionary:
 				_render_history_block(block)
@@ -2166,6 +2173,25 @@ func _drain_event_queue() -> void:
 
 func _handle_event(event: Dictionary) -> void:
 	var event_type := str(event.get("type", ""))
+	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+	if event_type == "_history_log_text":
+		_queue_message({"type": "history_text", "text": str(payload.get("text", "")), "marker": bool(payload.get("marker", false)), "indent": bool(payload.get("indent", false)), "estimated_height": _estimate_text_height(str(payload.get("text", "")))})
+		return
+	if event_type == "_history_thought":
+		_queue_message({"type": "history_thought", "header": str(payload.get("header", "Thought")), "detail": str(payload.get("detail", "")), "estimated_height": _estimate_text_height(str(payload.get("detail", "")))})
+		return
+	if event_type == "_history_code":
+		var code := str(payload.get("text", ""))
+		var extension := str(payload.get("path", "")).get_extension().to_lower()
+		var language := "gdscript" if extension == "gd" else ("python" if extension == "py" else "")
+		_queue_message({"type": "history_code", "text": code, "language": language, "indent": true, "estimated_height": _estimate_text_height(code)})
+		return
+	if event_type == "system_message":
+		_render_message_block("system", str(payload.get("text", "")))
+		return
+	if event_type == "user_submitted" and payload.has("text"):
+		_render_message_block("user", str(payload.get("text", "")))
+		return
 	if event_type == "server_tool_result":
 		_remember_server_file_read(event)
 	if event_type == "agent_reasoning_delta":
