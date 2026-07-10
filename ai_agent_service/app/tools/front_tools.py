@@ -1713,7 +1713,12 @@ def register_front_tools() -> None:
                     "response carries `auto_served: true`), so you do NOT need to pre-split typical level-width "
                     "reads yourself. Only a region above the auto-serve ceiling fails with error_code "
                     "'region_too_large', and then it returns `suggested_regions`: smaller pre-split rectangles "
-                    "covering the same area — just issue describe_map_region for each."
+                    "covering the same area — just issue describe_map_region for each. "
+                    "Hard size rule: requested_cells = width * height * depth (depth is 1 for 2D). "
+                    "Keep reads at or below 800 cells when possible. The absolute auto-serve ceiling is "
+                    "1600 cells; never issue a request above 1600. If the result has error_code "
+                    "'region_too_large', use its suggested_regions exactly and do not retry the original "
+                    "oversized rectangle."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1735,9 +1740,21 @@ def register_front_tools() -> None:
                         "x": {"type": "integer"},
                         "y": {"type": "integer"},
                         "z": {"type": "integer"},
-                        "width": {"type": "integer", "minimum": 1},
-                        "height": {"type": "integer", "minimum": 1},
-                        "depth": {"type": "integer", "minimum": 1},
+                        "width": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Region width. Ensure width * height * depth <= 1600; prefer <= 800.",
+                        },
+                        "height": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Region height. Ensure width * height * depth <= 1600; prefer <= 800.",
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Region depth; use 1 for 2D. Ensure width * height * depth <= 1600.",
+                        },
                         "cells_format": {
                             "type": "string",
                             "enum": ["summary_only", "non_empty_only", "full"],

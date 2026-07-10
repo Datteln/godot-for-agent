@@ -852,7 +852,7 @@ func _on_response(response: Dictionary) -> void:
 		_update_output_styles(response.get("output_styles", []))
 		return
 
-	if response.has("session_id") and response.has("pending_turn_id") and response.has("items"):
+	if response.has("session_id") and response.has("pending_turn_id") and response.has("pseudo_events"):
 		_handle_session_history(response)
 		return
 
@@ -1398,33 +1398,6 @@ func _split_thought_summary(text: String) -> Dictionary:
 	}
 
 
-## 把模型最终回复开头的 `Thought: ...` 摘要行转换为可折叠 workflow 条目格式。
-func _apply_thought_prefix(text: String) -> String:
-	var parts := _split_thought_summary(text)
-	var summary := str(parts.get("summary", ""))
-	if summary == "":
-		return text
-	var elapsed := 0.0
-	if _stream_started_ms >= 0:
-		elapsed = maxf(0.01, (Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)
-	var thought_line := "Thought for %.2fs > %s" % [elapsed, summary]
-	var rest := str(parts.get("rest", ""))
-	if rest == "":
-		return thought_line
-	return "%s\n\n%s" % [thought_line, rest]
-
-
-## 渲染后端为历史回放重建的 "Thought for Xs\n<思考正文>" 条目：第一行做折叠标题，
-## 剩余部分原样作为 detail，整段不经过通用的按行动作前缀拆分（见调用处注释）。
-func _append_history_thought_item(text: String) -> void:
-	_ensure_log_renderer()
-	var stripped := text.strip_edges()
-	var newline := stripped.find("\n")
-	var header := stripped if newline == -1 else stripped.substr(0, newline)
-	var detail := "" if newline == -1 else stripped.substr(newline + 1).strip_edges()
-	_queue_message({"type": "history_thought", "header": header, "detail": detail, "estimated_height": _estimate_text_height(text)})
-
-
 func _handle_final(response: Dictionary) -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Received final response.", {
 		"chars": str(response.get("text", "")).length()
@@ -1490,10 +1463,6 @@ func _handle_session_history(response: Dictionary) -> void:
 			"state": _status.text
 		})
 		return
-	var raw_items: Variant = response.get("items", [])
-	var items: Array = raw_items if raw_items is Array else []
-	var raw_blocks: Variant = response.get("blocks", [])
-	var blocks: Array = raw_blocks if raw_blocks is Array else []
 	var raw_pseudo_events: Variant = response.get("pseudo_events", [])
 	var pseudo_events: Array = raw_pseudo_events if raw_pseudo_events is Array else []
 	var session_id := str(response.get("session_id", ""))
@@ -1506,9 +1475,7 @@ func _handle_session_history(response: Dictionary) -> void:
 		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Restoring session history.", {
 		"session_id": session_id,
-		"count": pseudo_events.size() if not pseudo_events.is_empty() else (blocks.size() if response.has("blocks") else items.size()),
-		"structured": response.has("blocks"),
-		"pseudo_events": not pseudo_events.is_empty()
+		"count": pseudo_events.size()
 	})
 	_clear_messages()
 	_update_context_usage_status(
@@ -1525,345 +1492,18 @@ func _handle_session_history(response: Dictionary) -> void:
 			state_store.set_value("current_turn_id", _http_client.current_turn_id)
 	var saved_auto_scroll := _auto_scroll
 	_auto_scroll = false
-	if not pseudo_events.is_empty():
-		for event in pseudo_events:
-			if event is Dictionary:
-				_handle_event(event)
-	elif response.has("blocks"):
-		for block in blocks:
-			if block is Dictionary:
-				_render_history_block(block)
-	else:
-		_render_legacy_history_items(items)
+	for event in pseudo_events:
+		if event is Dictionary:
+			_handle_event(event)
 	if pending_turn_id != null:
 		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
 		_show_pending_results_notice()
 		_set_state(AgentState.WAITING_CONFIRM)
-	# 旧服务没有 blocks 时保留恢复提示；结构化响应本身已经完整表达内容，
-	# 不再向历史时间线注入一条并不存在的系统消息。
-	if not response.has("blocks") and not items.is_empty():
-		_append_message("system", _ui("history_restored") % str(items.size()))
-	elif blocks.is_empty() and items.is_empty() and _message_store.size() == 0:
+	if pseudo_events.is_empty() and _message_store.size() == 0:
 		_append_message("system", _ui("switch_session_empty"))
 	_auto_scroll = saved_auto_scroll
 	_force_scroll_once = true
 	_scroll_to_bottom()
-
-
-func _render_legacy_history_items(items: Array) -> void:
-	for item in items:
-		if not (item is Dictionary):
-			continue
-		var role := str(item.get("role", "system"))
-		var raw_text := str(item.get("text", ""))
-		if role == "assistant" and raw_text.strip_edges().begins_with("Thought for "):
-			_append_history_thought_item(raw_text)
-			continue
-		var text := _normalize_history_text(role, _strip_think_xml(raw_text)).strip_edges()
-		if text == "":
-			continue
-		# agent_tool_calls 事件对应的历史条目，实时对话不显示，历史也跳过
-		if text.begins_with("Tool calls"):
-			continue
-		var processed := _apply_thought_prefix(text) if role == "assistant" else text
-		if role == "assistant" and processed.begins_with("Thought for "):
-			_append_history_thought_item(processed)
-		elif role == "assistant":
-			_indent_current_text = true
-			_append_message(role, processed)
-			_indent_current_text = false
-		else:
-			_append_message(role, processed)
-
-
-func _render_history_block(block: Dictionary) -> void:
-	_ensure_log_renderer()
-	var block_type := str(block.get("type", ""))
-	match block_type:
-		"user":
-			_render_message_block("user", str(block.get("text", "")))
-		"error":
-			_render_message_block("error", str(block.get("text", "")))
-		"log_text":
-			_queue_message({
-				"type": "history_text",
-				"text": str(block.get("text", "")),
-				"marker": bool(block.get("marker", false)),
-				"indent": bool(block.get("indent", false)),
-				"estimated_height": _estimate_text_height(str(block.get("text", ""))),
-			})
-		"log_read":
-			_append_log_stream_message(
-				"Read %s (lines %d-%d)" % [
-					str(block.get("path", "<unknown>")),
-					int(block.get("line_start", 1)),
-					int(block.get("line_end", 1))
-				]
-			)
-		"log_grep":
-			_render_history_grep_block(block)
-		"log_edit":
-			_append_log_stream_message(
-				"Edit %s\n+%d -%d lines" % [
-					str(block.get("path", "<unknown>")),
-					int(block.get("added", 0)),
-					int(block.get("removed", 0))
-				]
-			)
-			var edit_after_text := str(block.get("after_text", ""))
-			if edit_after_text != "":
-				var ext := str(block.get("path", "")).get_extension().to_lower()
-				var lang := "gdscript" if ext == "gd" else ("python" if ext == "py" else "")
-				_queue_message({"type": "history_code", "text": edit_after_text, "language": lang, "indent": true, "estimated_height": _estimate_text_height(edit_after_text)})
-		"node_tree":
-			_render_history_node_tree(block)
-		"thought":
-			_queue_message({
-				"type": "history_thought",
-				"header": str(block.get("header", "Thought")),
-				"detail": str(block.get("detail", "")),
-				"estimated_height": _estimate_text_height(str(block.get("detail", ""))),
-			})
-		"plan_created":
-			_render_history_plan_created(block)
-		"step_started":
-			_append_log_stream_message(
-				"Step %d/%d started:\n%s%s" % [
-					int(block.get("index", 0)), int(block.get("total", 0)),
-					str(block.get("title", "")), _history_agent_suffix(block)
-				], null, true
-			)
-		"step_completed":
-			_append_log_stream_message(
-				"Step %d/%d completed:\n%s" % [
-					int(block.get("index", 0)), int(block.get("total", 0)),
-					str(block.get("summary", ""))
-				], null, true
-			)
-		"verify_started":
-			_append_log_stream_message(
-				"Verify started:\n%s (%s)" % [
-					str(block.get("file_path", "")), str(block.get("phase", ""))
-				], null, true
-			)
-		"verify_passed":
-			_append_log_stream_message(
-				"Verify passed:\n%s" % str(block.get("summary", "")), null, true
-			)
-		"verify_failed":
-			_append_log_stream_message(
-				"Verify found %d issue(s):\n%s" % [
-					int(block.get("issues_count", 0)), str(block.get("summary", ""))
-				], null, true
-			)
-		"delegate_results":
-			_render_history_delegate_results(block)
-		"delegate_result":
-			_append_log_stream_message(
-				"Delegate result: %s\n%s" % [
-					str(block.get("agent", "")),
-					str(block.get("summary", ""))
-				], null, true
-			)
-		"event":
-			var payload: Dictionary = block.get("payload", {}) if block.get("payload", {}) is Dictionary else {}
-			_render_event_description({
-				"type": str(block.get("event_type", "")),
-				"payload": payload
-			})
-		"system_text":
-			_render_message_block("system", str(block.get("text", "")))
-
-
-func _history_agent_suffix(block: Dictionary) -> String:
-	var agent := str(block.get("agent", "")).strip_edges()
-	return " (%s)" % agent if agent != "" else ""
-
-
-func _render_history_node_tree(block: Dictionary) -> void:
-	var lines: Array[String] = [str(block.get("title", "Scene tree"))]
-	var tree = block.get("tree", {})
-	if tree is Dictionary and not tree.is_empty():
-		_append_history_node_lines(tree, "", true, lines)
-	else:
-		lines.append("(empty)")
-	_append_log_stream_message("\n".join(lines), null, true)
-
-
-func _append_history_node_lines(node: Dictionary, prefix: String, is_last: bool, lines: Array[String]) -> void:
-	var branch := "└─ " if is_last else "├─ "
-	var name := str(node.get("name", node.get("path", "Node")))
-	var type_name := str(node.get("type", "Node"))
-	lines.append(prefix + branch + name + " (" + type_name + ")")
-	var children: Array = node.get("children", []) if node.get("children", []) is Array else []
-	var child_prefix := prefix + ("   " if is_last else "│  ")
-	for index in range(children.size()):
-		if children[index] is Dictionary:
-			_append_history_node_lines(children[index], child_prefix, index == children.size() - 1, lines)
-
-
-func _render_history_grep_block(block: Dictionary) -> void:
-	var lines: Array[String] = []
-	lines.append("Grep \"%s\" (in %s)" % [
-		str(block.get("pattern", "")).replace("\"", "\\\""),
-		str(block.get("include", "project"))
-	])
-	lines.append("%d match(es)" % int(block.get("match_count", 0)))
-	var results: Array = block.get("results", [])
-	for result in results:
-		if not (result is Dictionary):
-			continue
-		var location := str(result.get("path", ""))
-		var line = result.get("line")
-		if line != null:
-			location += ":%d" % int(line)
-		lines.append("%s %s" % [location, str(result.get("text", ""))])
-	if bool(block.get("truncated", false)):
-		lines.append("... (truncated)")
-	_append_log_stream_message("\n".join(lines))
-
-
-func _render_history_plan_created(block: Dictionary) -> void:
-	var lines: Array[String] = ["Plan created:"]
-	var summary := str(block.get("summary", "")).strip_edges()
-	if summary != "":
-		lines.append(summary)
-	var steps: Array = block.get("steps", [])
-	for step in steps:
-		if not (step is Dictionary):
-			continue
-		var label := str(step.get("title", "")).strip_edges()
-		if label == "":
-			label = str(step.get("task", "")).strip_edges()
-		var agent := str(step.get("agent", "")).strip_edges()
-		var suffix := " (%s)" % agent if agent != "" else ""
-		lines.append("%d. %s%s" % [int(step.get("index", 0)), label, suffix])
-	_append_log_stream_message("\n".join(lines), null, true)
-
-
-func _render_history_delegate_results(block: Dictionary) -> void:
-	var lines: Array[String] = ["Delegate results:"]
-	var results: Array = block.get("results", [])
-	for index in range(results.size()):
-		var result = results[index]
-		if not (result is Dictionary):
-			continue
-		lines.append("")
-		lines.append("**%d. %s**" % [index + 1, str(result.get("agent", "delegate"))])
-		lines.append(str(result.get("summary", "")))
-	_append_log_stream_message("\n".join(lines), null, true)
-
-
-func _normalize_history_text(role: String, text: String) -> String:
-	if role != "system":
-		return text
-	var json_text := _extract_history_json_text(text)
-	if not _looks_like_history_json_text(json_text):
-		return text
-	var parser := JSON.new()
-	if parser.parse(json_text) != OK:
-		return text
-	var parsed = parser.data
-	if not (parsed is Dictionary):
-		return text
-	var payload: Dictionary = parsed
-	if _history_payload_has_delegate_results(payload):
-		return _format_history_delegate_results(payload)
-	if _history_payload_has_delegate_summary(payload):
-		return _format_history_delegate_summary(payload)
-	if _history_payload_has_plan_tasks(payload):
-		return _format_history_plan_result(payload)
-	return text
-
-
-func _extract_history_json_text(text: String) -> String:
-	var stripped := text.strip_edges()
-	if stripped.begins_with("```json"):
-		stripped = stripped.substr("```json".length()).strip_edges()
-		if stripped.ends_with("```"):
-			stripped = stripped.substr(0, stripped.length() - 3).strip_edges()
-	return stripped
-
-
-func _looks_like_history_json_text(text: String) -> bool:
-	return text.strip_edges().begins_with("{")
-
-
-func _history_payload_has_delegate_results(payload: Dictionary) -> bool:
-	var results = payload.get("results")
-	if not (results is Array) or results.is_empty():
-		return false
-	for item in results:
-		if not (item is Dictionary) or not item.has("summary"):
-			return false
-	return true
-
-
-func _history_payload_has_delegate_summary(payload: Dictionary) -> bool:
-	return payload.has("summary") and not payload.has("results")
-
-
-func _history_payload_has_plan_tasks(payload: Dictionary) -> bool:
-	return bool(payload.get("ok", false)) and payload.get("tasks") is Array
-
-
-func _format_history_delegate_results(payload: Dictionary) -> String:
-	var lines := ["Delegate results:"]
-	var raw_results: Variant = payload.get("results", [])
-	var results: Array = raw_results if raw_results is Array else []
-	var limit = mini(results.size(), 8)
-	for index in range(limit):
-		var item = results[index]
-		if not (item is Dictionary):
-			continue
-		var agent := str(item.get("agent", "")).strip_edges()
-		var summary := _truncate_history_markdown(str(item.get("summary", "")), 1600)
-		lines.append("")
-		lines.append("**%d. %s**" % [index + 1, agent if agent != "" else "delegate"])
-		lines.append(summary if summary != "" else "No summary")
-	if results.size() > limit:
-		lines.append("")
-		lines.append("... %d more result(s)" % [results.size() - limit])
-	return "\n".join(lines)
-
-
-func _format_history_delegate_summary(payload: Dictionary) -> String:
-	var agent := str(payload.get("agent", "")).strip_edges()
-	var summary := _truncate_history_markdown(str(payload.get("summary", "")), 2000)
-	var title := "Delegate result: %s" % agent if agent != "" else "Delegate result:"
-	return "%s\n%s" % [title, summary if summary != "" else "No summary"]
-
-
-func _format_history_plan_result(payload: Dictionary) -> String:
-	var lines := ["Plan created"]
-	var raw_tasks: Variant = payload.get("tasks", [])
-	var tasks: Array = raw_tasks if raw_tasks is Array else []
-	var limit = mini(tasks.size(), 8)
-	for index in range(limit):
-		var task = tasks[index]
-		if not (task is Dictionary):
-			continue
-		var agent := str(task.get("agent", "")).strip_edges()
-		var label := _compact_history_summary(str(task.get("task", "")), 180)
-		var suffix := " (%s)" % agent if agent != "" else ""
-		lines.append("%d. %s%s" % [index + 1, label if label != "" else "Untitled task", suffix])
-	if tasks.size() > limit:
-		lines.append("... %d more task(s)" % [tasks.size() - limit])
-	return "\n".join(lines)
-
-
-func _compact_history_summary(text: String, max_chars: int) -> String:
-	var compact := " ".join(text.strip_edges().split())
-	if compact.length() > max_chars:
-		return compact.left(max_chars) + "..."
-	return compact
-
-
-func _truncate_history_markdown(text: String, max_chars: int) -> String:
-	var stripped := text.strip_edges()
-	if stripped.length() > max_chars:
-		return stripped.left(max_chars) + "\n... (truncated)"
-	return stripped
 
 
 func _on_error(message: String) -> void:
@@ -2199,7 +1839,6 @@ func _handle_event(event: Dictionary) -> void:
 	elif event_type == "agent_text_delta":
 		_on_text_delta(event)
 	elif event_type == "final":
-		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 		if payload.has("text"):
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (via event stream)", {})
 			_clear_pending_final_pair()
@@ -2214,12 +1853,10 @@ func _handle_event(event: Dictionary) -> void:
 		else:
 			_pending_final_event = event.duplicate(true)
 	elif event_type == "agent_model_selected":
-		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 		_active_model_name = str(payload.get("model", "")).strip_edges()
 		_refresh_status_text()
 	else:
 		if event_type == "agent_model_fallback":
-			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 			_active_model_name = str(payload.get("fallback_model", "")).strip_edges()
 			_refresh_status_text()
 		if event_type == "context_usage":

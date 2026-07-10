@@ -29,6 +29,7 @@ const DEFAULT_CHAT_REQUEST_HARD_CAP_S := 1800.0
 var editor_interface: EditorInterface
 var service: Node
 var current_turn_id: String = ""
+var _handled_tool_turn_ids: Dictionary = {}
 
 var _http: HTTPRequest
 var _event_http: HTTPRequest
@@ -191,6 +192,7 @@ func reset_session() -> void:
 	var abandoned_path := _inflight_path
 	var abandoned_session_id := _inflight_session_id
 	current_turn_id = ""
+	_handled_tool_turn_ids.clear()
 	_request_generation += 1
 	_queue.clear()
 	_abandon_inflight_request()
@@ -214,6 +216,7 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 	_abandon_inflight_request()
 	_replace_event_http()
 	current_turn_id = ""
+	_handled_tool_turn_ids.clear()
 	_last_event_seq = 0
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != new_session_id:
@@ -236,6 +239,7 @@ func interrupt_current() -> void:
 	if _event_timer != null:
 		_event_timer.stop()
 	current_turn_id = ""
+	_handled_tool_turn_ids.clear()
 	# 仅断开本地连接还不够：后端的 agent 循环（自动执行的静默工具）会继续跑完
 	# 整轮并持续写入新事件，等下一条用户消息发出后这些旧事件会被一起拉取、
 	# 误渲染成新对话内容。这里显式通知后端取消该会话仍在运行的请求。
@@ -254,6 +258,7 @@ func switch_to_session(previous_session_id: String) -> void:
 	_request_timeout_timer.stop()
 	_replace_event_http()
 	current_turn_id = ""
+	_handled_tool_turn_ids.clear()
 	_last_event_seq = 0
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != _session_id():
@@ -541,6 +546,8 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			return
 		if response.get("type", "") == "tool_calls":
 			current_turn_id = str(response.get("turn_id", ""))
+			if current_turn_id != "":
+				_handled_tool_turn_ids[current_turn_id] = true
 		response_received.emit(response)
 	else:
 		response_received.emit({"type": "data", "value": parsed})
@@ -584,8 +591,9 @@ func _try_recover_tool_calls_response(event: Dictionary) -> void:
 	if not (raw_calls is Array) or raw_calls.is_empty():
 		return
 	var turn_id := str(payload.get("turn_id", "")).strip_edges()
-	if turn_id == "":
+	if turn_id == "" or _handled_tool_turn_ids.has(turn_id):
 		return
+	_handled_tool_turn_ids[turn_id] = true
 
 	# 事件通道已经带回完整的 /chat 响应，释放丢失的 HTTP 回调占用的串行队列。
 	FrontendLogger.warn(editor_interface, "HTTP", "Recovering tool_calls from event stream.", {
