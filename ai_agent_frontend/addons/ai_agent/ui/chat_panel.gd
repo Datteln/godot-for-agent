@@ -46,6 +46,8 @@ const _MILESTONE_EVENT_TYPES := {
 	"compact_boundary": true,
 }
 const _REASONING_BOUNDARY_EVENT_TYPES := {
+	"agent_tool_calls": true,
+	"tool_calls": true,
 	"delegate_start": true,
 	"server_tool_start": true,
 	"server_tool_result": true,
@@ -1229,12 +1231,10 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		return
 
 	_mark_current_stream_closed()
-	_discard_stream_message()
-	# 模型这一轮已经决定调用工具，说明它的思考已经结束——必须在这里冻结计时器，
-	# 否则 _process() 会一直用 _reasoning_started_ms 刷新这条 "Thought for Xs"，
-	# 直到下一轮 reasoning_delta 到来才会被关闭，期间会一直跟着 Edit/确认框走。
-	_mark_reasoning_stream_closed()
-	_finish_reasoning_stream()
+	_finalize_stream_as_persistent()
+	# `agent_tool_calls` 事件会在同一批 SSE 尾包处理完后结束当前 Thought。
+	# 不在 HTTP 回调中标记 reasoning key 为 closed，否则正文之后才到的 reasoning
+	# 尾包会被丢弃，而不是作为下一条独立 Thought 保留。
 	var silent: Array = []
 	var confirm: Array = []
 	for call in calls:
@@ -2592,15 +2592,12 @@ func _on_text_delta(event: Dictionary) -> void:
 func _render_text_delta_body(key: String, text: String) -> void:
 	if _should_ignore_stream_delta(key, text):
 		return
-	# 只有当这条 text_delta 确实属于另一个 key 时才提前结束当前 reasoning——
-	# 同一个 key（同一 frame_id:loop）下，后端会出现先吐一两句简短旁白
-	# text_delta、随后继续吐大段 reasoning_delta 的交错顺序，并不是"text 一
-	# 开始就代表这轮 reasoning 已经结束"。之前不分 key 一律关闭，会导致同一
-	# key 后续真正的 reasoning_delta 全部被当成"迟到"丢弃（参见
-	# `_on_reasoning_delta` 里的 IGNORED 分支）。真正的结束时机交给各响应
-	# 路由（tool_calls/最终响应）那几处现有的 `_finish_reasoning_stream()`。
-	if key != _reasoning_key:
-		_mark_reasoning_stream_closed()
+	# 正文是当前 Thought 的分段边界，即使二者共享同一个 message key。
+	# 收到正文后立即固化当前 Thought；后续同 key 的 reasoning 尾包会创建新的
+	# Thought，而不是被写回旧块或被忽略。
+	if _reasoning_key != "":
+		if key != _reasoning_key:
+			_mark_reasoning_stream_closed()
 		_finish_reasoning_stream()
 	if key != _stream_key:
 		# 流式 key 变了（典型场景：coordinator 在服务端 delegate 给子 agent，
@@ -2774,7 +2771,8 @@ func _mark_reasoning_stream_closed() -> void:
 func _close_reasoning_for_boundary_event(event: Dictionary) -> void:
 	if not _should_close_reasoning_for_boundary_event(event):
 		return
-	_mark_reasoning_stream_closed()
+	# 边界只结束当前块，不封禁这个 key。某些模型会在正文/工具调用后补发
+	# reasoning 尾包；它应当成为新的 Thought。
 	_finish_reasoning_stream()
 
 

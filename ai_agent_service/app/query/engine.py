@@ -808,7 +808,12 @@ class QueryEngine:
         self._emit(
             session.session_id,
             "tool_calls",
-            {"turn_id": response.turn_id, "count": len(response.calls)},
+            {
+                "turn_id": response.turn_id,
+                "text": response.text,
+                "calls": [call.model_dump(mode="json") for call in response.calls],
+                "count": len(response.calls),
+            },
         )
         logger.info(
             log_template,

@@ -563,12 +563,51 @@ func _on_events_completed(result: int, code: int, _headers: PackedStringArray, b
 		for event in events:
 			if event is Dictionary:
 				_last_event_seq = max(_last_event_seq, int(event.get("seq", _last_event_seq)))
+				_try_recover_tool_calls_response(event)
 		if _suppress_events:
 			if not events.is_empty():
 				FrontendLogger.debug(editor_interface, "HTTP", "Suppressed events after interrupt.", {"count": events.size()})
 			return
 		if not events.is_empty():
 			events_received.emit(events)
+
+
+func _try_recover_tool_calls_response(event: Dictionary) -> void:
+	var event_type := str(event.get("type", ""))
+	if event_type != "tool_calls" or not _busy or _inflight_path != "/chat":
+		return
+	var raw_payload: Variant = event.get("payload", {})
+	if not (raw_payload is Dictionary):
+		return
+	var payload: Dictionary = raw_payload
+	var raw_calls: Variant = payload.get("calls", [])
+	if not (raw_calls is Array) or raw_calls.is_empty():
+		return
+	var turn_id := str(payload.get("turn_id", "")).strip_edges()
+	if turn_id == "":
+		return
+
+	# 事件通道已经带回完整的 /chat 响应，释放丢失的 HTTP 回调占用的串行队列。
+	FrontendLogger.warn(editor_interface, "HTTP", "Recovering tool_calls from event stream.", {
+		"turn_id": turn_id,
+		"count": raw_calls.size()
+	})
+	_request_generation += 1
+	_replace_chat_http()
+	_busy = false
+	_inflight_generation = -1
+	_inflight_path = ""
+	_inflight_session_id = ""
+	_inflight_started_at_msec = 0
+	_request_timeout_timer.stop()
+	current_turn_id = turn_id
+	response_received.emit({
+		"type": "tool_calls",
+		"turn_id": turn_id,
+		"text": payload.get("text", null),
+		"calls": raw_calls,
+	})
+	_pump()
 
 
 func _headers() -> PackedStringArray:

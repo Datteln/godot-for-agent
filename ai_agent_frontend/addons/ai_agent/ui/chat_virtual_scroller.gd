@@ -5,6 +5,7 @@ const ChatMessageStore = preload("res://addons/ai_agent/ui/chat_message_store.gd
 const ChatNodeFactory = preload("res://addons/ai_agent/ui/chat_node_factory.gd")
 
 const BUFFER_MESSAGES := 3
+const MIN_VISIBLE_MESSAGES := 50
 
 var _scroll: ScrollContainer
 var _message_list: VBoxContainer
@@ -116,10 +117,27 @@ func _compute_visible_range(scroll_y: float, stick_to_bottom: bool) -> Vector2i:
 	if stick_to_bottom:
 		var end := total
 		var start := _store.find_index_at_scroll(maxf(0.0, _store.total_height() - viewport_height))
-		return Vector2i(maxi(0, start - BUFFER_MESSAGES), end)
+		var first := maxi(0, start - BUFFER_MESSAGES)
+		# 确保至少渲染 MIN_VISIBLE_MESSAGES 条，向上扩展
+		if end - first < MIN_VISIBLE_MESSAGES:
+			first = maxi(0, end - MIN_VISIBLE_MESSAGES)
+		return Vector2i(first, end)
 	var first := _store.find_index_at_scroll(scroll_y)
 	var last := _store.find_index_at_scroll(scroll_y + viewport_height)
-	return Vector2i(maxi(0, first - BUFFER_MESSAGES), mini(total, last + BUFFER_MESSAGES + 1))
+	var range_start := maxi(0, first - BUFFER_MESSAGES)
+	var range_end := mini(total, last + BUFFER_MESSAGES + 1)
+	# 确保至少渲染 MIN_VISIBLE_MESSAGES 条，向两侧对称扩展
+	if range_end - range_start < MIN_VISIBLE_MESSAGES:
+		var deficit := MIN_VISIBLE_MESSAGES - (range_end - range_start)
+		var half := deficit / 2
+		range_start = maxi(0, range_start - half)
+		range_end = mini(total, range_end + (deficit - half))
+		# 若一侧到顶，把余量给另一侧
+		if range_start == 0:
+			range_end = mini(total, MIN_VISIBLE_MESSAGES)
+		elif range_end == total:
+			range_start = maxi(0, total - MIN_VISIBLE_MESSAGES)
+	return Vector2i(range_start, range_end)
 
 
 func _visible_indexes(visible_range: Vector2i) -> Dictionary:
