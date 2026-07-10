@@ -2468,6 +2468,355 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         title = f"Run tests ({kind})" if kind else "Run tests"
     elif name == "run_headless_self_test":
         title = "Run headless self-test"
+    elif name == "describe_map_context":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Describe map context\nError: {error}"
+        scene = str(result.get("scene", "")).strip()
+        revision = result.get("map_revision")
+        maps = result.get("maps", []) if isinstance(result.get("maps"), list) else []
+        map_count = len(maps)
+        total_layers = sum(
+            len(m.get("layers", [])) if isinstance(m.get("layers"), list) else 0
+            for m in maps if isinstance(m, dict)
+        )
+        total_cells = 0
+        for m in maps:
+            if isinstance(m, dict):
+                for layer in (m.get("layers", []) if isinstance(m.get("layers"), list) else []):
+                    if isinstance(layer, dict):
+                        total_cells += int(layer.get("cell_count", 0) or 0)
+        lines: list[str] = ["Describe map context"]
+        if scene:
+            lines.append(f"Scene: `{scene}`")
+        if revision is not None:
+            lines.append(f"Revision: {revision}")
+        lines.append(f"{map_count} map(s), {total_layers} layer(s), {total_cells} cell(s)")
+        notes = result.get("notes", []) if isinstance(result.get("notes"), list) else []
+        for note in notes[:3]:
+            if isinstance(note, str):
+                lines.append(f"  • {note}")
+        return "\n".join(lines)
+    elif name == "edit_map":
+        error = _front_tool_error_message(result)
+        target = str(result.get("target", "")).strip()
+        revision = result.get("map_revision")
+        cells = result.get("cells")
+        ops = result.get("operations")
+        mode = str(result.get("mode", "")).strip()
+        lines = ["Edit map"]
+        if target:
+            lines.append(f"Target: `{target}`")
+        if error:
+            lines.append(f"Error: {error}")
+            if revision is not None:
+                lines.append(f"Revision: {revision}")
+            return "\n".join(lines)
+        if revision is not None:
+            lines.append(f"Revision: {revision}")
+        if ops is not None:
+            lines.append(f"Operations: {ops}")
+        if cells is not None:
+            lines.append(f"Cells: {cells}")
+        if mode:
+            lines.append(f"Mode: {mode}")
+        validation = result.get("validation")
+        if isinstance(validation, dict):
+            v_passed = validation.get("passed")
+            v_issues = validation.get("issues", []) if isinstance(validation.get("issues"), list) else []
+            if v_passed is True:
+                lines.append("Validation: Passed ✓")
+            elif v_passed is False:
+                lines.append("Validation: Failed ✗")
+                for issue in v_issues[:3]:
+                    if isinstance(issue, str):
+                        lines.append(f"  • {issue}")
+        gap = result.get("coverage_gap_warning")
+        if gap and isinstance(gap, str):
+            lines.append(f"Coverage gap: {gap}")
+        return "\n".join(lines)
+    elif name == "repair_layer_coverage":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Repair layer coverage\nError: {error}"
+        target = str(result.get("target", "")).strip()
+        revision = result.get("map_revision")
+        repaired = result.get("repaired", False)
+        cells = result.get("cells")
+        lines = ["Repair layer coverage"]
+        if target:
+            lines.append(f"Target: `{target}`")
+        if revision is not None:
+            lines.append(f"Revision: {revision}")
+        if repaired:
+            lines.append("Repaired ✓")
+        else:
+            lines.append("No repair needed")
+        if cells is not None:
+            lines.append(f"Cells: {cells}")
+        return "\n".join(lines)
+    elif name == "repair_placements":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Repair placements\nError: {error}"
+        target = str(result.get("target", "")).strip()
+        repaired = result.get("repaired_count", result.get("repaired"))
+        lines = ["Repair placements"]
+        if target:
+            lines.append(f"Target: `{target}`")
+        if repaired is not None:
+            lines.append(f"Repaired: {repaired}")
+        return "\n".join(lines)
+    elif name == "repair_map_region":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Repair map region\nError: {error}"
+        target = str(result.get("target", "")).strip()
+        revision = result.get("map_revision")
+        lines = ["Repair map region"]
+        if target:
+            lines.append(f"Target: `{target}`")
+        if revision is not None:
+            lines.append(f"Revision: {revision}")
+        return "\n".join(lines)
+    elif name == "compact_spatial_index":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Compact spatial index\nError: {error}"
+        entries = result.get("entries_total", result.get("entries"))
+        lines = ["Compact spatial index: Done"]
+        if entries is not None:
+            lines.append(f"Entries: {entries}")
+        return "\n".join(lines)
+    elif name == "write_resource_registry":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Write resource registry\nError: {error}"
+        count = result.get("resource_count", result.get("count"))
+        lines = ["Write resource registry: Done"]
+        if count is not None:
+            lines.append(f"Resources: {count}")
+        return "\n".join(lines)
+    elif name == "save_map_blueprint":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Save map blueprint\nError: {error}"
+        path = str(result.get("path", "")).strip()
+        lines = ["Save map blueprint"]
+        if path:
+            lines.append(f"Saved: `{path}`")
+        return "\n".join(lines)
+    elif name == "apply_map_blueprint":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Apply map blueprint\nError: {error}"
+        target = str(result.get("target", "")).strip()
+        lines = ["Apply map blueprint: Done"]
+        if target:
+            lines.append(f"Target: `{target}`")
+        return "\n".join(lines)
+    elif name == "ensure_standard_map_layers":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Ensure standard map layers\nError: {error}"
+        target = str(result.get("target", "")).strip()
+        created = result.get("created_count", result.get("created"))
+        lines = ["Ensure standard map layers"]
+        if target:
+            lines.append(f"Target: `{target}`")
+        if created is not None:
+            lines.append(f"Created: {created} layer(s)")
+        return "\n".join(lines)
+    elif name == "paint_terrain_connect":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Paint terrain connect\nError: {error}"
+        target = str(result.get("target", "")).strip()
+        cells = result.get("cells")
+        lines = ["Paint terrain connect"]
+        if target:
+            lines.append(f"Target: `{target}`")
+        if cells is not None:
+            lines.append(f"Cells: {cells}")
+        return "\n".join(lines)
+    elif name == "place_map_objects":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Place map objects\nError: {error}"
+        placed = result.get("placed_count", result.get("placed"))
+        lines = ["Place map objects"]
+        if placed is not None:
+            lines.append(f"Placed: {placed} object(s)")
+        return "\n".join(lines)
+    elif name == "describe_map_region":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Describe map region\nError: {error}"
+        lines: list[str] = ["Describe map region"]
+        
+        # Check if this is a cell-focused result (has cells_format)
+        cells_format = result.get("cells_format")
+        if cells_format:
+            cells_total = result.get("cells_total", 0)
+            cells_returned = result.get("cells_returned", 0)
+            non_empty_count = result.get("non_empty_count", 0)
+            artifact_ref = result.get("artifact_ref", "")
+            lines.append(f"Cells: {cells_total} total, {cells_returned} returned, {non_empty_count} non-empty")
+            if artifact_ref:
+                lines.append(f"Artifact: `{artifact_ref}`")
+        else:
+            # Map overview result
+            scene = str(result.get("scene", "")).strip()
+            revision = result.get("map_revision")
+            maps = result.get("maps", []) if isinstance(result.get("maps"), list) else []
+            map_count = len(maps)
+            total_layers = sum(
+                len(m.get("layers", [])) if isinstance(m.get("layers"), list) else 0
+                for m in maps
+                if isinstance(m, dict)
+            )
+            total_cells = 0
+            for m in maps:
+                if isinstance(m, dict):
+                    for layer in (m.get("layers", []) if isinstance(m.get("layers"), list) else []):
+                        if isinstance(layer, dict):
+                            total_cells += int(layer.get("cell_count", 0) or 0)
+            if scene:
+                lines.append(f"Scene: `{scene}`")
+            if revision is not None:
+                lines.append(f"Revision: {revision}")
+            lines.append(f"{map_count} map(s), {total_layers} layer(s), {total_cells} cell(s)")
+        
+        notes = result.get("notes", []) if isinstance(result.get("notes"), list) else []
+        for note in notes[:3]:
+            if isinstance(note, str):
+                lines.append(f"  • {note}")
+        return "\n".join(lines)
+    elif name == "validate_map_region":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Validate map region\nError: {error}"
+        target = str(result.get("target", "")).strip()
+        revision = result.get("map_revision")
+        passed = result.get("passed", False)
+        region = result.get("region", {}) if isinstance(result.get("region"), dict) else {}
+        issues = result.get("issues", []) if isinstance(result.get("issues"), list) else []
+        lines = ["Validate map region"]
+        if target:
+            lines.append(f"Target: `{target}`")
+        if revision is not None:
+            lines.append(f"Revision: {revision}")
+        if isinstance(region, dict) and region:
+            x = region.get("x", "?")
+            y = region.get("y", "?")
+            w = region.get("width", "?")
+            h = region.get("height", "?")
+            lines.append(f"Region: ({x}, {y}) {w}×{h}")
+        if passed:
+            lines.append("Passed ✓")
+        else:
+            lines.append("Failed ✗")
+            for issue in issues[:5]:
+                if isinstance(issue, str):
+                    lines.append(f"  • {issue}")
+                elif isinstance(issue, dict):
+                    lines.append(f"  • {issue.get('message', issue.get('type', str(issue)))}")
+        return "\n".join(lines)
+    elif name == "validate_layer_coverage":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Validate layer coverage\nError: {error}"
+        passed = result.get("passed", False)
+        issues = result.get("issues", []) if isinstance(result.get("issues"), list) else []
+        lines = ["Validate layer coverage"]
+        if passed:
+            lines.append("Passed ✓")
+        else:
+            lines.append("Failed ✗")
+            for issue in issues[:5]:
+                if isinstance(issue, str):
+                    lines.append(f"  • {issue}")
+                elif isinstance(issue, dict):
+                    lines.append(f"  • {issue.get('message', issue.get('type', str(issue)))}")
+        return "\n".join(lines)
+    elif name == "validate_object_placements":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Validate object placements\nError: {error}"
+        passed = result.get("passed", False)
+        issues = result.get("issues", []) if isinstance(result.get("issues"), list) else []
+        checked = result.get("checked_count", result.get("total_checked"))
+        lines = ["Validate object placements"]
+        if checked is not None:
+            lines.append(f"Checked: {checked} object(s)")
+        if passed:
+            lines.append("Passed ✓")
+        else:
+            lines.append("Failed ✗")
+            for issue in issues[:5]:
+                if isinstance(issue, str):
+                    lines.append(f"  • {issue}")
+                elif isinstance(issue, dict):
+                    lines.append(f"  • {issue.get('message', issue.get('type', str(issue)))}")
+        return "\n".join(lines)
+    elif name == "query_spatial_index":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Query spatial index\nError: {error}"
+        count = result.get("count", result.get("entries_count"))
+        lines = ["Query spatial index"]
+        if count is not None:
+            lines.append(f"{count} entries")
+        return "\n".join(lines)
+    elif name == "find_placement_anchors":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Find placement anchors\nError: {error}"
+        anchors = result.get("anchors", []) if isinstance(result.get("anchors"), list) else []
+        lines = ["Find placement anchors"]
+        lines.append(f"{len(anchors)} anchor(s) found")
+        return "\n".join(lines)
+    elif name == "sample_noise_grid":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Sample noise grid\nError: {error}"
+        count = result.get("sample_count", result.get("count"))
+        lines = ["Sample noise grid"]
+        if count is not None:
+            lines.append(f"{count} samples")
+        return "\n".join(lines)
+    elif name == "sample_poisson_points":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Sample Poisson points\nError: {error}"
+        count = result.get("point_count", result.get("count"))
+        lines = ["Sample Poisson points"]
+        if count is not None:
+            lines.append(f"{count} points")
+        return "\n".join(lines)
+    elif name == "compose_map_blueprint_grammar":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Compose map blueprint grammar\nError: {error}"
+        lines = ["Compose map blueprint grammar: Done"]
+        return "\n".join(lines)
+    elif name == "validate_scene_state":
+        error = _front_tool_error_message(result)
+        if error:
+            return f"Validate scene state\nError: {error}"
+        passed = result.get("passed", False)
+        issues = result.get("issues", []) if isinstance(result.get("issues"), list) else []
+        lines = ["Validate scene state"]
+        if passed:
+            lines.append("Passed ✓")
+        else:
+            lines.append("Failed ✗")
+            for issue in issues[:5]:
+                if isinstance(issue, str):
+                    lines.append(f"  • {issue}")
+                elif isinstance(issue, dict):
+                    lines.append(f"  • {issue.get('message', issue.get('type', str(issue)))}")
+        return "\n".join(lines)
     elif name == "run_system_command":
         shell = str(result.get("shell", input_args.get("shell", "auto")))
         status = str(result.get("status", "unknown"))
@@ -2486,7 +2835,20 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
     error = _front_tool_error_message(result)
     if error:
         return f"{title}\nError: {error}"
-    return "\n".join([f"{title}:", *_front_result_lines(result)])
+    # Compact shallow fallback: only top-level scalar keys, never recurse into nested dicts/lists
+    lines = [f"{title}:"]
+    _SHALLOW_SKIP_KEYS = frozenset({"error", "errors", "detail", "details", "traceback"})
+    for key, val in list(result.items())[:12]:
+        if key in _SHALLOW_SKIP_KEYS:
+            continue
+        if isinstance(val, (dict, list)):
+            if isinstance(val, list):
+                lines.append(f"{key}: {len(val)} item(s)")
+            else:
+                lines.append(f"{key}: {len(val)} field(s)")
+        elif val not in (None, ""):
+            lines.append(f"{key}: {val}")
+    return "\n".join(lines)
 
 
 def _display_tool_content(content: str) -> str:
@@ -2497,6 +2859,82 @@ def _display_tool_content(content: str) -> str:
         return _truncate_text(content, _HISTORY_PREVIEW_LIMIT)
     text = json.dumps(parsed, ensure_ascii=False, indent=2)
     return "```json\n" + _truncate_text(text, _HISTORY_PREVIEW_LIMIT) + "\n```"
+
+
+def _compact_tool_summary(name: str, inner: dict[str, Any], input_args: dict[str, Any]) -> str:
+    """Generate concise tool result summary instead of full JSON dump.
+    
+    For tools not in specific categories (read/edit/grep), create a short
+    key-value style summary showing only important fields, similar to the
+    frontend EventFormatter display.
+    
+    Args:
+        name: Tool name
+        inner: Parsed tool result dictionary
+        input_args: Tool input arguments
+        
+    Returns:
+        Compact summary string, e.g., "Validate map region:\n• passed: True\n• issues_count: 0"
+    """
+    # Extract important status/result fields
+    summary_parts = []
+    
+    # Common status fields
+    if "ok" in inner:
+        summary_parts.append(f"ok: {inner['ok']}")
+    if "passed" in inner:
+        summary_parts.append(f"passed: {inner['passed']}")
+    if "success" in inner:
+        summary_parts.append(f"success: {inner['success']}")
+    if "status" in inner:
+        summary_parts.append(f"status: {inner['status']}")
+    
+    # Common result fields
+    if "message" in inner:
+        msg = str(inner["message"])
+        if len(msg) > 100:
+            msg = msg[:100] + "..."
+        summary_parts.append(f"message: {msg}")
+    if "result" in inner and not isinstance(inner["result"], (dict, list)):
+        summary_parts.append(f"result: {inner['result']}")
+    if "count" in inner:
+        summary_parts.append(f"count: {inner['count']}")
+    if "issues_count" in inner:
+        summary_parts.append(f"issues_count: {inner['issues_count']}")
+    if "issues" in inner and isinstance(inner["issues"], list):
+        count = len(inner["issues"])
+        if count > 0:
+            summary_parts.append(f"issues: {count} item(s)")
+    
+    # Path/file related fields
+    if "path" in inner:
+        summary_parts.append(f"path: {inner['path']}")
+    if "file_path" in inner:
+        summary_parts.append(f"file_path: {inner['file_path']}")
+    
+    # If no important fields found, show a minimal summary
+    if not summary_parts:
+        # Show a few generic fields if present
+        for key in ["target", "region", "data", "output"]:
+            if key in inner:
+                val = inner[key]
+                if isinstance(val, dict):
+                    summary_parts.append(f"{key}: {len(val)} field(s)")
+                elif isinstance(val, list):
+                    summary_parts.append(f"{key}: {len(val)} item(s)")
+                elif isinstance(val, str) and len(val) <= 100:
+                    summary_parts.append(f"{key}: {val}")
+                else:
+                    summary_parts.append(f"{key}: {type(val).__name__}")
+    
+    # Format as bullet list
+    if summary_parts:
+        display_name = name.replace("_", " ").title()
+        return f"{display_name}:\n" + "\n".join(f"• {part}" for part in summary_parts)
+    else:
+        # Fallback: just show tool name with success status
+        display_name = name.replace("_", " ").title()
+        return f"{display_name}: completed"
 
 
 def _count_lines(text: str) -> int:
@@ -2587,7 +3025,7 @@ def _format_tool_result_summary(name: str, input_args: dict[str, Any], content: 
         escaped_pattern = pattern.replace('"', '\\"')
         return f'Grep "{escaped_pattern}" (in project)'
 
-    return _display_tool_content(content)
+    return _compact_tool_summary(name, inner, input_args)
 
 
 def _history_items_for_frame(

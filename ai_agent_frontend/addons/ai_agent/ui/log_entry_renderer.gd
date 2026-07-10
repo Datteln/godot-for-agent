@@ -258,6 +258,8 @@ func make_rich_text(text: String, color = null, marker_text: String = "") -> Ric
 	if marker_text != "":
 		bbcode = "[color=%s]%s[/color]  %s" % [_marker_color_tag(marker_text), marker_text, bbcode]
 	rich.append_text(bbcode)
+	# Keep the source text available for the message-level copy fallback.
+	rich.set_meta("copy_text", text)
 	if rich_text_setup.is_valid():
 		rich_text_setup.call(rich)
 	return rich

@@ -15,6 +15,7 @@ var _top_spacer: Control
 var _bottom_spacer: Control
 var _node_cache: Dictionary = {}
 var _syncing := false
+var _scroll_sync_pending := false
 
 
 func setup(scroll: ScrollContainer, message_list: VBoxContainer, store: ChatMessageStore, factory: ChatNodeFactory) -> void:
@@ -31,8 +32,17 @@ func notify_message_added(index: int, stick_to_bottom: bool) -> void:
 	sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, stick_to_bottom)
 
 
-func on_scroll_changed(scroll_y: float) -> void:
-	sync(scroll_y, false)
+func on_scroll_changed(_scroll_y: float) -> void:
+	if _scroll_sync_pending:
+		return
+	_scroll_sync_pending = true
+	call_deferred("_deferred_scroll_sync")
+
+
+func _deferred_scroll_sync() -> void:
+	_scroll_sync_pending = false
+	if _scroll != null:
+		sync(float(_scroll.scroll_vertical), false)
 
 
 func sync(scroll_y: float, stick_to_bottom: bool) -> void:
@@ -163,6 +173,7 @@ func _pinned_indexes_outside(visible: Dictionary) -> Dictionary:
 
 
 func _sync_nodes(visible: Dictionary) -> void:
+	# ── 1. 移除不再可见的节点 ──
 	for index in _node_cache.keys().duplicate():
 		if visible.has(index):
 			continue
@@ -174,21 +185,40 @@ func _sync_nodes(visible: Dictionary) -> void:
 			old_node.queue_free()
 		_node_cache.erase(index)
 
+	# ── 2. 按 index 升序添加新节点（减少后续 move_child） ──
+	var new_indexes: Array = []
 	for index in visible.keys():
-		if _node_cache.has(index):
-			continue
+		if not _node_cache.has(index):
+			new_indexes.append(index)
+	new_indexes.sort()
+	for index in new_indexes:
 		var message := _store.get_message(int(index))
 		var node: Control = message.get("node", null) if bool(message.get("external", false)) else _factory.create(message)
 		if node != null:
 			_node_cache[index] = node
+			_message_list.add_child(node)
 
-	for child in _message_list.get_children():
-		_message_list.remove_child(child)
-	_message_list.add_child(_top_spacer)
-	for index in range(_store.size()):
-		if _node_cache.has(index):
-			_message_list.add_child(_node_cache[index])
-	_message_list.add_child(_bottom_spacer)
+	# ── 3. 确保 spacer 在节点树中 ──
+	if _top_spacer.get_parent() != _message_list:
+		_message_list.add_child(_top_spacer)
+	if _bottom_spacer.get_parent() != _message_list:
+		_message_list.add_child(_bottom_spacer)
+
+	# ── 4. 排序：只在位置不对时才 move_child，避免无谓的布局重算 ──
+	var sorted_visible: Array = visible.keys()
+	sorted_visible.sort()
+	if _message_list.get_child(0) != _top_spacer:
+		_message_list.move_child(_top_spacer, 0)
+	var pos := 1
+	for index in sorted_visible:
+		var node: Control = _node_cache[index]
+		if pos < _message_list.get_child_count() and _message_list.get_child(pos) != node:
+			_message_list.move_child(node, pos)
+		pos += 1
+	if pos < _message_list.get_child_count() and _message_list.get_child(pos) != _bottom_spacer:
+		_message_list.move_child(_bottom_spacer, pos)
+	elif pos >= _message_list.get_child_count():
+		_message_list.move_child(_bottom_spacer, pos)
 
 
 func _measure_visible_heights() -> void:

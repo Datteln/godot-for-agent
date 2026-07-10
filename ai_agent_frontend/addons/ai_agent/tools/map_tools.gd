@@ -1685,19 +1685,59 @@ static func _registry_entry_for_resource_input(input: Dictionary) -> Dictionary:
 	var registry_data: Dictionary = registry.get("data", {}) if registry.get("data", {}) is Dictionary else {}
 	var resource_key := str(input.get("resource", input.get("resource_key", ""))).strip_edges()
 	var fallback_key := str(input.get("fallback_resource", input.get("fallback_resource_key", ""))).strip_edges()
-	return _registry_entry_with_fallback(registry_data, resource_key, fallback_key)
+	var resolved := _registry_entry_with_fallback(registry_data, resource_key, fallback_key)
+	if not resolved.is_empty() or resource_key != "":
+		return resolved
+	return _registry_entry_for_raw_2d_tile(registry_data, input)
+
+
+static func _registry_entry_for_raw_2d_tile(registry_data: Dictionary, input: Dictionary) -> Dictionary:
+	if not input.has("source_id") or not input.has("atlas_x") or not input.has("atlas_y"):
+		return {}
+	var wanted := {
+		"source_id": int(input.get("source_id", -1)),
+		"atlas_x": int(input.get("atlas_x", -1)),
+		"atlas_y": int(input.get("atlas_y", -1)),
+	}
+	if wanted["source_id"] < 0 or wanted["atlas_x"] < 0 or wanted["atlas_y"] < 0:
+		return {}
+	for key in registry_data.keys():
+		var value = registry_data.get(key, {})
+		if not (value is Dictionary):
+			continue
+		var entry: Dictionary = value
+		if not bool(_validate_resource_contract_shape(str(key), entry).get("ok", false)):
+			continue
+		if _registry_2d_tile_signature(entry) != wanted:
+			continue
+		var resolved := entry.duplicate(true)
+		resolved["_resolved_resource"] = str(key)
+		resolved["_fallback_for"] = "raw_atlas"
+		return resolved
+	return {}
 
 
 static func _registry_entry_with_fallback(registry_data: Dictionary, resource_key: String, fallback_key: String) -> Dictionary:
 	if resource_key != "" and registry_data.get(resource_key, {}) is Dictionary:
 		var primary: Dictionary = (registry_data.get(resource_key, {}) as Dictionary).duplicate(true)
-		primary["_resolved_resource"] = resource_key
-		return primary
+		if bool(_validate_resource_contract_shape(resource_key, primary).get("ok", false)):
+			primary["_resolved_resource"] = resource_key
+			return primary
+		# Older registries may leave a semantic alias without a contract. Prefer the
+		# verified *_real entry instead of making every edit fail on that stale alias.
+		var real_key := resource_key + "_real"
+		if registry_data.get(real_key, {}) is Dictionary:
+			var real_entry: Dictionary = (registry_data.get(real_key, {}) as Dictionary).duplicate(true)
+			if bool(_validate_resource_contract_shape(real_key, real_entry).get("ok", false)):
+				real_entry["_resolved_resource"] = real_key
+				real_entry["_fallback_for"] = resource_key
+				return real_entry
 	if fallback_key != "" and registry_data.get(fallback_key, {}) is Dictionary:
 		var fallback: Dictionary = (registry_data.get(fallback_key, {}) as Dictionary).duplicate(true)
-		fallback["_resolved_resource"] = fallback_key
-		fallback["_fallback_for"] = resource_key
-		return fallback
+		if bool(_validate_resource_contract_shape(fallback_key, fallback).get("ok", false)):
+			fallback["_resolved_resource"] = fallback_key
+			fallback["_fallback_for"] = resource_key
+			return fallback
 	return {}
 
 

@@ -10,17 +10,33 @@ var rich_text_setup: Callable
 
 func create(data: Dictionary) -> Control:
 	var kind := str(data.get("type", "log"))
+	var node: Control
 	match kind:
 		"message":
-			return _create_message(data)
+			node = _create_message(data)
 		"history_thought":
-			return _create_history_thought(data)
+			node = _create_history_thought(data)
 		"history_text":
-			return _create_history_text(data)
+			node = _create_history_text(data)
 		"history_code":
-			return _create_history_code(data)
+			node = _create_history_code(data)
 		_:
-			return _create_log(data)
+			node = _create_log(data)
+	if node != null:
+		node.set_meta("copy_text", _copy_text_for(data))
+	return node
+
+
+func _copy_text_for(data: Dictionary) -> String:
+	match str(data.get("type", "log")):
+		"history_thought":
+			var header := str(data.get("header", "Thought"))
+			var detail := str(data.get("detail", ""))
+			return header if detail.strip_edges() == "" else header + "\n\n" + detail
+		"history_text", "history_code", "log", "message":
+			return str(data.get("text", ""))
+		_:
+			return ""
 
 
 func _create_message(data: Dictionary) -> Control:
@@ -107,6 +123,7 @@ func _create_history_code(data: Dictionary) -> Control:
 	for line in str(data.get("text", "")).split("\n"):
 		highlighted.append(MarkdownRenderer.highlight_code_line(str(line), str(data.get("language", "")), theme_colors))
 	rich.append_text("[bgcolor=%s][code]%s[/code][/bgcolor]" % [_theme_color_tag("code_bg"), "\n".join(highlighted)])
+	rich.set_meta("copy_text", str(data.get("text", "")))
 	content.add_child(rich)
 	return content
 

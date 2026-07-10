@@ -158,6 +158,7 @@ var _suppress_scroll_check := false   # 程序滚动时抑制 value_changed 误�
 var _scroll_request_pending := false
 var _post_final_scroll_frames := 0   # final 响应后持续滚动到底部的剩余帧数
 var _post_delta_scroll_frames := 0   # 文本流刷新后持续滚动到底部的剩余帧数（避免每帧都强制滚动）
+var _post_history_layout_frames := 0  # 历史节点完成布局后重新测量虚拟列表的剩余帧数
 var _user_is_dragging_scrollbar := false   # 用户正在拖拽滚动条
 var _user_scrolled_up_ms: int = 0   # 用户主动上滚的时间戳，用于冷却期
 var _empty_final_ignored_ms: int = -1   # 空 final 被忽略的时间戳，超时后强制结束 turn
@@ -185,6 +186,11 @@ func _process(_delta: float) -> void:
 			_render_stream_content()
 	if _post_delta_scroll_frames > 0 and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
 		_post_delta_scroll_frames -= 1
+		if _auto_scroll and not _user_is_dragging_scrollbar:
+			_do_scroll_to_bottom()
+	if _post_history_layout_frames > 0:
+		_post_history_layout_frames -= 1
+		_sync_virtual_messages()
 		if _auto_scroll and not _user_is_dragging_scrollbar:
 			_do_scroll_to_bottom()
 	# final 响应后连续多帧强制滚动到底部，等待 fit_content RichTextLabel 完成布局
@@ -796,19 +802,34 @@ func _on_message_rich_input(event: InputEvent, rich: RichTextLabel) -> void:
 	if mouse_event.button_index != MOUSE_BUTTON_RIGHT or not mouse_event.pressed:
 		return
 	_message_context_source = rich
-	_message_context_popup.set_item_disabled(0, rich.get_selected_text() == "")
+	_message_context_popup.set_item_disabled(0, _message_copy_text(rich) == "")
 	_message_context_popup.position = DisplayServer.mouse_get_position()
 	_message_context_popup.popup()
 	rich.accept_event()
+
+
+func _message_copy_text(rich: RichTextLabel) -> String:
+	if rich == null or not is_instance_valid(rich):
+		return ""
+	var selected := rich.get_selected_text()
+	if selected != "":
+		return selected
+	var node: Node = rich
+	var fallback := ""
+	while node != null:
+		if node.has_meta("copy_text"):
+			fallback = str(node.get_meta("copy_text"))
+		node = node.get_parent()
+	return fallback
 
 
 func _on_message_context_action(id: int) -> void:
 	match id:
 		0:
 			if _message_context_source != null and is_instance_valid(_message_context_source):
-				var selected := _message_context_source.get_selected_text()
-				if selected != "":
-					DisplayServer.clipboard_set(selected)
+				var copy_text := _message_copy_text(_message_context_source)
+				if copy_text != "":
+					DisplayServer.clipboard_set(copy_text)
 		1:
 			var pasted := DisplayServer.clipboard_get()
 			if pasted != "":
@@ -1454,6 +1475,11 @@ func _handle_final(response: Dictionary) -> void:
 	if state_store != null:
 		state_store.set_value("current_turn_id", "")
 		state_store.set_value("pending_calls", [])
+	# 清理已关闭 stream 的 delta_text 缓存，防止长对话内存泄漏
+	for closed_key in _closed_stream_keys.keys():
+		_stream_delta_text_by_key.erase(closed_key)
+	for closed_key in _closed_reasoning_keys.keys():
+		_reasoning_delta_text_by_key.erase(closed_key)
 
 
 func _handle_session_history(response: Dictionary) -> void:
@@ -1503,6 +1529,7 @@ func _handle_session_history(response: Dictionary) -> void:
 		_append_message("system", _ui("switch_session_empty"))
 	_auto_scroll = saved_auto_scroll
 	_force_scroll_once = true
+	_post_history_layout_frames = 4
 	_scroll_to_bottom()
 
 
@@ -1834,6 +1861,9 @@ func _handle_event(event: Dictionary) -> void:
 		return
 	if event_type == "server_tool_result":
 		_remember_server_file_read(event)
+		# 历史回放时，工具结果已由 _history_log_text 等事件完整渲染，
+		# 此处仅记录文件读取即可，不再走 _render_event_description 导致重复。
+		return
 	if event_type == "agent_reasoning_delta":
 		_on_reasoning_delta(event)
 	elif event_type == "agent_text_delta":
@@ -2834,6 +2864,7 @@ func _switch_to_session(session_id: String) -> void:
 	_auto_scroll = true
 	_post_final_scroll_frames = 0
 	_post_delta_scroll_frames = 0
+	_post_history_layout_frames = 0
 	_interrupted_locally = false
 	_event_queue.clear()
 	_draining_events = false
