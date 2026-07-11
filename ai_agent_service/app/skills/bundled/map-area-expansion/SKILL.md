@@ -18,6 +18,8 @@ paths: []
 
 大范围地形按「读边界 → 写块计划 → 小批 `edit_map` → 核对结果 → 必要时重读」执行。单次 `edit_map` 单轴范围不超过 5 格；动手前说明区域、动作、来源边界、预期 cells；调用时传 `expected_cells`。闭区间格数按 `B-A+1` 算：`x=85..87` 是 3 列，不是 2 列。每铺完一段独立地形（平台/阶梯/悬浮台）就地 `validate_map_region`，不要全部铺完再一次性校验。
 
+`edit_map` 的 `expected_cells` 必须等于所有 operations 实际写入单元数之和（fill/erase 为 `width * height * depth`，2D depth=1）；总写入不得超过 2000 cells。遇到 `cell_count_mismatch`、`map_edit_batch_too_large` 或 `region_too_large` 时按返回的实际数量、`max_cells` 或 `suggested_regions` 重拆，不要原样重试。
+
 `describe_map_region` 的读取频率：处理一段新地形前第一批必须读边界；后续只在衔接边界没读过、上一批返回的 `cells`/`operations` 数量不符、或发现边界/空洞/已有节点推翻当前假设时补读。`region_too_large` 时照返回的 `suggested_regions` 读，不要自己再拆。
 
 ## 横版平台关卡专用规划

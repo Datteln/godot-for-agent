@@ -16,6 +16,8 @@ var _bottom_spacer: Control
 var _node_cache: Dictionary = {}
 var _syncing := false
 var _scroll_sync_pending := false
+var _sync_again := false
+var _sync_again_stick_to_bottom := false
 
 
 func setup(scroll: ScrollContainer, message_list: VBoxContainer, store: ChatMessageStore, factory: ChatNodeFactory) -> void:
@@ -29,6 +31,26 @@ func setup(scroll: ScrollContainer, message_list: VBoxContainer, store: ChatMess
 
 
 func notify_message_added(index: int, stick_to_bottom: bool) -> void:
+	sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, stick_to_bottom)
+
+
+func refresh_message(index: int, stick_to_bottom: bool) -> void:
+	if _store == null or index < 0 or index >= _store.size():
+		return
+	if _node_cache.has(index):
+		var old_node: Control = _node_cache[index]
+		var new_node: Control = _factory.create(_store.get_message(index))
+		if new_node != null:
+			var child_index := old_node.get_index() if old_node.get_parent() == _message_list else -1
+			if child_index >= 0:
+				_message_list.remove_child(old_node)
+				_message_list.add_child(new_node)
+				_message_list.move_child(new_node, child_index)
+			else:
+				_message_list.add_child(new_node)
+			_node_cache[index] = new_node
+			if old_node != new_node and is_instance_valid(old_node):
+				old_node.queue_free()
 	sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, stick_to_bottom)
 
 
@@ -46,7 +68,11 @@ func _deferred_scroll_sync() -> void:
 
 
 func sync(scroll_y: float, stick_to_bottom: bool) -> void:
-	if _syncing or _message_list == null or _store == null:
+	if _message_list == null or _store == null:
+		return
+	if _syncing:
+		_sync_again = true
+		_sync_again_stick_to_bottom = _sync_again_stick_to_bottom or stick_to_bottom
 		return
 	_syncing = true
 	_measure_visible_heights()
@@ -57,6 +83,15 @@ func sync(scroll_y: float, stick_to_bottom: bool) -> void:
 	_bottom_spacer.custom_minimum_size = Vector2(0, _store.total_height(visible_range.y, _store.size(), excluded))
 	_sync_nodes(visible)
 	_syncing = false
+	if _sync_again:
+		var next_stick_to_bottom := _sync_again_stick_to_bottom
+		_sync_again = false
+		_sync_again_stick_to_bottom = false
+		call_deferred("_deferred_resync", next_stick_to_bottom)
+
+
+func _deferred_resync(stick_to_bottom: bool) -> void:
+	sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, stick_to_bottom)
 
 
 func clear() -> void:

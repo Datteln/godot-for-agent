@@ -118,7 +118,8 @@ def _append_map_state_read_error(
         return
     frame.messages.append(
         {
-            "role": "user",
+            "role": "system",
+            "internal": True,
             "content": (
                 "出错：自动读取没有拿到需要的 state，"
                 f"无法恢复挂起的 {tool_name} 调用。"
@@ -127,6 +128,43 @@ def _append_map_state_read_error(
             ),
         }
     )
+
+
+def _abort_pending_map_region_read_on_size_error(
+    session: Session,
+    tool_args: dict[str, Any],
+    error_code: str | None,
+    result: Any,
+) -> bool:
+    """在自动区域读取超限时取消挂起调用，避免原参数无限重试。"""
+    if (
+        str(error_code) != "region_too_large"
+        or not bool(tool_args.get("__auto_map_state_read"))
+        or session.pending_map_tool_after_read is None
+    ):
+        return False
+    session.pending_map_tool_after_read = None
+    suggested_regions = result.get("suggested_regions", []) if isinstance(result, dict) else []
+    frame = session.top_frame()
+    if frame is not None:
+        frame.messages.append(
+            {
+                "role": "system",
+                "internal": True,
+                "content": (
+                    "出错：自动 describe_map_region 请求超过 1600 cells，已取消原请求，"
+                    "禁止使用相同参数重试。请逐个使用工具返回的 suggested_regions 读取，"
+                    "所有分块成功后再重新调用原地图校验/规划工具。"
+                    f" suggested_regions={json.dumps(suggested_regions, ensure_ascii=False)}"
+                ),
+            }
+        )
+    logger.warning(
+        "Aborted pending map region read after size error session=%s target=%s",
+        session.session_id,
+        tool_args.get("target_path", ""),
+    )
+    return True
 
 
 def _append_platform_planning_failure_hint(
@@ -2256,7 +2294,8 @@ def _schedule_map_completion_continuation(session: Session) -> bool:
     blocker_text = _format_map_completion_blockers_for_prompt(session.map_completion_blockers)
     frame.messages.append(
         {
-            "role": "user",
+            "role": "system",
+            "internal": True,
             "content": (
                 "MAP_COMPLETION_GATE_BLOCKED\n"
                 "Your previous response attempted to finish the map task, but the service "
@@ -3028,6 +3067,21 @@ def _format_tool_result_summary(name: str, input_args: dict[str, Any], content: 
     return _compact_tool_summary(name, inner, input_args)
 
 
+def _is_internal_history_message(message: dict[str, Any]) -> bool:
+    """识别不应回放为聊天消息的服务内部恢复指令。"""
+    if bool(message.get("internal", False)):
+        return True
+    if str(message.get("role", "")) != "user":
+        return False
+    content = message.get("content", "")
+    text = flatten_message_text(content) if isinstance(content, list) else str(content)
+    return text.startswith((
+        "MAP_COMPLETION_GATE_BLOCKED",
+        "出错：自动读取没有拿到需要的 state",
+        "出错：自动 describe_map_region 请求超过 1600 cells",
+    ))
+
+
 def _history_items_for_frame(
     frame: Frame, *, include_system_prompt: bool = False
 ) -> list[SessionHistoryItemDTO]:
@@ -3041,9 +3095,11 @@ def _history_items_for_frame(
                 frame_id=frame.id,
                 agent=frame.agent.name,
             )
-        )
+    )
     tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
     for index, message in enumerate(frame.messages):
+        if _is_internal_history_message(message):
+            continue
         role = str(message.get("role", "system"))
         content = message.get("content", "")
         text = (
@@ -3577,6 +3633,8 @@ def _message_history_blocks(
     raw_content = message.get("content", "")
     text = "" if raw_content is None else str(raw_content)
     origin = _history_origin(frame)
+    if _is_internal_history_message(message):
+        return []
     if role == "user":
         if frame.parent_id is not None and message_index == 1:
             return []

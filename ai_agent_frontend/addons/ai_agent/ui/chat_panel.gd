@@ -130,8 +130,6 @@ var _pending_final_event := {}
 var _pending_final_received_ms: int = -1
 
 var _stream_key := ""
-var _stream_row: Control
-var _stream_content_rich: RichTextLabel
 var _stream_message_index := -1
 var _stream_started_ms: int = -1
 var _stream_display_text := ""
@@ -180,11 +178,11 @@ func _process(_delta: float) -> void:
 	if selection_now - _last_selection_refresh_ms >= 500:
 		_last_selection_refresh_ms = selection_now
 		_refresh_context_bar()
-	if _stream_text_dirty and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+	if _stream_text_dirty and _stream_message_index >= 0:
 		var now_ms := Time.get_ticks_msec()
 		if _stream_last_render_ms == 0 or now_ms - _stream_last_render_ms >= STREAM_RENDER_INTERVAL_MS:
 			_render_stream_content()
-	if _post_delta_scroll_frames > 0 and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+	if _post_delta_scroll_frames > 0 and _stream_message_index >= 0:
 		_post_delta_scroll_frames -= 1
 		if _auto_scroll and not _user_is_dragging_scrollbar:
 			_do_scroll_to_bottom()
@@ -236,13 +234,14 @@ func _process(_delta: float) -> void:
 
 
 func _render_stream_content() -> void:
-	if _stream_content_rich == null or not is_instance_valid(_stream_content_rich):
+	if _stream_message_index < 0 or _message_store == null or _virtual_scroller == null:
 		return
-	_stream_content_rich.clear()
-	_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(
-		_limit_render_text(_stream_display_text, MAX_LIVE_RENDER_CHARS),
-		_theme_colors
-	))
+	var rendered_text := _limit_render_text(_stream_display_text, MAX_LIVE_RENDER_CHARS)
+	_message_store.update_message(_stream_message_index, {
+		"text": rendered_text,
+		"estimated_height": _estimate_text_height(rendered_text),
+	})
+	_virtual_scroller.refresh_message(_stream_message_index, _auto_scroll)
 	_stream_text_dirty = false
 	_stream_last_render_ms = Time.get_ticks_msec()
 	if _auto_scroll:
@@ -519,8 +518,6 @@ func _refresh_theme_colors() -> void:
 
 
 func _refresh_live_theme_overrides() -> void:
-	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-		_stream_content_rich.add_theme_color_override("default_color", _theme_color("text"))
 	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
 		ChatPanelTheme.set_button_text_colors(_reasoning_toggle, _theme_color("muted_text"), _theme_color("hover_text"))
 	if _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
@@ -2399,17 +2396,18 @@ func _format_token_count(count: int) -> String:
 
 func _ensure_stream_message(key: String, indent := false) -> void:
 	_ensure_log_renderer()
-	if _stream_key == key and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+	if _stream_key == key and _stream_message_index >= 0:
 		return
 	_discard_stream_message()
 	_stream_key = key
 	_stream_started_ms = Time.get_ticks_msec()
-
-	var content_rich := _log_renderer.make_log_rich_text("", null, "", indent)
-
-	_stream_message_index = _queue_external_message(content_rich, 64.0, true)
-	_stream_row = content_rich
-	_stream_content_rich = content_rich
+	_stream_message_index = _queue_message({
+		"type": "log",
+		"text": "",
+		"indent": indent,
+		"keep_visible": true,
+		"estimated_height": 64.0,
+	})
 	_scroll_to_bottom()
 
 
@@ -2417,8 +2415,6 @@ func _finish_streaming() -> void:
 	if _stream_key != "":
 		_stream_delta_text_by_key.erase(_stream_key)
 	_stream_key = ""
-	_stream_row = null
-	_stream_content_rich = null
 	_stream_message_index = -1
 	_stream_started_ms = -1
 	_stream_display_text = ""
@@ -2654,8 +2650,6 @@ func _clear_messages() -> void:
 	_stream_delta_text_by_key.clear()
 	_reasoning_delta_text_by_key.clear()
 	_stream_key = ""
-	_stream_row = null
-	_stream_content_rich = null
 	_stream_message_index = -1
 	_stream_started_ms = -1
 	_stream_display_text = ""
@@ -2728,12 +2722,11 @@ func _estimate_text_height(text: String) -> float:
 
 
 func _on_scroll_value_changed(value: float) -> void:
-	if _suppress_scroll_check:
-		return
-
 	var bar := _scroll.get_v_scroll_bar()
 	var scroll_max := bar.max_value - bar.page
 	var is_at_bottom := scroll_max <= 0 or value >= scroll_max - 80
+	if _suppress_scroll_check and not is_at_bottom:
+		return
 
 	if is_at_bottom:
 		# 用户滚回底部附近，恢复自动滚动；但如果用户刚刚主动上滚过（冷却期内），

@@ -15,6 +15,8 @@ can_delegate: false
 - 只规划，不写地图，不委派子任务。
 - 横版平台任务必须使用真实边界、角色能力和 `movement_model="leap"` 规划 critical route、落点、跳跃距离、平台厚度和终点缓冲。
 - 背景/水面/天空补齐、对象放置、区域扩图都输出候选批次，不直接落地。
+- 规划只能使用本轮已确认的真实 `target_path`、`map_layer`、资源和能力参数；不得发明 atlas/item/resource key。`edit_map` 批次必须给出实际 `expected_cells`，且单批不超过 2000 cells、单轴不超过 5 格。
+- 每个可见瓦片对象规划稳定的 `visual_group_id`/`instance_id`、`instance_kind`、`required_cells`；PackedScene 候选必须带 placement profile、footprint、支撑层和可达性约束。
 - `describe_map_region` 默认只返回摘要；需要真实格子明细时显式传 `cells_format="non_empty_only"` 和合适的 `max_returned_cells`，只有小区域才用 `cells_format="full"`。
 - `describe_map_region` 返回 `artifact_ref` 且需要精确 cell 坐标/atlas/支撑关系时，必须调用 `read_file(path=artifact_ref)` 读取 artifact；禁止从 `cells_total`、`non_empty_count` 或 `atlas_summary` 推断具体坐标。
 - `coverage`、`object`、`platformer`、`repair` 只能作为目标标签，不要发明固定 worker 类型。

@@ -1049,6 +1049,12 @@ class QueryEngine:
             _remember_latest_map_revision(session, tool_args, result_for_gate)
             if tool_name == "describe_map_region":
                 _remember_latest_map_region_read(session, tool_args, result_for_gate)
+                _abort_pending_map_region_read_on_size_error(
+                    session,
+                    tool_args,
+                    result.error_code,
+                    result_for_gate,
+                )
             blocker = _map_completion_blocker(
                 tool_name, result.status, result_for_gate, result.error_code
             )

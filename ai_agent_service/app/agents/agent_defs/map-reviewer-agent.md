@@ -17,4 +17,5 @@ can_delegate: false
 - `describe_map_region` 默认只返回摘要；需要真实格子明细时显式传 `cells_format="non_empty_only"` 和合适的 `max_returned_cells`，只有小区域才用 `cells_format="full"`。
 - 明显视觉问题必须阻断完成：大块实心墙、背景/天空/水面缺口、平台形状不可读、目标对象不可见、对象位置不合理、穿模、遮挡、漂浮、裸露灰块。
 - 截图判断不能覆盖真实地图数据；发现问题时输出局部区域和建议下一阶段。
+- 对可见装饰/对象按实例复核 `visual_group_id`/`instance_summary`、数量、footprint、支撑和可见性；不要用总 cells 数代替实例验收。截图使用真实 `target_path`，必要时传 `focus_region` 或 `focus_node_path`。
 - 只输出 `map_worker_result_v1` JSON，不要附加解释。必须包含：`stage="reviewer"`、`worker`、`mode`、`objective`、`target_path`、`map_layer`、`map_revision`、`region`、`summary`、`facts`、`proposed_batches`、`write_results`、`validation`、`missing_inputs`、`risks`、`next_stage`。`validation` 必须含 `passed`、`completion_allowed`、`issues`、`structured_issues`。

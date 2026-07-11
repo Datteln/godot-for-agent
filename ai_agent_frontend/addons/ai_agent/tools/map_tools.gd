@@ -740,6 +740,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 	var planned := {}
 	var placement_map_layer := map_layer_for_placement(input)
 	var prepared: Array = []
+	var relocated_objects: Array = []
 	for object_index in range((objects_value as Array).size()):
 		var object_value = (objects_value as Array)[object_index]
 		if not (object_value is Dictionary):
@@ -809,6 +810,36 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 			planned,
 			input
 		)
+		if not bool(placement_check.get("ok", true)) \
+				and str(object_spec.get("placement_kind", object_spec.get("kind", ""))).to_lower() == "coin" \
+				and str(placement_check.get("error_code", "")) == "placement_cell_not_empty":
+			for offset in range(1, 9):
+				var candidate := coords + Vector3i(0, -offset, 0)
+				var candidate_check := _validate_single_object_placement(
+					map_node,
+					str(target_result.get("path", "")),
+					dimension,
+					placement_map_layer,
+					candidate,
+					placement_profile,
+					occupied,
+					blocked_cells,
+					planned,
+					input
+				)
+				if bool(candidate_check.get("ok", false)):
+					relocated_objects.append({
+						"from": MapValidator.coord_payload(coords, dimension),
+						"to": MapValidator.coord_payload(candidate, dimension),
+					})
+					coords = candidate
+					coord_key = MapValidator.coord_key(coords)
+					object_spec["x"] = coords.x
+					object_spec["y"] = coords.y
+					if dimension == 3:
+						object_spec["z"] = coords.z
+					placement_check = candidate_check
+					break
 		if not bool(placement_check.get("ok", true)):
 			return _with_object_batch_failure(placement_check, object_index, object_spec, placement_map_layer, placement_profile)
 		var scene_path := PathUtils.to_res_path(str(object_spec.get("scene_path", resource_def.get("scene_path", ""))))
@@ -860,6 +891,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 		"parent_path": str(root.get_path_to(parent)) if parent != root else ".",
 		"dimension": dimension,
 		"objects": prepared.size(),
+		"relocated_objects": relocated_objects,
 		"instance_summary": _summarize_object_instances(prepared),
 		"paths": paths,
 		"spatial_index": index_result,
@@ -1643,11 +1675,17 @@ static func _validate_operation_resource_contract(operation: Dictionary, resourc
 			return {"ok": false, "message": "raw TileSet atlas ids are not allowed in edit_map fill; register the verified resource first and use resource/resource_key.", "error_code": "unregistered_map_resource"}
 		return {"ok": true}
 	if resource_entry.is_empty():
+		var registry := _read_json_resource(RESOURCE_REGISTRY_PATH)
+		var registry_data: Dictionary = registry.get("data", {}) if registry.get("data", {}) is Dictionary else {}
+		var available_resources: Array = registry_data.keys()
+		available_resources.sort()
 		return {
 			"ok": false,
-			"message": "resource '%s' is not registered; call write_resource_registry from verified map data before using atlas/item ids." % resource_key,
+			"message": "resource '%s' is not registered; do not retry edit_map. Read verified map data, call write_resource_registry, then use one of the registered resource keys." % resource_key,
 			"error_code": "unregistered_map_resource",
 			"resource": resource_key,
+			"available_resources": available_resources,
+			"hint": "Never invent semantic resource keys or atlas coordinates. Use describe_map_context/describe_map_region and write_resource_registry first.",
 		}
 	var shape_check := _validate_resource_contract_shape(resource_key, resource_entry)
 	if not bool(shape_check.get("ok", false)):

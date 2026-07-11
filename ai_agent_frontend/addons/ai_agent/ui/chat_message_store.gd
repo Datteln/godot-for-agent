@@ -23,6 +23,17 @@ func get_message(index: int) -> Dictionary:
 	return _messages[index]
 
 
+func update_message(index: int, data: Dictionary) -> void:
+	if index < 0 or index >= _messages.size():
+		return
+	var message: Dictionary = _messages[index]
+	for key in data:
+		message[key] = data[key]
+	message["index"] = index
+	message["estimated_height"] = maxf(1.0, float(message.get("estimated_height", 64.0)))
+	_heights_dirty = true
+
+
 func get_range(from_index: int, to_index: int) -> Array[Dictionary]:
 	var result: Array[Dictionary] = []
 	for index in range(maxi(0, from_index), mini(to_index, _messages.size())):
