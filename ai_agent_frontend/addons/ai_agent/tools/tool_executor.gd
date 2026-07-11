@@ -502,7 +502,10 @@ func _finish_map_write_batch(tool_name: String, input: Dictionary, result: Dicti
 		result["write_batch_id"] = str(input.get("write_batch_id", ""))
 		result["worker"] = str(input.get("worker", ""))
 		result["mode"] = str(input.get("mode", ""))
-		result["pipeline_template"] = str(input.get("pipeline_template", ""))
+		if input.has("workflow_operations"):
+			result["workflow_operations"] = input.get("workflow_operations", [])
+		if input.has("workflow_constraints"):
+			result["workflow_constraints"] = input.get("workflow_constraints", [])
 		result["frame_id"] = str(input.get("frame_id", ""))
 		result["delegate_group_id"] = str(input.get("delegate_group_id", ""))
 		if undo_manager != null:

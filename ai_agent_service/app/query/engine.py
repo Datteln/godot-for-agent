@@ -1046,6 +1046,10 @@ class QueryEngine:
                     "result": result.result,
                 }
             result_for_gate = payload.get("result") if isinstance(payload, dict) else None
+            if isinstance(result_for_gate, dict) and "workflow_constraints" in tool_args:
+                result_for_gate.setdefault(
+                    "workflow_constraints", tool_args["workflow_constraints"]
+                )
             _remember_latest_map_revision(session, tool_args, result_for_gate)
             if tool_name == "describe_map_region":
                 _remember_latest_map_region_read(session, tool_args, result_for_gate)
@@ -1071,6 +1075,8 @@ class QueryEngine:
                         session.map_completion_blockers,
                         target,
                         revision_value,
+                        tool_name,
+                        tool_args,
                     )
                     if not _has_review_blocker(
                         session.map_completion_blockers,
@@ -1118,9 +1124,7 @@ class QueryEngine:
                 if actual_cells is not None:
                     hint += f"- 重试时必须把 expected_cells 设为 {actual_cells}\n"
                 hint += "- 禁止用相同参数重试第 3 次，必须切换策略或提前终止\n"
-                frame.messages.append(
-                    {"role": "user", "content": hint}
-                )
+                frame.messages.append({"role": "user", "content": hint})
             logger.info(
                 "Tool result appended session=%s turn_id=%s tool=%s status=%s frame=%s",
                 session.session_id,

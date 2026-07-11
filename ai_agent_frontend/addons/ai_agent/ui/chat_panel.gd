@@ -135,6 +135,8 @@ var _stream_started_ms: int = -1
 var _stream_display_text := ""
 var _stream_text_dirty := false
 var _stream_last_render_ms := 0
+var _stream_continuation_frame := ""
+var _stream_continuation_prefix := ""
 var _reasoning_key := ""
 var _reasoning_toggle: Button
 var _reasoning_detail_rich: RichTextLabel
@@ -184,7 +186,14 @@ func _process(_delta: float) -> void:
 			_render_stream_content()
 	if _post_delta_scroll_frames > 0 and _stream_message_index >= 0:
 		_post_delta_scroll_frames -= 1
+		_sync_virtual_messages()
 		if _auto_scroll and not _user_is_dragging_scrollbar:
+			_do_scroll_to_bottom()
+	if _auto_scroll and not _user_is_dragging_scrollbar and _scroll != null:
+		var stream_bar := _scroll.get_v_scroll_bar()
+		var stream_bottom := maxf(0.0, stream_bar.max_value - stream_bar.page)
+		if float(_scroll.scroll_vertical) < stream_bottom - 2.0:
+			_sync_virtual_messages()
 			_do_scroll_to_bottom()
 	if _post_history_layout_frames > 0:
 		_post_history_layout_frames -= 1
@@ -272,8 +281,11 @@ func _limit_render_text(text: String, max_chars: int) -> String:
 
 ## 程序控制滚动到底部，设置抑制标志防止 value_changed 误判
 func _do_scroll_to_bottom() -> void:
+	if _scroll == null:
+		return
 	_suppress_scroll_check = true
-	_scroll.scroll_vertical = 999999
+	var bar := _scroll.get_v_scroll_bar()
+	_scroll.scroll_vertical = int(ceil(maxf(0.0, bar.max_value - bar.page)))
 	# 布局可能需要 1-2 帧才能稳定，用 call_deferred 链延长抑制窗口
 	call_deferred("_reset_scroll_suppress_deferred")
 
@@ -1248,8 +1260,14 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring tool_calls while a previous batch is still pending confirmation.", {"count": calls.size()})
 		return
 
-	_mark_current_stream_closed()
-	_finalize_stream_as_persistent()
+	# 工具调用是同一轮 assistant 输出的边界，不是正文流的结束。
+	# 保留当前临时正文块；工具结果单独入队，后续同 frame 的文本继续写入该块。
+	if not calls.is_empty() and _stream_message_index >= 0:
+		var first_call: Variant = calls[0]
+		if first_call is Dictionary:
+			_stream_continuation_frame = str(first_call.get("frame_id", ""))
+			_stream_continuation_prefix = _stream_display_text
+		_mark_current_stream_closed()
 	# `agent_tool_calls` 事件会在同一批 SSE 尾包处理完后结束当前 Thought。
 	# 不在 HTTP 回调中标记 reasoning key 为 closed，否则正文之后才到的 reasoning
 	# 尾包会被丢弃，而不是作为下一条独立 Thought 保留。
@@ -2289,19 +2307,36 @@ func _render_text_delta_body(key: String, text: String) -> void:
 		if key != _reasoning_key:
 			_mark_reasoning_stream_closed()
 		_finish_reasoning_stream()
-	if key != _stream_key:
+	var stripped := _strip_think_xml(text)
+	var parts := _split_thought_summary(stripped)
+	var rest := str(parts.get("rest", ""))
+	var incoming_frame := key.get_slice(":", 0)
+	if key != _stream_key and _stream_message_index >= 0 and _stream_continuation_frame != "" and incoming_frame == _stream_continuation_frame:
+		# 工具结果返回后，服务端可能给下一轮 LLM 输出新的 message_index。
+		# 该文本仍属于同一 assistant turn，追加到原流式块，不重建节点。
+		_stream_key = key
+		_stream_display_text = _stream_continuation_prefix
+		if rest.strip_edges() != "":
+			if _stream_display_text.strip_edges() != "":
+				_stream_display_text += "\n\n"
+			_stream_display_text += rest
+	elif key != _stream_key:
 		# 流式 key 变了（典型场景：coordinator 在服务端 delegate 给子 agent，
 		# frame_id 从 f1 变成 f2，前端从未收到 tool_calls，_handle_tool_calls()
 		# 不会被调用）。这里必须先把"旧 key"已经显示在屏幕上的文本保留为
 		# 工作流条目，再开始新 key 的流式行——否则下面整段会直接覆盖
 		# _stream_display_text，旧内容就在用户眼前消失得无影无踪。
 		_finalize_stream_as_persistent()
-	var stripped := _strip_think_xml(text)
-	var parts := _split_thought_summary(stripped)
-	var rest := str(parts.get("rest", ""))
-	_stream_display_text = rest if rest.strip_edges() != "" else stripped
+	elif _stream_continuation_frame != "" and _stream_continuation_prefix != "":
+		# 同一个新 key 的后续 append_delta 是累计文本，保留工具调用前的正文前缀。
+		_stream_display_text = _stream_continuation_prefix
+		if rest.strip_edges() != "":
+			_stream_display_text += "\n\n" + rest
+	else:
+		_stream_display_text = rest if rest.strip_edges() != "" else stripped
 	_stream_text_dirty = true
-	_ensure_stream_message(key, true)
+	if _stream_message_index < 0:
+		_ensure_stream_message(key, true)
 	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta]", {
 		"key": key, "text_len": text.length(), "display_len": _stream_display_text.length(),
 		"preview": text.left(40).replace("\n", "\\n")
@@ -2420,6 +2455,8 @@ func _finish_streaming() -> void:
 	_stream_display_text = ""
 	_stream_text_dirty = false
 	_stream_last_render_ms = 0
+	_stream_continuation_frame = ""
+	_stream_continuation_prefix = ""
 
 
 func _finish_reasoning_stream() -> void:
@@ -2655,6 +2692,8 @@ func _clear_messages() -> void:
 	_stream_display_text = ""
 	_stream_text_dirty = false
 	_stream_last_render_ms = 0
+	_stream_continuation_frame = ""
+	_stream_continuation_prefix = ""
 	_reasoning_key = ""
 	_reasoning_toggle = null
 	_reasoning_detail_rich = null

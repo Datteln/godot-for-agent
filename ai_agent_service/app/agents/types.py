@@ -59,6 +59,8 @@ class AgentDefinition:
     edit_map_max_turns: int | None = None
     can_delegate: bool = False
     hooks: dict[str, str] | None = None
+    workflow_operations: list[str] = field(default_factory=list)
+    workflow_constraints: list[dict[str, Any]] = field(default_factory=list)
     effective_tools: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 

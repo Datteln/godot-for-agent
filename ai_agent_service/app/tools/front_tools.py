@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.orchestrator.map_workers import pipeline_template_ids
 from app.tools.registry import ToolDef, register as _register_tool
 
 
@@ -46,12 +45,22 @@ def _worker_spec_schema() -> dict[str, Any]:
                     "Optional map skills; the service adds the skills required by the pipeline."
                 ),
             },
+            "operations": {"type": "array", "items": {"type": "string"}},
+            "constraints": {
+                "type": "array",
+                "items": _object_schema(
+                    {
+                        "validator": {"type": "string"},
+                        "required_args": {"type": "object"},
+                    },
+                    ["validator"],
+                ),
+            },
             "output_schema": {"type": "string", "enum": ["map_worker_result_v1"]},
-            "pipeline_template": {"type": "string", "enum": list(pipeline_template_ids())},
             "stage_id": {"type": "string"},
             "max_turns": {"type": "integer", "minimum": 1, "maximum": 12},
         },
-        ["name", "objective", "mode", "allowed_tools", "output_schema"],
+        ["name", "objective", "mode", "allowed_tools", "operations", "output_schema"],
     )
 
 
@@ -107,8 +116,8 @@ def register_front_tools() -> None:
                         "worker_spec": {
                             "description": (
                                 "Optional dynamic map worker spec. Only map-agent may use this. "
-                                "Fields include name, objective, mode, allowed_tools, skills, output_schema, "
-                                "pipeline_template, stage_id, max_turns."
+                                "Fields include name, objective, mode, allowed_tools, operations, constraints, "
+                                "skills, output_schema, stage_id, max_turns."
                             ),
                             **_worker_spec_schema(),
                         },

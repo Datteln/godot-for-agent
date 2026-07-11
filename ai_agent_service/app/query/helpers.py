@@ -60,6 +60,7 @@ _HISTORY_TOOL_DROP_KEYS = frozenset(
     {"data_url", "base64", "image_base64", "screenshot_base64", "binary", "bytes"}
 )
 
+
 def _raw_tool_call(call: FrontToolCallDTO) -> dict[str, Any]:
     """生成可写入 agent 历史的 assistant tool_call。"""
     return {
@@ -704,7 +705,11 @@ def _map_tool_requires_map_layer(
     tool_args: dict[str, Any],
 ) -> bool:
     """判断地图工具是否必须带 2D map_layer。"""
-    if tool_name in {"plan_platform_level", "plan_reachable_map_growth", "compute_reachable_frontier"}:
+    if tool_name in {
+        "plan_platform_level",
+        "plan_reachable_map_growth",
+        "compute_reachable_frontier",
+    }:
         return True
     if "map_layer" in tool_args or "ground_map_layer" in tool_args:
         return True
@@ -835,9 +840,9 @@ def _top_atlas_summary(value: Any, limit: int = _MAP_ATLAS_SUMMARY_LIMIT) -> Any
     items = list(value.items())
     try:
         items.sort(
-            key=lambda item: int(item[1].get("count", item[1]))
-            if isinstance(item[1], dict)
-            else int(item[1]),
+            key=lambda item: (
+                int(item[1].get("count", item[1])) if isinstance(item[1], dict) else int(item[1])
+            ),
             reverse=True,
         )
     except (TypeError, ValueError):
@@ -893,12 +898,16 @@ def _map_result_summary(
             "cells_format": result.get("cells_format"),
             "cells_total": result.get("cells_total"),
             "cells_returned": result.get("cells_returned"),
-            "non_empty_count": result.get("non_empty_count")
-            if "non_empty_count" in result
-            else (len(cells) if isinstance(cells, list) else result.get("cells")),
-            "cells_omitted": result.get("cells_omitted")
-            if "cells_omitted" in result
-            else (isinstance(cells, list) and bool(cells)),
+            "non_empty_count": (
+                result.get("non_empty_count")
+                if "non_empty_count" in result
+                else (len(cells) if isinstance(cells, list) else result.get("cells"))
+            ),
+            "cells_omitted": (
+                result.get("cells_omitted")
+                if "cells_omitted" in result
+                else (isinstance(cells, list) and bool(cells))
+            ),
             "artifact_ref": artifact_ref,
         }
         if "atlas_summary" in result:
@@ -907,8 +916,7 @@ def _map_result_summary(
             summary["atlas_summary_top"] = atlas_summary
             summary["atlas_summary_omitted"] = True
         if artifact_ref is not None and (
-            result.get("cells_omitted")
-            or result.get("cells_returned") != result.get("cells_total")
+            result.get("cells_omitted") or result.get("cells_returned") != result.get("cells_total")
         ):
             summary["exact_cells_hint"] = (
                 "需要精确 cell 坐标/atlas 时，调用 read_file 读取 artifact_ref；"
@@ -1162,22 +1170,26 @@ def _history_payload_for_front_tool(
         slim = dict(payload)
         slim["result"] = _map_result_summary(tool_name, result, artifact_ref)
         return _bounded_tool_message_body(slim)
-    if tool_name in {
-        "run_system_command",
-        "execute_gd_script",
-        "run_tests",
-        "run_headless_self_test",
-        "git_diff",
-        "git_status",
-        "export_project",
-        "read_scene_tree",
-        "read_runtime_state",
-        "read_class_docs",
-        "read_image_metadata",
-        "read_resource",
-        "validate_scene_state",
-        "read_debugger_errors",
-    } or _json_char_size(result) > _HISTORY_TOOL_MAX_JSON_CHARS:
+    if (
+        tool_name
+        in {
+            "run_system_command",
+            "execute_gd_script",
+            "run_tests",
+            "run_headless_self_test",
+            "git_diff",
+            "git_status",
+            "export_project",
+            "read_scene_tree",
+            "read_runtime_state",
+            "read_class_docs",
+            "read_image_metadata",
+            "read_resource",
+            "validate_scene_state",
+            "read_debugger_errors",
+        }
+        or _json_char_size(result) > _HISTORY_TOOL_MAX_JSON_CHARS
+    ):
         slim = dict(payload)
         slim["result"] = _front_tool_result_summary(tool_name, result)
         return _bounded_tool_message_body(slim)
@@ -1323,7 +1335,9 @@ def _map_completion_blocker(
     revision_value = (
         revision if isinstance(revision, int) and not isinstance(revision, bool) else None
     )
-    pipeline_template = str(result_dict.get("pipeline_template", ""))
+    workflow_constraints = result_dict.get("workflow_constraints", [])
+    if not isinstance(workflow_constraints, list):
+        workflow_constraints = []
     if status != "applied":
         return {
             "tool": tool_name,
@@ -1331,7 +1345,7 @@ def _map_completion_blocker(
             "issues": [str(error_code or status)],
             "target": target,
             "required_revision": revision_value,
-            "pipeline_template": pipeline_template,
+            "workflow_constraints": workflow_constraints,
         }
 
     issues = result_dict.get("issues")
@@ -1347,7 +1361,7 @@ def _map_completion_blocker(
             "issues": normalized_issues or ["map tool reported blocking_completion=true"],
             "target": target,
             "required_revision": revision_value,
-            "pipeline_template": pipeline_template,
+            "workflow_constraints": workflow_constraints,
         }
     if result_dict.get("completion_allowed") is False:
         return {
@@ -1356,7 +1370,7 @@ def _map_completion_blocker(
             "issues": normalized_issues or ["map tool reported completion_allowed=false"],
             "target": target,
             "required_revision": revision_value,
-            "pipeline_template": pipeline_template,
+            "workflow_constraints": workflow_constraints,
         }
     if (
         tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
@@ -1370,7 +1384,7 @@ def _map_completion_blocker(
             ],
             "target": target,
             "required_revision": revision_value,
-            "pipeline_template": pipeline_template,
+            "workflow_constraints": workflow_constraints,
         }
     return None
 
@@ -1388,9 +1402,13 @@ def _blocker_revision(blocker: dict[str, Any]) -> int | None:
 
 
 def _clear_validation_blockers(
-    blockers: list[dict[str, Any]], target: str, revision: int | None
+    blockers: list[dict[str, Any]],
+    target: str,
+    revision: int | None,
+    validator: str,
+    args: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """清除已被同 revision validate_map_region 覆盖的写后校验阻断。"""
+    """按同 revision 验证结果清除或缩减写后校验阻断。"""
     validation_reasons = {
         "map_write_requires_validation",
         "completion_not_allowed",
@@ -1405,6 +1423,24 @@ def _clear_validation_blockers(
         if _same_map_target(blocker, target) and (
             revision is None or blocker_revision is None or revision >= blocker_revision
         ):
+            constraints = blocker.get("workflow_constraints", [])
+            if isinstance(constraints, list) and constraints:
+                remaining_constraints = [
+                    constraint
+                    for constraint in constraints
+                    if not (
+                        isinstance(constraint, dict)
+                        and constraint.get("validator") == validator
+                        and isinstance(constraint.get("required_args", {}), dict)
+                        and all(
+                            args.get(key) == value
+                            for key, value in constraint.get("required_args", {}).items()
+                        )
+                    )
+                ]
+                if remaining_constraints:
+                    remaining.append({**blocker, "workflow_constraints": remaining_constraints})
+                    continue
             continue
         remaining.append(blocker)
     return remaining
@@ -2257,9 +2293,7 @@ def _has_map_review_required(blockers: list[dict[str, Any]]) -> bool:
 
 def _has_only_map_review_required(blockers: list[dict[str, Any]]) -> bool:
     """Return true when visual review is the only remaining map completion blocker."""
-    return bool(blockers) and all(
-        item.get("reason") == "map_review_required" for item in blockers
-    )
+    return bool(blockers) and all(item.get("reason") == "map_review_required" for item in blockers)
 
 
 def _format_map_completion_blockers_for_prompt(blockers: list[dict[str, Any]]) -> str:
@@ -2517,7 +2551,8 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         map_count = len(maps)
         total_layers = sum(
             len(m.get("layers", [])) if isinstance(m.get("layers"), list) else 0
-            for m in maps if isinstance(m, dict)
+            for m in maps
+            if isinstance(m, dict)
         )
         total_cells = 0
         for m in maps:
@@ -2562,7 +2597,9 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         validation = result.get("validation")
         if isinstance(validation, dict):
             v_passed = validation.get("passed")
-            v_issues = validation.get("issues", []) if isinstance(validation.get("issues"), list) else []
+            v_issues = (
+                validation.get("issues", []) if isinstance(validation.get("issues"), list) else []
+            )
             if v_passed is True:
                 lines.append("Validation: Passed ✓")
             elif v_passed is False:
@@ -2692,7 +2729,7 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         if error:
             return f"Describe map region\nError: {error}"
         lines: list[str] = ["Describe map region"]
-        
+
         # Check if this is a cell-focused result (has cells_format)
         cells_format = result.get("cells_format")
         if cells_format:
@@ -2700,7 +2737,9 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
             cells_returned = result.get("cells_returned", 0)
             non_empty_count = result.get("non_empty_count", 0)
             artifact_ref = result.get("artifact_ref", "")
-            lines.append(f"Cells: {cells_total} total, {cells_returned} returned, {non_empty_count} non-empty")
+            lines.append(
+                f"Cells: {cells_total} total, {cells_returned} returned, {non_empty_count} non-empty"
+            )
             if artifact_ref:
                 lines.append(f"Artifact: `{artifact_ref}`")
         else:
@@ -2725,7 +2764,7 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
             if revision is not None:
                 lines.append(f"Revision: {revision}")
             lines.append(f"{map_count} map(s), {total_layers} layer(s), {total_cells} cell(s)")
-        
+
         notes = result.get("notes", []) if isinstance(result.get("notes"), list) else []
         for note in notes[:3]:
             if isinstance(note, str):
@@ -2902,22 +2941,22 @@ def _display_tool_content(content: str) -> str:
 
 def _compact_tool_summary(name: str, inner: dict[str, Any], input_args: dict[str, Any]) -> str:
     """Generate concise tool result summary instead of full JSON dump.
-    
+
     For tools not in specific categories (read/edit/grep), create a short
     key-value style summary showing only important fields, similar to the
     frontend EventFormatter display.
-    
+
     Args:
         name: Tool name
         inner: Parsed tool result dictionary
         input_args: Tool input arguments
-        
+
     Returns:
         Compact summary string, e.g., "Validate map region:\n• passed: True\n• issues_count: 0"
     """
     # Extract important status/result fields
     summary_parts = []
-    
+
     # Common status fields
     if "ok" in inner:
         summary_parts.append(f"ok: {inner['ok']}")
@@ -2927,7 +2966,7 @@ def _compact_tool_summary(name: str, inner: dict[str, Any], input_args: dict[str
         summary_parts.append(f"success: {inner['success']}")
     if "status" in inner:
         summary_parts.append(f"status: {inner['status']}")
-    
+
     # Common result fields
     if "message" in inner:
         msg = str(inner["message"])
@@ -2944,13 +2983,13 @@ def _compact_tool_summary(name: str, inner: dict[str, Any], input_args: dict[str
         count = len(inner["issues"])
         if count > 0:
             summary_parts.append(f"issues: {count} item(s)")
-    
+
     # Path/file related fields
     if "path" in inner:
         summary_parts.append(f"path: {inner['path']}")
     if "file_path" in inner:
         summary_parts.append(f"file_path: {inner['file_path']}")
-    
+
     # If no important fields found, show a minimal summary
     if not summary_parts:
         # Show a few generic fields if present
@@ -2965,7 +3004,7 @@ def _compact_tool_summary(name: str, inner: dict[str, Any], input_args: dict[str
                     summary_parts.append(f"{key}: {val}")
                 else:
                     summary_parts.append(f"{key}: {type(val).__name__}")
-    
+
     # Format as bullet list
     if summary_parts:
         display_name = name.replace("_", " ").title()
@@ -3075,11 +3114,13 @@ def _is_internal_history_message(message: dict[str, Any]) -> bool:
         return False
     content = message.get("content", "")
     text = flatten_message_text(content) if isinstance(content, list) else str(content)
-    return text.startswith((
-        "MAP_COMPLETION_GATE_BLOCKED",
-        "出错：自动读取没有拿到需要的 state",
-        "出错：自动 describe_map_region 请求超过 1600 cells",
-    ))
+    return text.startswith(
+        (
+            "MAP_COMPLETION_GATE_BLOCKED",
+            "出错：自动读取没有拿到需要的 state",
+            "出错：自动 describe_map_region 请求超过 1600 cells",
+        )
+    )
 
 
 def _history_items_for_frame(
@@ -3095,7 +3136,7 @@ def _history_items_for_frame(
                 frame_id=frame.id,
                 agent=frame.agent.name,
             )
-    )
+        )
     tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
     for index, message in enumerate(frame.messages):
         if _is_internal_history_message(message):
@@ -4171,8 +4212,6 @@ def _inject_compact_snapshot(frame: Frame, *, has_rag_context: bool) -> None:
     insert_at = len(blocks) - 1 if has_rag_context and blocks else len(blocks)
     blocks.insert(insert_at, compact_block)
     system_message["content"] = blocks
-
-
 
 
 __all__ = [

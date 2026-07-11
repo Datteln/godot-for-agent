@@ -41,8 +41,6 @@ from app.orchestrator.map_workers import (
     build_dynamic_map_worker,
     is_map_worker_write_mode,
     is_map_write_tool,
-    pipeline_required_parameters,
-    skills_for_map_agent,
     validate_map_write_args,
 )
 
@@ -436,11 +434,6 @@ async def _delegate_child_frame(
         except KeyError:
             return None
     task_text = task.strip()
-    if not isinstance(worker_spec, dict):
-        child_skills = tuple(
-            dict.fromkeys((*child_agent.skills, *skills_for_map_agent(child_agent.name, task_text)))
-        )
-        child_agent = replace(child_agent, skills=list(child_skills))
     prompt = (
         await prompt_factory(child_agent, task_text)
         if prompt_factory is not None
@@ -1306,30 +1299,21 @@ def _has_pending_map_write_validation(session: Session) -> bool:
     return False
 
 
-def _pending_pipeline_templates(session: Session) -> set[str]:
-    """读取待验证地图写入所属的流水线模板。"""
-    return {
-        str(blocker.get("pipeline_template", ""))
-        for blocker in session.map_completion_blockers
-        if (
-            blocker.get("reason") == "map_write_requires_validation"
-            or (
-                blocker.get("reason") in {"blocking_completion", "completion_not_allowed"}
-                and blocker.get("tool") in MAP_WRITE_TOOL_NAMES
-            )
-        )
-        and str(blocker.get("pipeline_template", ""))
-    }
-
-
 def _map_validation_arg_error(session: Session, tool_name: str, args: dict[str, Any]) -> str | None:
-    """按流水线模板检查验证工具关键参数。"""
-    if tool_name != "validate_map_region":
-        return None
-    for template_id in _pending_pipeline_templates(session):
-        required = pipeline_required_parameters(template_id)
-        if "movement_model=leap" in required and args.get("movement_model") != "leap":
-            return "platformer_extend 写入后的 validate_map_region 必须传 movement_model='leap'"
+    """按写入时声明的通用约束检查验证工具参数。"""
+    for blocker in session.map_completion_blockers:
+        raw_constraints = blocker.get("workflow_constraints", [])
+        if not isinstance(raw_constraints, list):
+            continue
+        for constraint in raw_constraints:
+            if not isinstance(constraint, dict) or constraint.get("validator") != tool_name:
+                continue
+            required_args = constraint.get("required_args", {})
+            if not isinstance(required_args, dict):
+                continue
+            for key, value in required_args.items():
+                if args.get(key) != value:
+                    return f"{tool_name} 必须传 {key}={value!r} 以满足当前地图约束"
     return None
 
 
@@ -1412,15 +1396,6 @@ def _append_map_write_followup_protocol_errors(
     return False
 
 
-def _description_field(description: str, key: str) -> str:
-    """从动态 worker 描述中读取简单 key=value 元数据。"""
-    prefix = f"{key}="
-    for part in description.split():
-        if part.startswith(prefix):
-            return part.removeprefix(prefix)
-    return ""
-
-
 def _with_map_write_metadata(
     *,
     session: Session,
@@ -1467,9 +1442,10 @@ def _with_map_write_metadata(
     enriched.setdefault("worker", frame.agent.name)
     enriched.setdefault("mode", "write_one_batch")
     enriched.setdefault("frame_id", frame.id)
-    pipeline_template = _description_field(frame.agent.description, "pipeline_template")
-    if pipeline_template:
-        enriched.setdefault("pipeline_template", pipeline_template)
+    if frame.agent.workflow_operations:
+        enriched.setdefault("workflow_operations", frame.agent.workflow_operations)
+    if frame.agent.workflow_constraints:
+        enriched.setdefault("workflow_constraints", frame.agent.workflow_constraints)
     if frame.pending_delegate_group_id is not None:
         enriched.setdefault("delegate_group_id", frame.pending_delegate_group_id)
     if "task_summary" not in enriched:

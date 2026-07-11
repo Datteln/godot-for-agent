@@ -236,6 +236,8 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
                 "prompt": frame.agent.prompt,
                 "tools": frame.agent.tools or [],
                 "skills": frame.agent.skills,
+                "workflow_operations": frame.agent.workflow_operations,
+                "workflow_constraints": frame.agent.workflow_constraints,
                 "model": frame.agent.model,
                 "effort": frame.agent.effort,
                 "max_turns": frame.agent.max_turns,
