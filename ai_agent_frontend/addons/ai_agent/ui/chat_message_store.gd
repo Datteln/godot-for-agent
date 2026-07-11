@@ -100,6 +100,19 @@ func remove_message(index: int) -> void:
 		_messages[next_index]["index"] = next_index
 
 
+func move_message(index: int, target_index: int) -> int:
+	if index < 0 or index >= _messages.size():
+		return index
+	var message := _messages[index]
+	_messages.remove_at(index)
+	var destination := clampi(target_index, 0, _messages.size())
+	_messages.insert(destination, message)
+	for next_index in range(_messages.size()):
+		_messages[next_index]["index"] = next_index
+	_heights_dirty = true
+	return destination
+
+
 func _rebuild_prefix_heights() -> void:
 	if not _heights_dirty:
 		return

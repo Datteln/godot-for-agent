@@ -156,6 +156,29 @@ func remove_message(index: int) -> void:
 	sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, false)
 
 
+func move_message(index: int, target_index: int) -> int:
+	if _store == null or index < 0 or index >= _store.size():
+		return index
+	var node = _node_cache.get(index, null)
+	if node != null:
+		_node_cache.erase(index)
+	var new_index := _store.move_message(index, target_index)
+	var shifted := {}
+	for cached_index in _node_cache.keys():
+		var old_index := int(cached_index)
+		var adjusted := old_index
+		if old_index < index and old_index >= new_index:
+			adjusted += 1
+		elif old_index > index and old_index <= new_index:
+			adjusted -= 1
+		shifted[adjusted] = _node_cache[cached_index]
+	_node_cache = shifted
+	if node != null:
+		_node_cache[new_index] = node
+	sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, true)
+	return new_index
+
+
 func _compute_visible_range(scroll_y: float, stick_to_bottom: bool) -> Vector2i:
 	var total := _store.size()
 	if total == 0:

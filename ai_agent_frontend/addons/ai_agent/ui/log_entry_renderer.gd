@@ -465,8 +465,15 @@ func append_workflow_summary_entry(content: VBoxContainer, entry: String, marker
 	content.add_child(make_log_rich_text(header_text, _theme_color("muted_text"), marker_text, header_indent))
 	var body := rest_lines(entry).strip_edges()
 	if body != "":
-		var toggle := make_workflow_toggle("展开详情", _theme_color("muted_text"))
+		var toggle := make_workflow_toggle(_summary_text(body), _theme_color("muted_text"))
 		append_collapsible(content, toggle, body, "")
+
+
+func _summary_text(text: String) -> String:
+	var summary := " ".join(text.strip_edges().split("\n"))
+	if summary.length() > 100:
+		return summary.left(100) + "..."
+	return summary
 
 
 ## 核心方法：拆分并追加一条日志流消息到 message_list。

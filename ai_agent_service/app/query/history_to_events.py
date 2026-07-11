@@ -128,6 +128,7 @@ def blocks_to_pseudo_events(blocks: list[SessionHistoryBlock]) -> list[dict[str,
                             "step_index": block["index"],
                             "total_steps": block["total"],
                             "summary": block["summary"],
+                            "full_summary": block.get("full_summary", block["summary"]),
                         },
                     }
                 )

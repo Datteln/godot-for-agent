@@ -137,7 +137,7 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 				int(payload.get("step_index", 0)),
 				int(payload.get("total_steps", 0))
 			]
-			return _title_with_body(done_title, str(payload.get("summary", "")))
+			return _title_with_body(done_title, str(payload.get("full_summary", payload.get("summary", ""))))
 		"verify_started":
 			return _title_with_body("Verify started:", "%s (%s)" % [
 				str(payload.get("file_path", "")),

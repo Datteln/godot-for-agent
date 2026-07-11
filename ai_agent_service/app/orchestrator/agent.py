@@ -519,7 +519,8 @@ def _plan_step_completed(
     idx = frame_steps.pop(done.id, None)
     if idx is None:
         return
-    summary = " ".join(text.split())
+    full_summary = " ".join(text.split())
+    summary = full_summary
     if len(summary) > 240:
         summary = summary[:240] + "..."
     _emit_orchestration_event(
@@ -532,6 +533,7 @@ def _plan_step_completed(
             "step_index": idx + 1,
             "total_steps": len(plan.get("steps", [])),
             "summary": summary,
+            "full_summary": full_summary,
         },
     )
 

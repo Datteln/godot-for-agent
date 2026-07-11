@@ -1320,6 +1320,7 @@ func _handle_tool_calls(response: Dictionary) -> void:
 			results.append(result)
 			_append_tool_result(call, result, preview, stats)
 
+	_move_stream_to_end()
 	if not confirm.is_empty():
 		FrontendLogger.info(editor_interface, "ChatPanel", "Waiting for inline tool confirmation.", {"count": confirm.size()})
 		_pending_calls = confirm.duplicate(true)
@@ -1329,6 +1330,15 @@ func _handle_tool_calls(response: Dictionary) -> void:
 	else:
 		_set_state(AgentState.WAITING_LLM)
 		_http_client.send_tool_results(results, _request_model())
+
+
+func _move_stream_to_end() -> void:
+	if _stream_message_index < 0 or _virtual_scroller == null or _message_store == null:
+		return
+	_stream_message_index = _virtual_scroller.move_message(
+		_stream_message_index,
+		_message_store.size() - 1
+	)
 
 
 func _on_decision(results: Array) -> void:
