@@ -2,7 +2,7 @@
 name: map-procedural-generation
 description: 从零批量生成/装饰地图的算法栈（zone planning、Poisson/noise 采样、grammar/blueprint 模板、草图转地图）。
 when_to_use: 用户要求大范围生成、装饰、村庄/地牢/房间/道路/资源分布、"自然分布"、模板复用、或草图/参考图转地图时加载。
-allowed-tools: [plan_map_layout, plan_map_algorithms, sample_poisson_points, sample_noise_grid, compose_map_blueprint_grammar, save_map_blueprint, apply_map_blueprint, read_image_metadata, paint_from_image_grid, edit_map, paint_terrain_connect, place_map_objects, validate_map_region, repair_map_region]
+allowed-tools: [plan_map_layout, plan_map_algorithms, sample_poisson_points, sample_noise_grid, compose_map_blueprint_grammar, save_map_blueprint, apply_map_blueprint, ensure_standard_map_layers, read_scene_tree, read_image_metadata, query_spatial_index, find_placement_anchors, validate_object_placements, repair_placements, paint_from_image_grid, edit_map, fill_rect, paint_terrain_connect, place_map_objects, validate_layer_coverage, validate_map_region, repair_map_region, compact_spatial_index]
 paths: []
 ---
 

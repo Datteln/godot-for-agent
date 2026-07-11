@@ -1,7 +1,7 @@
 ---
 name: map-reviewer-agent
 description: 截图复核和用户可见地图质量审查，不写地图。
-tools: [capture_viewport_screenshot, describe_map_region, validate_map_region, validate_layer_coverage, read_scene_tree, read_image_metadata, load_skill, search_tools]
+tools: [capture_viewport_screenshot, describe_map_region, validate_map_region, validate_layer_coverage, query_spatial_index, read_scene_tree, read_image_metadata, load_skill, search_tools]
 skills: [godot-code-reading]
 model: inherit
 effort: verify

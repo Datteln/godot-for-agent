@@ -42,6 +42,7 @@ from app.orchestrator.map_workers import (
     is_map_worker_write_mode,
     is_map_write_tool,
     pipeline_required_parameters,
+    skills_for_map_agent,
     validate_map_write_args,
 )
 
@@ -435,9 +436,14 @@ async def _delegate_child_frame(
         except KeyError:
             return None
     task_text = task.strip()
+    if not isinstance(worker_spec, dict):
+        child_skills = tuple(
+            dict.fromkeys((*child_agent.skills, *skills_for_map_agent(child_agent.name, task_text)))
+        )
+        child_agent = replace(child_agent, skills=list(child_skills))
     prompt = (
         await prompt_factory(child_agent, task_text)
-        if prompt_factory is not None and not isinstance(worker_spec, dict)
+        if prompt_factory is not None
         else child_agent.prompt
     )
     child_agent = replace(child_agent, prompt=prompt)
@@ -723,7 +729,11 @@ def _json_object_from_text(text: str) -> dict[str, Any] | None:
 def _slim_map_delegate_value(value: Any) -> Any:
     """递归瘦身地图子任务结果，避免父 agent 继承大数组。"""
     if isinstance(value, str):
-        return value if len(value) <= _MAP_DELEGATE_TEXT_LIMIT else value[:_MAP_DELEGATE_TEXT_LIMIT] + "..."
+        return (
+            value
+            if len(value) <= _MAP_DELEGATE_TEXT_LIMIT
+            else value[:_MAP_DELEGATE_TEXT_LIMIT] + "..."
+        )
     if isinstance(value, list):
         return [_slim_map_delegate_value(item) for item in value[:_MAP_DELEGATE_LIST_LIMIT]]
     if not isinstance(value, dict):
@@ -1288,9 +1298,10 @@ def _has_pending_map_write_validation(session: Session) -> bool:
         reason = blocker.get("reason")
         if reason in {"map_write_requires_validation", "map_review_required"}:
             return True
-        if reason in {"blocking_completion", "completion_not_allowed"} and blocker.get(
-            "tool"
-        ) in MAP_WRITE_TOOL_NAMES:
+        if (
+            reason in {"blocking_completion", "completion_not_allowed"}
+            and blocker.get("tool") in MAP_WRITE_TOOL_NAMES
+        ):
             return True
     return False
 
@@ -1428,9 +1439,8 @@ def _with_map_write_metadata(
     supplied_revision_is_int = isinstance(supplied_revision, int) and not isinstance(
         supplied_revision, bool
     )
-    if (
-        latest_revision is not None
-        and (not supplied_revision_is_int or latest_revision > supplied_revision)
+    if latest_revision is not None and (
+        not supplied_revision_is_int or latest_revision > supplied_revision
     ):
         logger.info(
             "Overriding stale map expected_revision session=%s frame=%s tool=%s target=%s supplied=%s latest=%s",

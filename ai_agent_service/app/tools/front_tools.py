@@ -39,6 +39,13 @@ def _worker_spec_schema() -> dict[str, Any]:
                 ],
             },
             "allowed_tools": {"type": "array", "items": {"type": "string"}},
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional map skills; the service adds the skills required by the pipeline."
+                ),
+            },
             "output_schema": {"type": "string", "enum": ["map_worker_result_v1"]},
             "pipeline_template": {"type": "string", "enum": list(pipeline_template_ids())},
             "stage_id": {"type": "string"},
@@ -100,7 +107,7 @@ def register_front_tools() -> None:
                         "worker_spec": {
                             "description": (
                                 "Optional dynamic map worker spec. Only map-agent may use this. "
-                                "Fields include name, objective, mode, allowed_tools, output_schema, "
+                                "Fields include name, objective, mode, allowed_tools, skills, output_schema, "
                                 "pipeline_template, stage_id, max_turns."
                             ),
                             **_worker_spec_schema(),
@@ -2682,14 +2689,20 @@ def register_front_tools() -> None:
                                     "footprint_width": {"type": "integer", "minimum": 1},
                                     "footprint_height": {"type": "integer", "minimum": 1},
                                     "requires_support": {"type": "boolean"},
-                                    "support_layers": {"type": "array", "items": {"type": "string"}},
+                                    "support_layers": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
                                     "semantic_layer": {"type": "string"},
                                     "tags": {"type": "array", "items": {"type": "string"}},
                                     "visual_group_id": {
                                         "type": "string",
                                         "description": "Optional stable id for this visible object instance.",
                                     },
-                                    "instance_id": {"type": "string", "description": "Alias for visual_group_id."},
+                                    "instance_id": {
+                                        "type": "string",
+                                        "description": "Alias for visual_group_id.",
+                                    },
                                     "instance_kind": {
                                         "type": "string",
                                         "description": "Optional visible object kind such as tree, coin, enemy, sign.",

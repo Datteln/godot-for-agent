@@ -235,6 +235,7 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
                 "description": frame.agent.description,
                 "prompt": frame.agent.prompt,
                 "tools": frame.agent.tools or [],
+                "skills": frame.agent.skills,
                 "model": frame.agent.model,
                 "effort": frame.agent.effort,
                 "max_turns": frame.agent.max_turns,
@@ -457,9 +458,7 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
             if isinstance(item, dict)
         ],
         map_completion_blockers=[
-            item
-            for item in _as_list(data.get("map_completion_blockers"))
-            if isinstance(item, dict)
+            item for item in _as_list(data.get("map_completion_blockers")) if isinstance(item, dict)
         ],
         latest_map_revisions={
             str(key): value

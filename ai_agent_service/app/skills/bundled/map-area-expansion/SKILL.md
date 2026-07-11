@@ -2,7 +2,7 @@
 name: map-area-expansion
 description: 扩建已有地图的可达性增长流程、横版平台关卡专用规划（critical route/jump graph/coin arcs/enemy slots）、移动模型能力校准与导航烘焙。
 when_to_use: 扩展已有地图（而不是从空白区生成）、横版平台跳跃关卡设计、需要校准 leap/free 移动能力参数、或需要导航网格烘焙时加载。
-allowed-tools: [plan_reachable_map_growth, compute_reachable_frontier, plan_platform_level, validate_map_region, repair_map_region, bake_navigation_mesh, describe_map_region, query_spatial_index, read_file, read_class_docs]
+allowed-tools: [plan_reachable_map_growth, compute_reachable_frontier, plan_platform_level, validate_map_region, validate_layer_coverage, repair_map_region, bake_navigation_mesh, describe_map_region, query_spatial_index, read_scene_tree, read_file, read_class_docs, edit_map, capture_viewport_screenshot]
 paths: []
 ---
 

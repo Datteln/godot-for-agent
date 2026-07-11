@@ -65,6 +65,36 @@ PIPELINE_TEMPLATE_IDS = frozenset(
     }
 )
 
+MAP_SKILL_NAMES = frozenset(
+    {
+        "bundled:godot-code-reading",
+        "bundled:map-area-expansion",
+        "bundled:map-procedural-generation",
+    }
+)
+
+PIPELINE_SKILLS: dict[str, tuple[str, ...]] = {
+    "read_only_diagnosis": ("bundled:godot-code-reading",),
+    "platformer_extend": (
+        "bundled:godot-code-reading",
+        "bundled:map-area-expansion",
+    ),
+    "background_fill": (
+        "bundled:godot-code-reading",
+        "bundled:map-procedural-generation",
+    ),
+    "object_placement": (
+        "bundled:godot-code-reading",
+        "bundled:map-procedural-generation",
+    ),
+    "repair_existing_map": (
+        "bundled:godot-code-reading",
+        "bundled:map-area-expansion",
+        "bundled:map-procedural-generation",
+    ),
+    "single_point_edit": ("bundled:godot-code-reading",),
+}
+
 
 @dataclass(frozen=True)
 class PipelineStageSpec:
@@ -230,6 +260,13 @@ def pipeline_required_parameters(template_id: str) -> tuple[str, ...]:
     return template.required_parameters if template is not None else ()
 
 
+def skills_for_map_agent(agent_name: str, objective: str) -> tuple[str, ...]:
+    """根据地图专职 agent 的任务补充服务层预加载 Skill。"""
+    if agent_name != "map-planner-agent":
+        return ()
+    return PIPELINE_SKILLS[select_pipeline_template(objective)]
+
+
 def validate_map_write_args(name: str, args: dict[str, Any]) -> str | None:
     """校验地图写工具必需的批次与版本字段。"""
     if not requires_map_revision(name):
@@ -250,6 +287,7 @@ def build_dynamic_map_worker(
     objective = spec.get("objective")
     mode = spec.get("mode")
     allowed_tools = spec.get("allowed_tools")
+    requested_skills = spec.get("skills", [])
     output_schema = spec.get("output_schema")
     pipeline_template = spec.get("pipeline_template")
     stage_id = spec.get("stage_id")
@@ -261,12 +299,20 @@ def build_dynamic_map_worker(
         return "worker_spec.mode 必须是受控地图 worker mode"
     if not isinstance(allowed_tools, list) or not allowed_tools:
         return "worker_spec.allowed_tools 不能为空"
+    if not isinstance(requested_skills, list) or not all(
+        isinstance(skill, str) for skill in requested_skills
+    ):
+        return "worker_spec.skills 必须是字符串数组"
     if output_schema != "map_worker_result_v1":
         return "worker_spec.output_schema 必须是 map_worker_result_v1"
     if pipeline_template is not None and pipeline_template not in PIPELINE_TEMPLATE_IDS:
         return "worker_spec.pipeline_template 必须是受支持的地图流水线模板"
     pipeline_template = select_pipeline_template(str(objective), pipeline_template)
     spec["pipeline_template"] = pipeline_template
+    unknown_skills = set(requested_skills) - MAP_SKILL_NAMES
+    if unknown_skills:
+        return f"worker_spec.skills 包含不允许的 Skill：{', '.join(sorted(unknown_skills))}"
+    skills = tuple(dict.fromkeys((*PIPELINE_SKILLS[pipeline_template], *requested_skills)))
     if stage_id is not None and (not isinstance(stage_id, str) or not stage_id.strip()):
         return "worker_spec.stage_id 必须是非空字符串"
     if not any(stage.worker_mode == mode for stage in PIPELINE_TEMPLATES[pipeline_template].stages):
@@ -299,7 +345,7 @@ def build_dynamic_map_worker(
         max_turns = 6
     max_turns = max(1, min(max_turns, 12))
 
-    prompt = _dynamic_map_worker_prompt(spec, sorted(effective))
+    prompt = _dynamic_map_worker_prompt(spec, sorted(effective), skills)
     worker = AgentDefinition(
         name=name.strip(),
         source="project",
@@ -314,15 +360,19 @@ def build_dynamic_map_worker(
         max_turns=max_turns,
         edit_map_max_turns=1 if is_map_worker_write_mode(mode) else None,
         can_delegate=False,
+        skills=list(skills),
     )
     return resolve_effective_tools(worker, set(REGISTRY))
 
 
-def _dynamic_map_worker_prompt(spec: dict[str, Any], tools: list[str]) -> str:
+def _dynamic_map_worker_prompt(
+    spec: dict[str, Any], tools: list[str], skills: tuple[str, ...]
+) -> str:
     """生成动态地图 worker 的系统提示词。"""
     return (
         "你是一次性 Godot 地图 worker，只为当前委派帧存在。\n\n"
         f"worker_spec:\n{spec}\n\n"
+        f"已绑定 Skill：{', '.join(skills)}。这些 Skill 会在 worker prompt 中预加载。\n"
         f"可用流水线模板：{', '.join(pipeline_template_ids())}。\n"
         f"服务层已裁剪工具：{', '.join(tools)}。\n"
         "规则：\n"
@@ -360,6 +410,7 @@ def restore_project_agent(data: dict[str, Any], available_tools: set[str]) -> Ag
         description=str(data.get("description", "")),
         prompt=str(data.get("prompt", "")),
         tools=[str(tool) for tool in data.get("tools", []) if isinstance(tool, str)],
+        skills=[str(skill) for skill in data.get("skills", []) if isinstance(skill, str)],
         model=str(data.get("model", "inherit")),
         effort=data.get("effort", "standard"),
         max_turns=int(data.get("max_turns", 6)),
