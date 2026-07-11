@@ -68,7 +68,7 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 		"context_usage":
 			return ""
 		"delegate_start":
-			return ui_text.get("event_delegate", "Task(%s)") % _format_delegate_args(payload)
+			return _format_delegate_start(payload)
 		"delegate_result":
 			return _title_with_body("Delegate result: %s" % str(payload.get("agent", "delegate")), str(payload.get("summary", "")))
 		"cache_hit":
@@ -229,10 +229,17 @@ static func _format_event_args(payload: Dictionary) -> String:
 		if not args.has(key):
 			continue
 		var value := str(args.get(key, "")).strip_edges()
-		if value.length() > 90:
-			value = value.left(90) + "..."
 		parts.append("%s=`%s`" % [key, value])
 	return ", ".join(parts)
+
+
+static func _format_delegate_start(payload: Dictionary) -> String:
+	var raw_args = payload.get("args", {})
+	var args: Dictionary = raw_args if raw_args is Dictionary else {}
+	var agent := str(args.get("agent", payload.get("agent", "delegate")))
+	var task := str(args.get("task", payload.get("task", ""))).strip_edges()
+	var header := "Task(agent=%s)" % agent
+	return header if task == "" else header + "\ntask:\n" + task
 
 
 static func _format_delegate_args(payload: Dictionary) -> String:
@@ -311,13 +318,13 @@ static func format_tool_call_args(name: String, input: Dictionary) -> String:
 	if name == "run_tests" or name == "run_headless_self_test":
 		return "kind=%s" % str(input.get("kind", "project"))
 	if name == "run_system_command":
-		return truncate_text(str(input.get("command", "")), 60)
+		return str(input.get("command", ""))
 	for key in ["path", "target_path", "file_path", "script_path", "resource_path", "scene_path", "material_path", "track_path"]:
 		if input.has(key):
 			return str(input.get(key, ""))
 	for key in ["pattern", "query", "include", "command", "agent", "task", "class_name", "node_path", "name", "key", "action", "group", "preset"]:
 		if input.has(key):
-			return truncate_text(str(input.get(key, "")), 60)
+			return str(input.get(key, ""))
 	return ""
 
 
@@ -350,7 +357,7 @@ static func format_tool_result_detail(name: String, input: Dictionary, status: S
 				summary = ui_text.get("tool_run_result", "%s (exit=%s)") % [run_status, str(exit_code)]
 			var output := str(inner.get("output", "")).strip_edges()
 			if output != "":
-				summary += "\n```\n%s\n```" % truncate_text(output, 800)
+				summary += "\n```\n%s\n```" % output
 			return summary
 		"read_debugger_errors":
 			var items: Array = inner.get("items", []) if inner.get("items") is Array else []

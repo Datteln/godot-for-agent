@@ -85,6 +85,8 @@ func split_thought_header(fl: String) -> Dictionary:
 
 
 func is_workflow_summary_start(line: String) -> bool:
+	if line.begins_with("Task("):
+		return true
 	if line.begins_with("Plan created"):
 		return true
 	if line.begins_with("Delegate results") or line.begins_with("Delegate result:"):
@@ -463,7 +465,8 @@ func append_workflow_summary_entry(content: VBoxContainer, entry: String, marker
 	content.add_child(make_log_rich_text(header_text, _theme_color("muted_text"), marker_text, header_indent))
 	var body := rest_lines(entry).strip_edges()
 	if body != "":
-		content.add_child(make_log_rich_text(body, null, "", true))
+		var toggle := make_workflow_toggle("展开详情", _theme_color("muted_text"))
+		append_collapsible(content, toggle, body, "")
 
 
 ## 核心方法：拆分并追加一条日志流消息到 message_list。
