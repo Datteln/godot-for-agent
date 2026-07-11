@@ -4027,7 +4027,9 @@ static func _platform_entry_anchor(input: Dictionary, editor_interface: EditorIn
 	var sample_x := int(input.get("entry_sample_x", region_x - sample_width))
 	var sample_y := int(input.get("entry_sample_y", input.get("y", 0)))
 	var sample_height: int = maxi(4, int(input.get("entry_sample_height", maxi(30, int(input.get("height", 20))))))
+	var min_landing_width := maxi(1, int(input.get("min_landing_width", 2)))
 	var best_support := Vector3i(-2147483648, 0, 0)
+	var valid_supports := {}
 	var non_empty_cells := 0
 	var blocked_above_cells := 0
 	var blocked_above_examples: Array = []
@@ -4044,8 +4046,16 @@ static func _platform_entry_anchor(input: Dictionary, editor_interface: EditorIn
 				if blocked_above_examples.size() < 8:
 					blocked_above_examples.append({"support": {"x": coords.x, "y": coords.y}, "blocked_above": {"x": coords.x, "y": coords.y - 1}})
 				continue
-			if coords.x > best_support.x or (coords.x == best_support.x and coords.y < best_support.y):
-				best_support = coords
+			valid_supports["%d:%d" % [coords.x, coords.y]] = coords
+	for value in valid_supports.values():
+		var support: Vector3i = value
+		var has_width := true
+		for offset in range(min_landing_width):
+			if not valid_supports.has("%d:%d" % [support.x - offset, support.y]):
+				has_width = false
+				break
+		if has_width and (support.x > best_support.x or (support.x == best_support.x and support.y < best_support.y)):
+			best_support = support
 	if best_support.x == -2147483648:
 		var suggested_width: int = sample_width * 2
 		var suggested_height: int = sample_height * 2
@@ -4056,6 +4066,7 @@ static func _platform_entry_anchor(input: Dictionary, editor_interface: EditorIn
 			"sample_rect": {"x": sample_x, "y": sample_y, "width": sample_width, "height": sample_height},
 			"non_empty_cells": non_empty_cells,
 			"blocked_above_cells": blocked_above_cells,
+			"min_landing_width": min_landing_width,
 			"blocked_above_examples": blocked_above_examples,
 			"suggested_entry_sample": {
 				"x": sample_x - sample_width,
@@ -4072,6 +4083,7 @@ static func _platform_entry_anchor(input: Dictionary, editor_interface: EditorIn
 		"sample_rect": {"x": sample_x, "y": sample_y, "width": sample_width, "height": sample_height},
 		"entry_support": {"x": best_support.x, "y": best_support.y},
 		"entry_anchor": {"x": best_support.x, "y": best_support.y - 1},
+		"min_landing_width": min_landing_width,
 		"note": "plan_platform_level must connect the first generated platform from this existing foothold.",
 	}
 

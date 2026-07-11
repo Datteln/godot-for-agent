@@ -122,10 +122,24 @@ static func render_markdown_table(table_lines: Array[String], theme_colors: Dict
 
 
 static func format_table_cell(cell: String) -> String:
-	var escaped := escape_bbcode(cell.strip_edges())
+	var escaped := escape_bbcode(_wrap_table_cell(cell.strip_edges()))
 	escaped = replace_inline_code(escaped)
 	escaped = replace_bold(escaped)
 	return escaped
+
+
+static func _wrap_table_cell(cell: String) -> String:
+	if cell.length() < 14:
+		return cell
+	var result := ""
+	var line := ""
+	for index in range(cell.length()):
+		var character := cell.substr(index, 1)
+		line += character
+		if line.length() >= 10 and "，。；、/（）()".contains(character):
+			result += line + "\n"
+			line = ""
+	return result + line
 
 
 static func split_table_row(line: String) -> PackedStringArray:

@@ -56,7 +56,9 @@ func height_at(index: int) -> float:
 	if index < 0 or index >= _messages.size():
 		return 0.0
 	var message := _messages[index]
-	return maxf(float(message.get("measured_height", 0.0)), float(message.get("estimated_height", 64.0))) + item_spacing
+	var measured := float(message.get("measured_height", 0.0))
+	var height := measured if measured > 1.0 else float(message.get("estimated_height", 64.0))
+	return height + item_spacing
 
 
 func total_height(from_index: int = 0, to_index: int = -1, excluded: Dictionary = {}) -> float:

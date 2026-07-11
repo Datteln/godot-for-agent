@@ -75,7 +75,7 @@ func sync(scroll_y: float, stick_to_bottom: bool) -> void:
 		_sync_again_stick_to_bottom = _sync_again_stick_to_bottom or stick_to_bottom
 		return
 	_syncing = true
-	_measure_visible_heights()
+	var heights_changed := _measure_visible_heights()
 	var visible_range := _compute_visible_range(scroll_y, stick_to_bottom)
 	var visible := _visible_indexes(visible_range)
 	var excluded := _pinned_indexes_outside(visible)
@@ -83,6 +83,8 @@ func sync(scroll_y: float, stick_to_bottom: bool) -> void:
 	_bottom_spacer.custom_minimum_size = Vector2(0, _store.total_height(visible_range.y, _store.size(), excluded))
 	_sync_nodes(visible)
 	_syncing = false
+	if heights_changed:
+		call_deferred("_deferred_resync", stick_to_bottom)
 	if _sync_again:
 		var next_stick_to_bottom := _sync_again_stick_to_bottom
 		_sync_again = false
@@ -256,11 +258,16 @@ func _sync_nodes(visible: Dictionary) -> void:
 		_message_list.move_child(_bottom_spacer, pos)
 
 
-func _measure_visible_heights() -> void:
+func _measure_visible_heights() -> bool:
+	var changed := false
 	for index in _node_cache.keys():
 		var node: Control = _node_cache[index]
 		if node != null and is_instance_valid(node) and node.size.y > 1.0:
-			_store.update_height(int(index), node.size.y)
+			var old_height := float(_store.get_message(int(index)).get("measured_height", 0.0))
+			if absf(old_height - node.size.y) > 1.0:
+				_store.update_height(int(index), node.size.y)
+				changed = true
+	return changed
 
 
 func _make_spacer(name: String) -> Control:

@@ -12,7 +12,9 @@ static func plan_platform_level(input: Dictionary, context: Dictionary = {}) -> 
 	var seed := int(input.get("seed", 0))
 	var entry_anchor := _entry_anchor_from_input(input)
 	var requires_entry_anchor := bool(input.get("connect_from_existing", true))
-	if not entry_anchor.is_empty() and not input.has("ground_y"):
+	# 已读取到真实入口后，入口支撑面是 ground_y 的唯一可信来源；
+	# 不允许调用方传入的推断值覆盖它。
+	if not entry_anchor.is_empty():
 		ground_y = int(entry_anchor.get("y", ground_y - 1)) + 1
 	var route := _build_critical_route(region, ground_y, ability, seed, entry_anchor)
 	var platforms: Array = route.get("platforms", [])
