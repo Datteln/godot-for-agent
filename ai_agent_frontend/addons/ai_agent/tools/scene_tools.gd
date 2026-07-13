@@ -25,7 +25,26 @@ static func _relative_path(root: Node, node: Node) -> String:
 
 
 ## 将工具协议中的本地坐标转换成 Godot 的 Vector2/Vector3，并拒绝不支持空间坐标的节点。
-static func _apply_optional_position(node: Node, input: Dictionary) -> Dictionary:
+static func _apply_optional_position(node: Node, input: Dictionary, parent: Node, root: Node) -> Dictionary:
+	if input.has("map_cell") and input.has("position"):
+		return {"ok": false, "message": "map_cell and position are mutually exclusive", "error_code": "ambiguous_position"}
+	if input.has("map_cell"):
+		var map_path := str(input.get("target_path", "")).strip_edges()
+		var map := root.get_node_or_null(NodePath(map_path)) if map_path != "" else _first_tilemap_2d(root)
+		if map == null or not map.has_method("map_to_local") or not (map is Node2D):
+			return {"ok": false, "message": "target_path must resolve to a 2D TileMap/TileMapLayer for map_cell placement", "error_code": "map_target_required"}
+		var cell_value = _recover_json_encoded(input.get("map_cell"))
+		if not cell_value is Dictionary:
+			return {"ok": false, "message": "map_cell must be an object with integer x/y fields", "error_code": "invalid_map_cell"}
+		var cell: Dictionary = cell_value
+		if typeof(cell.get("x", null)) != TYPE_INT or typeof(cell.get("y", null)) != TYPE_INT:
+			return {"ok": false, "message": "map_cell.x and map_cell.y must be integers", "error_code": "invalid_map_cell"}
+		var local: Vector2 = map.call("map_to_local", Vector2i(int(cell["x"]), int(cell["y"])))
+		var world: Vector2 = (map as Node2D).to_global(local)
+		if not parent is Node2D:
+			return {"ok": false, "message": "map_cell placement requires a Node2D parent", "error_code": "parent_type_mismatch"}
+		(node as Node2D).position = (parent as Node2D).to_local(world)
+		return {}
 	if not input.has("position"):
 		return {}
 	var position_value = _recover_json_encoded(input.get("position"))
@@ -104,8 +123,9 @@ static func _placement_reference(root: Node, node: Node) -> Dictionary:
 	if tile_size.x <= 0 or tile_size.y <= 0:
 		return {}
 	var local: Vector2 = (map as Node2D).to_local((node as Node2D).global_position)
-	var col := int(floor(local.x / float(tile_size.x)))
-	var row := int(floor(local.y / float(tile_size.y)))
+	var mapped := map.call("local_to_map", local)
+	var col := int(mapped.x)
+	var row := int(mapped.y)
 	var min_x := used.position.x
 	var min_y := used.position.y
 	var max_x := used.position.x + used.size.x - 1
@@ -501,7 +521,7 @@ static func add_node(input: Dictionary, editor_interface: EditorInterface, undo_
 		return {"ok": false, "message": "Cannot instantiate node type: " + type_name}
 	var node: Node = instance
 	node.name = str(input.get("name", type_name))
-	var position_error := _apply_optional_position(node, input)
+	var position_error := _apply_optional_position(node, input, parent, root)
 	if not position_error.is_empty():
 		return position_error
 	var visual_error := _apply_visual_resource(node, type_name, input)
@@ -682,6 +702,11 @@ static func instance_scene(input: Dictionary, editor_interface: EditorInterface,
 		"scene_path": scene_path,
 		"position": _node_position_payload(node),
 	}
+	if input.has("map_cell") and node is Node2D:
+		var requested_cell = input.get("map_cell", {})
+		var global_position := (node as Node2D).global_position
+		result["requested_map_cell"] = requested_cell
+		result["world_position"] = {"x": global_position.x, "y": global_position.y}
 	if not placement.is_empty():
 		result["placement"] = placement
 	return result
@@ -706,7 +731,7 @@ static func duplicate_node(input: Dictionary, editor_interface: EditorInterface,
 		return {"ok": false, "message": "Failed to duplicate node: " + path, "error_code": "duplicate_failed"}
 	if input.has("name"):
 		clone.name = str(input.get("name"))
-	var position_error := _apply_optional_position(clone, input)
+	var position_error := _apply_optional_position(clone, input, parent, root)
 	if not position_error.is_empty():
 		return position_error
 	parent.add_child(clone)

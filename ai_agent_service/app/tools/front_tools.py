@@ -841,6 +841,8 @@ def register_front_tools() -> None:
                 "name": "instance_scene",
                 "description": (
                     "Instantiate a .tscn/.scn file as a new child node, with an optional local 2D/3D position. "
+                    "For map objects, pass target_path plus map_cell to let Godot convert map cells through the "
+                    "native TileMap transform; do not hand-calculate world pixels. map_cell and position are mutually exclusive. "
                     "When the scene has a TileMap, the result includes `placement` with `placed_at_tile` (the "
                     "tile cell the instance landed on) and `map_tile_bounds` — verify placed_at_tile is inside "
                     "the region you intended; a coordinate far outside the map is rejected with error_code "
@@ -868,6 +870,17 @@ def register_front_tools() -> None:
                                 "y": {"type": "number"},
                                 "z": {"type": "number"},
                             },
+                            "required": ["x", "y"],
+                            "additionalProperties": False,
+                        },
+                        "target_path": {
+                            "type": "string",
+                            "description": "TileMap/TileMapLayer path used to convert map_cell into the parent-local position.",
+                        },
+                        "map_cell": {
+                            "type": "object",
+                            "description": "2D map cell anchor {x,y}; use this instead of position for platform placement.",
+                            "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
                             "required": ["x", "y"],
                             "additionalProperties": False,
                         },
@@ -2531,6 +2544,10 @@ def register_front_tools() -> None:
                                 "this field to avoid calculation errors; the frontend uses the actual cell count "
                                 "from the operations themselves."
                             ),
+                        },
+                        "platformer_mode": {
+                            "type": "boolean",
+                            "description": "Enable platformer write guards: platform/ground fills are limited to thin support thickness.",
                         },
                         "expected_visual_groups": {
                             "type": "integer",

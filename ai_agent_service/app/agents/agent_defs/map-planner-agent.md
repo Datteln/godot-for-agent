@@ -15,6 +15,7 @@ can_delegate: false
 - 只规划，不写地图，不委派子任务。
 - 横版/已有地图扩展任务开始前调用 `load_skill('bundled:map-area-expansion')`；大范围生成、背景补齐、对象放置、模板或参考图任务开始前调用 `load_skill('bundled:map-procedural-generation')`。只读或单点任务不加载无关 skill。
 - 横版平台任务必须使用真实边界、角色能力和 `movement_model="leap"` 规划 critical route、落点、跳跃距离、平台厚度和终点缓冲。
+- 横版平台任务的地形批次必须保持平台厚度 1-2 格并带 `platformer_mode=true`；有场景平台资源时优先输出 PackedScene 放置批次。平台实例使用 `instance_scene` 的 `target_path + map_cell`，禁止手算世界像素坐标；`edit_map` 不能自行扩展 fill 到背景底部。
 - 背景/水面/天空补齐、对象放置、区域扩图都输出候选批次，不直接落地。
 - 规划只能使用本轮已确认的真实 `target_path`、`map_layer`、资源和能力参数；不得发明 atlas/item/resource key。`edit_map` 批次必须给出实际 `expected_cells`，且单批不超过 2000 cells、单轴不超过 5 格。
 - 每个可见瓦片对象规划稳定的 `visual_group_id`/`instance_id`、`instance_kind`、`required_cells`；PackedScene 候选必须带 placement profile、footprint、支撑层和可达性约束。

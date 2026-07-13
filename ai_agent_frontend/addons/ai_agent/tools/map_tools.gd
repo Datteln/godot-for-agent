@@ -14,6 +14,7 @@ const MapReachableGrowth = preload("res://addons/ai_agent/tools/map_reachable_gr
 const MAX_EDITED_CELLS := 100000
 const MAX_EDIT_MAP_BATCH_CELLS := 2000
 const MAX_THIN_NON_BLANKET_FILL_WIDTH := 12
+const MAX_PLATFORM_FILL_THICKNESS := 2
 const MAX_DESCRIBED_CELLS := 800
 const DEFAULT_DESCRIBE_RETURNED_CELLS := 120
 ## describe_map_region 是纯内存读取（一次循环读完整片区域），800 只是响应体大小的策略上限，
@@ -108,6 +109,48 @@ static func _validate_edit_map_batch_shape(operations: Array, dimension: int) ->
 			"max_cells": MAX_EDIT_MAP_BATCH_CELLS,
 			"hint": "Retry with smaller edit_map calls whose total expected_cells is <= max_cells.",
 		}, "map_edit_batch_too_large")
+	return {"ok": true}
+
+
+static func _is_platformer_scene(target: Node) -> bool:
+	var root := target.owner if target.owner != null else target
+	if root == null:
+		return false
+	return _find_node_named(root, "Platforms") != null
+
+
+static func _find_node_named(node: Node, wanted_name: String) -> Node:
+	if node.name == wanted_name:
+		return node
+	for child in node.get_children():
+		var found := _find_node_named(child, wanted_name)
+		if found != null:
+			return found
+	return null
+
+
+static func _validate_platform_fill_shape(operations: Array, target: Node, dimension: int, input: Dictionary) -> Dictionary:
+	if dimension != 2 or (not bool(input.get("platformer_mode", false)) and not _is_platformer_scene(target)):
+		return {"ok": true}
+	for operation_value in operations:
+		if not (operation_value is Dictionary):
+			continue
+		var operation: Dictionary = operation_value
+		if str(operation.get("action", "")) != "fill":
+			continue
+		var semantic := str(operation.get("semantic_layer", "")).to_lower()
+		var tags_value = operation.get("tags", [])
+		var tags: Array = tags_value if tags_value is Array else []
+		var is_ground := semantic in ["ground", "platform", "floor"] or tags.has("ground_top") or tags.has("ground_fill") or tags.has("platform")
+		if is_ground and int(operation.get("height", 1)) > MAX_PLATFORM_FILL_THICKNESS:
+			return _merge_map_completion_blocker({
+				"ok": false,
+				"message": "platformer ground fill thickness must be <= %d; emit a thin platform batch or instantiate platform.tscn." % MAX_PLATFORM_FILL_THICKNESS,
+				"error_code": "platform_fill_too_thick",
+				"height": int(operation.get("height", 1)),
+				"max_platform_thickness": MAX_PLATFORM_FILL_THICKNESS,
+				"hint": "Use platform_thickness 1 or 2, or use place_map_objects with a platform PackedScene.",
+			}, "platform_fill_too_thick")
 	return {"ok": true}
 
 
@@ -209,6 +252,9 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		return {"ok": false, "message": "at most 128 operations are allowed", "error_code": "map_edit_too_large"}
 
 	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var platform_shape := _validate_platform_fill_shape(operations, target, dimension, input)
+	if not bool(platform_shape.get("ok", false)):
+		return platform_shape
 	if not input.has("expected_cells"):
 		return _merge_map_completion_blocker({
 			"ok": false,
@@ -859,7 +905,7 @@ static func place_map_objects(input: Dictionary, editor_interface: EditorInterfa
 		if dimension == 3 and not (node is Node3D):
 			return _with_object_batch_failure({"ok": false, "message": "3D map object must instantiate a Node3D scene: " + scene_path, "error_code": "object_type_mismatch"}, object_index, object_spec, placement_map_layer, placement_profile)
 		node.name = _object_instance_name(object_spec, resource_key, scene_path)
-		_apply_object_position(node, map_node, coords, dimension)
+		_apply_object_position(node, map_node, coords, dimension, parent)
 		_apply_object_metadata(node, object_spec, resource_key, scene_path, coords, dimension)
 		prepared.append({
 			"node": node,
@@ -2440,19 +2486,28 @@ static func _object_instance_name(object_spec: Dictionary, resource_key: String,
 	return scene_path.get_file().get_basename()
 
 
-static func _apply_object_position(node: Node, map_node: Node, coords: Vector3i, dimension: int) -> void:
+static func _apply_object_position(node: Node, map_node: Node, coords: Vector3i, dimension: int, parent: Node = null) -> void:
+	var target_parent := parent if parent != null else node.get_parent()
 	if dimension == 3 and node is Node3D:
-		var cell_size := Vector3.ONE
-		if "cell_size" in map_node:
-			cell_size = map_node.get("cell_size")
-		var base_3d := (map_node as Node3D).position if map_node is Node3D else Vector3.ZERO
-		(node as Node3D).position = base_3d + Vector3(coords.x * cell_size.x, coords.y * cell_size.y, coords.z * cell_size.z)
+		if map_node.has_method("map_to_local") and target_parent is Node3D:
+			var local_3d: Vector3 = map_node.call("map_to_local", coords)
+			var world_3d: Vector3 = (map_node as Node3D).to_global(local_3d)
+			(node as Node3D).position = (target_parent as Node3D).to_local(world_3d)
+		elif "cell_size" in map_node:
+			var cell_size: Vector3 = map_node.get("cell_size")
+			var base_3d := (map_node as Node3D).position if map_node is Node3D else Vector3.ZERO
+			(node as Node3D).position = base_3d + Vector3(coords.x * cell_size.x, coords.y * cell_size.y, coords.z * cell_size.z)
 	elif dimension == 2 and node is Node2D:
-		var tile_size := Vector2i.ONE
-		if "tile_set" in map_node and map_node.get("tile_set") != null:
-			tile_size = map_node.get("tile_set").tile_size
-		var base_2d := (map_node as Node2D).position if map_node is Node2D else Vector2.ZERO
-		(node as Node2D).position = base_2d + Vector2(coords.x * tile_size.x, coords.y * tile_size.y)
+		if map_node.has_method("map_to_local") and target_parent is Node2D:
+			var local_2d: Vector2 = map_node.call("map_to_local", Vector2i(coords.x, coords.y))
+			var world_2d: Vector2 = (map_node as Node2D).to_global(local_2d)
+			(node as Node2D).position = (target_parent as Node2D).to_local(world_2d)
+		else:
+			var tile_size := Vector2i.ONE
+			if "tile_set" in map_node and map_node.get("tile_set") != null:
+				tile_size = map_node.get("tile_set").tile_size
+			var base_2d := (map_node as Node2D).position if map_node is Node2D else Vector2.ZERO
+			(node as Node2D).position = base_2d + Vector2(coords.x * tile_size.x, coords.y * tile_size.y)
 
 
 static func _apply_object_metadata(
@@ -3436,7 +3491,7 @@ static func _repair_spatial_object_issues(input: Dictionary, editor_interface: E
 			before_position = (node as Node3D).position
 		elif node is Node2D:
 			before_position = (node as Node2D).position
-		_apply_object_position(node, target, new_coords, dimension)
+		_apply_object_position(node, target, new_coords, dimension, node.get_parent())
 		var after_position = null
 		if node is Node3D:
 			after_position = (node as Node3D).position
