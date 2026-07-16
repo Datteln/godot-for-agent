@@ -72,6 +72,10 @@ logger = logging.getLogger(__name__)
 _MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
 _MAP_ARTIFACT_MAX_FILES_PER_SESSION = 128
 _MAP_ARTIFACT_MAX_BYTES_PER_SESSION = 100 * 1024 * 1024
+_MAP_MAX_AUTO_ITERATIONS = 3
+_MAP_VALIDATION_FAILURE_REASONS = frozenset(
+    {"blocking_completion", "completion_not_allowed", "validator_failed", "map_validation_repeat_limit"}
+)
 
 
 def _normalize_model_override(model: str | None) -> str | None:
@@ -141,6 +145,9 @@ from app.query.helpers import (
     _json_char_size,
     _map_completion_blocker,
     _map_completion_gate_text,
+    _MAP_VALIDATION_REPEAT_LIMIT,
+    _map_validation_is_successful,
+    _remember_map_validation,
     _persisted_history_events,
     _region_summary_from_value,
     _remember_latest_map_region_read,
@@ -334,7 +341,9 @@ class QueryEngine:
             except OSError:
                 logger.debug("Failed to prune map artifact path=%s", path)
 
-    def session_history(self, session_id: str, limit: int = 200) -> SessionHistoryResponse:
+    def session_history(
+        self, session_id: str, limit: int = 200, before: int = 0
+    ) -> SessionHistoryResponse:
         """Return frontend-renderable history for a persisted session."""
         session = self._store.get_or_create(session_id, self.available_tools)
         events = _persisted_history_events(session)
@@ -346,22 +355,24 @@ class QueryEngine:
         # 本来该串行复用的请求队列卡死。既然最终只展示最近 `limit` 条，这里先
         # 把输入收窄到最近窗口再转换，而不是转换全量历史后再丢弃大半。
         if limit > 0:
-            recent_frames = session.agent_stack[-limit:]
-            recent_events = events[-(limit * 8) :] if len(events) > limit * 8 else events
+            recent_frames = session.agent_stack[-(limit + max(before, 0)) :]
+            recent_events = events[-((limit + max(before, 0)) * 8) :]
         else:
             recent_frames = session.agent_stack
             recent_events = events
         blocks = _structured_session_history(recent_frames, recent_events)
-        if limit > 0 and len(blocks) > limit:
-            blocks = blocks[-limit:]
-        pseudo_events = blocks_to_pseudo_events(blocks)
+        offset = min(max(before, 0), len(blocks))
+        end = len(blocks) - offset
+        start = max(0, end - limit) if limit > 0 else 0
+        page = blocks[start:end]
+        page_pseudo_events = blocks_to_pseudo_events(page)
         logger.info(
             "Session history requested session=%s frames=%d/%d blocks=%d events=%d pending=%s",
             session_id,
             len(recent_frames),
             len(session.agent_stack),
-            len(blocks),
-            len(pseudo_events),
+            len(page),
+            len(page_pseudo_events),
             session.pending_turn_id is not None,
         )
         return SessionHistoryResponse(
@@ -370,7 +381,9 @@ class QueryEngine:
             pending_turn_id=session.pending_turn_id,
             context_used_tokens=_history_context_used_tokens(session, events),
             context_token_limit=self._settings.auto_compact_token_threshold,
-            pseudo_events=pseudo_events,
+            history_before=offset + len(page),
+            history_has_more=start > 0,
+            pseudo_events=page_pseudo_events,
         )
 
     async def submit_user_turn(self, request: ChatRequest) -> ChatResponse:
@@ -543,6 +556,16 @@ class QueryEngine:
             resumed = self._resume_pending_map_tool_calls(session)
             if resumed is not None:
                 return resumed
+            if any(
+                blocker.get("reason") in _MAP_VALIDATION_FAILURE_REASONS
+                for blocker in session.map_completion_blockers
+            ):
+                logger.warning(
+                    "Stopping map task after validation failure session=%s blockers=%s",
+                    session.session_id,
+                    session.map_completion_blockers,
+                )
+                return ChatFinalResponse(text=_map_completion_gate_text(session.map_completion_blockers))
         else:
             if session.pending_turn_id is not None:
                 logger.warning(
@@ -561,6 +584,7 @@ class QueryEngine:
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
             session.pending_verify_candidates.clear()
             session.map_completion_blockers.clear()
+            session.map_auto_iterations = 0
             self._emit(
                 session.session_id, "user_submitted", {"has_context": request.context is not None}
             )
@@ -663,7 +687,7 @@ class QueryEngine:
         while (
             isinstance(response, ChatFinalResponse)
             and session.map_completion_blockers
-            and map_gate_continuations < 3
+            and session.map_auto_iterations < _MAP_MAX_AUTO_ITERATIONS
         ):
             scheduled = False
             if _has_only_map_review_required(session.map_completion_blockers):
@@ -684,6 +708,7 @@ class QueryEngine:
             if not scheduled:
                 break
             map_gate_continuations += 1
+            session.map_auto_iterations += 1
             step = await self._run_agent_turn(
                 session,
                 security,
@@ -1063,7 +1088,11 @@ class QueryEngine:
                 tool_name, result.status, result_for_gate, result.error_code
             )
             if tool_name in _MAP_VALIDATION_TOOL_NAMES and isinstance(result_for_gate, dict):
-                if result_for_gate.get("completion_allowed") is True:
+                validation_state = _remember_map_validation(
+                    session, tool_name, result_for_gate, tool_args
+                )
+                validation_success = _map_validation_is_successful(result_for_gate)
+                if validation_success:
                     target = str(result_for_gate.get("target", tool_args.get("target_path", "")))
                     revision = result_for_gate.get("map_revision")
                     revision_value = (
@@ -1086,8 +1115,26 @@ class QueryEngine:
                         session.map_completion_blockers.append(
                             _review_required_blocker(tool_name, target, revision_value)
                         )
-                elif blocker is not None:
-                    session.map_completion_blockers = [blocker]
+                else:
+                    validation_blocker = blocker or {
+                        "tool": tool_name,
+                        "reason": "validator_failed",
+                        "issues": ["map validation did not pass"],
+                        "target": validation_state["target"],
+                        "required_revision": validation_state["map_revision"],
+                    }
+                    validation_blocker["validation_fingerprint"] = validation_state[
+                        "fingerprint"
+                    ]
+                    validation_blocker["repeat_count"] = validation_state["repeat_count"]
+                    validation_blocker["next_stage"] = "planner"
+                    if validation_state["repeat_count"] >= _MAP_VALIDATION_REPEAT_LIMIT:
+                        validation_blocker["reason"] = "map_validation_repeat_limit"
+                        validation_blocker["issues"] = [
+                            *validation_blocker.get("issues", []),
+                            "same validation failure repeated without a new map revision; automatic retry stopped",
+                        ]
+                    session.map_completion_blockers = [validation_blocker]
             elif blocker is not None:
                 session.map_completion_blockers = [blocker]
             history_payload = (

@@ -913,7 +913,21 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
     issue_list = [str(issue) for issue in issues] if isinstance(issues, list) else []
 
     if stage == "validator":
-        if completion_allowed:
+        canonical = session.latest_map_validations.get(target)
+        canonical_matches = (
+            isinstance(canonical, dict)
+            and (not target or canonical.get("target") in ("", target))
+            and (revision is None or canonical.get("map_revision") in (None, revision))
+        )
+        canonical_success = canonical_matches and canonical is not None and all(
+            canonical.get(key) is expected
+            for key, expected in (
+                ("passed", True),
+                ("completion_allowed", True),
+                ("blocking_completion", False),
+            )
+        )
+        if completion_allowed and canonical_success:
             blockers = _clear_map_blockers(
                 session.map_completion_blockers,
                 target,
@@ -939,15 +953,32 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
                 },
             )
         else:
-            session.map_completion_blockers = [
-                {
-                    "tool": frame.agent.name,
-                    "reason": "validator_failed",
-                    "issues": issue_list or ["validator reported completion_allowed=false"],
-                    "target": target,
-                    "required_revision": revision,
-                }
-            ]
+            existing = next(
+                (
+                    blocker
+                    for blocker in session.map_completion_blockers
+                    if blocker.get("target") in ("", target)
+                    and (
+                        revision is None
+                        or blocker.get("required_revision") in (None, revision)
+                    )
+                ),
+                None,
+            )
+            if existing is not None:
+                existing.setdefault("next_stage", "planner")
+            else:
+                session.map_completion_blockers = [
+                    {
+                        "tool": frame.agent.name,
+                        "reason": "validator_failed",
+                        "issues": issue_list
+                        or ["validator failed or no canonical tool validation was recorded"],
+                        "target": target,
+                        "required_revision": revision,
+                        "next_stage": "planner",
+                    }
+                ]
         return
 
     if completion_allowed:
@@ -1982,8 +2013,16 @@ def _delta_callback(
 
     reasoning_started_at = time.monotonic()
     accumulated_text: dict[str, str] = {"content": "", "reasoning": ""}
+    last_kind = ""
+    stream_segment = 0
 
     def _on_delta(kind: str, text: str, token_count: int | None) -> None:
+        nonlocal last_kind, stream_segment
+        # 一个 reasoning phase 对应一个前端 Thought。正文之后再次收到
+        # reasoning_content 时，开始新的 Thought；同一 phase 的流式分片保持合并。
+        if kind == "reasoning" and last_kind != "reasoning":
+            stream_segment += 1
+        last_kind = kind
         event_type = "agent_reasoning_delta" if kind == "reasoning" else "agent_text_delta"
         accumulated_text[kind] = accumulated_text.get(kind, "") + text
         payload: dict[str, Any] = {
@@ -1992,6 +2031,7 @@ def _delta_callback(
             "message_index": message_index,
             "timeline_frame_id": timeline_frame_id,
             "timeline_message_index": timeline_message_index,
+            "stream_segment": stream_segment,
             "text": text,
             "append_delta": True,
         }

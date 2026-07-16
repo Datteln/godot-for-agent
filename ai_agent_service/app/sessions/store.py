@@ -55,6 +55,12 @@ class Session:
             用于防止 Verify 与 LLM 修复之间死循环。
         map_completion_blockers: 地图编辑任务的阻断完成原因；前端地图工具回传
             `blocking_completion` 或尚未通过路线校验时写入，最终回复前清空或拦截。
+        map_auto_iterations: 当前地图任务已自动续跑的次数；超过上限后必须交还用户，
+            不再继续调用地图工具。
+        latest_map_validations: 最近一次真实地图校验的完整状态；用于跨轮次、压缩和
+            worker 回填时防止旧上下文把失败误报为通过。
+        map_validation_failure_counts: 校验失败指纹 → 无新地图 revision 时的重复次数；
+            达到上限后停止自动续跑。
         latest_map_revisions: 最近一次地图读/写/验证工具返回的 target_path → map_revision；
             服务层下发地图写工具前用它覆盖过期的 `expected_revision`。
         latest_map_layers: 最近一次地图工具确认的 target_path → map_layer；服务层在
@@ -95,6 +101,9 @@ class Session:
     verify_retry_count: dict[str, int] = field(default_factory=dict)
     pending_verify_candidates: list[dict[str, Any]] = field(default_factory=list)
     map_completion_blockers: list[dict[str, Any]] = field(default_factory=list)
+    map_auto_iterations: int = 0
+    latest_map_validations: dict[str, dict[str, Any]] = field(default_factory=dict)
+    map_validation_failure_counts: dict[str, int] = field(default_factory=dict)
     latest_map_revisions: dict[str, int] = field(default_factory=dict)
     latest_map_layers: dict[str, int] = field(default_factory=dict)
     latest_map_region_reads: dict[str, int] = field(default_factory=dict)
@@ -354,6 +363,9 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "verify_retry_count": session.verify_retry_count,
         "pending_verify_candidates": session.pending_verify_candidates,
         "map_completion_blockers": session.map_completion_blockers,
+        "map_auto_iterations": session.map_auto_iterations,
+        "latest_map_validations": session.latest_map_validations,
+        "map_validation_failure_counts": session.map_validation_failure_counts,
         "latest_map_revisions": session.latest_map_revisions,
         "latest_map_layers": session.latest_map_layers,
         "latest_map_region_reads": session.latest_map_region_reads,
@@ -462,6 +474,17 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         map_completion_blockers=[
             item for item in _as_list(data.get("map_completion_blockers")) if isinstance(item, dict)
         ],
+        map_auto_iterations=_as_int(data.get("map_auto_iterations")),
+        latest_map_validations={
+            str(key): value
+            for key, value in _as_dict(data.get("latest_map_validations")).items()
+            if isinstance(value, dict)
+        },
+        map_validation_failure_counts={
+            str(key): value
+            for key, value in _as_dict(data.get("map_validation_failure_counts")).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        },
         latest_map_revisions={
             str(key): value
             for key, value in _as_dict(data.get("latest_map_revisions")).items()

@@ -416,6 +416,8 @@ class SessionHistoryResponse(BaseModel):
     pending_turn_id: str | None = None
     context_used_tokens: int = 0
     context_token_limit: int = 0
+    history_before: int = 0
+    history_has_more: bool = False
     pseudo_events: list[dict[str, Any]] = Field(default_factory=list)
 
 

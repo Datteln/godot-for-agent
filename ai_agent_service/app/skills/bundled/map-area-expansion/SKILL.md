@@ -26,7 +26,7 @@ paths: []
 
 横版平台跳跃关卡不要只用通用 zone/Poisson 算法。用户目标是平台游戏、Mario/Celeste 类跳跃、Brackeys 平台地图、关卡主路径、跳跃/落点/金币弧线/敌人槽位时，优先调用 `plan_platform_level`。它会先生成 critical route、platform motifs、jump_graph、`edit_map_batches`、`coin_arcs`、`enemy_slots` 和 `movement_model="leap"` 校验计划；再把批次转成小批 `edit_map`，把奖励弧线/敌人槽位转成真实资源放置。不要先随便铺瓦片再事后 A* 校验。
 
-`plan_platform_level` 不是只管能不能跳到，它也会执行平台关卡形态语法：平台默认 1-2 格厚、非休息段限制最大宽度、终点前必须有安全平地、重复挑战形状会被扣分/拒绝。返回 `score.passed=false` 或 `blocked_reason="score_issues"` 时，不要执行 `edit_map_batches`，先调小 `max_platform_width`/`max_platform_thickness`、调大 `min_finish_buffer_width` 或换 seed 重新规划。目标是先生成一串可读的落点/表面，再用少量支撑和装饰表达形状；禁止把新区铺成连续厚墙、密集竖柱阵列或大块实心矩形。
+`plan_platform_level` 不只判断能不能跳到：它输出可读的落点、挑战段、终点缓冲和形态评分。返回 `score.passed=false`、`blocked_reason` 非空或 `ability_used_defaults` 非空时，不执行 `edit_map_batches`；补齐真实能力参数或调整规划输入后重新规划。执行者只能采用这份规划中的路线批次，不能为了满足“地面/填充”描述手写一串上下相连的 `fill`。背景、装饰与可站立路线是不同区域：它们各自按规划语义落地，不能用固定厚度或批次拆分替代关卡设计。
 
 扩展已有横版地图时，`plan_platform_level`/`plan_reachable_map_growth` 必须默认 `connect_from_existing=true`，并传 `target_path`/`map_layer` 让工具扫描左侧边界已有表面，返回 `entry_anchor`。返回的 `blocked_reason` 非空（`entry_anchor_not_found`/`jump_graph_failed`/`score_issues`）时，`edit_map_batches` 已经被工具结构性清空，不需要你自己再判断要不要执行——但仍要按 `blocked_reason` 处理：`entry_anchor_not_found` 时扩大/移动 `entry_sample_*` 重新找边界落脚点；`jump_graph_failed`/`score_issues` 时降低新平台起点高度、缩短 gap 或增大 landing_width 后重新规划。右侧新区内部可达不算完成，必须从左侧初始地图的真实落脚点一路可达。
 

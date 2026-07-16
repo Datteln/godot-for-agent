@@ -59,6 +59,7 @@ _HISTORY_TOOL_MAX_DICT_ITEMS = 120
 _HISTORY_TOOL_DROP_KEYS = frozenset(
     {"data_url", "base64", "image_base64", "screenshot_base64", "binary", "bytes"}
 )
+_MAP_VALIDATION_REPEAT_LIMIT = 2
 
 
 def _raw_tool_call(call: FrontToolCallDTO) -> dict[str, Any]:
@@ -1323,6 +1324,81 @@ def _remember_latest_map_revision(
         )
 
 
+def _map_validation_is_successful(result: dict[str, Any]) -> bool:
+    """判断一次地图校验是否真的允许完成，不采信规划器的口头结论。"""
+    passed = result.get("passed")
+    passed_ok = passed is True if isinstance(passed, bool) else False
+    return (
+        passed_ok
+        and result.get("completion_allowed", True) is True
+        and result.get("blocking_completion") is not True
+    )
+
+
+def _map_validation_fingerprint(
+    tool_name: str,
+    result: dict[str, Any],
+    target: str,
+    revision: int | None,
+) -> str:
+    """为同一目标、版本、区域和问题生成稳定的校验失败指纹。"""
+    region = result.get("region")
+    issues = result.get("issues")
+    structured_issues = result.get("structured_issues")
+    payload = {
+        "tool": tool_name,
+        "target": target,
+        "revision": revision,
+        "region": region if isinstance(region, dict) else region,
+        "issues": issues if isinstance(issues, list) else [],
+        "structured_issues": (
+            structured_issues if isinstance(structured_issues, list) else []
+        ),
+        "passed": result.get("passed"),
+        "completion_allowed": result.get("completion_allowed"),
+        "blocking_completion": result.get("blocking_completion"),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
+
+
+def _remember_map_validation(
+    session: Session,
+    tool_name: str,
+    result: dict[str, Any],
+    tool_args: dict[str, Any],
+) -> dict[str, Any]:
+    """持久化真实校验状态，并统计无新写入的重复失败次数。"""
+    target = str(result.get("target", result.get("target_path", tool_args.get("target_path", ""))))
+    revision = result.get("map_revision")
+    revision_value = revision if isinstance(revision, int) and not isinstance(revision, bool) else None
+    fingerprint = _map_validation_fingerprint(tool_name, result, target, revision_value)
+    previous = session.latest_map_validations.get(target)
+    previous_fingerprint = previous.get("fingerprint") if isinstance(previous, dict) else None
+    previous_revision = previous.get("map_revision") if isinstance(previous, dict) else None
+    count = session.map_validation_failure_counts.get(fingerprint, 0)
+    if not _map_validation_is_successful(result):
+        count = count + 1 if previous_fingerprint == fingerprint and previous_revision == revision_value else 1
+        session.map_validation_failure_counts[fingerprint] = count
+    else:
+        count = 0
+    state = {
+        "target": target,
+        "map_revision": revision_value,
+        "region": result.get("region", {}),
+        "passed": result.get("passed") is True,
+        "completion_allowed": result.get("completion_allowed", True) is True,
+        "blocking_completion": result.get("blocking_completion") is True,
+        "issues": result.get("issues", []),
+        "structured_issues": result.get("structured_issues", []),
+        "fingerprint": fingerprint,
+        "repeat_count": count,
+        "next_stage": "reviewer" if _map_validation_is_successful(result) else "planner",
+    }
+    session.latest_map_validations[target] = state
+    return state
+
+
 def _map_completion_blocker(
     tool_name: str, status: str, result: Any, error_code: str | None
 ) -> dict[str, Any] | None:
@@ -1650,19 +1726,27 @@ def _remember_latest_map_region_read(
             normalized_args["target_path"] = target
         if layer is not None:
             normalized_args["map_layer"] = layer
-    signature = _map_region_read_signature("describe_map_region", normalized_args)
-    if signature is None:
+    signatures: list[str] = []
+    requested_signature = _map_region_read_signature("describe_map_region", tool_args)
+    if requested_signature is not None:
+        signatures.append(requested_signature)
+    normalized_signature = _map_region_read_signature("describe_map_region", normalized_args)
+    if normalized_signature is not None and normalized_signature not in signatures:
+        signatures.append(normalized_signature)
+    if not signatures:
         return
     revision = _map_revision_from_result(result) if isinstance(result, dict) else None
     if revision is None:
         return
-    session.latest_map_region_reads[signature] = revision
-    if isinstance(result, dict):
-        session.latest_map_region_summaries[signature] = _map_result_summary(
-            "describe_map_region",
-            result,
-            None,
-        )
+    summary = (
+        _map_result_summary("describe_map_region", result, None)
+        if isinstance(result, dict)
+        else None
+    )
+    for signature in signatures:
+        session.latest_map_region_reads[signature] = revision
+        if summary is not None:
+            session.latest_map_region_summaries[signature] = summary
     while len(session.latest_map_region_reads) > 64:
         first_key = next(iter(session.latest_map_region_reads))
         del session.latest_map_region_reads[first_key]
@@ -2324,6 +2408,20 @@ def _schedule_map_completion_continuation(session: Session) -> bool:
     frame = session.top_frame()
     if frame is None:
         return False
+    if any(
+        blocker.get("reason") == "map_validation_repeat_limit"
+        or (
+            isinstance(blocker.get("repeat_count"), int)
+            and blocker.get("repeat_count", 0) >= _MAP_VALIDATION_REPEAT_LIMIT
+        )
+        for blocker in session.map_completion_blockers
+    ):
+        logger.warning(
+            "Stopped repeated map validation continuation session=%s blockers=%s",
+            session.session_id,
+            session.map_completion_blockers,
+        )
+        return False
     _pop_last_assistant_final(session)
     blocker_text = _format_map_completion_blockers_for_prompt(session.map_completion_blockers)
     frame.messages.append(
@@ -2335,12 +2433,12 @@ def _schedule_map_completion_continuation(session: Session) -> bool:
                 "Your previous response attempted to finish the map task, but the service "
                 "completion gate is still blocked. Do not summarize or answer final yet.\n\n"
                 f"Current blockers:\n{blocker_text}\n\n"
-                "Continue the task now. Pick the next concrete repair/verification action and "
-                "call the appropriate tool. If the blocker came from validate_map_region, fix "
-                "the reported region with small map edits or object changes, then run "
-                "validate_map_region again. If visual review is still needed, capture or inspect "
-                "the map and then validate again. Only final-answer after a same-revision result "
-                "has completion_allowed=true and no blocking_completion blockers remain."
+                "Continue the task now. For a validator failure, return to the map planner and "
+                "produce a new plan_platform_level result before writing; do not route a goal "
+                "buffer/design failure through repair_map_region. The actual validator result "
+                "is authoritative, and the planner must not claim validation passed without it. "
+                "Only final-answer after a same-revision result has passed=true, "
+                "completion_allowed=true, and blocking_completion is not true."
             ),
         }
     )

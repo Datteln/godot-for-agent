@@ -312,8 +312,8 @@ func fetch_recovery_pointer() -> void:
 	_enqueue("GET", "/recovery-pointer", {})
 
 
-func fetch_session_history(limit: int = 200) -> void:
-	var path := "/sessions/%s/history?limit=%d" % [_session_id().uri_encode(), limit]
+func fetch_session_history(limit: int = 200, before: int = 0) -> void:
+	var path := "/sessions/%s/history?limit=%d&before=%d" % [_session_id().uri_encode(), limit, before]
 	_enqueue("GET", path, {})
 
 

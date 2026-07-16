@@ -94,10 +94,10 @@ func _create_history_thought(data: Dictionary) -> Control:
 	var header := str(data.get("header", "Thought"))
 	var detail := str(data.get("detail", ""))
 	if detail.strip_edges() == "":
-		content.add_child(log_renderer.make_log_rich_text(header, _theme_color("muted_text"), "*"))
+		content.add_child(log_renderer.make_log_rich_text(header, _theme_color("muted_text"), "✻"))
 	else:
 		var toggle: Button = log_renderer.make_workflow_toggle(header, _theme_color("muted_text"))
-		log_renderer.append_collapsible(content, toggle, detail, "*")
+		log_renderer.append_collapsible(content, toggle, detail, "✻")
 	return content
 
 
@@ -108,7 +108,7 @@ func _create_history_text(data: Dictionary) -> Control:
 	content.add_child(log_renderer.make_log_rich_text(
 		str(data.get("text", "")),
 		null,
-		"*" if bool(data.get("marker", false)) else "",
+		"✻" if bool(data.get("marker", false)) else "",
 		bool(data.get("indent", false))
 	))
 	return content

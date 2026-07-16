@@ -404,16 +404,6 @@ class OpenAICompatibleProvider:
                         continue
                     if delta.role:
                         role = delta.role
-                    if delta.content:
-                        content_parts.append(delta.content)
-                        now = time.monotonic()
-                        if on_delta is not None and now - last_content_emit >= _DELTA_MIN_INTERVAL_S:
-                            content_text = "".join(content_parts)
-                            delta_text = content_text[emitted_content_len:]
-                            emitted_content_len = max(emitted_content_len, len(content_text))
-                            last_content_emit = now
-                            if delta_text:
-                                on_delta("content", delta_text, None)
                     reasoning_piece = getattr(delta, "reasoning_content", None)
                     if reasoning_piece:
                         reasoning_parts.append(reasoning_piece)
@@ -425,6 +415,16 @@ class OpenAICompatibleProvider:
                             last_reasoning_emit = now
                             if delta_text:
                                 on_delta("reasoning", delta_text, None)
+                    if delta.content:
+                        content_parts.append(delta.content)
+                        now = time.monotonic()
+                        if on_delta is not None and now - last_content_emit >= _DELTA_MIN_INTERVAL_S:
+                            content_text = "".join(content_parts)
+                            delta_text = content_text[emitted_content_len:]
+                            emitted_content_len = max(emitted_content_len, len(content_text))
+                            last_content_emit = now
+                            if delta_text:
+                                on_delta("content", delta_text, None)
                     for tool_call_delta in delta.tool_calls or []:
                         entry = tool_calls_acc.setdefault(
                             tool_call_delta.index,
@@ -461,14 +461,14 @@ class OpenAICompatibleProvider:
         content = "".join(content_parts) or None
         reasoning = "".join(reasoning_parts) or None
         if on_delta is not None:
-            if content is not None:
-                delta_text = content[emitted_content_len:]
-                if delta_text:
-                    on_delta("content", delta_text, None)
             if reasoning is not None:
                 delta_text = reasoning[emitted_reasoning_len:]
                 if delta_text or reasoning_tokens is not None:
                     on_delta("reasoning", delta_text, reasoning_tokens)
+            if content is not None:
+                delta_text = content[emitted_content_len:]
+                if delta_text:
+                    on_delta("content", delta_text, None)
 
         tool_calls = [
             ToolCallRequest(

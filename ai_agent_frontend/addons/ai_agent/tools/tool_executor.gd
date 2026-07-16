@@ -172,7 +172,11 @@ func execute(tool_call: Dictionary) -> Dictionary:
 		"export_project":
 			result = await ProgramTools.export_project(input, editor_interface)
 		"read_scene_tree":
+			if editor_interface == null:
+				return AgentDTO.error_result(tool_call, "Godot editor interface is unavailable.", "editor_interface_unavailable")
 			result = SceneTools.read_scene_tree(editor_interface)
+			if result.is_empty():
+				return AgentDTO.error_result(tool_call, "No edited scene is open in the Godot editor.", "no_edited_scene")
 		"read_runtime_state":
 			result = SceneTools.read_runtime_state(input, editor_interface)
 		"validate_scene_state":

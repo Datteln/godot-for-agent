@@ -2398,7 +2398,9 @@ def register_front_tools() -> None:
                     "reject an off-by-one batch (error_code 'cell_count_mismatch') before any tiles are written, "
                     "instead of discovering the gap later in validate_map_region. The tool also rejects oversized "
                     "batches and thin, non-blanket fills that look like broad map repair; split those into local "
-                    "segments, or mark true backdrop/water/sky work with the matching semantic_layer/tags."
+                    "segments, or mark true backdrop/water/sky work with the matching semantic_layer/tags. For a "
+                    "platformer level extension, do not invent a ground-fill wall here: first call "
+                    "plan_platform_level with measured player ability, then apply only its approved route batches."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2538,16 +2540,9 @@ def register_front_tools() -> None:
                             "type": "integer",
                             "minimum": 1,
                             "description": (
-                                "Optional self-check: the number of cells this batch is supposed to write. "
-                                "If provided and does not match the actual cell count, a warning is included "
-                                "in the result but the operation still executes normally. You can safely omit "
-                                "this field to avoid calculation errors; the frontend uses the actual cell count "
-                                "from the operations themselves."
+                                "Required self-check: the number of cells this batch is supposed to write. "
+                                "The frontend rejects a mismatch before any tiles are written."
                             ),
-                        },
-                        "platformer_mode": {
-                            "type": "boolean",
-                            "description": "Enable platformer write guards: platform/ground fills are limited to thin support thickness.",
                         },
                         "expected_visual_groups": {
                             "type": "integer",

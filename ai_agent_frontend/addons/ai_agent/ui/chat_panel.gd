@@ -30,6 +30,7 @@ const MAX_MESSAGE_LIST_CHILDREN := 50
 const MAX_LIVE_RENDER_CHARS := 60000
 const MAX_MESSAGE_RENDER_CHARS := 90000
 const MAX_REASONING_RENDER_CHARS := 30000
+const MAX_MESSAGE_STORE_MESSAGES := 240
 const INPUT_MIN_HEIGHT := 60
 const INPUT_MAX_HEIGHT := 240
 const FINAL_RESPONSE_EVENT_WAIT_MS := 2500
@@ -101,6 +102,9 @@ var _reset_btn: Button
 var _history_btn: Button
 var _history_popup: PopupMenu
 var _history_session_ids: Array = []
+var _history_before := 0
+var _history_has_more := false
+var _history_loading := false
 var _effort_options: OptionButton
 var _permission_options: OptionButton
 var _style_options: OptionButton
@@ -149,7 +153,6 @@ var _reasoning_last_render_ms := 0
 var _rendered_assistant_keys := {}
 var _live_response_keys := {}   # 仅追踪本轮实时响应，避免历史加载的指纹误判为重复
 var _closed_stream_keys := {}
-var _closed_reasoning_keys := {}   # 新增：专门追踪已关闭的 reasoning stream
 var _stream_delta_text_by_key := {}
 var _reasoning_delta_text_by_key := {}
 var _theme_colors: Dictionary = {}
@@ -229,7 +232,6 @@ func _process(_delta: float) -> void:
 			})
 			_empty_final_ignored_ms = -1
 			_mark_current_stream_closed()
-			_mark_reasoning_stream_closed()
 			_finish_reasoning_stream()
 			_finish_streaming()
 			_append_message("system", "⚠ 服务端未返回最终回复，已自动结束。")
@@ -558,10 +560,8 @@ func _on_send() -> void:
 	_interrupted_locally = false
 	_clear_pending_final_pair()
 	_finish_streaming()
-	_mark_reasoning_stream_closed()
 	_finish_reasoning_stream()
 	_closed_stream_keys.clear()
-	_closed_reasoning_keys.clear()   # 新增
 	_stream_delta_text_by_key.clear()
 	_reasoning_delta_text_by_key.clear()
 	_live_response_keys.clear()
@@ -1392,37 +1392,6 @@ func _strip_think_xml(text: String) -> String:
 	return result
 
 
-## 若回复以 `Thought: ...` 摘要行开头，拆分出摘要文本与剩余正文。
-func _split_reasoning_xml_payload(text: String) -> Dictionary:
-	for tag_name in ["think", "thinking"]:
-		var open_tag := "<%s>" % tag_name
-		var close_tag := "</%s>" % tag_name
-		var start := text.find(open_tag)
-		if start == -1:
-			var close_only := text.find(close_tag)
-			if close_only != -1:
-				return {
-					"reasoning": text.substr(0, close_only).strip_edges(),
-					"body": text.substr(close_only + close_tag.length()).strip_edges()
-				}
-			continue
-		var content_start := start + open_tag.length()
-		var end_tag := text.find(close_tag, content_start)
-		if end_tag == -1:
-			return {
-				"reasoning": (text.substr(0, start) + text.substr(content_start)).strip_edges(),
-				"body": ""
-			}
-		var before := text.substr(0, start).strip_edges()
-		var inside := text.substr(content_start, end_tag - content_start).strip_edges()
-		var body := text.substr(end_tag + close_tag.length()).strip_edges()
-		var reasoning := inside
-		if before != "":
-			reasoning = before if reasoning == "" else before + "\n\n" + reasoning
-		return {"reasoning": reasoning, "body": body}
-	return {"reasoning": text.strip_edges(), "body": ""}
-
-
 func _split_thought_summary(text: String) -> Dictionary:
 	var stripped := text.strip_edges()
 	if not stripped.begins_with("Thought:"):
@@ -1471,7 +1440,6 @@ func _handle_final(response: Dictionary) -> void:
 	_empty_final_ignored_ms = -1
 	render_text = render_text + "\n\n"
 	_mark_current_stream_closed()
-	_mark_reasoning_stream_closed()   # 阻止后续迟到的 reasoning delta
 	_finish_reasoning_stream()         # 置空 toggle，停止 _process 刷新
 
 	# 用 _live_response_keys（每次 send 清空）判断本轮是否已渲染，避免历史加载的
@@ -1503,8 +1471,6 @@ func _handle_final(response: Dictionary) -> void:
 	# 清理已关闭 stream 的 delta_text 缓存，防止长对话内存泄漏
 	for closed_key in _closed_stream_keys.keys():
 		_stream_delta_text_by_key.erase(closed_key)
-	for closed_key in _closed_reasoning_keys.keys():
-		_reasoning_delta_text_by_key.erase(closed_key)
 
 
 func _handle_session_history(response: Dictionary) -> void:
@@ -1526,8 +1492,13 @@ func _handle_session_history(response: Dictionary) -> void:
 		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Restoring session history.", {
 		"session_id": session_id,
-		"count": pseudo_events.size()
+		"count": pseudo_events.size(),
+		"before": int(response.get("history_before", 0)),
+		"has_more": bool(response.get("history_has_more", false))
 	})
+	_history_loading = false
+	_history_before = int(response.get("history_before", 0))
+	_history_has_more = bool(response.get("history_has_more", false))
 	_clear_messages()
 	_update_context_usage_status(
 		int(response.get("context_used_tokens", 0)),
@@ -1798,10 +1769,11 @@ func _remember_delta_event(event: Dictionary, latest_delta: Dictionary, ordered_
 	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 	# 同 `_stream_event_key()`：用 `message_index` 而不是会在每次 round-trip 重新清零
 	# 的 `loop` 去重，否则跨轮次合批时可能把两个不同轮次的增量错误合并成一条。
-	var key := "%s:%s:%s" % [
+	var key := "%s:%s:%s:%s" % [
 		str(event.get("type", "")),
 		str(payload.get("frame_id", "")),
-		str(payload.get("message_index", ""))
+		str(payload.get("message_index", "")),
+		str(payload.get("stream_segment", 0))
 	]
 	if not latest_delta.has(key):
 		ordered_delta_keys.append(key)
@@ -2271,23 +2243,11 @@ func _on_reasoning_delta(event: Dictionary) -> void:
 	var payload: Dictionary = raw_payload if raw_payload is Dictionary else {}
 	var key := _stream_event_key(payload)
 	var token_count := int(payload.get("token_count", 0))
-	if key != "" and _closed_reasoning_keys.has(key):
-		var closed_split := _split_reasoning_xml_payload(str(payload.get("text", "")))
-		var closed_body := str(closed_split.get("body", ""))
-		if closed_body != "":
-			_render_text_delta_body(key, closed_body)
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta] IGNORED - key already closed", {
-			"key": key,
-			"body_len": closed_body.length(),
-			"token_count": token_count
-		})
-		return
-	var raw_text := _accumulated_stream_text(payload, key, _reasoning_delta_text_by_key)
-	var split := _split_reasoning_xml_payload(raw_text)
-	var text := str(split.get("reasoning", ""))
-	var body := str(split.get("body", ""))
+	# 后端只把千问的 reasoning_content 转换为 agent_reasoning_delta。
+	# 因此该事件里的全部文本都必须渲染进 Thought，不能再从中拆正文。
+	var text := _accumulated_stream_text(payload, key, _reasoning_delta_text_by_key)
 	FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta]", {
-		"body_len": body.length(), "key": key, "text_len": text.length(), "preview": text.left(60).replace("\n", "\\n")
+		"key": key, "text_len": text.length(), "preview": text.left(60).replace("\n", "\\n")
 	})
 	if text != "":
 		_ensure_reasoning_entry(key)
@@ -2295,8 +2255,6 @@ func _on_reasoning_delta(event: Dictionary) -> void:
 		if token_count > 0:
 			_reasoning_token_count = token_count
 		_update_reasoning_entry()
-	if body != "":
-		_render_text_delta_body(key, body)
 
 
 func _on_text_delta(event: Dictionary) -> void:
@@ -2310,13 +2268,6 @@ func _on_text_delta(event: Dictionary) -> void:
 func _render_text_delta_body(key: String, text: String) -> void:
 	if _should_ignore_stream_delta(key, text):
 		return
-	# 正文是当前 Thought 的分段边界，即使二者共享同一个 message key。
-	# 收到正文后立即固化当前 Thought；后续同 key 的 reasoning 尾包会创建新的
-	# Thought，而不是被写回旧块或被忽略。
-	if _reasoning_key != "":
-		if key != _reasoning_key:
-			_mark_reasoning_stream_closed()
-		_finish_reasoning_stream()
 	var stripped := _strip_think_xml(text)
 	var parts := _split_thought_summary(stripped)
 	var rest := str(parts.get("rest", ""))
@@ -2337,6 +2288,7 @@ func _render_text_delta_body(key: String, text: String) -> void:
 		# 工作流条目，再开始新 key 的流式行——否则下面整段会直接覆盖
 		# _stream_display_text，旧内容就在用户眼前消失得无影无踪。
 		_finalize_stream_as_persistent()
+		_stream_display_text = rest if rest.strip_edges() != "" else stripped
 	elif _stream_continuation_frame != "" and _stream_continuation_prefix != "":
 		# 同一个新 key 的后续 append_delta 是累计文本，保留工具调用前的正文前缀。
 		_stream_display_text = _stream_continuation_prefix
@@ -2359,8 +2311,14 @@ func _render_text_delta_body(key: String, text: String) -> void:
 ## 导致不同轮次的 reasoning/text 流共享同一个 key，互相误判成"迟到的旧流"而被吞掉。
 ## `message_index`（= 这条增量即将写入 `frame.messages` 的下标）在整个 frame 生命周期
 ## 内只会单调增长，不会重置，才是真正稳定唯一的"这是哪一次 LLM 调用"标识。
+## `stream_segment` 仅在正文后进入新的 reasoning phase 时递增，用于让新 reasoning
+## 创建新 Thought，并使其后的正文写入该 Thought 后的新正文行。
 func _stream_event_key(payload: Dictionary) -> String:
-	return "%s:%s" % [str(payload.get("frame_id", "")), str(payload.get("message_index", ""))]
+	return "%s:%s:%s" % [
+		str(payload.get("frame_id", "")),
+		str(payload.get("message_index", "")),
+		str(payload.get("stream_segment", 0))
+	]
 
 
 func _accumulated_stream_text(payload: Dictionary, key: String, accumulator: Dictionary) -> String:
@@ -2390,7 +2348,6 @@ func _ensure_reasoning_entry(key: String) -> void:
 	_ensure_log_renderer()
 	if _reasoning_key == key and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
 		return
-	_mark_reasoning_stream_closed()
 	_finish_reasoning_stream()
 	_reasoning_key = key
 	_reasoning_started_ms = Time.get_ticks_msec()
@@ -2477,12 +2434,14 @@ func _finish_reasoning_stream() -> void:
 		_reasoning_toggle.text = "✻  " + finished_header + " ✓"
 	if _reasoning_key != "":
 		_reasoning_delta_text_by_key.erase(_reasoning_key)
-	var finished_header := _format_reasoning_header() + " ✓" if _reasoning_started_ms >= 0 else "Thought"
-	var finished_text := _reasoning_text
 	if _reasoning_message_index >= 0:
-		_remove_queued_message(_reasoning_message_index)
-		if finished_text.strip_edges() != "":
-			_queue_message({"type": "history_thought", "header": finished_header, "detail": finished_text, "estimated_height": _estimate_text_height(finished_text)})
+		# 保留外部 Thought 节点原位。删除后重新追加持久消息会把 Thought
+		# 移到已经出现的正文之后，破坏 Thought → 正文的显示顺序。
+		if _message_store != null:
+			_message_store.update_message(_reasoning_message_index, {
+				"keep_visible": false,
+				"estimated_height": _estimate_text_height(_reasoning_text)
+			})
 	_reasoning_key = ""
 	_reasoning_toggle = null
 	_reasoning_detail_rich = null
@@ -2497,11 +2456,6 @@ func _finish_reasoning_stream() -> void:
 func _mark_current_stream_closed() -> void:
 	if _stream_key != "":
 		_closed_stream_keys[_stream_key] = true
-
-
-func _mark_reasoning_stream_closed() -> void:
-	if _reasoning_key != "":
-		_closed_reasoning_keys[_reasoning_key] = true
 
 
 func _close_reasoning_for_boundary_event(event: Dictionary) -> void:
@@ -2556,12 +2510,11 @@ func _discard_stream_message() -> void:
 ## 直接丢弃——这样用户能看到模型在工具调用之间的说明/思考文字。
 func _finalize_stream_as_persistent() -> void:
 	var text := _stream_display_text
-	if _stream_message_index >= 0:
-		_remove_queued_message(_stream_message_index)
 	if text.strip_edges() != "":
-		_indent_current_text = true
-		_append_log_stream_message(text, null, true)
-		_indent_current_text = false
+		if _stream_text_dirty:
+			_render_stream_content()
+		if _stream_message_index >= 0 and _message_store != null:
+			_message_store.update_message(_stream_message_index, {"keep_visible": false})
 		_rendered_assistant_keys[_message_fingerprint(text)] = true
 	_finish_streaming()
 
@@ -2693,7 +2646,6 @@ func _clear_messages() -> void:
 	_rendered_assistant_keys.clear()
 	_live_response_keys.clear()
 	_closed_stream_keys.clear()
-	_closed_reasoning_keys.clear()
 	_stream_delta_text_by_key.clear()
 	_reasoning_delta_text_by_key.clear()
 	_stream_key = ""
@@ -2713,6 +2665,9 @@ func _clear_messages() -> void:
 	_reasoning_token_count = 0
 	_reasoning_text_dirty = false
 	_reasoning_last_render_ms = 0
+	_history_before = 0
+	_history_has_more = false
+	_history_loading = false
 	if _virtual_scroller != null:
 		_virtual_scroller.clear()
 	if _message_store != null:
@@ -2738,6 +2693,15 @@ func _sync_virtual_messages() -> void:
 
 func _queue_message(data: Dictionary) -> int:
 	_initialize_virtual_messages()
+	while _message_store.size() >= MAX_MESSAGE_STORE_MESSAGES:
+		var removable := -1
+		for index in range(_message_store.size()):
+			if not bool(_message_store.get_message(index).get("keep_visible", false)):
+				removable = index
+				break
+		if removable < 0:
+			break
+		_remove_queued_message(removable)
 	var index := _message_store.add_message(data)
 	_virtual_scroller.notify_message_added(index, _auto_scroll or _force_scroll_once)
 	_scroll_to_bottom()
@@ -2788,6 +2752,9 @@ func _on_scroll_value_changed(value: float) -> void:
 		# 用户主动向上滚动——无论是否正在流式输出，都尊重用户意图。
 		_auto_scroll = false
 		_user_scrolled_up_ms = Time.get_ticks_msec()
+		if value <= 40.0 and _state == AgentState.IDLE and _history_has_more and not _history_loading:
+			_history_loading = true
+			_http_client.fetch_session_history(200, _history_before)
 	if _virtual_scroller != null:
 		_virtual_scroller.on_scroll_changed(value)
 

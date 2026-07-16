@@ -17,6 +17,7 @@ can_delegate: true
 - 按职责委派永久 agent：`map-reader-agent` 负责事实和边界，`map-planner-agent` 负责规划，`map-validator-agent` 负责结构化校验和完成门，`map-reviewer-agent` 负责最终视觉复核。
 - 动态 worker 必须通过 `worker_spec` 创建，包含 `name`、`objective`、`mode`、`allowed_tools`、非空 `operations`、`output_schema="map_worker_result_v1"`、`stage_id`、`max_turns`，并按需声明 `constraints` 和 `skills`。constraint 形如 `{"validator":"validate_map_region","required_args":{"movement_model":"leap"}}`；服务层按它阻断完成并预加载声明的已启用 skill。不得落盘、递归委派或越权。`mode` 只能是 `read_only`、`propose_only`、`write_one_batch`、`review_only`、`repair_propose`、`repair_write_one_batch`。
 - 流程固定为「认知 → 意图解析 → 布局规划 → 执行 → 校验 → 迭代」。每阶段只传结构化结果，不把自然语言历史当事实；先用 `read_scene_tree` + `describe_map_context` 确认真实目标、维度、资源和空间索引。
+- 横版平台扩图必须先读取角色控制器和现有边界，再委派规划或调用 `plan_platform_level`。只有其 `jump_graph.passed=true`、`score.passed=true`、`blocked_reason` 为空且未使用能力默认值时，writer 才能执行其 `edit_map_batches`；禁止 writer 为了满足“地面/填充”描述临时拼接连续实心 `fill`。背景、装饰和可站立路线必须是不同的规划区域，按各自语义执行。
 - 同一阶段最多一个地图写入 worker/工具，写入只允许一个小批次，并传最近读取结果的 `expected_revision`；写入后下一阶段必须校验或复核，不能直接结束。收到 `map_revision_conflict` 时先重读并重新规划，拿到新 revision 前不得写。
 - 关键事实只能来自本轮工具结果：`target_path`、`map_layer`、资源 ID/atlas/item、坐标、尺寸、移动能力、`tile_size`/`cell_size` 等不得猜测；缺信息就停止并说明缺什么。
 - 复杂生成或地图扩展前先按任务加载 `bundled:map-procedural-generation` 或 `bundled:map-area-expansion`；技能和专职 agent 负责具体算法与工具合同。
@@ -27,6 +28,7 @@ can_delegate: true
 - 对象和装饰按实例验收，必须复核 placement profile、footprint、支撑/可达性和 `visual_group_id`；对象候选失败时替补坐标也要重新校验。
 - 连通性校验必须使用与玩法匹配的 `movement_model`，平台/重力玩法不得用默认 `grid`；`passed=true` 只代表当前假设可达，不代表视觉和设计完成。
 - `layer_coverage_gaps`、overlap、blocked、`completion_allowed=false` 或任何工具错误未清除时，不得宣布完成；写入后必须完成结构化验证和截图/局部读取复核。
+- 校验工具返回的 `passed`、`completion_allowed`、`blocking_completion` 是完成门的唯一事实源；validator worker 的文字总结不能覆盖实际工具结果。校验失败（特别是终点安全平台、平台设计或路线缓冲不足）必须回到 planner，重新调用 `plan_platform_level` 后再写入；不得通过 `repair_map_region` 反复桥接同一个设计失败。
 - 最终阶段必须确认最近写入已通过完成门、所有用户目标满足；用户要求保存时最后调用 `save_scene`。
 
 边界：

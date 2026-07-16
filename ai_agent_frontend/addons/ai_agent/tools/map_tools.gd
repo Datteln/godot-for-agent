@@ -14,7 +14,6 @@ const MapReachableGrowth = preload("res://addons/ai_agent/tools/map_reachable_gr
 const MAX_EDITED_CELLS := 100000
 const MAX_EDIT_MAP_BATCH_CELLS := 2000
 const MAX_THIN_NON_BLANKET_FILL_WIDTH := 12
-const MAX_PLATFORM_FILL_THICKNESS := 2
 const MAX_DESCRIBED_CELLS := 800
 const DEFAULT_DESCRIBE_RETURNED_CELLS := 120
 ## describe_map_region 是纯内存读取（一次循环读完整片区域），800 只是响应体大小的策略上限，
@@ -109,48 +108,6 @@ static func _validate_edit_map_batch_shape(operations: Array, dimension: int) ->
 			"max_cells": MAX_EDIT_MAP_BATCH_CELLS,
 			"hint": "Retry with smaller edit_map calls whose total expected_cells is <= max_cells.",
 		}, "map_edit_batch_too_large")
-	return {"ok": true}
-
-
-static func _is_platformer_scene(target: Node) -> bool:
-	var root := target.owner if target.owner != null else target
-	if root == null:
-		return false
-	return _find_node_named(root, "Platforms") != null
-
-
-static func _find_node_named(node: Node, wanted_name: String) -> Node:
-	if node.name == wanted_name:
-		return node
-	for child in node.get_children():
-		var found := _find_node_named(child, wanted_name)
-		if found != null:
-			return found
-	return null
-
-
-static func _validate_platform_fill_shape(operations: Array, target: Node, dimension: int, input: Dictionary) -> Dictionary:
-	if dimension != 2 or (not bool(input.get("platformer_mode", false)) and not _is_platformer_scene(target)):
-		return {"ok": true}
-	for operation_value in operations:
-		if not (operation_value is Dictionary):
-			continue
-		var operation: Dictionary = operation_value
-		if str(operation.get("action", "")) != "fill":
-			continue
-		var semantic := str(operation.get("semantic_layer", "")).to_lower()
-		var tags_value = operation.get("tags", [])
-		var tags: Array = tags_value if tags_value is Array else []
-		var is_ground := semantic in ["ground", "platform", "floor"] or tags.has("ground_top") or tags.has("ground_fill") or tags.has("platform")
-		if is_ground and int(operation.get("height", 1)) > MAX_PLATFORM_FILL_THICKNESS:
-			return _merge_map_completion_blocker({
-				"ok": false,
-				"message": "platformer ground fill thickness must be <= %d; emit a thin platform batch or instantiate platform.tscn." % MAX_PLATFORM_FILL_THICKNESS,
-				"error_code": "platform_fill_too_thick",
-				"height": int(operation.get("height", 1)),
-				"max_platform_thickness": MAX_PLATFORM_FILL_THICKNESS,
-				"hint": "Use platform_thickness 1 or 2, or use place_map_objects with a platform PackedScene.",
-			}, "platform_fill_too_thick")
 	return {"ok": true}
 
 
@@ -252,9 +209,6 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		return {"ok": false, "message": "at most 128 operations are allowed", "error_code": "map_edit_too_large"}
 
 	var dimension := 3 if target.get_class() == "GridMap" else 2
-	var platform_shape := _validate_platform_fill_shape(operations, target, dimension, input)
-	if not bool(platform_shape.get("ok", false)):
-		return platform_shape
 	if not input.has("expected_cells"):
 		return _merge_map_completion_blocker({
 			"ok": false,

@@ -201,9 +201,11 @@ def create_router(
         )
 
     @router.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)
-    async def session_history(session_id: str, limit: int = 200) -> SessionHistoryResponse:
-        logger.info("HTTP /sessions/%s/history limit=%d", session_id, limit)
-        return query_engine.session_history(session_id, limit=limit)
+    async def session_history(
+        session_id: str, limit: int = 200, before: int = 0
+    ) -> SessionHistoryResponse:
+        logger.info("HTTP /sessions/%s/history limit=%d before=%d", session_id, limit, before)
+        return query_engine.session_history(session_id, limit=limit, before=before)
 
     @router.get("/recovery-pointer", response_model=RecoveryPointerResponse)
     async def recovery_pointer() -> RecoveryPointerResponse:

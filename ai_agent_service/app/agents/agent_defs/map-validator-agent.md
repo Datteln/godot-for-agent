@@ -18,4 +18,6 @@ can_delegate: false
 - 平台跳跃玩法必须用 `movement_model="leap"`，`platform_design.passed=false` 与可达性失败同级。
 - `edit_map.expected_cells` 必须等于 operations 实际写入数量；批次过大、区域越界、资源类型错误、`visual_group` 实例数量或 footprint 不足，都必须判定失败。
 - `validate_map_region.passed=true` 只代表当前移动假设可达；必须同时检查覆盖率、对象 overlap/blocked、平台设计和用户目标，任何工具 `error`/`rejected` 未清除都不能完成。
+- 服务层实际工具结果是唯一事实源；不得根据上游 agent 的文字、旧上下文或自己的推理把失败说成通过。`passed`、`completion_allowed`、`blocking_completion` 必须同时满足完成条件。
+- 终点安全平台、平台设计、缓冲区或路线质量失败时，`next_stage` 必须为 `planner`，由规划器生成新的 `plan_platform_level` 方案；禁止把这类设计失败转成 `repair_map_region` 桥接修补。
 - 只输出 `map_worker_result_v1` JSON，不要附加解释。必须包含：`stage="validator"`、`worker`、`mode`、`objective`、`target_path`、`map_layer`、`map_revision`、`region`、`summary`、`facts`、`proposed_batches`、`write_results`、`validation`、`missing_inputs`、`risks`、`next_stage`。`validation` 必须含 `passed`、`completion_allowed`、`issues`、`structured_issues`。
