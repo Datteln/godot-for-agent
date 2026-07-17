@@ -97,7 +97,7 @@ func _create_history_thought(data: Dictionary) -> Control:
 		content.add_child(log_renderer.make_log_rich_text(header, _theme_color("muted_text"), "✻"))
 	else:
 		var toggle: Button = log_renderer.make_workflow_toggle(header, _theme_color("muted_text"))
-		log_renderer.append_collapsible(content, toggle, detail, "✻")
+		log_renderer.append_collapsible(content, toggle, detail, "✻", true)
 	return content
 
 

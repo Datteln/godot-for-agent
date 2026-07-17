@@ -2403,8 +2403,10 @@ def _format_map_completion_blockers_for_prompt(blockers: list[dict[str, Any]]) -
     return "\n".join(lines)
 
 
-def _schedule_map_completion_continuation(session: Session) -> bool:
-    """Turn a blocked final answer into another root-agent work step."""
+def _schedule_map_completion_continuation(
+    session: Session, *, discard_final: bool = True
+) -> bool:
+    """把地图校验失败原因交给根 agent，并安排下一轮修复。"""
     frame = session.top_frame()
     if frame is None:
         return False
@@ -2422,16 +2424,17 @@ def _schedule_map_completion_continuation(session: Session) -> bool:
             session.map_completion_blockers,
         )
         return False
-    _pop_last_assistant_final(session)
+    if discard_final:
+        _pop_last_assistant_final(session)
     blocker_text = _format_map_completion_blockers_for_prompt(session.map_completion_blockers)
     frame.messages.append(
         {
-            "role": "system",
+            "role": "user",
             "internal": True,
             "content": (
                 "MAP_COMPLETION_GATE_BLOCKED\n"
-                "Your previous response attempted to finish the map task, but the service "
-                "completion gate is still blocked. Do not summarize or answer final yet.\n\n"
+                "The latest map validation did not permit completion. Do not summarize or "
+                "answer final yet.\n\n"
                 f"Current blockers:\n{blocker_text}\n\n"
                 "Continue the task now. For a validator failure, return to the map planner and "
                 "produce a new plan_platform_level result before writing; do not route a goal "

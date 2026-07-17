@@ -2445,6 +2445,19 @@ def register_front_tools() -> None:
                                     },
                                     "atlas_x": {"type": "integer"},
                                     "atlas_y": {"type": "integer"},
+                                    "reference_cell": {
+                                        "type": "object",
+                                        "description": (
+                                            "Required for a ground-tagged 2D fill when the target layer already has tiles. "
+                                            "Use an existing real ground cell read by describe_map_region; its atlas must "
+                                            "match this fill, preventing a mislabeled bridge/decor tile from becoming terrain."
+                                        ),
+                                        "properties": {
+                                            "x": {"type": "integer"},
+                                            "y": {"type": "integer"},
+                                        },
+                                        "required": ["x", "y"],
+                                    },
                                     "alternative_tile": {"type": "integer"},
                                     "item": {
                                         "type": "integer",

@@ -9,6 +9,7 @@ const MarkdownRenderer = preload("res://addons/ai_agent/ui/markdown_renderer.gd"
 var theme_colors: Dictionary
 var editor_interface: EditorInterface
 var rich_text_setup: Callable
+var layout_changed: Callable
 
 
 # ─── 颜色辅助 ────────────────────────────────────────────────────────────────
@@ -323,7 +324,7 @@ func _set_arrow_pivot(arrow: Label) -> void:
 	arrow.pivot_offset = arrow.size / 2
 
 
-func append_collapsible(content: VBoxContainer, toggle: Button, detail: String, marker_text: String = "") -> RichTextLabel:
+func append_collapsible(content: VBoxContainer, toggle: Button, detail: String, marker_text: String = "", lazy_detail := false) -> RichTextLabel:
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_theme_constant_override("separation", 4)
@@ -346,13 +347,20 @@ func append_collapsible(content: VBoxContainer, toggle: Button, detail: String, 
 	row.add_child(arrow)
 	content.add_child(row)
 
-	var detail_rich := make_log_rich_text(detail, _theme_color("muted_text"))
+	var detail_rich := make_log_rich_text("" if lazy_detail else detail, _theme_color("muted_text"))
+	detail_rich.set_meta("copy_text", detail)
+	detail_rich.set_meta("detail_loaded", not lazy_detail)
 	detail_rich.visible = false
 	content.add_child(detail_rich)
 
 	toggle.pressed.connect(func():
+		if not bool(detail_rich.get_meta("detail_loaded", false)):
+			detail_rich.append_text(MarkdownRenderer.markdown_to_bbcode(detail, theme_colors))
+			detail_rich.set_meta("detail_loaded", true)
 		detail_rich.visible = not detail_rich.visible
 		arrow.rotation_degrees = 90.0 if detail_rich.visible else 0.0
+		if layout_changed.is_valid():
+			layout_changed.call_deferred()
 	)
 	return detail_rich
 
@@ -374,7 +382,7 @@ func append_history_thought_entry(message_list: VBoxContainer, header: String, d
 	if detail.strip_edges() == "":
 		content.add_child(make_log_rich_text(header, _theme_color("muted_text"), "✻"))
 	else:
-		append_collapsible(content, make_workflow_toggle(header, _theme_color("muted_text")), detail, "✻")
+		append_collapsible(content, make_workflow_toggle(header, _theme_color("muted_text")), detail, "✻", true)
 	message_list.add_child(content)
 
 
@@ -471,8 +479,8 @@ func append_workflow_summary_entry(content: VBoxContainer, entry: String, marker
 
 func _summary_text(text: String) -> String:
 	var summary := " ".join(text.strip_edges().split("\n"))
-	if summary.length() > 100:
-		return summary.left(100) + "..."
+	if summary.length() > 20:
+		return summary.left(20) + "..."
 	return summary
 
 

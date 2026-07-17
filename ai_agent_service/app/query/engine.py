@@ -73,9 +73,6 @@ _MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
 _MAP_ARTIFACT_MAX_FILES_PER_SESSION = 128
 _MAP_ARTIFACT_MAX_BYTES_PER_SESSION = 100 * 1024 * 1024
 _MAP_MAX_AUTO_ITERATIONS = 3
-_MAP_VALIDATION_FAILURE_REASONS = frozenset(
-    {"blocking_completion", "completion_not_allowed", "validator_failed", "map_validation_repeat_limit"}
-)
 
 
 def _normalize_model_override(model: str | None) -> str | None:
@@ -556,16 +553,6 @@ class QueryEngine:
             resumed = self._resume_pending_map_tool_calls(session)
             if resumed is not None:
                 return resumed
-            if any(
-                blocker.get("reason") in _MAP_VALIDATION_FAILURE_REASONS
-                for blocker in session.map_completion_blockers
-            ):
-                logger.warning(
-                    "Stopping map task after validation failure session=%s blockers=%s",
-                    session.session_id,
-                    session.map_completion_blockers,
-                )
-                return ChatFinalResponse(text=_map_completion_gate_text(session.map_completion_blockers))
         else:
             if session.pending_turn_id is not None:
                 logger.warning(

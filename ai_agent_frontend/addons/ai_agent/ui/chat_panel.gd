@@ -465,6 +465,7 @@ func _build_children() -> void:
 	_log_renderer.theme_colors = _theme_colors
 	_log_renderer.editor_interface = editor_interface
 	_log_renderer.rich_text_setup = _configure_message_rich_text
+	_log_renderer.layout_changed = _on_collapsible_layout_changed
 	_initialize_virtual_messages()
 
 
@@ -475,6 +476,7 @@ func _ensure_log_renderer() -> void:
 	_log_renderer.theme_colors = _theme_colors
 	_log_renderer.editor_interface = editor_interface
 	_log_renderer.rich_text_setup = _configure_message_rich_text
+	_log_renderer.layout_changed = _on_collapsible_layout_changed
 
 
 func _initialize_virtual_messages() -> void:
@@ -1260,6 +1262,8 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring tool_calls while a previous batch is still pending confirmation.", {"count": calls.size()})
 		return
 
+	_append_tool_response_text(response, calls)
+
 	# 工具调用是同一轮 assistant 输出的边界，不是正文流的结束。
 	# 保留当前临时正文块；工具结果单独入队，后续同 frame 的文本继续写入该块。
 	if not calls.is_empty() and _stream_message_index >= 0:
@@ -1330,6 +1334,29 @@ func _handle_tool_calls(response: Dictionary) -> void:
 	else:
 		_set_state(AgentState.WAITING_LLM)
 		_http_client.send_tool_results(results, _request_model())
+
+
+func _append_tool_response_text(response: Dictionary, calls: Array) -> void:
+	# tool_calls 响应中的 text 可能包含流式事件未完全显示的正文，补入当前消息并去重。
+	var raw_text: Variant = response.get("text", "")
+	if raw_text == null:
+		return
+	var response_text := _strip_think_xml(str(raw_text)).strip_edges()
+	if response_text == "":
+		return
+	var frame_id := ""
+	if not calls.is_empty() and calls[0] is Dictionary:
+		frame_id = str(calls[0].get("frame_id", ""))
+	if _stream_message_index < 0 and frame_id != "":
+		_ensure_stream_message("%s:tool_response:0" % frame_id, true)
+	if _stream_display_text.strip_edges() == "":
+		_stream_display_text = response_text
+	elif response_text.begins_with(_stream_display_text):
+		_stream_display_text = response_text
+	elif not _stream_display_text.begins_with(response_text):
+		_stream_display_text += "\n\n" + response_text
+	_stream_text_dirty = true
+	_render_stream_content()
 
 
 func _move_stream_to_end() -> void:
@@ -2348,6 +2375,13 @@ func _ensure_reasoning_entry(key: String) -> void:
 	_ensure_log_renderer()
 	if _reasoning_key == key and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
 		return
+	# 新的 reasoning 是正文顺序边界。先固定此前的正文，再把 Thought 入队，
+	# 之后到达的正文增量只能创建在该 Thought 下方的新消息节点中。
+	if _stream_message_index >= 0:
+		if _stream_display_text.strip_edges() != "":
+			_finalize_stream_as_persistent()
+		else:
+			_discard_stream_message()
 	_finish_reasoning_stream()
 	_reasoning_key = key
 	_reasoning_started_ms = Time.get_ticks_msec()
@@ -2689,6 +2723,11 @@ func _scroll_to_bottom() -> void:
 func _sync_virtual_messages() -> void:
 	if _virtual_scroller != null:
 		_virtual_scroller.sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, _auto_scroll or _force_scroll_once)
+
+
+func _on_collapsible_layout_changed() -> void:
+	# 折叠内容变化后，等待 RichTextLabel 布局稳定再重测虚拟消息高度。
+	_post_history_layout_frames = max(_post_history_layout_frames, 2)
 
 
 func _queue_message(data: Dictionary) -> int:

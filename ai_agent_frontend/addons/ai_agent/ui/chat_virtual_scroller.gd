@@ -5,7 +5,7 @@ const ChatMessageStore = preload("res://addons/ai_agent/ui/chat_message_store.gd
 const ChatNodeFactory = preload("res://addons/ai_agent/ui/chat_node_factory.gd")
 
 const BUFFER_MESSAGES := 3
-const MIN_VISIBLE_MESSAGES := 50
+const MIN_VISIBLE_MESSAGES := 12
 
 var _scroll: ScrollContainer
 var _message_list: VBoxContainer

@@ -519,8 +519,8 @@ def _plan_step_completed(
     idx = frame_steps.pop(done.id, None)
     if idx is None:
         return
-    full_summary = " ".join(text.split())
-    summary = full_summary
+    full_summary = text.strip()
+    summary = " ".join(full_summary.split())
     if len(summary) > 240:
         summary = summary[:240] + "..."
     _emit_orchestration_event(

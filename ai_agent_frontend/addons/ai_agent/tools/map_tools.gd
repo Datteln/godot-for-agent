@@ -13,7 +13,6 @@ const MapReachableGrowth = preload("res://addons/ai_agent/tools/map_reachable_gr
 
 const MAX_EDITED_CELLS := 100000
 const MAX_EDIT_MAP_BATCH_CELLS := 2000
-const MAX_THIN_NON_BLANKET_FILL_WIDTH := 12
 const MAX_DESCRIBED_CELLS := 800
 const DEFAULT_DESCRIBE_RETURNED_CELLS := 120
 ## describe_map_region 是纯内存读取（一次循环读完整片区域），800 只是响应体大小的策略上限，
@@ -57,20 +56,6 @@ static func _operation_cells(operation: Dictionary, dimension: int) -> int:
 	return width * height * depth
 
 
-static func _is_blanket_layer_operation(operation: Dictionary) -> bool:
-	var semantic_layer := str(operation.get("semantic_layer", operation.get("resource", operation.get("resource_key", "")))).to_lower()
-	for token in ["background", "backdrop", "sky", "water", "ocean", "sea"]:
-		if semantic_layer.find(token) >= 0:
-			return true
-	var tags_value = operation.get("tags", [])
-	var tags: Array = tags_value if tags_value is Array else []
-	for tag in tags:
-		var tag_text := str(tag).to_lower()
-		if tag_text in ["background", "backdrop", "sky", "water", "blanket_layer"]:
-			return true
-	return false
-
-
 static func _validate_edit_map_batch_shape(operations: Array, dimension: int) -> Dictionary:
 	var total_cells := 0
 	for operation_value in operations:
@@ -88,17 +73,6 @@ static func _validate_edit_map_batch_shape(operations: Array, dimension: int) ->
 				"max_cells": MAX_EDIT_MAP_BATCH_CELLS,
 				"hint": "Retry with smaller edit_map calls whose total expected_cells is <= max_cells.",
 			}, "map_edit_batch_too_large")
-		if str(operation.get("action", "")) == "fill" and dimension == 2 and not _is_blanket_layer_operation(operation):
-			var width := max(1, int(operation.get("width", 1)))
-			var height := max(1, int(operation.get("height", 1)))
-			if width > MAX_THIN_NON_BLANKET_FILL_WIDTH and height <= 2:
-				return _merge_map_completion_blocker({
-					"ok": false,
-					"message": "thin non-blanket fill width=%d height=%d looks like an over-broad map repair; split into local segments or use a background/water semantic layer if this is a blanket layer." % [width, height],
-					"error_code": "thin_fill_requires_local_segments",
-					"width": width,
-					"height": height,
-				}, "thin_fill_requires_local_segments")
 	if total_cells > MAX_EDIT_MAP_BATCH_CELLS:
 		return _merge_map_completion_blocker({
 			"ok": false,
@@ -242,6 +216,11 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		var resource_contract_check := _validate_operation_resource_contract(operation, resolved_resource_entry, dimension)
 		if not bool(resource_contract_check.get("ok", true)):
 			return resource_contract_check
+		var ground_reference_check := _validate_ground_fill_reference(
+			target, dimension, map_layer, operation, resolved_resource_entry
+		)
+		if not bool(ground_reference_check.get("ok", true)):
+			return ground_reference_check
 		var resolved_scene_path := str(resolved_resource_entry.get("scene_path", "")).strip_edges()
 		if resolved_scene_path != "":
 			# 语义表里这个资源是按 scene_path（对象/PackedScene）登记的，不是瓦片——用 edit_map
@@ -311,11 +290,9 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 	var coverage_gaps := _compute_coverage_gaps(coverage_edited_extent_before, coverage_edited_extent_after, coverage_siblings, coverage_target_columns_after)
 	var result := {
 		"ok": true,
-		"completion_allowed": false,
-		"blocking_completion": true,
+		"validation_required": true,
 		"validation": {
-			"passed": false,
-			"blocking_completion": true,
+			"status": "pending",
 			"issues": ["map_edit_requires_followup_validation"],
 		},
 		"target": str(target_result.get("path", "")),
@@ -1705,6 +1682,50 @@ static func _validate_operation_resource_contract(operation: Dictionary, resourc
 		return {"ok": false, "message": "registered resource '%s' has no source_id" % resource_key, "error_code": "invalid_resource_contract", "resource": resource_key}
 	if _registry_2d_tile_signature(resource_entry).is_empty():
 		return {"ok": false, "message": "registered resource '%s' has no atlas_coords/atlas_x/atlas_y" % resource_key, "error_code": "invalid_resource_contract", "resource": resource_key}
+	return {"ok": true}
+
+
+static func _validate_ground_fill_reference(
+	target: Node,
+	dimension: int,
+	map_layer: int,
+	operation: Dictionary,
+	resource_entry: Dictionary
+) -> Dictionary:
+	# 已有前景地面时，扩建必须锚定一个同 atlas 的真实格子，避免把错误 registry
+	# 条目（例如桥梁）误当成 ground 后连续 fill 到整段路线。
+	if dimension != 2 or str(operation.get("action", "")) != "fill":
+		return {"ok": true}
+	var tags: Array = resource_entry.get("tags", []) if resource_entry.get("tags", []) is Array else []
+	if not tags.has("ground"):
+		return {"ok": true}
+	var used_cells: Array = target.call("get_used_cells", map_layer) if target.get_class() == "TileMap" else target.call("get_used_cells")
+	if used_cells.is_empty():
+		return {"ok": true}
+	var reference_value = operation.get("reference_cell", null)
+	if not (reference_value is Dictionary):
+		return {
+			"ok": false,
+			"message": "ground fill requires reference_cell from a real existing ground tile; read describe_map_region with cells_format=non_empty_only first.",
+			"error_code": "ground_reference_required",
+			"hint": "Set reference_cell to the x/y of an existing foreground ground cell whose source_id/atlas_coords match this fill.",
+		}
+	var reference: Dictionary = reference_value
+	var reference_cell := _read_map_cell(
+		target, Vector3i(int(reference.get("x", 0)), int(reference.get("y", 0)), 0), dimension, map_layer
+	)
+	var reference_atlas: Vector2i = reference_cell.get("atlas_coords", Vector2i(-1, -1))
+	if int(reference_cell.get("source_id", -1)) != int(operation.get("source_id", -1)) \
+			or reference_atlas != Vector2i(int(operation.get("atlas_x", -1)), int(operation.get("atlas_y", -1))):
+		return {
+			"ok": false,
+			"message": "ground fill atlas does not match reference_cell; do not use a registry label as proof of terrain semantics.",
+			"error_code": "ground_reference_mismatch",
+			"reference_cell": {"x": int(reference.get("x", 0)), "y": int(reference.get("y", 0))},
+			"reference_signature": {"source_id": int(reference_cell.get("source_id", -1)), "atlas_x": reference_atlas.x, "atlas_y": reference_atlas.y},
+			"requested_signature": {"source_id": int(operation.get("source_id", -1)), "atlas_x": int(operation.get("atlas_x", -1)), "atlas_y": int(operation.get("atlas_y", -1))},
+			"hint": "Use the exact source_id/atlas coordinates returned for the real ground reference cell, then retry the small batch.",
+		}
 	return {"ok": true}
 
 
