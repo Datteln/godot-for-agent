@@ -6,6 +6,7 @@ const ChatNodeFactory = preload("res://addons/ai_agent/ui/chat_node_factory.gd")
 
 const BUFFER_MESSAGES := 3
 const MIN_VISIBLE_MESSAGES := 12
+const MAX_RESYNC_FRAMES := 4
 
 var _scroll: ScrollContainer
 var _message_list: VBoxContainer
@@ -18,6 +19,11 @@ var _syncing := false
 var _scroll_sync_pending := false
 var _sync_again := false
 var _sync_again_stick_to_bottom := false
+var _resync_requested := false
+var _resync_stick_to_bottom := false
+var _consecutive_resyncs := 0
+var _prepend_scroll_restore_pending := false
+var _pending_prepend_scroll_offset := 0.0
 
 
 func setup(scroll: ScrollContainer, message_list: VBoxContainer, store: ChatMessageStore, factory: ChatNodeFactory) -> void:
@@ -32,6 +38,59 @@ func setup(scroll: ScrollContainer, message_list: VBoxContainer, store: ChatMess
 
 func notify_message_added(index: int, stick_to_bottom: bool) -> void:
 	sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, stick_to_bottom)
+
+
+func prepend_messages(count: int, scroll_offset: float) -> void:
+	if count <= 0:
+		return
+	var shifted := {}
+	for cached_index in _node_cache.keys():
+		shifted[int(cached_index) + count] = _node_cache[cached_index]
+	_node_cache = shifted
+	if scroll_offset > 0.0:
+		_pending_prepend_scroll_offset += scroll_offset
+		if not _prepend_scroll_restore_pending:
+			_prepend_scroll_restore_pending = true
+			call_deferred("_restore_prepend_scroll")
+	else:
+		sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, false)
+
+
+func _restore_prepend_scroll() -> void:
+	_prepend_scroll_restore_pending = false
+	if _scroll == null or not is_instance_valid(_scroll):
+		_pending_prepend_scroll_offset = 0.0
+		return
+	var offset := _pending_prepend_scroll_offset
+	_pending_prepend_scroll_offset = 0.0
+	if offset <= 0.0:
+		return
+	_scroll.scroll_vertical += int(round(offset))
+	# scroll_vertical 的 value_changed 会合并到已有 deferred sync；若 setter
+	# 因边界而没有发信号，也补排一次，避免留下旧的可见范围。
+	on_scroll_changed(_scroll.scroll_vertical)
+
+
+func debug_state() -> Dictionary:
+	return {
+		"store_size": _store.size() if _store != null else -1,
+		"cache_size": _node_cache.size(),
+		"child_count": _message_list.get_child_count() if _message_list != null else -1,
+		"syncing": _syncing,
+		"sync_again": _sync_again,
+		"resync_requested": _resync_requested,
+		"consecutive_resyncs": _consecutive_resyncs,
+	}
+
+
+func consume_resync_request() -> Dictionary:
+	var request := {
+		"requested": _resync_requested,
+		"stick_to_bottom": _resync_stick_to_bottom,
+	}
+	_resync_requested = false
+	_resync_stick_to_bottom = false
+	return request
 
 
 func refresh_message(index: int, stick_to_bottom: bool) -> void:
@@ -83,20 +142,33 @@ func sync(scroll_y: float, stick_to_bottom: bool) -> void:
 	_bottom_spacer.custom_minimum_size = Vector2(0, _store.total_height(visible_range.y, _store.size(), excluded))
 	_sync_nodes(visible)
 	_syncing = false
-	if heights_changed:
-		call_deferred("_deferred_resync", stick_to_bottom)
+	var needs_resync := heights_changed
+	var next_stick_to_bottom := stick_to_bottom
 	if _sync_again:
-		var next_stick_to_bottom := _sync_again_stick_to_bottom
+		needs_resync = true
+		next_stick_to_bottom = next_stick_to_bottom or _sync_again_stick_to_bottom
 		_sync_again = false
 		_sync_again_stick_to_bottom = false
-		call_deferred("_deferred_resync", next_stick_to_bottom)
+	if needs_resync:
+		_request_next_frame_resync(next_stick_to_bottom)
+	else:
+		_consecutive_resyncs = 0
 
 
-func _deferred_resync(stick_to_bottom: bool) -> void:
-	sync(float(_scroll.scroll_vertical) if _scroll != null else 0.0, stick_to_bottom)
+func _request_next_frame_resync(stick_to_bottom: bool) -> void:
+	if _consecutive_resyncs >= MAX_RESYNC_FRAMES:
+		return
+	_consecutive_resyncs += 1
+	_resync_requested = true
+	_resync_stick_to_bottom = _resync_stick_to_bottom or stick_to_bottom
 
 
 func clear() -> void:
+	_resync_requested = false
+	_resync_stick_to_bottom = false
+	_consecutive_resyncs = 0
+	_sync_again = false
+	_sync_again_stick_to_bottom = false
 	if _store != null:
 		for index in range(_store.size()):
 			var message := _store.get_message(index)
@@ -118,7 +190,10 @@ func clear() -> void:
 	_node_cache.clear()
 	if _message_list != null:
 		for child in _message_list.get_children():
+			if child == _top_spacer or child == _bottom_spacer:
+				continue
 			_message_list.remove_child(child)
+			child.queue_free()
 
 
 func remove_external_node(node: Control) -> void:

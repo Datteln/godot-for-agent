@@ -8,13 +8,42 @@ var item_spacing := 0.0
 
 
 func add_message(data: Dictionary) -> int:
-	var message := data.duplicate(true)
-	message["index"] = _messages.size()
-	message["estimated_height"] = maxf(1.0, float(message.get("estimated_height", 64.0)))
-	message["measured_height"] = maxf(0.0, float(message.get("measured_height", 0.0)))
-	_messages.append(message)
+	_messages.append(_normalize_message(data, _messages.size()))
 	_heights_dirty = true
 	return _messages.size() - 1
+
+
+func append_messages(messages: Array) -> void:
+	for data in messages:
+		if data is Dictionary:
+			_messages.append(_normalize_message(data, _messages.size()))
+	_heights_dirty = true
+
+
+func prepend_messages(messages: Array) -> float:
+	var normalized: Array[Dictionary] = []
+	var added_height := 0.0
+	for data in messages:
+		if data is Dictionary:
+			var message := _normalize_message(data, normalized.size())
+			normalized.append(message)
+			var measured := float(message.get("measured_height", 0.0))
+			added_height += (measured if measured > 1.0 else float(message.get("estimated_height", 64.0))) + item_spacing
+	if normalized.is_empty():
+		return 0.0
+	_messages = normalized + _messages
+	for index in range(_messages.size()):
+		_messages[index]["index"] = index
+	_heights_dirty = true
+	return added_height
+
+
+func _normalize_message(data: Dictionary, index: int) -> Dictionary:
+	var message := data.duplicate(true)
+	message["index"] = index
+	message["estimated_height"] = maxf(1.0, float(message.get("estimated_height", 64.0)))
+	message["measured_height"] = maxf(0.0, float(message.get("measured_height", 0.0)))
+	return message
 
 
 func get_message(index: int) -> Dictionary:

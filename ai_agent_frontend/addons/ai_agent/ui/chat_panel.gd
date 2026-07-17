@@ -26,6 +26,9 @@ const STREAM_RENDER_INTERVAL_MS := 120
 const REASONING_RENDER_INTERVAL_MS := 250
 const EVENT_DRAIN_BATCH_SIZE := 24
 const EVENT_DRAIN_TIME_BUDGET_MS := 6
+const HISTORY_REPLAY_BATCH_SIZE := 12
+const HISTORY_REPLAY_TIME_BUDGET_MS := 4
+const HISTORY_PAGE_SIZE := 40
 const MAX_MESSAGE_LIST_CHILDREN := 50
 const MAX_LIVE_RENDER_CHARS := 60000
 const MAX_MESSAGE_RENDER_CHARS := 90000
@@ -105,6 +108,12 @@ var _history_session_ids: Array = []
 var _history_before := 0
 var _history_has_more := false
 var _history_loading := false
+var _history_replaying := false
+var _history_batch_messages: Array = []
+var _history_replay_events: Array = []
+var _history_replay_cursor := 0
+var _history_replay_context: Dictionary = {}
+var _history_replay_started_ms := -1
 var _effort_options: OptionButton
 var _permission_options: OptionButton
 var _style_options: OptionButton
@@ -179,6 +188,15 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
+	if _virtual_scroller != null:
+		var resync_request := _virtual_scroller.consume_resync_request()
+		if bool(resync_request.get("requested", false)):
+			_virtual_scroller.sync(
+				float(_scroll.scroll_vertical) if _scroll != null else 0.0,
+				bool(resync_request.get("stick_to_bottom", false))
+			)
+	if _history_replaying:
+		_drain_history_replay()
 	var selection_now := Time.get_ticks_msec()
 	if selection_now - _last_selection_refresh_ms >= 500:
 		_last_selection_refresh_ms = selection_now
@@ -1502,7 +1520,11 @@ func _handle_final(response: Dictionary) -> void:
 
 func _handle_session_history(response: Dictionary) -> void:
 	_ensure_log_renderer()
+	if _history_replaying:
+		FrontendLogger.warn(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] ignored_history_while_replaying")
+		return
 	if _state != AgentState.IDLE:
+		_history_loading = false
 		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored session history while a turn is active.", {
 			"state": _status.text
 		})
@@ -1512,6 +1534,7 @@ func _handle_session_history(response: Dictionary) -> void:
 	var session_id := str(response.get("session_id", ""))
 	# 响应 session_id 与当前不符说明是切换会话后迟到的过期响应，直接丢弃。
 	if session_id != "" and session_id != _current_session_id():
+		_history_loading = false
 		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored stale session history: session mismatch.", {
 			"response_session": session_id,
 			"current": _current_session_id()
@@ -1523,10 +1546,22 @@ func _handle_session_history(response: Dictionary) -> void:
 		"before": int(response.get("history_before", 0)),
 		"has_more": bool(response.get("history_has_more", false))
 	})
-	_history_loading = false
-	_history_before = int(response.get("history_before", 0))
-	_history_has_more = bool(response.get("history_has_more", false))
-	_clear_messages()
+	var requested_before := _history_before
+	var next_before := int(response.get("history_before", 0))
+	var prepend := _message_store != null and _message_store.size() > 0 and requested_before > 0
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] replay_begin", {
+		"requested_before": requested_before,
+		"next_before": next_before,
+		"pseudo_events": pseudo_events.size(),
+		"prepend": prepend,
+		"store_before": _message_store.size() if _message_store != null else -1,
+		"replaying": _history_replaying,
+	})
+	_history_replaying = true
+	_history_replay_started_ms = Time.get_ticks_msec()
+	_history_batch_messages.clear()
+	if not prepend:
+		_clear_messages(false)
 	_update_context_usage_status(
 		int(response.get("context_used_tokens", 0)),
 		int(response.get("context_token_limit", 0))
@@ -1539,16 +1574,91 @@ func _handle_session_history(response: Dictionary) -> void:
 		_http_client.current_turn_id = str(pending_turn_id)
 		if state_store != null:
 			state_store.set_value("current_turn_id", _http_client.current_turn_id)
-	var saved_auto_scroll := _auto_scroll
+	_history_replay_events = pseudo_events
+	_history_replay_cursor = 0
+	_history_replay_context = {
+		"prepend": prepend,
+		"requested_before": requested_before,
+		"next_before": next_before,
+		"has_more": bool(response.get("history_has_more", false)),
+		"pending_turn_id": pending_turn_id,
+		"session_id": session_id,
+		"saved_auto_scroll": _auto_scroll,
+	}
 	_auto_scroll = false
-	for event in pseudo_events:
+	_drain_history_replay()
+
+
+func _drain_history_replay() -> void:
+	if not _history_replaying:
+		return
+	var started_ms := Time.get_ticks_msec()
+	var cursor_before := _history_replay_cursor
+	var processed := 0
+	while _history_replay_cursor < _history_replay_events.size() and processed < HISTORY_REPLAY_BATCH_SIZE:
+		var event = _history_replay_events[_history_replay_cursor]
+		_history_replay_cursor += 1
 		if event is Dictionary:
 			_handle_event(event)
+		processed += 1
+		if Time.get_ticks_msec() - started_ms >= HISTORY_REPLAY_TIME_BUDGET_MS:
+			break
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] replay_batch", {
+		"cursor_from": cursor_before,
+		"cursor_to": _history_replay_cursor,
+		"total_events": _history_replay_events.size(),
+		"processed": processed,
+		"batch_messages": _history_batch_messages.size(),
+		"elapsed_ms": Time.get_ticks_msec() - started_ms,
+	})
+	if _history_replay_cursor < _history_replay_events.size():
+		return
+	_finish_history_replay()
+
+
+func _finish_history_replay() -> void:
+	var prepend := bool(_history_replay_context.get("prepend", false))
+	var requested_before := int(_history_replay_context.get("requested_before", 0))
+	var next_before := int(_history_replay_context.get("next_before", 0))
+	var pending_turn_id = _history_replay_context.get("pending_turn_id")
+	var session_id := str(_history_replay_context.get("session_id", _current_session_id()))
+	var saved_auto_scroll := bool(_history_replay_context.get("saved_auto_scroll", false))
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] commit_batch", {
+		"prepend": prepend,
+		"batch_messages": _history_batch_messages.size(),
+		"store_before": _message_store.size() if _message_store != null else -1,
+		"virtual": _virtual_scroller.debug_state() if _virtual_scroller != null else {},
+	})
+	_history_replaying = false
+	if prepend:
+		var added_height := _message_store.prepend_messages(_history_batch_messages)
+		_virtual_scroller.prepend_messages(_history_batch_messages.size(), added_height)
+	else:
+		_message_store.append_messages(_history_batch_messages)
+		_virtual_scroller.sync(float(_scroll.scroll_vertical), false)
+	var batch_count := _history_batch_messages.size()
+	_history_batch_messages.clear()
+	_history_loading = false
+	_history_before = next_before
+	_history_has_more = bool(_history_replay_context.get("has_more", false)) and next_before > requested_before
+	_history_replay_events.clear()
+	_history_replay_cursor = 0
+	_history_replay_context.clear()
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] replay_end", {
+		"batch_messages": batch_count,
+		"store_after": _message_store.size() if _message_store != null else -1,
+		"history_before": _history_before,
+		"history_has_more": _history_has_more,
+		"scroll_vertical": _scroll.scroll_vertical if _scroll != null else -1,
+		"replay_elapsed_ms": Time.get_ticks_msec() - _history_replay_started_ms if _history_replay_started_ms >= 0 else -1,
+		"virtual": _virtual_scroller.debug_state() if _virtual_scroller != null else {},
+	})
+	_history_replay_started_ms = -1
 	if pending_turn_id != null:
 		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
 		_show_pending_results_notice()
 		_set_state(AgentState.WAITING_CONFIRM)
-	if pseudo_events.is_empty() and _message_store.size() == 0:
+	if batch_count == 0 and _message_store.size() == 0:
 		_append_message("system", _ui("switch_session_empty"))
 	_auto_scroll = saved_auto_scroll
 	_force_scroll_once = true
@@ -2675,7 +2785,12 @@ func _append_tool_result_panel(call: Dictionary, result: Dictionary, preview: Co
 	_queue_external_message(content, 120.0)
 
 
-func _clear_messages() -> void:
+func _clear_messages(reset_history := true) -> void:
+	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] clear_messages", {
+		"reset_history": reset_history,
+		"store_before": _message_store.size() if _message_store != null else -1,
+		"virtual": _virtual_scroller.debug_state() if _virtual_scroller != null else {},
+	})
 	_clear_pending_final_pair()
 	_rendered_assistant_keys.clear()
 	_live_response_keys.clear()
@@ -2699,9 +2814,16 @@ func _clear_messages() -> void:
 	_reasoning_token_count = 0
 	_reasoning_text_dirty = false
 	_reasoning_last_render_ms = 0
-	_history_before = 0
-	_history_has_more = false
-	_history_loading = false
+	if reset_history:
+		_history_before = 0
+		_history_has_more = false
+		_history_loading = false
+		_history_replaying = false
+		_history_batch_messages.clear()
+		_history_replay_events.clear()
+		_history_replay_cursor = 0
+		_history_replay_context.clear()
+		_history_replay_started_ms = -1
 	if _virtual_scroller != null:
 		_virtual_scroller.clear()
 	if _message_store != null:
@@ -2731,6 +2853,10 @@ func _on_collapsible_layout_changed() -> void:
 
 
 func _queue_message(data: Dictionary) -> int:
+	if _history_replaying:
+		var batch_index := _history_batch_messages.size()
+		_history_batch_messages.append(data.duplicate(true))
+		return batch_index
 	_initialize_virtual_messages()
 	while _message_store.size() >= MAX_MESSAGE_STORE_MESSAGES:
 		var removable := -1
@@ -2791,9 +2917,15 @@ func _on_scroll_value_changed(value: float) -> void:
 		# 用户主动向上滚动——无论是否正在流式输出，都尊重用户意图。
 		_auto_scroll = false
 		_user_scrolled_up_ms = Time.get_ticks_msec()
-		if value <= 40.0 and _state == AgentState.IDLE and _history_has_more and not _history_loading:
+		if value <= 40.0 and _state == AgentState.IDLE and _history_has_more and not _history_loading and not _history_replaying:
+			FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] request_older", {
+				"value": value,
+				"history_before": _history_before,
+				"store_size": _message_store.size() if _message_store != null else -1,
+				"replaying": _history_replaying,
+			})
 			_history_loading = true
-			_http_client.fetch_session_history(200, _history_before)
+			_http_client.fetch_session_history(HISTORY_PAGE_SIZE, _history_before)
 	if _virtual_scroller != null:
 		_virtual_scroller.on_scroll_changed(value)
 

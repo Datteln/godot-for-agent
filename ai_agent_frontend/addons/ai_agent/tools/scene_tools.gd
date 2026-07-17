@@ -679,7 +679,7 @@ static func instance_scene(input: Dictionary, editor_interface: EditorInterface,
 	var node: Node = instance
 	if input.has("name"):
 		node.name = str(input.get("name"))
-	var position_error := _apply_optional_position(node, input)
+	var position_error := _apply_optional_position(node, input, parent, root)
 	if not position_error.is_empty():
 		return position_error
 	parent.add_child(node)
