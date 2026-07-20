@@ -498,15 +498,16 @@ func _ensure_log_renderer() -> void:
 
 
 func _initialize_virtual_messages() -> void:
-	if _message_store != null:
-		return
-	_message_store = ChatMessageStore.new()
-	_node_factory = ChatNodeFactory.new()
-	_node_factory.log_renderer = _log_renderer
-	_node_factory.theme_colors = _theme_colors
-	_node_factory.rich_text_setup = _configure_message_rich_text
-	_virtual_scroller = ChatVirtualScroller.new()
-	_virtual_scroller.setup(_scroll, _message_list, _message_store, _node_factory)
+	if _message_store == null:
+		_message_store = ChatMessageStore.new()
+	if _node_factory == null:
+		_node_factory = ChatNodeFactory.new()
+		_node_factory.log_renderer = _log_renderer
+		_node_factory.theme_colors = _theme_colors
+		_node_factory.rich_text_setup = _configure_message_rich_text
+	if _virtual_scroller == null:
+		_virtual_scroller = ChatVirtualScroller.new()
+		_virtual_scroller.setup(_scroll, _message_list, _message_store, _node_factory)
 
 
 func _connect_signals() -> void:
@@ -1617,6 +1618,7 @@ func _drain_history_replay() -> void:
 
 
 func _finish_history_replay() -> void:
+	_initialize_virtual_messages()
 	var prepend := bool(_history_replay_context.get("prepend", false))
 	var requested_before := int(_history_replay_context.get("requested_before", 0))
 	var next_before := int(_history_replay_context.get("next_before", 0))
@@ -1976,16 +1978,21 @@ func _handle_event(event: Dictionary) -> void:
 	var event_type := str(event.get("type", ""))
 	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 	if event_type == "_history_log_text":
-		_queue_message({"type": "history_text", "text": str(payload.get("text", "")), "marker": bool(payload.get("marker", false)), "indent": bool(payload.get("indent", false)), "estimated_height": _estimate_text_height(str(payload.get("text", "")))})
+		var history_text := str(payload.get("text", ""))
+		_queue_message({"type": "log", "text": history_text, "mark_text": bool(payload.get("marker", false)), "indent": bool(payload.get("indent", false)), "estimated_height": _estimate_text_height(history_text)})
 		return
 	if event_type == "_history_thought":
-		_queue_message({"type": "history_thought", "header": str(payload.get("header", "Thought")), "detail": str(payload.get("detail", "")), "estimated_height": _estimate_text_height(str(payload.get("detail", "")))})
+		var thought_header := str(payload.get("header", "Thought"))
+		var thought_detail := str(payload.get("detail", ""))
+		var thought_text := thought_header if thought_detail.strip_edges() == "" else thought_header + "\n" + thought_detail
+		_queue_message({"type": "log", "text": thought_text, "single_entry": true, "estimated_height": _estimate_text_height(thought_detail)})
 		return
 	if event_type == "_history_code":
 		var code := str(payload.get("text", ""))
 		var extension := str(payload.get("path", "")).get_extension().to_lower()
 		var language := "gdscript" if extension == "gd" else ("python" if extension == "py" else "")
-		_queue_message({"type": "history_code", "text": code, "language": language, "indent": true, "estimated_height": _estimate_text_height(code)})
+		var fenced_code := "```%s\n%s\n```" % [language, code]
+		_queue_message({"type": "log", "text": fenced_code, "single_entry": true, "indent": true, "estimated_height": _estimate_text_height(code)})
 		return
 	if event_type == "system_message":
 		_render_message_block("system", str(payload.get("text", "")))
@@ -1993,10 +2000,19 @@ func _handle_event(event: Dictionary) -> void:
 	if event_type == "user_submitted" and payload.has("text"):
 		_render_message_block("user", str(payload.get("text", "")))
 		return
+	if event_type == "_history_front_tool_result":
+		var history_call: Dictionary = payload.get("call", {}) if payload.get("call", {}) is Dictionary else {}
+		var history_result: Dictionary = payload.get("result", {}) if payload.get("result", {}) is Dictionary else {}
+		if not EventFormatter.is_workflow_tool(str(history_call.get("name", ""))):
+			_append_message("system", EventFormatter.format_tool_call_header(history_call))
+		_append_tool_result(history_call, history_result)
+		return
 	if event_type == "server_tool_result":
 		_remember_server_file_read(event)
-		# 历史回放时，工具结果已由 _history_log_text 等事件完整渲染，
-		# 此处仅记录文件读取即可，不再走 _render_event_description 导致重复。
+		# 结构化历史中的 Read/Grep/Edit/场景树只会生成 server_tool_result；
+		# 回放时必须走实时事件使用的 formatter/renderer，否则这些消息会整条消失。
+		if _history_replaying:
+			_render_event_description(event)
 		return
 	if event_type == "agent_reasoning_delta":
 		_on_reasoning_delta(event)

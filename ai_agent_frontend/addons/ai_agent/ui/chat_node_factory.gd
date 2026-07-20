@@ -1,8 +1,6 @@
 @tool
 extends RefCounted
 
-const MarkdownRenderer = preload("res://addons/ai_agent/ui/markdown_renderer.gd")
-
 var log_renderer: RefCounted
 var theme_colors: Dictionary = {}
 var rich_text_setup: Callable
@@ -14,12 +12,6 @@ func create(data: Dictionary) -> Control:
 	match kind:
 		"message":
 			node = _create_message(data)
-		"history_thought":
-			node = _create_history_thought(data)
-		"history_text":
-			node = _create_history_text(data)
-		"history_code":
-			node = _create_history_code(data)
 		_:
 			node = _create_log(data)
 	if node != null:
@@ -29,11 +21,7 @@ func create(data: Dictionary) -> Control:
 
 func _copy_text_for(data: Dictionary) -> String:
 	match str(data.get("type", "log")):
-		"history_thought":
-			var header := str(data.get("header", "Thought"))
-			var detail := str(data.get("detail", ""))
-			return header if detail.strip_edges() == "" else header + "\n\n" + detail
-		"history_text", "history_code", "log", "message":
+		"log", "message":
 			return str(data.get("text", ""))
 		_:
 			return ""
@@ -64,7 +52,13 @@ func _create_log(data: Dictionary) -> Control:
 	var container := VBoxContainer.new()
 	container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	container.add_theme_constant_override("separation", 2)
-	for entry in log_renderer.split_log_entries(log_renderer.normalize_action_message(str(data.get("text", "")))):
+	var normalized: String = log_renderer.normalize_action_message(str(data.get("text", "")))
+	var entries: Array[String] = []
+	if bool(data.get("single_entry", false)):
+		entries.append(normalized)
+	else:
+		entries.assign(log_renderer.split_log_entries(normalized))
+	for entry in entries:
 		_append_log_entry(container, str(entry), data)
 	return container
 
@@ -85,53 +79,3 @@ func _append_log_entry(container: VBoxContainer, entry: String, data: Dictionary
 			log_renderer.append_workflow_summary_entry(container, entry, marker)
 		_:
 			container.add_child(log_renderer.make_log_rich_text(entry, data.get("color", null), marker, bool(data.get("indent", false))))
-
-
-func _create_history_thought(data: Dictionary) -> Control:
-	var content := VBoxContainer.new()
-	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	content.add_theme_constant_override("separation", 2)
-	var header := str(data.get("header", "Thought"))
-	var detail := str(data.get("detail", ""))
-	if detail.strip_edges() == "":
-		content.add_child(log_renderer.make_log_rich_text(header, _theme_color("muted_text"), "✻"))
-	else:
-		var toggle: Button = log_renderer.make_workflow_toggle(header, _theme_color("muted_text"))
-		log_renderer.append_collapsible(content, toggle, detail, "✻", true)
-	return content
-
-
-func _create_history_text(data: Dictionary) -> Control:
-	var content := VBoxContainer.new()
-	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	content.add_theme_constant_override("separation", 2)
-	content.add_child(log_renderer.make_log_rich_text(
-		str(data.get("text", "")),
-		null,
-		"✻" if bool(data.get("marker", false)) else "",
-		bool(data.get("indent", false))
-	))
-	return content
-
-
-func _create_history_code(data: Dictionary) -> Control:
-	var content := VBoxContainer.new()
-	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	content.add_theme_constant_override("separation", 2)
-	var rich: RichTextLabel = log_renderer.make_log_rich_text("", null, "", bool(data.get("indent", true)))
-	var highlighted: Array[String] = []
-	for line in str(data.get("text", "")).split("\n"):
-		highlighted.append(MarkdownRenderer.highlight_code_line(str(line), str(data.get("language", "")), theme_colors))
-	rich.append_text("[bgcolor=%s][code]%s[/code][/bgcolor]" % [_theme_color_tag("code_bg"), "\n".join(highlighted)])
-	rich.set_meta("copy_text", str(data.get("text", "")))
-	content.add_child(rich)
-	return content
-
-
-func _theme_color(name: String) -> Color:
-	var value = theme_colors.get(name, Color.WHITE)
-	return value if value is Color else Color.WHITE
-
-
-func _theme_color_tag(name: String) -> String:
-	return _theme_color(name).to_html(false)

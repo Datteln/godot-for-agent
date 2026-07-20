@@ -24,8 +24,8 @@ from app.storage.atomic import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
-_MAX_HISTORY_EVENTS = 500
 _COALESCED_HISTORY_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta", "context_usage"}
+_STREAM_HISTORY_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta"}
 
 
 @dataclass
@@ -190,13 +190,55 @@ class Session:
         self.pending_tool_calls = {}
 
     def record_history_event(self, event_type: str, payload: dict[str, Any]) -> int:
-        """Record a bounded, coalesced event timeline used for history replay."""
+        """记录用于历史回放的事件，并合并同一流片段的增量文本。"""
         self.history_event_counter += 1
         record = {
             "seq": self.history_event_counter,
             "type": event_type,
             "payload": dict(payload),
         }
+        if event_type in _STREAM_HISTORY_EVENT_TYPES and bool(payload.get("append_delta", False)):
+            current_key = (
+                event_type,
+                str(payload.get("frame_id", "")),
+                str(payload.get("loop", "")),
+                str(payload.get("timeline_frame_id", "")),
+                str(payload.get("timeline_message_index", payload.get("message_index", ""))),
+                str(payload.get("stream_segment", "")),
+            )
+            for index in range(len(self.history_events) - 1, -1, -1):
+                previous = self.history_events[index]
+                if str(previous.get("type", "")) not in _STREAM_HISTORY_EVENT_TYPES:
+                    break
+                previous_payload = previous.get("payload", {})
+                if not isinstance(previous_payload, dict):
+                    continue
+                previous_key = (
+                    str(previous.get("type", "")),
+                    str(previous_payload.get("frame_id", "")),
+                    str(previous_payload.get("loop", "")),
+                    str(previous_payload.get("timeline_frame_id", "")),
+                    str(
+                        previous_payload.get(
+                            "timeline_message_index",
+                            previous_payload.get("message_index", ""),
+                        )
+                    ),
+                    str(previous_payload.get("stream_segment", "")),
+                )
+                if previous_key != current_key:
+                    continue
+                merged_payload = dict(payload)
+                merged_payload["text"] = str(previous_payload.get("text", "")) + str(
+                    payload.get("text", "")
+                )
+                merged_payload["append_delta"] = False
+                self.history_events[index] = {
+                    "seq": previous.get("seq", self.history_event_counter),
+                    "type": event_type,
+                    "payload": merged_payload,
+                }
+                return self.history_event_counter
         if (
             event_type in _COALESCED_HISTORY_EVENT_TYPES
             and not bool(payload.get("append_delta", False))
@@ -206,22 +248,20 @@ class Session:
             previous_payload = previous.get("payload", {})
             if not isinstance(previous_payload, dict):
                 previous_payload = {}
-            previous_key = (
+            previous_snapshot_key = (
                 str(previous.get("type", "")),
                 str(previous_payload.get("frame_id", "")),
                 str(previous_payload.get("loop", "")),
             )
-            current_key = (
+            current_snapshot_key = (
                 event_type,
                 str(payload.get("frame_id", "")),
                 str(payload.get("loop", "")),
             )
-            if previous_key == current_key:
+            if previous_snapshot_key == current_snapshot_key:
                 self.history_events[-1] = record
                 return self.history_event_counter
         self.history_events.append(record)
-        if len(self.history_events) > _MAX_HISTORY_EVENTS:
-            del self.history_events[: len(self.history_events) - _MAX_HISTORY_EVENTS]
         return self.history_event_counter
 
 

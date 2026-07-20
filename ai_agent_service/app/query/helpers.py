@@ -3580,7 +3580,7 @@ def _grep_matches(inner: dict[str, Any]) -> list[GrepMatchDTO]:
     return matches
 
 
-def _tool_history_blocks(
+def _tool_history_blocks_without_replay(
     frame: Frame,
     name: str,
     input_args: dict[str, Any],
@@ -3738,6 +3738,31 @@ def _tool_history_blocks(
 
     summary = _format_tool_result_summary(name, input_args, content).strip()
     return [LogTextHistoryBlock(text=summary, marker=True, **origin)] if summary else []
+
+
+def _tool_history_blocks(
+    frame: Frame,
+    name: str,
+    input_args: dict[str, Any],
+    content: str,
+) -> list[SessionHistoryBlock]:
+    """重建工具历史块，并让前端工具结果复用实时回放事件。"""
+    blocks = _tool_history_blocks_without_replay(frame, name, input_args, content)
+    if name not in _HISTORY_FRONT_TOOLS:
+        return blocks
+    result = _json_object(content)
+    status = str(result.get("status", ""))
+    if status == "":
+        status = "error" if result.get("error") or result.get("ok") is False else "applied"
+        result = {"status": status, "result": result}
+    replay_event = {
+        "type": "_history_front_tool_result",
+        "payload": {
+            "call": {"name": name, "input": input_args, "agent": frame.agent.name},
+            "result": result,
+        },
+    }
+    return [block.model_copy(update={"replay_event": replay_event}) for block in blocks]
 
 
 def _system_history_blocks(frame: Frame, text: str) -> list[SessionHistoryBlock]:
@@ -3967,7 +3992,7 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
     trailing: list[SessionHistoryBlock] = []
     legacy_stream_anchor = 0
     legacy_stream_key: tuple[str, str] | None = None
-    stream_groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    stream_groups: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     normalized_events: list[tuple[Event, int, int]] = []
     for event in events:
         if event.type not in {"agent_reasoning_delta", "agent_text_delta"}:
@@ -3983,6 +4008,7 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
                     event.payload.get("message_index", ""),
                 )
             ),
+            str(event.payload.get("stream_segment", "")),
         )
         group = stream_groups.setdefault(
             group_key,
@@ -4076,13 +4102,14 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
             anchored.setdefault(message_index, []).extend(blocks)
 
     result: list[SessionHistoryBlock] = []
-    seen: set[str] = set()
+    last_fingerprint = ""
 
     def append_unique(block: SessionHistoryBlock) -> None:
+        nonlocal last_fingerprint
         fingerprint = _block_fingerprint(block)
-        if fingerprint in seen:
+        if fingerprint == last_fingerprint:
             return
-        seen.add(fingerprint)
+        last_fingerprint = fingerprint
         result.append(block)
 
     tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]] = {}

@@ -367,50 +367,6 @@ func append_collapsible(content: VBoxContainer, toggle: Button, detail: String, 
 
 # ─── 各类型日志条目追加 ───────────────────────────────────────────────────────
 
-## 历史会话回放专用：把后端重建的 "Thought for Xs\n<完整思考正文>" 历史条目渲染成
-## 与实时流式接收时同样的可折叠 "✻ Thought for Xs" 组件。
-## 之所以不走 `append_log_stream_message` -> `split_log_entries` 的通用拆分逻辑：
-## 思考正文是模型自由生成的自然语言，可能凑巧有某一行以 "Read "/"Edit "/"Grep "/
-## "Thought:" 开头，会被那套按"工具日志动作前缀"设计的启发式拆分逻辑误判为
-## 新日志条目的开始，把同一段思考拦腰截断、甚至把后半段丢给 Read/Edit 等条目
-## 类型而丢弃多余内容——表现就是"历史里 Thought 内容缺失/被截断"。这里把整段
-## detail 原样塞进同一个折叠组件，不做任何按行重新分类。
-func append_history_thought_entry(message_list: VBoxContainer, header: String, detail: String) -> void:
-	var content := VBoxContainer.new()
-	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	content.add_theme_constant_override("separation", 2)
-	if detail.strip_edges() == "":
-		content.add_child(make_log_rich_text(header, _theme_color("muted_text"), "✻"))
-	else:
-		append_collapsible(content, make_workflow_toggle(header, _theme_color("muted_text")), detail, "✻", true)
-	message_list.add_child(content)
-
-
-## 结构化历史文本专用。与通用文本路径不同，marker=true 明确表示行动条目，
-## 因此使用与 Read/Edit 相同的蓝色实心标记，不再退化成灰色状态圆圈。
-func append_history_text_entry(message_list: VBoxContainer, text: String, marker: bool, indent: bool) -> void:
-	var content := VBoxContainer.new()
-	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	content.add_theme_constant_override("separation", 2)
-	content.add_child(make_log_rich_text(text, null, "●" if marker else "", indent))
-	message_list.add_child(content)
-
-
-func append_history_code_entry(message_list: VBoxContainer, text: String, language: String, indent: bool) -> void:
-	var content := VBoxContainer.new()
-	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	content.add_theme_constant_override("separation", 2)
-	var rich := make_log_rich_text("", null, "", indent)
-	var highlighted: Array[String] = []
-	for line in text.split("\n"):
-		highlighted.append(MarkdownRenderer.highlight_code_line(str(line), language, theme_colors))
-	rich.append_text("[bgcolor=%s][code]%s[/code][/bgcolor]" % [
-		_theme_color_tag("code_bg"), "\n".join(highlighted)
-	])
-	content.add_child(rich)
-	message_list.add_child(content)
-
-
 func append_thought_entry(content: VBoxContainer, entry: String, marker_text: String = "") -> void:
 	var split := split_thought_header(first_line(entry))
 	var header := str(split.get("header", ""))

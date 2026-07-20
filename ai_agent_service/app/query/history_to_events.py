@@ -9,6 +9,9 @@ def blocks_to_pseudo_events(blocks: list[SessionHistoryBlock]) -> list[dict[str,
     """将历史块转换为与 SSE 相同的事件包结构。"""
     events: list[dict[str, Any]] = []
     for history_block in blocks:
+        if history_block.replay_event is not None:
+            events.append(history_block.replay_event)
+            continue
         block = history_block.model_dump(mode="json")
         payload: dict[str, Any]
         match block["type"]:

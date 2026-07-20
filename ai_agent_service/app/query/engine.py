@@ -351,13 +351,24 @@ class QueryEngine:
         # 不加界会让这一步随历史总量无限增长，最终触发前端 30s 看门狗超时、把
         # 本来该串行复用的请求队列卡死。既然最终只展示最近 `limit` 条，这里先
         # 把输入收窄到最近窗口再转换，而不是转换全量历史后再丢弃大半。
+        omitted_inputs = False
         if limit > 0:
-            recent_frames = session.agent_stack[-(limit + max(before, 0)) :]
-            recent_events = events[-((limit + max(before, 0)) * 8) :]
+            target_blocks = limit + max(before, 0)
+            input_window = max(target_blocks, 1)
+            while True:
+                recent_frames = session.agent_stack[-input_window:]
+                recent_events = events[-(input_window * 8) :]
+                omitted_inputs = len(recent_frames) < len(session.agent_stack) or len(
+                    recent_events
+                ) < len(events)
+                blocks = _structured_session_history(recent_frames, recent_events)
+                if not omitted_inputs or len(blocks) >= target_blocks:
+                    break
+                input_window *= 2
         else:
             recent_frames = session.agent_stack
             recent_events = events
-        blocks = _structured_session_history(recent_frames, recent_events)
+            blocks = _structured_session_history(recent_frames, recent_events)
         offset = min(max(before, 0), len(blocks))
         end = len(blocks) - offset
         start = max(0, end - limit) if limit > 0 else 0
@@ -379,7 +390,7 @@ class QueryEngine:
             context_used_tokens=_history_context_used_tokens(session, events),
             context_token_limit=self._settings.auto_compact_token_threshold,
             history_before=offset + len(page),
-            history_has_more=start > 0,
+            history_has_more=start > 0 or omitted_inputs,
             pseudo_events=page_pseudo_events,
         )
 

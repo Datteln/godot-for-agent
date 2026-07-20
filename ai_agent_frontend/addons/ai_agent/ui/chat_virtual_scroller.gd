@@ -346,6 +346,8 @@ func _sync_nodes(visible: Dictionary) -> void:
 		_message_list.move_child(_top_spacer, 0)
 	var pos := 1
 	for index in sorted_visible:
+		if not _node_cache.has(index):
+			continue
 		var node: Control = _node_cache[index]
 		if pos < _message_list.get_child_count() and _message_list.get_child(pos) != node:
 			_message_list.move_child(node, pos)

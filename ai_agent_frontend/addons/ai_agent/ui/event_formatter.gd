@@ -167,6 +167,8 @@ static func workflow_entry_from_event_result(payload: Dictionary) -> String:
 			return format_read_event_entry(summary)
 		"grep":
 			return format_grep_event_entry(summary)
+		"edit":
+			return format_edit_event_entry(summary)
 		_:
 			return ""
 
@@ -197,6 +199,14 @@ static func format_grep_event_entry(summary: Dictionary) -> String:
 	if bool(summary.get("truncated", false)):
 		lines.append("... truncated ...")
 	return "Grep \"%s\" (in %s)\n%s" % [pattern, include, "\n".join(lines)]
+
+
+static func format_edit_event_entry(summary: Dictionary) -> String:
+	return "Edit %s\n+%d -%d lines" % [
+		str(summary.get("path", "<unknown>")),
+		int(summary.get("added", 0)),
+		int(summary.get("removed", 0)),
+	]
 
 
 static func format_plan_created_event(payload: Dictionary) -> String:
@@ -333,7 +343,7 @@ static func format_tool_result_detail(name: String, input: Dictionary, status: S
 	if status == "rejected":
 		return ui_text.get("tool_rejected", "Rejected")
 	if status == "error":
-		var message := str(inner.get("message", result.get("error_code", ui_text.get("tool_unknown_error", "Unknown error"))))
+		var message := _tool_error_message(result, str(ui_text.get("tool_unknown_error", "Unknown error")))
 		return ui_text.get("tool_error_detail", "Error: %s") % message
 	match name:
 		"read_file", "read_script":
@@ -391,6 +401,21 @@ static func format_tool_result_detail(name: String, input: Dictionary, status: S
 			if inner.has("path"):
 				return ui_text.get("tool_done_path", "Done: `%s`") % str(inner.get("path"))
 			return ui_text.get("tool_done", "Done")
+
+
+static func _tool_error_message(value: Variant, fallback: String = "") -> String:
+	if value is Dictionary:
+		var data: Dictionary = value
+		for key in ["message", "error", "result"]:
+			if data.has(key):
+				var detail := _tool_error_message(data.get(key))
+				if detail != "":
+					return detail
+		return _tool_error_message(data.get("error_code"), fallback)
+	if value == null:
+		return fallback
+	var text := str(value).strip_edges()
+	return text if text != "" else fallback
 
 
 static func format_log_tool_result(name: String, input: Dictionary, result: Dictionary, fallback: String) -> String:

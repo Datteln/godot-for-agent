@@ -251,6 +251,7 @@ class HistoryBlockBase(BaseModel):
 
     frame_id: str | None = None
     agent: str | None = None
+    replay_event: dict[str, Any] | None = Field(default=None, exclude=True)
 
 
 class UserHistoryBlock(HistoryBlockBase):
