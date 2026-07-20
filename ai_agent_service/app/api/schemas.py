@@ -430,6 +430,7 @@ class RecoveryPointerDTO(BaseModel):
     pending_turn_id: str | None = None
     project_hash: str
     updated_at: str
+    map_checkpoint: dict[str, Any] | None = None
 
 
 class RecoveryPointerResponse(BaseModel):

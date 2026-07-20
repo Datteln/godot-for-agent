@@ -143,6 +143,12 @@ class Frame:
         active_deferred_tools: 本帧通过 `search_tools` 激活的 deferred 工具名；
             只在本帧内生效，不提升权限、不跨 agent 继承。
         search_tools_noop_count: 本帧连续未激活新工具的 `search_tools` 次数。
+        persistent_turn_count: 地图帧在当前 map revision 内累计的 LLM 轮数；
+            前端工具回传造成的新 `run_turn` 调用不会清零。
+        persistent_edit_map_turn_count: 当前 map revision 内累计的纯 `edit_map`
+            轮数，与常规轮次预算分开计算。
+        map_progress_revision: 上述预算对应的 map revision；真实写入推进 revision
+            后预算自动进入新进展周期。
         compact_snapshot: 当前帧最近一次有效压缩的持久化快照；未压缩时为 None。
     """
 
@@ -158,4 +164,7 @@ class Frame:
     search_tools_noop_count: int = 0
     history_anchor_frame_id: str | None = None
     history_anchor_message_index: int | None = None
+    persistent_turn_count: int = 0
+    persistent_edit_map_turn_count: int = 0
+    map_progress_revision: int | None = None
     compact_snapshot: CompactSnapshot | None = None

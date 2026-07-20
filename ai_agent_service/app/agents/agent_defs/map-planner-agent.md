@@ -23,3 +23,4 @@ can_delegate: false
 - `describe_map_region` 返回 `artifact_ref` 且需要精确 cell 坐标/atlas/支撑关系时，必须调用 `read_file(path=artifact_ref)` 读取 artifact；禁止从 `cells_total`、`non_empty_count` 或 `atlas_summary` 推断具体坐标。
 - `coverage`、`object`、`platformer`、`repair` 只能作为目标标签，不要发明固定 worker 类型。
 - 只输出 `map_worker_result_v1` JSON，不要附加解释。必须包含：`stage="planner"`、`worker`、`mode`、`objective`、`target_path`、`map_layer`、`map_revision`、`region`、`summary`、`facts`、`proposed_batches`、`write_results`、`validation`、`missing_inputs`、`risks`、`next_stage`。无内容的数组用 `[]`，未校验时 `validation={"passed":false,"completion_allowed":false,"issues":[],"structured_issues":[]}`。
+- `proposed_batches` 必须保持确定顺序，并为每批给出 `expected_cells` 和可由工具结果直接检查的 `postconditions`；不得让 writer 在批次之间重新规划。

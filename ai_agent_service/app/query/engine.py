@@ -49,6 +49,14 @@ from app.orchestrator.agent import (
     run_turn,
 )
 from app.orchestrator.map_workers import MAP_REVISION_GUARDED_TOOL_NAMES
+from app.orchestrator.map_progress import (
+    remember_validation_cache,
+    remember_map_plan_progress,
+    remember_validation_progress,
+    reset_map_task_progress,
+    resume_map_task,
+    validation_mode,
+)
 from app.output_styles.catalog import OutputStyleCatalog
 from app.permissions.engine import make_session_allow_grant
 from app.prompt.builder import LayeredPrompt, build_system_prompt
@@ -69,6 +77,8 @@ from app.storage.atomic import atomic_write_json
 from app.verify.runner import VerifyRunner
 
 logger = logging.getLogger(__name__)
+
+_MAP_AUTO_COMPACT_CONTEXT_TOKENS = 64_000
 _MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
 _MAP_ARTIFACT_MAX_FILES_PER_SESSION = 128
 _MAP_ARTIFACT_MAX_BYTES_PER_SESSION = 100 * 1024 * 1024
@@ -124,6 +134,135 @@ def _step_to_response(step: StepResult) -> ChatResponse:
     if isinstance(step, ErrorResult):
         return ChatErrorResponse(text=step.text)
     raise TypeError(f"未知编排结果类型：{type(step)!r}")
+
+
+def _map_batch_postcondition_error(
+    status: str,
+    tool_args: dict[str, Any],
+    result: Any,
+) -> str | None:
+    """本地检查批次结果，失败时阻止释放后续批次。"""
+    if status != "applied" or not isinstance(result, dict) or result.get("ok") is False:
+        return "batch tool did not apply successfully"
+    batch_id = str(tool_args.get("write_batch_id", ""))
+    if batch_id and result.get("write_batch_id") != batch_id:
+        return "write_batch_id mismatch"
+    expected_revision = tool_args.get("expected_revision")
+    actual_revision = result.get("map_revision")
+    if (
+        isinstance(expected_revision, int)
+        and not isinstance(expected_revision, bool)
+        and actual_revision != expected_revision + 1
+    ):
+        return "map revision did not advance exactly once"
+    expected_cells = tool_args.get("expected_cells")
+    if (
+        isinstance(expected_cells, int)
+        and not isinstance(expected_cells, bool)
+        and isinstance(result.get("cells"), int)
+        and result.get("cells") != expected_cells
+    ):
+        return "expected_cells postcondition failed"
+    postconditions = tool_args.get("postconditions")
+    if isinstance(postconditions, dict):
+        for key, expected in postconditions.items():
+            if result.get(key) != expected:
+                return f"postcondition {key}={expected!r} failed"
+    return None
+
+
+def _remember_map_batch_result(
+    session: Session,
+    tool_name: str,
+    status: str,
+    tool_args: dict[str, Any],
+    result: Any,
+) -> None:
+    """记录确定性批次结果，并在局部校验失败时清空后续队列。"""
+    if tool_name not in MAP_REVISION_GUARDED_TOOL_NAMES or "plan_version" not in tool_args:
+        return
+    state = session.map_task_state
+    error = _map_batch_postcondition_error(status, tool_args, result)
+    entry = {
+        "plan_version": tool_args.get("plan_version"),
+        "batch_index": tool_args.get("batch_index"),
+        "write_batch_id": tool_args.get("write_batch_id"),
+        "tool": tool_name,
+        "result": result if isinstance(result, dict) else {},
+        "postconditions_passed": error is None,
+        "error": error,
+    }
+    state.executed_batches.append(entry)
+    state.counters.executed_batches += 1
+    if error is None:
+        state.counters.writes += 1
+        state.stage = "validate" if not state.pending_batches else "write"
+        if not state.pending_batches and session.latest_context_used_tokens >= 32_000:
+            session.force_compact_next_turn = True
+        return
+    state.counters.failed_batches += 1
+    state.pending_batches.clear()
+    state.stage = "plan"
+    state.unresolved_issues = [error]
+
+
+def _resume_map_batch_queue(session: Session) -> ChatToolCallsResponse | None:
+    """在上一批成功后直接下发下一批，不再唤醒 LLM。"""
+    state = session.map_task_state
+    if not state.pending_batches or state.unresolved_issues:
+        return None
+    raw = state.pending_batches.pop(0)
+    input_args = raw.get("input", {})
+    if not isinstance(input_args, dict):
+        state.pending_batches.clear()
+        return None
+    target = str(input_args.get("target_path", ""))
+    latest_revision = session.latest_map_revisions.get(target)
+    if latest_revision is not None:
+        input_args["expected_revision"] = latest_revision
+    call = FrontToolCallDTO(
+        id=str(raw.get("id", "")),
+        name=str(raw.get("name", "")),
+        input=input_args,
+        needs_confirm=bool(raw.get("needs_confirm", False)),
+        frame_id=str(raw.get("frame_id", "")),
+        agent=str(raw.get("agent", "map-agent")),
+        render_kind=(str(raw["render_kind"]) if raw.get("render_kind") is not None else None),
+    )
+    frame = next((item for item in session.agent_stack if item.id == call.frame_id), None)
+    if frame is None:
+        state.pending_batches.clear()
+        return None
+    frame.messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": json.dumps(call.input, ensure_ascii=False),
+                    },
+                }
+            ],
+        }
+    )
+    turn_id = session.new_turn_id()
+    session.set_pending(
+        turn_id,
+        [call.id],
+        {
+            call.id: {
+                "name": call.name,
+                "input": call.input,
+                "frame_id": call.frame_id,
+                "agent": call.agent,
+            }
+        },
+    )
+    return ChatToolCallsResponse(turn_id=turn_id, text=None, calls=[call])
 
 
 from app.query.helpers import (
@@ -597,7 +736,28 @@ class QueryEngine:
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
             session.pending_verify_candidates.clear()
             session.map_completion_blockers.clear()
-            session.map_auto_iterations = 0
+            session.set_map_auto_iterations(0)
+            if session.map_task_state.status == "paused":
+                resume_map_task(session.map_task_state)
+                frame.messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Resume the existing map task from map_task_state.checkpoint. "
+                            "Reuse cached facts and executed_batches; do not reread the whole map."
+                        ),
+                    }
+                )
+                resumed_batch = _resume_map_batch_queue(session)
+                if resumed_batch is not None:
+                    self._emit_tool_call_response(
+                        session,
+                        resumed_batch,
+                        "Resumed map batch from checkpoint session=%s turn_id=%s count=%d",
+                    )
+                    return resumed_batch
+            else:
+                reset_map_task_progress(session, frame)
             self._emit(
                 session.session_id, "user_submitted", {"has_context": request.context is not None}
             )
@@ -700,7 +860,7 @@ class QueryEngine:
         while (
             isinstance(response, ChatFinalResponse)
             and session.map_completion_blockers
-            and session.map_auto_iterations < _MAP_MAX_AUTO_ITERATIONS
+            and session.map_task_state.auto_iterations < _MAP_MAX_AUTO_ITERATIONS
         ):
             scheduled = False
             if _has_only_map_review_required(session.map_completion_blockers):
@@ -721,7 +881,7 @@ class QueryEngine:
             if not scheduled:
                 break
             map_gate_continuations += 1
-            session.map_auto_iterations += 1
+            session.set_map_auto_iterations(session.map_task_state.auto_iterations + 1)
             step = await self._run_agent_turn(
                 session,
                 security,
@@ -742,6 +902,8 @@ class QueryEngine:
                 gated_text = _map_completion_gate_text(session.map_completion_blockers)
                 _replace_last_assistant_final(session, gated_text)
                 response = ChatFinalResponse(text=gated_text)
+            elif session.map_task_state.status == "running" and session.map_task_state.task_id:
+                session.map_task_state.status = "completed"
             self._emit(session.session_id, "final", {"text_length": len(response.text)})
             logger.info(
                 "Chat produced final response session=%s text_length=%d",
@@ -805,6 +967,10 @@ class QueryEngine:
             tuple[Callable[[Session], ChatToolCallsResponse | None], str],
             ...,
         ] = (
+            (
+                _resume_map_batch_queue,
+                "Resumed deterministic map batch session=%s turn_id=%s count=%d",
+            ),
             (
                 _resume_pending_map_tool_after_read,
                 "Resumed pending map tool after region read session=%s turn_id=%s count=%d",
@@ -1085,11 +1251,70 @@ class QueryEngine:
                     "result": result.result,
                 }
             result_for_gate = payload.get("result") if isinstance(payload, dict) else None
+            _remember_map_batch_result(
+                session,
+                tool_name,
+                result.status,
+                tool_args,
+                result_for_gate,
+            )
+            if tool_name in MAP_REVISION_GUARDED_TOOL_NAMES and "plan_version" in tool_args:
+                batch_entry = (
+                    session.map_task_state.executed_batches[-1]
+                    if session.map_task_state.executed_batches
+                    else {}
+                )
+                self._emit(
+                    session.session_id,
+                    "map_batch_result",
+                    {
+                        "plan_version": tool_args.get("plan_version"),
+                        "batch_index": tool_args.get("batch_index"),
+                        "write_batch_id": tool_args.get("write_batch_id"),
+                        "postconditions_passed": batch_entry.get("postconditions_passed", False),
+                        "remaining_batches": len(session.map_task_state.pending_batches),
+                    },
+                )
             if isinstance(result_for_gate, dict) and "workflow_constraints" in tool_args:
                 result_for_gate.setdefault(
                     "workflow_constraints", tool_args["workflow_constraints"]
                 )
-            _remember_latest_map_revision(session, tool_args, result_for_gate)
+            _remember_latest_map_revision(session, tool_name, tool_args, result_for_gate)
+            if isinstance(result_for_gate, dict):
+                remember_map_plan_progress(
+                    session,
+                    tool_name,
+                    tool_args,
+                    result_for_gate,
+                )
+                remember_validation_cache(
+                    session,
+                    tool_name,
+                    tool_args,
+                    result_for_gate,
+                )
+                if tool_name == "describe_map_region" and result.status == "applied":
+                    session.map_task_state.counters.reads += 1
+                    target = str(result_for_gate.get("target", tool_args.get("target_path", "")))
+                    session.map_task_state.no_progress_streaks[target] = 0
+                    if session.map_task_state.stage == "read":
+                        session.map_task_state.stage = "plan"
+                if (
+                    tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
+                    and result.status == "applied"
+                    and "plan_version" not in tool_args
+                ):
+                    session.map_task_state.counters.writes += 1
+                    session.map_task_state.stage = "validate"
+                if session.latest_context_used_tokens >= 32_000 and tool_name in {
+                    "plan_map_layout",
+                    "plan_map_algorithms",
+                    "plan_platform_level",
+                    "plan_reachable_map_growth",
+                    "validate_map_region",
+                    *MAP_REVISION_GUARDED_TOOL_NAMES,
+                }:
+                    session.force_compact_next_turn = True
             if tool_name == "describe_map_region":
                 _remember_latest_map_region_read(session, tool_args, result_for_gate)
                 _abort_pending_map_region_read_on_size_error(
@@ -1110,7 +1335,27 @@ class QueryEngine:
                     session, tool_name, result_for_gate, tool_args
                 )
                 validation_success = _map_validation_is_successful(result_for_gate)
-                if validation_success:
+                mode = validation_mode(tool_args)
+                remember_validation_progress(
+                    session,
+                    tool_name,
+                    tool_args,
+                    result_for_gate,
+                    validation_success,
+                )
+                if tool_name == "validate_map_region" and mode == "diagnostic":
+                    session.map_completion_blockers = [
+                        {
+                            "tool": tool_name,
+                            "reason": "map_diagnostic_complete",
+                            "issues": result_for_gate.get("issues", [])
+                            or ["diagnostic finished; planner must produce a changed map plan"],
+                            "target": validation_state["target"],
+                            "required_revision": validation_state["map_revision"],
+                            "next_stage": "planner",
+                        }
+                    ]
+                elif validation_success:
                     target = str(result_for_gate.get("target", tool_args.get("target_path", "")))
                     revision = result_for_gate.get("map_revision")
                     revision_value = (
@@ -1141,13 +1386,12 @@ class QueryEngine:
                         "target": validation_state["target"],
                         "required_revision": validation_state["map_revision"],
                     }
-                    validation_blocker["validation_fingerprint"] = validation_state[
-                        "fingerprint"
-                    ]
+                    validation_blocker["validation_fingerprint"] = validation_state["fingerprint"]
                     validation_blocker["repeat_count"] = validation_state["repeat_count"]
-                    validation_blocker["next_stage"] = "planner"
+                    validation_blocker["next_stage"] = "diagnostic"
                     if validation_state["repeat_count"] >= _MAP_VALIDATION_REPEAT_LIMIT:
                         validation_blocker["reason"] = "map_validation_repeat_limit"
+                        validation_blocker["next_stage"] = "planner"
                         validation_blocker["issues"] = [
                             *validation_blocker.get("issues", []),
                             "same validation failure repeated without a new map revision; automatic retry stopped",
@@ -1274,8 +1518,12 @@ class QueryEngine:
         cancelled = await self._cancel_active_tasks(session_id)
 
         discarded = 0
+        map_checkpoint_created = False
         async with self._store.lock_for(session_id):
             session = self._store.get_or_create(session_id, self.available_tools)
+            if session.map_task_state.status == "running":
+                session.map_task_state.make_checkpoint("user_interrupted")
+                map_checkpoint_created = True
             had_pending_plan = session.pending_plan is not None
             session.pending_plan = None
             if session.pending_turn_id is not None:
@@ -1293,15 +1541,22 @@ class QueryEngine:
                     discarded += 1
                 session.clear_pending()
                 self._store.save(session)
-                if self._recovery is not None:
+                if self._recovery is not None and not map_checkpoint_created:
                     self._recovery.clear(session_id)
-            elif had_pending_plan:
+            elif had_pending_plan or map_checkpoint_created:
                 self._store.save(session)
 
         self._emit(
             session_id, "turn_interrupted", {"cancelled": cancelled, "pending_discarded": discarded}
         )
         last_seq = self._events.last_seq(session_id) if self._events is not None else 0
+        if self._recovery is not None and map_checkpoint_created:
+            self._recovery.write(
+                session_id,
+                None,
+                last_seq,
+                session.map_task_state.checkpoint,
+            )
         logger.info(
             "Turn interrupted session=%s cancelled=%s pending_discarded=%d last_seq=%d",
             session_id,
@@ -1456,7 +1711,19 @@ class QueryEngine:
                     used_tokens = 0
                 if used_tokens > 0:
                     session.latest_context_used_tokens = used_tokens
-                    if used_tokens >= self._settings.auto_compact_token_threshold:
+                    frame = session.top_frame()
+                    is_map_frame = frame is not None and (
+                        frame.agent.name.startswith("map-") or bool(frame.agent.workflow_operations)
+                    )
+                    threshold = (
+                        min(
+                            self._settings.auto_compact_token_threshold,
+                            _MAP_AUTO_COMPACT_CONTEXT_TOKENS,
+                        )
+                        if is_map_frame
+                        else self._settings.auto_compact_token_threshold
+                    )
+                    if used_tokens >= threshold:
                         session.force_compact_next_turn = True
             session.record_history_event(event_type, payload)
         if self._events is None:
@@ -1468,6 +1735,15 @@ class QueryEngine:
     def _record_recovery(self, session: Session, response: ChatResponse) -> None:
         """根据最新响应写入或清理最小恢复指针。"""
         if self._recovery is None:
+            return
+        if session.map_task_state.status == "paused":
+            last_seq = self._events.last_seq(session.session_id) if self._events is not None else 0
+            self._recovery.write(
+                session.session_id,
+                session.pending_turn_id,
+                last_seq,
+                session.map_task_state.checkpoint,
+            )
             return
         if isinstance(response, ChatToolCallsResponse):
             last_seq = self._events.last_seq(session.session_id) if self._events is not None else 0

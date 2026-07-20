@@ -504,6 +504,8 @@ func _finish_map_write_batch(tool_name: String, input: Dictionary, result: Dicti
 		result["previous_map_revision"] = previous_revision
 		result["map_revision"] = next_revision
 		result["write_batch_id"] = str(input.get("write_batch_id", ""))
+		result["plan_version"] = int(input.get("plan_version", 0))
+		result["batch_index"] = int(input.get("batch_index", 0))
 		result["worker"] = str(input.get("worker", ""))
 		result["mode"] = str(input.get("mode", ""))
 		if input.has("workflow_operations"):

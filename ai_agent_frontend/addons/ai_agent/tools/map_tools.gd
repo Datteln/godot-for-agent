@@ -15,10 +15,11 @@ const MAX_EDITED_CELLS := 100000
 const MAX_EDIT_MAP_BATCH_CELLS := 2000
 const MAX_DESCRIBED_CELLS := 800
 const DEFAULT_DESCRIBE_RETURNED_CELLS := 120
-## describe_map_region 的自动读取范围按轴限制：2D 每轴 20 格，3D 每轴 10 格。
-## 超出时返回同样按轴切分的 suggested_regions，模型无需自己推拆分。
-const MAX_AUTOSERVED_DESCRIBED_AXIS_2D := 20
-const MAX_AUTOSERVED_DESCRIBED_AXIS_3D := 10
+## describe_map_region 主要按总 cells 限制，允许关卡常见的细长区域一次读取；
+## 单轴仅保留绝对护栏，防止极端坐标范围拖慢编辑器。
+const MAX_AUTOSERVED_DESCRIBED_CELLS := 1600
+const MAX_AUTOSERVED_DESCRIBED_AXIS_2D := 160
+const MAX_AUTOSERVED_DESCRIBED_AXIS_3D := 40
 const MAX_NOISE_CELLS := 4096
 ## 空间索引整份读出/整份重写，条目数上限防止它随使用无限膨胀、拖慢每次 edit_map。
 ## 到顶后仍允许更新/删除已有坐标，只拒绝新增坐标，并在结果里给出 warning。
@@ -305,6 +306,11 @@ static func edit_map(input: Dictionary, editor_interface: EditorInterface, undo_
 		"layer_coverage_gaps": coverage_gaps,
 		"message": "Map edited through Godot native APIs; serialized map data was not modified directly."
 	}
+	var touched_coords: Array = []
+	for changed_cell in after:
+		var changed_position: Vector3i = changed_cell.get("coords", Vector3i.ZERO)
+		touched_coords.append(changed_position if dimension == 3 else Vector2i(changed_position.x, changed_position.y))
+	result["touched_region"] = _used_bounds_3d(touched_coords) if dimension == 3 else _used_bounds_2d(touched_coords)
 	var visual_groups := _summarize_visual_groups_from_cells(after)
 	if int(visual_groups.get("count", 0)) > 0:
 		result["visual_groups"] = visual_groups
@@ -1119,19 +1125,21 @@ static func repair_placements(input: Dictionary, editor_interface: EditorInterfa
 	}
 
 
-## 把超过单轴读取上限的区域切成对齐子区域，保证每轴都不超过 max_axis_cells。
-static func _split_region(origin: Vector3i, width: int, height: int, depth: int, dimension: int, max_axis_cells: int) -> Array:
-	var step := maxi(1, max_axis_cells)
+## 把超限区域切成总 cells 和单轴都合法的对齐子区域。
+static func _split_region(origin: Vector3i, width: int, height: int, depth: int, dimension: int, max_cells: int, max_axis_cells: int) -> Array:
+	var step_x := mini(width, mini(max_axis_cells, max_cells))
+	var step_y := mini(height, mini(max_axis_cells, maxi(1, int(max_cells / step_x))))
+	var step_z := mini(depth, mini(max_axis_cells, maxi(1, int(max_cells / (step_x * step_y))))) if dimension == 3 else 1
 	var regions: Array = []
 	var z := 0
 	while z < depth:
-		var dz := mini(step, depth - z) if dimension == 3 else 1
+		var dz := mini(step_z, depth - z) if dimension == 3 else 1
 		var y := 0
 		while y < height:
-			var dy := mini(step, height - y)
+			var dy := mini(step_y, height - y)
 			var x := 0
 			while x < width:
-				var dx := mini(step, width - x)
+				var dx := mini(step_x, width - x)
 				var entry := {"x": origin.x + x, "y": origin.y + y, "width": dx, "height": dy}
 				if dimension == 3:
 					entry["z"] = origin.z + z
@@ -1167,15 +1175,16 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	var max_returned_cells := max(1, int(input.get("max_returned_cells", DEFAULT_DESCRIBE_RETURNED_CELLS)))
 	var requested_cells: int = width * height * depth
 	var max_axis_cells := MAX_AUTOSERVED_DESCRIBED_AXIS_3D if dimension == 3 else MAX_AUTOSERVED_DESCRIBED_AXIS_2D
-	if width > max_axis_cells or height > max_axis_cells or (dimension == 3 and depth > max_axis_cells):
-		# 超出自动读取的单轴上限：回退成切好的 suggested_regions，模型照着逐块读即可。
+	if requested_cells > MAX_AUTOSERVED_DESCRIBED_CELLS or width > max_axis_cells or height > max_axis_cells or (dimension == 3 and depth > max_axis_cells):
+		# 超出总 cells 或绝对单轴护栏：返回可直接执行的 suggested_regions。
 		return {
 			"ok": false,
-			"message": "requested region exceeds the %d-cell per-axis auto-serve limit; issue these smaller queries instead (already split for you)." % max_axis_cells,
+			"message": "requested region exceeds the %d-cell total or %d-cell per-axis auto-serve limit; issue these smaller queries instead (already split for you)." % [MAX_AUTOSERVED_DESCRIBED_CELLS, max_axis_cells],
 			"error_code": "region_too_large",
 			"cells": requested_cells,
+			"max_cells": MAX_AUTOSERVED_DESCRIBED_CELLS,
 			"max_axis_cells": max_axis_cells,
-			"suggested_regions": _split_region(origin, width, height, depth, dimension, max_axis_cells),
+			"suggested_regions": _split_region(origin, width, height, depth, dimension, MAX_AUTOSERVED_DESCRIBED_CELLS, max_axis_cells),
 		}
 
 	var cells: Array = []

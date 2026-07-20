@@ -8,6 +8,7 @@ import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from app.storage.atomic import atomic_write_json
 
@@ -23,6 +24,7 @@ class RecoveryPointer:
     pending_turn_id: str | None
     project_hash: str
     updated_at: str
+    map_checkpoint: dict[str, Any] | None = None
 
 
 def _project_hash(project_root: Path) -> str:
@@ -38,7 +40,13 @@ class RecoveryPointerStore:
         self._project_root = project_root
         self._project_hash = _project_hash(project_root)
 
-    def write(self, session_id: str, pending_turn_id: str | None, last_event_seq: int) -> None:
+    def write(
+        self,
+        session_id: str,
+        pending_turn_id: str | None,
+        last_event_seq: int,
+        map_checkpoint: dict[str, Any] | None = None,
+    ) -> None:
         """写入最新恢复指针。"""
         pointer = RecoveryPointer(
             session_id=session_id,
@@ -46,6 +54,7 @@ class RecoveryPointerStore:
             last_event_seq=last_event_seq,
             project_hash=self._project_hash,
             updated_at=datetime.now(timezone.utc).isoformat(),
+            map_checkpoint=map_checkpoint,
         )
         atomic_write_json(self._path, asdict(pointer))
         logger.info(
@@ -63,6 +72,8 @@ class RecoveryPointerStore:
             return None
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and not isinstance(data.get("map_checkpoint"), dict):
+                data["map_checkpoint"] = None
             pointer = RecoveryPointer(**data)
         except (OSError, TypeError, ValueError) as exc:
             logger.warning("Recovery pointer read failed path=%s error=%s", self._path, exc)
@@ -70,7 +81,11 @@ class RecoveryPointerStore:
         if pointer.project_hash != self._project_hash:
             logger.warning("Recovery pointer ignored due to project mismatch path=%s", self._path)
             return None
-        logger.debug("Recovery pointer read session=%s pending_turn=%s", pointer.session_id, pointer.pending_turn_id)
+        logger.debug(
+            "Recovery pointer read session=%s pending_turn=%s",
+            pointer.session_id,
+            pointer.pending_turn_id,
+        )
         return pointer
 
     def clear(self, session_id: str | None = None) -> None:

@@ -43,6 +43,11 @@ from app.orchestrator.map_workers import (
     is_map_write_tool,
     validate_map_write_args,
 )
+from app.orchestrator.map_progress import (
+    cached_validation_result,
+    map_write_stage_error,
+    validation_call_error,
+)
 
 MAX_AGENT_DEPTH = 4
 EVENT_TEXT_PREVIEW_CHARS = 24_000
@@ -75,6 +80,19 @@ class FrontToolCall:
     frame_id: str
     agent: str
     render_kind: str | None
+
+
+def _queued_front_call(call: FrontToolCall) -> dict[str, Any]:
+    """把前端调用转换为可持久化批次项。"""
+    return {
+        "id": call.id,
+        "name": call.name,
+        "input": call.input,
+        "needs_confirm": call.needs_confirm,
+        "frame_id": call.frame_id,
+        "agent": call.agent,
+        "render_kind": call.render_kind,
+    }
 
 
 @dataclass(frozen=True)
@@ -919,12 +937,16 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
             and (not target or canonical.get("target") in ("", target))
             and (revision is None or canonical.get("map_revision") in (None, revision))
         )
-        canonical_success = canonical_matches and canonical is not None and all(
-            canonical.get(key) is expected
-            for key, expected in (
-                ("passed", True),
-                ("completion_allowed", True),
-                ("blocking_completion", False),
+        canonical_success = (
+            canonical_matches
+            and canonical is not None
+            and all(
+                canonical.get(key) is expected
+                for key, expected in (
+                    ("passed", True),
+                    ("completion_allowed", True),
+                    ("blocking_completion", False),
+                )
             )
         )
         if completion_allowed and canonical_success:
@@ -958,10 +980,7 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
                     blocker
                     for blocker in session.map_completion_blockers
                     if blocker.get("target") in ("", target)
-                    and (
-                        revision is None
-                        or blocker.get("required_revision") in (None, revision)
-                    )
+                    and (revision is None or blocker.get("required_revision") in (None, revision))
                 ),
                 None,
             )
@@ -1282,7 +1301,7 @@ def _requires_create_plan_before_map_delegate(
 def _append_map_write_protocol_errors(frame: Frame, calls: list[Any]) -> bool:
     """校验地图写工具单轮协议，失败时补工具错误并要求模型重试。"""
     write_calls = [call for call in calls if is_map_write_tool(call.name)]
-    if len(write_calls) > 1:
+    if len(write_calls) > 1 and len(write_calls) != len(calls):
         logger.warning(
             "Map write protocol violation frame=%s agent=%s write_calls=%d",
             frame.id,
@@ -1293,7 +1312,7 @@ def _append_map_write_protocol_errors(frame: Frame, calls: list[Any]) -> bool:
             frame.messages.append(
                 _tool_message(
                     call.id,
-                    "同一轮最多只能调用一个地图写工具；本轮所有工具均未执行，请拆成串行批次",
+                    "确定性地图批次不能与读取、验证或服务端工具混在同一轮；请只提交有序写批次",
                     is_error=True,
                 )
             )
@@ -1334,6 +1353,9 @@ def _has_pending_map_write_validation(session: Session) -> bool:
 
 def _map_validation_arg_error(session: Session, tool_name: str, args: dict[str, Any]) -> str | None:
     """按写入时声明的通用约束检查验证工具参数。"""
+    progress_error = validation_call_error(session, tool_name, args)
+    if progress_error is not None:
+        return progress_error
     for blocker in session.map_completion_blockers:
         raw_constraints = blocker.get("workflow_constraints", [])
         if not isinstance(raw_constraints, list):
@@ -1347,6 +1369,213 @@ def _map_validation_arg_error(session: Session, tool_name: str, args: dict[str, 
             for key, value in required_args.items():
                 if args.get(key) != value:
                     return f"{tool_name} 必须传 {key}={value!r} 以满足当前地图约束"
+    return None
+
+
+def _uses_persistent_map_budget(frame: Frame) -> bool:
+    """判断帧是否属于需要跨 HTTP 累计预算的地图工作流。"""
+    return frame.agent.name.startswith("map-") or bool(frame.agent.workflow_operations)
+
+
+_MAP_STAGE_TOOLS: dict[str, frozenset[str]] = {
+    "read": frozenset(
+        {
+            "delegate",
+            "delegate_many",
+            "describe_map_context",
+            "describe_map_region",
+            "read_scene_tree",
+            "read_file",
+            "read_class_docs",
+            "read_image_metadata",
+            "query_spatial_index",
+            "convert_map_coords",
+            "load_skill",
+            "search_tools",
+        }
+    ),
+    "plan": frozenset(
+        {
+            "delegate",
+            "delegate_many",
+            "plan_map_layout",
+            "plan_map_algorithms",
+            "plan_platform_level",
+            "plan_reachable_map_growth",
+            "compute_reachable_frontier",
+            "sample_poisson_points",
+            "sample_noise_grid",
+            "compose_map_blueprint_grammar",
+            "describe_map_region",
+            "query_spatial_index",
+            "find_placement_anchors",
+            "read_file",
+            "read_class_docs",
+            "load_skill",
+            "search_tools",
+        }
+    ),
+    "write": MAP_WRITE_TOOL_NAMES
+    | frozenset(
+        {
+            "describe_map_region",
+            "query_spatial_index",
+            "find_placement_anchors",
+            "read_file",
+            "load_skill",
+            "search_tools",
+        }
+    ),
+    "validate": frozenset(
+        {
+            "delegate",
+            "delegate_many",
+            "validate_map_region",
+            "validate_layer_coverage",
+            "validate_object_placements",
+            "describe_map_region",
+            "query_spatial_index",
+            "read_file",
+            "load_skill",
+            "search_tools",
+        }
+    ),
+    "diagnostic": frozenset(
+        {
+            "validate_map_region",
+            "describe_map_region",
+            "query_spatial_index",
+            "read_file",
+            "load_skill",
+        }
+    ),
+    "review": frozenset(
+        {
+            "delegate",
+            "delegate_many",
+            "capture_viewport_screenshot",
+            "describe_map_region",
+            "validate_map_region",
+            "validate_layer_coverage",
+            "validate_object_placements",
+            "read_scene_tree",
+            "read_image_metadata",
+            "save_scene",
+            "load_skill",
+        }
+    ),
+}
+
+
+def _stage_effective_tools(session: Session, frame: Frame) -> list[str]:
+    """按地图任务阶段裁剪工具，非地图帧保持原白名单。"""
+    if not _uses_persistent_map_budget(frame):
+        return list(frame.agent.effective_tools)
+    stage = session.map_task_state.stage
+    allowed = _MAP_STAGE_TOOLS.get(stage)
+    if allowed is None:
+        return list(frame.agent.effective_tools)
+    return [name for name in frame.agent.effective_tools if name in allowed]
+
+
+def _latest_map_progress_revision(session: Session) -> int | None:
+    """返回会话当前已知的最高地图 revision。"""
+    return max(session.latest_map_revisions.values(), default=None)
+
+
+def _sync_map_progress_budget(session: Session, frame: Frame) -> None:
+    """地图 revision 前进时开启新的生产性迭代预算。"""
+    revision = _latest_map_progress_revision(session)
+    if revision == frame.map_progress_revision:
+        return
+    frame.persistent_turn_count = 0
+    frame.persistent_edit_map_turn_count = 0
+    frame.map_progress_revision = revision
+
+
+def _region_contains(outer: dict[str, Any], inner: dict[str, Any]) -> bool:
+    """判断缓存区域是否完整覆盖请求区域。"""
+    try:
+        for axis, size in (("x", "width"), ("y", "height"), ("z", "depth")):
+            outer_start = int(outer.get(axis, 0))
+            inner_start = int(inner.get(axis, 0))
+            if outer_start > inner_start:
+                return False
+            if outer_start + int(outer.get(size, 1)) < inner_start + int(inner.get(size, 1)):
+                return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _cached_map_region_summary(
+    session: Session,
+    args: dict[str, Any],
+) -> dict[str, Any] | None:
+    """返回同 revision 下覆盖请求的最近区域摘要。"""
+    target = args.get("target_path")
+    layer = args.get("map_layer")
+    if not isinstance(target, str) or not target:
+        return None
+    if not isinstance(layer, int) or isinstance(layer, bool):
+        return None
+    current_revision = session.latest_map_revisions.get(target)
+    targets = session.map_context_state.get("targets", {})
+    target_state = targets.get(target, {}) if isinstance(targets, dict) else {}
+    layers = target_state.get("layers", {}) if isinstance(target_state, dict) else {}
+    layer_state = layers.get(str(layer), {}) if isinstance(layers, dict) else {}
+    regions = layer_state.get("recent_regions", []) if isinstance(layer_state, dict) else []
+    if not isinstance(regions, list):
+        return None
+    requested_region = {
+        "x": args.get("x", 0),
+        "y": args.get("y", 0),
+        "z": args.get("z", 0),
+        "width": args.get("width", 1),
+        "height": args.get("height", 1),
+        "depth": args.get("depth", 1),
+    }
+    format_rank = {"summary_only": 0, "non_empty_only": 1, "full": 2}
+    requested_rank = format_rank.get(str(args.get("cells_format", "summary_only")), 0)
+    for entry in reversed(regions):
+        if not isinstance(entry, dict) or entry.get("map_revision") != current_revision:
+            continue
+        cached_rank = format_rank.get(str(entry.get("cells_format", "summary_only")), 0)
+        if cached_rank < requested_rank:
+            continue
+        region = entry.get("region", {})
+        if isinstance(region, dict) and _region_contains(region, requested_region):
+            session.map_task_state.counters.read_cache_hits += 1
+            return {**entry, "cache_hit": True, "cache_reason": "same_revision_region_covered"}
+    return None
+
+
+def _resumed_full_map_read_error(session: Session, args: dict[str, Any]) -> str | None:
+    """恢复任务时拒绝重新读取已知整图范围。"""
+    if not session.map_task_state.resumed_from_checkpoint:
+        return None
+    target = args.get("target_path")
+    layer = args.get("map_layer")
+    if not isinstance(target, str) or not isinstance(layer, int):
+        return None
+    targets = session.map_context_state.get("targets", {})
+    target_state = targets.get(target, {}) if isinstance(targets, dict) else {}
+    layers = target_state.get("layers", {}) if isinstance(target_state, dict) else {}
+    layer_state = layers.get(str(layer), {}) if isinstance(layers, dict) else {}
+    used_bounds = layer_state.get("used_bounds") if isinstance(layer_state, dict) else None
+    requested = {
+        "x": args.get("x", 0),
+        "y": args.get("y", 0),
+        "z": args.get("z", 0),
+        "width": args.get("width", 1),
+        "height": args.get("height", 1),
+        "depth": args.get("depth", 1),
+    }
+    if isinstance(used_bounds, dict) and _region_contains(requested, used_bounds):
+        return (
+            "任务已从结构化检查点恢复；禁止从头读取整个地图。"
+            "请复用 checkpoint/region cache，只读取 failure_frontier 或尚未缓存的小区域。"
+        )
     return None
 
 
@@ -2213,7 +2442,7 @@ async def run_turn(
         或 `ErrorResult`（LLM 调用失败/达到轮数上限）。
     """
     logger.info("Agent run_turn start session=%s max_turns=%d", session.session_id, max_turns)
-    frame_turns: dict[str, int] = {}  # frame_id -> 本次 run_turn 调用内该帧已消耗的总轮数
+    frame_turns: dict[str, int] = {}  # 非地图帧仍只统计本次 run_turn 的轮数
     # frame_id -> 其中单独计入 edit_map_max_turns 预算的轮数（tool_calls 仅含 edit_map 时）
     frame_edit_map_turns: dict[str, int] = {}
     for loop_index in range(max_turns):
@@ -2222,7 +2451,28 @@ async def run_turn(
             logger.error("Agent run_turn failed: empty frame stack session=%s", session.session_id)
             return ErrorResult(text="会话没有活跃的 agent 帧")
 
-        used = frame_turns.get(frame.id, 0)
+        persistent_map_budget = _uses_persistent_map_budget(frame)
+        if persistent_map_budget:
+            if session.map_task_state.status == "paused":
+                checkpoint = json.dumps(
+                    session.map_task_state.checkpoint or {}, ensure_ascii=False, default=str
+                )
+                _emit_orchestration_event(
+                    event_callback,
+                    "map_task_paused",
+                    {
+                        "frame_id": frame.id,
+                        "reason": session.map_task_state.pause_reason,
+                        "checkpoint": session.map_task_state.checkpoint or {},
+                        "counters": session.map_task_state.counters.__dict__,
+                    },
+                )
+                return ErrorResult(text=f"地图任务因连续无进展已暂停。恢复检查点：{checkpoint}")
+            _sync_map_progress_budget(session, frame)
+            session.map_task_state.counters.llm_turns += 1
+        used = (
+            frame.persistent_turn_count if persistent_map_budget else frame_turns.get(frame.id, 0)
+        )
         # 这里只做一个宽松的总量护栏（max_turns + edit_map_max_turns），防止帧无限循环；
         # 哪个预算先耗尽由下面 tool_calls 揭晓后的精确分类检查负责。
         total_budget = frame.agent.max_turns + (frame.agent.edit_map_max_turns or 0)
@@ -2234,10 +2484,14 @@ async def run_turn(
                 return result
             continue
 
-        frame_turns[frame.id] = used + 1
+        if persistent_map_budget:
+            frame.persistent_turn_count = used + 1
+        else:
+            frame_turns[frame.id] = used + 1
 
         try:
-            visible_tools = tools_for(frame.agent.effective_tools, frame.active_deferred_tools)
+            visible_effective_tools = _stage_effective_tools(session, frame)
+            visible_tools = tools_for(visible_effective_tools, frame.active_deferred_tools)
             logger.info(
                 "Agent frame step session=%s loop=%d frame=%s agent=%s depth=%d messages=%d tools=%d",
                 session.session_id,
@@ -2365,8 +2619,15 @@ async def run_turn(
         # 工具（read_scene_tree/截图/规划等）的常规 max_turns 配额；反之亦然。
         is_edit_map_turn = bool(tool_names) and all(name == "edit_map" for name in tool_names)
         if is_edit_map_turn and frame.agent.edit_map_max_turns is not None:
-            edit_map_used = frame_edit_map_turns.get(frame.id, 0) + 1
-            frame_edit_map_turns[frame.id] = edit_map_used
+            edit_map_used = (
+                frame.persistent_edit_map_turn_count
+                if persistent_map_budget
+                else frame_edit_map_turns.get(frame.id, 0)
+            ) + 1
+            if persistent_map_budget:
+                frame.persistent_edit_map_turn_count = edit_map_used
+            else:
+                frame_edit_map_turns[frame.id] = edit_map_used
             if edit_map_used > frame.agent.edit_map_max_turns:
                 result = await _handle_frame_turns_exhausted(
                     session,
@@ -2380,7 +2641,17 @@ async def run_turn(
                     return result
                 continue
         else:
-            general_used = frame_turns.get(frame.id, 0) - frame_edit_map_turns.get(frame.id, 0)
+            total_used = (
+                frame.persistent_turn_count
+                if persistent_map_budget
+                else frame_turns.get(frame.id, 0)
+            )
+            edit_used = (
+                frame.persistent_edit_map_turn_count
+                if persistent_map_budget
+                else frame_edit_map_turns.get(frame.id, 0)
+            )
+            general_used = total_used - edit_used
             if general_used > frame.agent.max_turns:
                 result = await _handle_frame_turns_exhausted(
                     session,
@@ -2396,7 +2667,7 @@ async def run_turn(
 
         permission_ctx = PermissionContext(
             security=security,
-            effective_tools=frozenset(frame.agent.effective_tools),
+            effective_tools=frozenset(visible_effective_tools),
             deny_rules=security.deny_rules,
             allow_rules=security.allow_rules,
             session_allow=session_allow or set(),
@@ -2574,6 +2845,88 @@ async def run_turn(
                 tool_name=tool.name,
                 args=args,
             )
+            if tool.name == "describe_map_region":
+                cached_region = _cached_map_region_summary(session, args)
+                if cached_region is not None:
+                    logger.info(
+                        "Map region read served from cache session=%s frame=%s target=%s layer=%s",
+                        session.session_id,
+                        frame.id,
+                        args.get("target_path"),
+                        args.get("map_layer"),
+                    )
+                    _emit_orchestration_event(
+                        event_callback,
+                        "map_cache_hit",
+                        {"kind": "region", "target": args.get("target_path")},
+                    )
+                    pending_items.append(
+                        _PendingToolMessage(
+                            _tool_message(
+                                call.id,
+                                {"status": "applied", "result": cached_region},
+                            )
+                        )
+                    )
+                    continue
+                resumed_read_error = _resumed_full_map_read_error(session, args)
+                if resumed_read_error is not None:
+                    pending_items.append(
+                        _PendingToolMessage(
+                            _tool_message(call.id, resumed_read_error, is_error=True)
+                        )
+                    )
+                    continue
+            if tool.name in _MAP_VALIDATION_TOOL_NAMES:
+                cached_validation = cached_validation_result(session, tool.name, args)
+                if cached_validation is not None:
+                    logger.info(
+                        "Map validation served from cache session=%s frame=%s target=%s",
+                        session.session_id,
+                        frame.id,
+                        args.get("target_path"),
+                    )
+                    _emit_orchestration_event(
+                        event_callback,
+                        "map_cache_hit",
+                        {"kind": "validation", "target": args.get("target_path")},
+                    )
+                    pending_items.append(
+                        _PendingToolMessage(
+                            _tool_message(
+                                call.id,
+                                {"status": "applied", "result": cached_validation},
+                            )
+                        )
+                    )
+                    continue
+                validation_error = _map_validation_arg_error(session, tool.name, args)
+                if validation_error is not None:
+                    logger.warning(
+                        "Map validation blocked by progress policy session=%s frame=%s tool=%s error=%s",
+                        session.session_id,
+                        frame.id,
+                        tool.name,
+                        validation_error,
+                    )
+                    pending_items.append(
+                        _PendingToolMessage(_tool_message(call.id, validation_error, is_error=True))
+                    )
+                    continue
+            if tool.name in MAP_WRITE_TOOL_NAMES:
+                stage_error = map_write_stage_error(session, tool.name, args)
+                if stage_error is not None:
+                    logger.warning(
+                        "Map write blocked by progress stage session=%s frame=%s tool=%s error=%s",
+                        session.session_id,
+                        frame.id,
+                        tool.name,
+                        stage_error,
+                    )
+                    pending_items.append(
+                        _PendingToolMessage(_tool_message(call.id, stage_error, is_error=True))
+                    )
+                    continue
 
             decision = check(tool, args, permission_ctx)
             logger.info(
@@ -2613,7 +2966,7 @@ async def run_turn(
 
         # 第二遍：执行 server 工具——`is_concurrency_safe` 的一组用
         # `asyncio.gather` 并发执行，其余按原始顺序串行执行。
-        call_ctx = replace(tool_ctx, effective_tools=frozenset(frame.agent.effective_tools))
+        call_ctx = replace(tool_ctx, effective_tools=frozenset(visible_effective_tools))
         server_calls = [item for item in pending_items if isinstance(item, _PendingServerCall)]
         concurrent_calls = [item for item in server_calls if item.tool.is_concurrency_safe]
         sequential_calls = [item for item in server_calls if not item.tool.is_concurrency_safe]
@@ -2732,6 +3085,39 @@ async def run_turn(
             frame.messages.append(_tool_message(item.call_id, result, is_error=is_error))
 
         if front_calls:
+            if len(front_calls) > 1 and all(
+                call.name in MAP_WRITE_TOOL_NAMES for call in front_calls
+            ):
+                state = session.map_task_state
+                state.plan_version = max(1, state.plan_version)
+                state.pending_batches.clear()
+                for batch_index, call in enumerate(front_calls):
+                    call.input.setdefault("plan_version", state.plan_version)
+                    call.input.setdefault("batch_index", batch_index)
+                state.pending_batches.extend(_queued_front_call(call) for call in front_calls[1:])
+                front_calls = front_calls[:1]
+                assistant_message = frame.messages[-1] if frame.messages else {}
+                raw_tool_calls = assistant_message.get("tool_calls")
+                if isinstance(raw_tool_calls, list):
+                    assistant_message["tool_calls"] = [
+                        item
+                        for item in raw_tool_calls
+                        if isinstance(item, dict) and item.get("id") == front_calls[0].id
+                    ]
+                logger.info(
+                    "Map batch queue created session=%s plan_version=%d pending=%d",
+                    session.session_id,
+                    state.plan_version,
+                    len(state.pending_batches),
+                )
+                _emit_orchestration_event(
+                    event_callback,
+                    "map_batch_queue_created",
+                    {
+                        "plan_version": state.plan_version,
+                        "batch_count": len(state.pending_batches) + 1,
+                    },
+                )
             session.set_pending(
                 turn_id,
                 [c.id for c in front_calls],

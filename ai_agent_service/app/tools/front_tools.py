@@ -81,6 +81,29 @@ def register(tool: ToolDef) -> None:
                         ),
                     },
                 )
+                properties.setdefault(
+                    "plan_version",
+                    {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Service-managed version of the deterministic map batch plan.",
+                    },
+                )
+                properties.setdefault(
+                    "batch_index",
+                    {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Zero-based position in the current deterministic batch queue.",
+                    },
+                )
+                properties.setdefault(
+                    "postconditions",
+                    {
+                        "type": "object",
+                        "description": "Optional local assertions checked before the next queued batch is released.",
+                    },
+                )
             required = parameters.setdefault("required", [])
             if isinstance(required, list) and "expected_revision" not in required:
                 required.append("expected_revision")
@@ -1739,12 +1762,12 @@ def register_front_tools() -> None:
                     "(`cells_format=summary_only`) so large reads do not flood context; request "
                     "`cells_format=non_empty_only` with `max_returned_cells` for precise occupied cells, or "
                     "`cells_format=full` only for small regions where every cell is needed. A larger-than-usual region is served whole automatically (the "
-                    "response carries `auto_served: true`), so you do NOT need to pre-split reads within "
-                    "the per-axis limit. A region beyond that limit fails with error_code "
+                    "response carries `auto_served: true`), so you do NOT need to pre-split normal or thin-wide reads. "
+                    "A region beyond the total/absolute-axis limit fails with error_code "
                     "'region_too_large', and then it returns `suggested_regions`: smaller pre-split rectangles "
                     "covering the same area — just issue describe_map_region for each. "
-                    "Hard size rule: 2D width and height must each be <= 20; 3D width, height, and depth "
-                    "must each be <= 10. If the result has error_code "
+                    "Hard size rule: width*height*depth must be <= 1600; additionally 2D axes must each be <=160 "
+                    "and 3D axes <=40. A 100x5 2D strip is valid. If the result has error_code "
                     "'region_too_large', use its suggested_regions exactly and do not retry the original "
                     "oversized rectangle."
                 ),
@@ -1771,17 +1794,17 @@ def register_front_tools() -> None:
                         "width": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Region width. Maximum 20 for 2D TileMaps and 10 for 3D GridMaps.",
+                            "description": "Region width. Keep total cells <=1600; absolute maximum 160 for 2D and 40 for 3D.",
                         },
                         "height": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Region height. Maximum 20 for 2D TileMaps and 10 for 3D GridMaps.",
+                            "description": "Region height. Keep total cells <=1600; absolute maximum 160 for 2D and 40 for 3D.",
                         },
                         "depth": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Region depth; use 1 for 2D and at most 10 for 3D GridMaps.",
+                            "description": "Region depth; use 1 for 2D, keep total cells <=1600, absolute maximum 40 for 3D.",
                         },
                         "cells_format": {
                             "type": "string",
@@ -3197,6 +3220,15 @@ def register_front_tools() -> None:
                         "width": {"type": "integer", "minimum": 1},
                         "height": {"type": "integer", "minimum": 1},
                         "depth": {"type": "integer", "minimum": 1},
+                        "validation_mode": {
+                            "type": "string",
+                            "enum": ["diagnostic", "completion"],
+                            "description": (
+                                "Use diagnostic only to locate one failure frontier after completion fails. "
+                                "Use completion for the frozen user acceptance route; completion runs at most once "
+                                "per map revision and its start/goal/waypoints/movement limits cannot drift."
+                            ),
+                        },
                         "start": {
                             "type": "object",
                             "description": "Optional BFS start cell {x, y[, z]} in map coordinates.",

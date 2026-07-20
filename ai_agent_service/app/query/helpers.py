@@ -1285,6 +1285,7 @@ def _update_map_context_state(
 
 def _remember_latest_map_revision(
     session: Session,
+    tool_name: str,
     tool_args: dict[str, Any],
     result: Any,
 ) -> None:
@@ -1305,7 +1306,23 @@ def _remember_latest_map_revision(
     if revision is not None:
         previous = session.latest_map_revisions.get(target)
         if previous is None or revision > previous:
+            touched_region = _map_write_touched_region(tool_args, result)
+            if (
+                previous is not None
+                and tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
+                and isinstance(touched_region, dict)
+            ):
+                _promote_unaffected_map_region_cache(
+                    session,
+                    target,
+                    previous,
+                    revision,
+                    touched_region,
+                    map_layer,
+                )
             session.latest_map_revisions[target] = revision
+            session.map_no_progress_streaks[target] = 0
+            session.map_task_state.counters.revision_advances += 1
             logger.info(
                 "Latest map revision updated session=%s target=%s previous=%s current=%s",
                 session.session_id,
@@ -1323,6 +1340,103 @@ def _remember_latest_map_revision(
             previous_layer,
             map_layer,
         )
+
+
+def _map_write_touched_region(
+    tool_args: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    """从写结果或矩形入参提取精确失效区域。"""
+    for value in (result.get("touched_region"), result.get("region"), tool_args.get("region")):
+        if isinstance(value, dict):
+            return value
+    if all(key in tool_args for key in ("x", "y", "width", "height")):
+        return {
+            "x": tool_args.get("x", 0),
+            "y": tool_args.get("y", 0),
+            "z": tool_args.get("z", 0),
+            "width": tool_args.get("width", 1),
+            "height": tool_args.get("height", 1),
+            "depth": tool_args.get("depth", 1),
+        }
+    return None
+
+
+def _regions_intersect(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """判断两个二维或三维整数区域是否相交。"""
+    try:
+        for axis, size in (("x", "width"), ("y", "height"), ("z", "depth")):
+            left_start = int(left.get(axis, 0))
+            right_start = int(right.get(axis, 0))
+            left_end = left_start + int(left.get(size, 1))
+            right_end = right_start + int(right.get(size, 1))
+            if left_end <= right_start or right_end <= left_start:
+                return False
+        return True
+    except (TypeError, ValueError):
+        return True
+
+
+def _promote_unaffected_map_region_cache(
+    session: Session,
+    target: str,
+    previous_revision: int,
+    current_revision: int,
+    touched_region: dict[str, Any],
+    touched_layer: int | None,
+) -> None:
+    """写入后仅失效相交区域，并把未相交缓存提升到新 revision。"""
+    for signature, cached_revision in list(session.latest_map_region_reads.items()):
+        parsed = _parsed_map_region_read_signature(signature)
+        if parsed is None or cached_revision != previous_revision or parsed[0] != target:
+            continue
+        _, layer, x, y, z, width, height, depth = parsed
+        region = {
+            "x": x,
+            "y": y,
+            "z": z,
+            "width": width,
+            "height": height,
+            "depth": depth,
+        }
+        intersects = (touched_layer is None or layer == touched_layer) and _regions_intersect(
+            region, touched_region
+        )
+        if intersects:
+            session.latest_map_region_reads.pop(signature, None)
+            session.latest_map_region_summaries.pop(signature, None)
+        else:
+            session.latest_map_region_reads[signature] = current_revision
+
+    targets = session.map_context_state.get("targets", {})
+    target_state = targets.get(target, {}) if isinstance(targets, dict) else {}
+    layers = target_state.get("layers", {}) if isinstance(target_state, dict) else {}
+    if not isinstance(layers, dict):
+        return
+    for layer_key, layer_state in layers.items():
+        regions = layer_state.get("recent_regions", []) if isinstance(layer_state, dict) else []
+        if not isinstance(regions, list):
+            continue
+        layer: int | None
+        try:
+            layer = int(layer_key)
+        except (TypeError, ValueError):
+            layer = None
+        kept: list[Any] = []
+        for entry in regions:
+            if not isinstance(entry, dict) or entry.get("map_revision") != previous_revision:
+                kept.append(entry)
+                continue
+            region = entry.get("region", {})
+            intersects = (
+                (touched_layer is None or layer == touched_layer)
+                and isinstance(region, dict)
+                and _regions_intersect(region, touched_region)
+            )
+            if not intersects:
+                entry["map_revision"] = current_revision
+                kept.append(entry)
+        layer_state["recent_regions"] = kept
 
 
 def _map_validation_is_successful(result: dict[str, Any]) -> bool:
@@ -1352,9 +1466,7 @@ def _map_validation_fingerprint(
         "revision": revision,
         "region": region if isinstance(region, dict) else region,
         "issues": issues if isinstance(issues, list) else [],
-        "structured_issues": (
-            structured_issues if isinstance(structured_issues, list) else []
-        ),
+        "structured_issues": (structured_issues if isinstance(structured_issues, list) else []),
         "passed": result.get("passed"),
         "completion_allowed": result.get("completion_allowed"),
         "blocking_completion": result.get("blocking_completion"),
@@ -1372,14 +1484,20 @@ def _remember_map_validation(
     """持久化真实校验状态，并统计无新写入的重复失败次数。"""
     target = str(result.get("target", result.get("target_path", tool_args.get("target_path", ""))))
     revision = result.get("map_revision")
-    revision_value = revision if isinstance(revision, int) and not isinstance(revision, bool) else None
+    revision_value = (
+        revision if isinstance(revision, int) and not isinstance(revision, bool) else None
+    )
     fingerprint = _map_validation_fingerprint(tool_name, result, target, revision_value)
     previous = session.latest_map_validations.get(target)
     previous_fingerprint = previous.get("fingerprint") if isinstance(previous, dict) else None
     previous_revision = previous.get("map_revision") if isinstance(previous, dict) else None
     count = session.map_validation_failure_counts.get(fingerprint, 0)
     if not _map_validation_is_successful(result):
-        count = count + 1 if previous_fingerprint == fingerprint and previous_revision == revision_value else 1
+        count = (
+            count + 1
+            if previous_fingerprint == fingerprint and previous_revision == revision_value
+            else 1
+        )
         session.map_validation_failure_counts[fingerprint] = count
     else:
         count = 0
@@ -1713,6 +1831,65 @@ def _map_region_read_signature(tool_name: str, tool_args: dict[str, Any]) -> str
     )
 
 
+def _parsed_map_region_read_signature(
+    signature: str,
+) -> tuple[str, int, int, int, int, int, int, int] | None:
+    """解析地图读取签名，供同 revision 的区域包含复用。"""
+    parts = signature.split("|")
+    if len(parts) != 8:
+        return None
+    try:
+        return (
+            parts[0],
+            int(parts[1]),
+            int(parts[2]),
+            int(parts[3]),
+            int(parts[4]),
+            int(parts[5]),
+            int(parts[6]),
+            int(parts[7]),
+        )
+    except ValueError:
+        return None
+
+
+def _map_region_signature_contains(outer: str, inner: str) -> bool:
+    """判断 outer 签名的区域是否完整覆盖 inner。"""
+    outer_value = _parsed_map_region_read_signature(outer)
+    inner_value = _parsed_map_region_read_signature(inner)
+    if outer_value is None or inner_value is None:
+        return False
+    outer_target, outer_layer, ox, oy, oz, ow, oh, od = outer_value
+    inner_target, inner_layer, ix, iy, iz, iw, ih, depth = inner_value
+    return (
+        outer_target == inner_target
+        and outer_layer == inner_layer
+        and ox <= ix
+        and oy <= iy
+        and oz <= iz
+        and ox + ow >= ix + iw
+        and oy + oh >= iy + ih
+        and oz + od >= iz + depth
+    )
+
+
+def _current_map_region_signature(
+    session: Session,
+    requested_signature: str,
+    target: str,
+) -> str | None:
+    """查找当前 revision 下精确或完整覆盖请求的已读区域签名。"""
+    latest_revision = session.latest_map_revisions.get(target)
+    for signature, revision in reversed(session.latest_map_region_reads.items()):
+        if latest_revision is not None and revision != latest_revision:
+            continue
+        if signature == requested_signature or _map_region_signature_contains(
+            signature, requested_signature
+        ):
+            return signature
+    return None
+
+
 def _remember_latest_map_region_read(
     session: Session,
     tool_args: dict[str, Any],
@@ -1762,7 +1939,13 @@ def _latest_map_region_summary_for_call(
     signature = _map_region_read_signature(call.name, resolved_input)
     if signature is None:
         return None
-    summary = session.latest_map_region_summaries.get(signature)
+    target = resolved_input.get("target_path")
+    if not isinstance(target, str):
+        target = ""
+    cached_signature = _current_map_region_signature(session, signature, target)
+    if cached_signature is None:
+        return None
+    summary = session.latest_map_region_summaries.get(cached_signature)
     return summary if isinstance(summary, dict) else None
 
 
@@ -1806,14 +1989,10 @@ def _map_tool_region_read_current(session: Session, call: FrontToolCallDTO) -> b
     signature = _map_region_read_signature(call.name, resolved_input)
     if signature is None:
         return True
-    read_revision = session.latest_map_region_reads.get(signature)
-    if read_revision is None:
-        return False
     target = resolved_input.get("target_path")
     if not isinstance(target, str) or not target:
-        return True
-    latest_revision = session.latest_map_revisions.get(target)
-    return latest_revision is not None and read_revision == latest_revision
+        return signature in session.latest_map_region_reads
+    return _current_map_region_signature(session, signature, target) is not None
 
 
 def _map_region_read_call_for_tool(
@@ -2438,6 +2617,7 @@ def _format_map_completion_blockers_for_prompt(blockers: list[dict[str, Any]]) -
         reason = str(blocker.get("reason", "blocked"))
         target = str(blocker.get("target", ""))
         revision = blocker.get("required_revision")
+        next_stage = str(blocker.get("next_stage", ""))
         issues = blocker.get("issues", [])
         issue_text = ""
         if isinstance(issues, list) and issues:
@@ -2447,15 +2627,15 @@ def _format_map_completion_blockers_for_prompt(blockers: list[dict[str, Any]]) -
             parts.append(f"target={target}")
         if isinstance(revision, int) and not isinstance(revision, bool):
             parts.append(f"map_revision={revision}")
+        if next_stage:
+            parts.append(f"next_stage={next_stage}")
         if issue_text:
             parts.append(f"issues={issue_text}")
         lines.append(" | ".join(parts))
     return "\n".join(lines)
 
 
-def _schedule_map_completion_continuation(
-    session: Session, *, discard_final: bool = True
-) -> bool:
+def _schedule_map_completion_continuation(session: Session, *, discard_final: bool = True) -> bool:
     """把地图校验失败原因交给根 agent，并安排下一轮修复。"""
     frame = session.top_frame()
     if frame is None:
@@ -2486,10 +2666,12 @@ def _schedule_map_completion_continuation(
                 "The latest map validation did not permit completion. Do not summarize or "
                 "answer final yet.\n\n"
                 f"Current blockers:\n{blocker_text}\n\n"
-                "Continue the task now. For a validator failure, return to the map planner and "
-                "produce a new plan_platform_level result before writing; do not route a goal "
-                "buffer/design failure through repair_map_region. The actual validator result "
-                "is authoritative, and the planner must not claim validation passed without it. "
+                "Continue only through each blocker's explicit next_stage. A completion failure may "
+                "run one validation_mode=diagnostic call to locate the failure frontier; after that, "
+                "return to the map planner and produce a changed plan before writing. Do not repeat "
+                "completion at the same revision, change start/goal to evade the frozen contract, or "
+                "route a goal buffer/design failure through repair_map_region. The actual validator "
+                "result is authoritative, and the planner must not claim validation passed without it. "
                 "Only final-answer after a same-revision result has passed=true, "
                 "completion_allowed=true, and blocking_completion is not true."
             ),

@@ -226,6 +226,7 @@ def create_router(
                 pending_turn_id=pointer.pending_turn_id,
                 project_hash=pointer.project_hash,
                 updated_at=pointer.updated_at,
+                map_checkpoint=pointer.map_checkpoint,
             ),
         )
 
