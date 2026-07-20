@@ -131,6 +131,7 @@ from app.query.helpers import (
     _PERSISTED_HISTORY_EVENT_TYPES,
     _append_platform_planning_failure_hint,
     _build_user_content,
+    _bind_map_validation_to_pending_write,
     _clear_validation_blockers,
     _defer_map_tool_for_region_read,
     _defer_map_validation_for_state_read,
@@ -227,6 +228,7 @@ class QueryEngine:
         # 消息/中断，short-lived 地出现多个；用 set 而不是单个槎位，避免新任务
         # 覆盖掉真正持有锁、仍在运行的旧任务引用，导致 interrupt() 取消错对象。
         self._active_tasks: dict[str, set[asyncio.Task]] = {}
+        self._history_blocks_cache: dict[str, tuple[tuple[int, int, int], list[Any]]] = {}
 
     @property
     def available_tools(self) -> set[str]:
@@ -352,7 +354,7 @@ class QueryEngine:
         # 本来该串行复用的请求队列卡死。既然最终只展示最近 `limit` 条，这里先
         # 把输入收窄到最近窗口再转换，而不是转换全量历史后再丢弃大半。
         omitted_inputs = False
-        if limit > 0:
+        if limit > 0 and before <= 0:
             target_blocks = limit + max(before, 0)
             input_window = max(target_blocks, 1)
             while True:
@@ -366,9 +368,22 @@ class QueryEngine:
                     break
                 input_window *= 2
         else:
+            # 局部窗口会把较早的 frame 误判成历史末尾，提前返回
+            # history_has_more=false。仅在真正向上翻页时构建完整时间线，
+            # 并缓存结果，避免每页重复做 O(frames + events) 的转换。
             recent_frames = session.agent_stack
             recent_events = events
-            blocks = _structured_session_history(recent_frames, recent_events)
+            cache_key = (
+                len(recent_frames),
+                len(recent_events),
+                recent_events[-1].seq if recent_events else 0,
+            )
+            cached = self._history_blocks_cache.get(session.session_id)
+            if cached is not None and cached[0] == cache_key:
+                blocks = cached[1]
+            else:
+                blocks = _structured_session_history(recent_frames, recent_events)
+                self._history_blocks_cache[session.session_id] = (cache_key, blocks)
         offset = min(max(before, 0), len(blocks))
         end = len(blocks) - offset
         start = max(0, end - limit) if limit > 0 else 0
@@ -779,9 +794,10 @@ class QueryEngine:
         """按既有顺序挂起需要先读取地图状态的工具调用。"""
         if not isinstance(response, ChatToolCallsResponse):
             return response
-        response = _defer_map_tool_for_region_read(session, response)
+        response = _bind_map_validation_to_pending_write(session, response)
         response = _defer_map_write_for_state_read(session, response)
-        return _defer_map_validation_for_state_read(session, response)
+        response = _defer_map_validation_for_state_read(session, response)
+        return _defer_map_tool_for_region_read(session, response)
 
     def _resume_pending_map_tool_calls(self, session: Session) -> ChatToolCallsResponse | None:
         """按既有优先级恢复自动读取后挂起的地图工具调用。"""
@@ -1085,6 +1101,10 @@ class QueryEngine:
             blocker = _map_completion_blocker(
                 tool_name, result.status, result_for_gate, result.error_code
             )
+            if blocker is not None:
+                map_layer = tool_args.get("map_layer")
+                if isinstance(map_layer, int) and not isinstance(map_layer, bool):
+                    blocker["map_layer"] = map_layer
             if tool_name in _MAP_VALIDATION_TOOL_NAMES and isinstance(result_for_gate, dict):
                 validation_state = _remember_map_validation(
                     session, tool_name, result_for_gate, tool_args

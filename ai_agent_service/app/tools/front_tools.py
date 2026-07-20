@@ -1739,13 +1739,12 @@ def register_front_tools() -> None:
                     "(`cells_format=summary_only`) so large reads do not flood context; request "
                     "`cells_format=non_empty_only` with `max_returned_cells` for precise occupied cells, or "
                     "`cells_format=full` only for small regions where every cell is needed. A larger-than-usual region is served whole automatically (the "
-                    "response carries `auto_served: true`), so you do NOT need to pre-split typical level-width "
-                    "reads yourself. Only a region above the auto-serve ceiling fails with error_code "
+                    "response carries `auto_served: true`), so you do NOT need to pre-split reads within "
+                    "the per-axis limit. A region beyond that limit fails with error_code "
                     "'region_too_large', and then it returns `suggested_regions`: smaller pre-split rectangles "
                     "covering the same area — just issue describe_map_region for each. "
-                    "Hard size rule: requested_cells = width * height * depth (depth is 1 for 2D). "
-                    "Keep reads at or below 800 cells when possible. The absolute auto-serve ceiling is "
-                    "1600 cells; never issue a request above 1600. If the result has error_code "
+                    "Hard size rule: 2D width and height must each be <= 20; 3D width, height, and depth "
+                    "must each be <= 10. If the result has error_code "
                     "'region_too_large', use its suggested_regions exactly and do not retry the original "
                     "oversized rectangle."
                 ),
@@ -1772,17 +1771,17 @@ def register_front_tools() -> None:
                         "width": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Region width. Ensure width * height * depth <= 1600; prefer <= 800.",
+                            "description": "Region width. Maximum 20 for 2D TileMaps and 10 for 3D GridMaps.",
                         },
                         "height": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Region height. Ensure width * height * depth <= 1600; prefer <= 800.",
+                            "description": "Region height. Maximum 20 for 2D TileMaps and 10 for 3D GridMaps.",
                         },
                         "depth": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Region depth; use 1 for 2D. Ensure width * height * depth <= 1600.",
+                            "description": "Region depth; use 1 for 2D and at most 10 for 3D GridMaps.",
                         },
                         "cells_format": {
                             "type": "string",

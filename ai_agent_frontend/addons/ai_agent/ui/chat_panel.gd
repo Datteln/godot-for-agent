@@ -2701,8 +2701,8 @@ func _append_message(role: String, text: String, color = null) -> void:
 			return
 		_rendered_assistant_keys[assistant_key] = true
 
-	if role != "user" and role != "error":
-		_append_log_stream_message(text, color, role != "assistant")
+	if role != "user":
+		_append_log_stream_message(text, _theme_color("error_text") if role == "error" and color == null else color, role != "assistant")
 		return
 
 	_queue_message({"type": "message", "role": role, "text": _limit_render_text(text, MAX_MESSAGE_RENDER_CHARS), "color": color, "estimated_height": _estimate_text_height(text)})
@@ -2918,7 +2918,7 @@ func _estimate_text_height(text: String) -> float:
 func _on_scroll_value_changed(value: float) -> void:
 	var bar := _scroll.get_v_scroll_bar()
 	var scroll_max := bar.max_value - bar.page
-	var is_at_bottom := scroll_max <= 0 or value >= scroll_max - 80
+	var is_at_bottom := scroll_max <= 0 or value >= scroll_max - 8
 	if _suppress_scroll_check and not is_at_bottom:
 		return
 

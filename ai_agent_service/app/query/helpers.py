@@ -154,7 +154,7 @@ def _abort_pending_map_region_read_on_size_error(
                 "role": "system",
                 "internal": True,
                 "content": (
-                    "出错：自动 describe_map_region 请求超过 1600 cells，已取消原请求，"
+                    "出错：自动 describe_map_region 请求超过单轴读取上限，已取消原请求，"
                     "禁止使用相同参数重试。请逐个使用工具返回的 suggested_regions 读取，"
                     "所有分块成功后再重新调用原地图校验/规划工具。"
                     f" suggested_regions={json.dumps(suggested_regions, ensure_ascii=False)}"
@@ -192,6 +192,7 @@ def _append_platform_planning_failure_hint(
     frame.messages.append(
         {
             "role": "user",
+            "history_role": "error",
             "content": (
                 "出错：平台扩图规划失败，禁止执行空 edit_map_batches。"
                 f"blocked_reason={blocked_reason or 'unknown'}。"
@@ -2207,6 +2208,55 @@ def _defer_map_validation_for_state_read(
     return replacement
 
 
+def _bind_map_validation_to_pending_write(
+    session: Session,
+    response: ChatToolCallsResponse,
+) -> ChatToolCallsResponse:
+    """将写后校验绑定到同一地图目标与图层，避免错误路径触发自动重读。"""
+    pending = next(
+        (
+            blocker
+            for blocker in session.map_completion_blockers
+            if blocker.get("reason") == "map_write_requires_validation"
+            and isinstance(blocker.get("target"), str)
+            and blocker["target"]
+        ),
+        None,
+    )
+    if pending is None:
+        return response
+
+    target_path = str(pending["target"])
+    map_layer = pending.get("map_layer")
+    calls: list[FrontToolCallDTO] = []
+    changed = False
+    for call in response.calls:
+        if call.name not in _MAP_VALIDATION_TOOL_NAMES:
+            calls.append(call)
+            continue
+        input_data = dict(call.input)
+        if input_data.get("target_path") != target_path:
+            input_data["target_path"] = target_path
+            changed = True
+        if isinstance(map_layer, int) and not isinstance(map_layer, bool):
+            if input_data.get("map_layer") != map_layer:
+                input_data["map_layer"] = map_layer
+                changed = True
+        calls.append(call.model_copy(update={"input": input_data}))
+
+    if not changed:
+        return response
+    bound = response.model_copy(update={"calls": calls})
+    _replace_last_assistant_tool_calls(session, bound.text, bound.calls)
+    logger.info(
+        "Bound map validation to pending write session=%s target=%s layer=%s",
+        session.session_id,
+        target_path,
+        map_layer,
+    )
+    return bound
+
+
 def _resume_pending_map_validation_after_read(session: Session) -> ChatToolCallsResponse | None:
     """自动读完 map layer 后恢复此前挂起的地图校验调用。"""
     pending = session.pending_map_validation_after_read
@@ -3219,7 +3269,7 @@ def _is_internal_history_message(message: dict[str, Any]) -> bool:
         (
             "MAP_COMPLETION_GATE_BLOCKED",
             "出错：自动读取没有拿到需要的 state",
-            "出错：自动 describe_map_region 请求超过 1600 cells",
+            "出错：自动 describe_map_region 请求超过单轴读取上限",
         )
     )
 
@@ -3802,6 +3852,9 @@ def _message_history_blocks(
     origin = _history_origin(frame)
     if _is_internal_history_message(message):
         return []
+    if str(message.get("history_role", "")) == "error":
+        displayed = text.strip()
+        return [ErrorHistoryBlock(text=displayed, **origin)] if displayed else []
     if role == "user":
         if frame.parent_id is not None and message_index == 1:
             return []

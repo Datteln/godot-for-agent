@@ -15,10 +15,10 @@ const MAX_EDITED_CELLS := 100000
 const MAX_EDIT_MAP_BATCH_CELLS := 2000
 const MAX_DESCRIBED_CELLS := 800
 const DEFAULT_DESCRIBE_RETURNED_CELLS := 120
-## describe_map_region 是纯内存读取（一次循环读完整片区域），800 只是响应体大小的策略上限，
-## 不是 IO 成本。超过 800 但不超过这个上限时直接自动整片返回（标 auto_served），模型无需自己
-## 分块多次查询；只有超过这个上限才回退成 region_too_large + suggested_regions。
-const MAX_AUTOSERVED_DESCRIBED_CELLS := 1600
+## describe_map_region 的自动读取范围按轴限制：2D 每轴 20 格，3D 每轴 10 格。
+## 超出时返回同样按轴切分的 suggested_regions，模型无需自己推拆分。
+const MAX_AUTOSERVED_DESCRIBED_AXIS_2D := 20
+const MAX_AUTOSERVED_DESCRIBED_AXIS_3D := 10
 const MAX_NOISE_CELLS := 4096
 ## 空间索引整份读出/整份重写，条目数上限防止它随使用无限膨胀、拖慢每次 edit_map。
 ## 到顶后仍允许更新/删除已有坐标，只拒绝新增坐标，并在结果里给出 warning。
@@ -1119,10 +1119,9 @@ static func repair_placements(input: Dictionary, editor_interface: EditorInterfa
 	}
 
 
-## 把一块超过单次读取上限的区域切成若干 ≤max_cells 的对齐子区域。每块边长取 max_cells 的
-## 维度方根量级（2D 方块 / 3D 立方块），保证 w*h*d ≤ max_cells，拼起来正好覆盖原区域无重叠。
-static func _split_region(origin: Vector3i, width: int, height: int, depth: int, dimension: int, max_cells: int) -> Array:
-	var step := maxi(1, int(floor(pow(float(max_cells), 1.0 / float(dimension)))))
+## 把超过单轴读取上限的区域切成对齐子区域，保证每轴都不超过 max_axis_cells。
+static func _split_region(origin: Vector3i, width: int, height: int, depth: int, dimension: int, max_axis_cells: int) -> Array:
+	var step := maxi(1, max_axis_cells)
 	var regions: Array = []
 	var z := 0
 	while z < depth:
@@ -1167,15 +1166,16 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		return {"ok": false, "message": "cells_format must be summary_only, non_empty_only, or full", "error_code": "invalid_cells_format"}
 	var max_returned_cells := max(1, int(input.get("max_returned_cells", DEFAULT_DESCRIBE_RETURNED_CELLS)))
 	var requested_cells: int = width * height * depth
-	if requested_cells > MAX_AUTOSERVED_DESCRIBED_CELLS:
-		# 超出自动整片返回的上限：回退成切好的 suggested_regions，模型照着逐块读即可，不用自己推拆分。
+	var max_axis_cells := MAX_AUTOSERVED_DESCRIBED_AXIS_3D if dimension == 3 else MAX_AUTOSERVED_DESCRIBED_AXIS_2D
+	if width > max_axis_cells or height > max_axis_cells or (dimension == 3 and depth > max_axis_cells):
+		# 超出自动读取的单轴上限：回退成切好的 suggested_regions，模型照着逐块读即可。
 		return {
 			"ok": false,
-			"message": "requested region has %d cells, over the %d-cell auto-serve limit; issue these smaller queries instead (already split for you)." % [requested_cells, MAX_AUTOSERVED_DESCRIBED_CELLS],
+			"message": "requested region exceeds the %d-cell per-axis auto-serve limit; issue these smaller queries instead (already split for you)." % max_axis_cells,
 			"error_code": "region_too_large",
 			"cells": requested_cells,
-			"max_cells": MAX_AUTOSERVED_DESCRIBED_CELLS,
-			"suggested_regions": _split_region(origin, width, height, depth, dimension, MAX_DESCRIBED_CELLS),
+			"max_axis_cells": max_axis_cells,
+			"suggested_regions": _split_region(origin, width, height, depth, dimension, max_axis_cells),
 		}
 
 	var cells: Array = []
