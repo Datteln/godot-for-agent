@@ -230,6 +230,13 @@ def create_router(
             ),
         )
 
+    @router.post("/recovery-pointer/dismiss", response_model=RecoveryPointerResponse)
+    async def dismiss_recovery_pointer(request: ResetRequest) -> RecoveryPointerResponse:
+        """忽略指定会话的恢复提示，同时保留该会话及其历史记录。"""
+        logger.info("HTTP /recovery-pointer/dismiss session=%s", request.session_id)
+        recovery_store.clear(request.session_id)
+        return RecoveryPointerResponse(exists=False)
+
     @router.get("/commands", response_model=list[CommandInfo])
     async def commands() -> list[CommandInfo]:
         logger.debug("HTTP /commands count=%d", len(COMMANDS))

@@ -1810,7 +1810,7 @@ func _on_recovery_accepted(pointer: Dictionary) -> void:
 
 func _on_recovery_rejected() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Recovery rejected.")
-	_http_client.reset_session()
+	_http_client.dismiss_recovery_pointer()
 	if state_store != null:
 		state_store.set_value("recovery_pointer", null)
 	_append_message("system", _ui("recovery_dismissed"))

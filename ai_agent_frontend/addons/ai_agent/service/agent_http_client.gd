@@ -312,6 +312,11 @@ func fetch_recovery_pointer() -> void:
 	_enqueue("GET", "/recovery-pointer", {})
 
 
+func dismiss_recovery_pointer() -> void:
+	FrontendLogger.info(editor_interface, "HTTP", "Dismissing recovery pointer.", {"session_id": _session_id()})
+	_enqueue("POST", "/recovery-pointer/dismiss", {"session_id": _session_id()})
+
+
 func fetch_session_history(limit: int = 40, before: int = 0) -> void:
 	var path := "/sessions/%s/history?limit=%d&before=%d" % [_session_id().uri_encode(), limit, before]
 	FrontendLogger.debug(editor_interface, "AgentHttpClient", "[DEBUG-HISTORY-7C2A] enqueue_history", {
