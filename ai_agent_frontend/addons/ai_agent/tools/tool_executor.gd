@@ -44,6 +44,19 @@ const MAP_REVISION_GUARDED_TOOLS := {
 	"paint_from_image_grid": true,
 }
 
+const MAP_TARGET_REQUIRED_TOOLS := {
+	"edit_map": true,
+	"paint_terrain_connect": true,
+	"place_map_objects": true,
+	"repair_placements": true,
+	"repair_layer_coverage": true,
+	"repair_map_region": true,
+	"save_map_blueprint": true,
+	"apply_map_blueprint": true,
+	"fill_rect": true,
+	"paint_from_image_grid": true,
+}
+
 const MAP_READ_TOOLS := {
 	"describe_tilemap_selection": true,
 	"describe_map_context": true,
@@ -130,6 +143,22 @@ func execute(tool_call: Dictionary) -> Dictionary:
 
 	if is_map_write:
 		_inject_map_write_metadata(input, tool_call)
+		if MAP_TARGET_REQUIRED_TOOLS.has(name):
+			var target_path := str(input.get("target_path", "")).strip_edges()
+			if target_path == "":
+				var target_error := {
+					"ok": false,
+					"error_code": "missing_target_path",
+					"message": "%s requires a non-empty target_path" % name,
+					"revision_key": "",
+				}
+				return AgentDTO.tool_result(
+					str(tool_call.get("id", "")),
+					str(tool_call.get("frame_id", "")),
+					"error",
+					target_error,
+					"missing_target_path"
+				)
 		if requires_map_revision:
 			var revision_error := _validate_map_write_revision(input, map_revision_key)
 			if not revision_error.is_empty():
@@ -446,6 +475,7 @@ func _validate_map_write_revision(input: Dictionary, key: String) -> Dictionary:
 			"error_code": "expected_revision_required",
 			"message": "map write requires expected_revision",
 			"actual_revision": _current_map_revision(key),
+			"revision_key": key,
 		}
 	var expected_revision = input.get("expected_revision")
 	if expected_revision is float and float(int(expected_revision)) == expected_revision:
@@ -457,6 +487,7 @@ func _validate_map_write_revision(input: Dictionary, key: String) -> Dictionary:
 			"error_code": "expected_revision_required",
 			"message": "expected_revision must be an integer",
 			"actual_revision": _current_map_revision(key),
+			"revision_key": key,
 		}
 	var actual_revision := _current_map_revision(key)
 	if int(expected_revision) != actual_revision:
@@ -464,6 +495,7 @@ func _validate_map_write_revision(input: Dictionary, key: String) -> Dictionary:
 			"ok": false,
 			"error_code": "map_revision_conflict",
 			"target_path": key,
+			"revision_key": key,
 			"expected_revision": int(expected_revision),
 			"actual_revision": actual_revision,
 			"next_expected_revision": actual_revision,

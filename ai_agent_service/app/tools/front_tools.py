@@ -11,6 +11,10 @@ from typing import Any
 
 from app.tools.registry import ToolDef, register as _register_tool
 
+_MAP_TARGET_OPTIONAL_TOOLS = frozenset(
+    {"compact_spatial_index", "write_resource_registry", "ensure_standard_map_layers"}
+)
+
 
 def _object_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
     return {
@@ -107,6 +111,14 @@ def register(tool: ToolDef) -> None:
             required = parameters.setdefault("required", [])
             if isinstance(required, list) and "expected_revision" not in required:
                 required.append("expected_revision")
+            if (
+                isinstance(required, list)
+                and tool.name not in _MAP_TARGET_OPTIONAL_TOOLS
+                and isinstance(properties, dict)
+                and "target_path" in properties
+                and "target_path" not in required
+            ):
+                required.append("target_path")
     _register_tool(tool)
 
 

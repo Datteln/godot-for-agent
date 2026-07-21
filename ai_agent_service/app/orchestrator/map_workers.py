@@ -34,6 +34,20 @@ MAP_WRITE_TOOL_NAMES = frozenset(
     }
 )
 MAP_REVISION_GUARDED_TOOL_NAMES = MAP_WRITE_TOOL_NAMES - frozenset({"write_resource_registry"})
+MAP_TARGET_REQUIRED_TOOL_NAMES = frozenset(
+    {
+        "edit_map",
+        "paint_terrain_connect",
+        "place_map_objects",
+        "repair_placements",
+        "repair_layer_coverage",
+        "repair_map_region",
+        "save_map_blueprint",
+        "apply_map_blueprint",
+        "fill_rect",
+        "paint_from_image_grid",
+    }
+)
 MAP_WORKER_MODES = frozenset(
     {
         "read_only",
@@ -93,6 +107,10 @@ def validate_map_write_args(name: str, args: dict[str, Any]) -> str | None:
     """校验地图写工具必需的批次与版本字段。"""
     if not requires_map_revision(name):
         return None
+    if name in MAP_TARGET_REQUIRED_TOOL_NAMES:
+        target_path = args.get("target_path")
+        if not isinstance(target_path, str) or not target_path.strip():
+            return f"{name} 必须提供非空 target_path；" "禁止对地图写入静默使用 __selected_map__"
     expected_revision = args.get("expected_revision")
     if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
         return "地图写工具必须提供整数 expected_revision"

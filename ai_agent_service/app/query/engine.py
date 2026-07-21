@@ -593,6 +593,19 @@ class QueryEngine:
                 except asyncio.CancelledError:
                     self._store.replace_in_memory(request.session_id, snapshot)
                     raise
+                except Exception:
+                    self._store.replace_in_memory(request.session_id, snapshot)
+                    logger.exception(
+                        "Chat request failed; restored session snapshot session=%s request_id=%s",
+                        request.session_id,
+                        request.request_id,
+                    )
+                    return ChatErrorResponse(
+                        text=(
+                            "处理工具结果时发生内部错误；会话状态已回滚，"
+                            "待回传工具仍可使用同一 request_id 安全重试"
+                        )
+                    )
 
                 if request.request_id is not None:
                     session.request_id_cache[request.request_id] = response.model_dump()
@@ -1279,7 +1292,19 @@ class QueryEngine:
                 result_for_gate.setdefault(
                     "workflow_constraints", tool_args["workflow_constraints"]
                 )
-            _remember_latest_map_revision(session, tool_name, tool_args, result_for_gate)
+            result_target = (
+                str(result_for_gate.get("target_path", ""))
+                if isinstance(result_for_gate, dict)
+                else ""
+            )
+            trusted_error_revision = (
+                result.status == "error"
+                and str(result.error_code) == "map_revision_conflict"
+                and bool(str(tool_args.get("target_path", "")).strip())
+                and result_target == str(tool_args.get("target_path", "")).strip()
+            )
+            if result.status == "applied" or trusted_error_revision:
+                _remember_latest_map_revision(session, tool_name, tool_args, result_for_gate)
             if isinstance(result_for_gate, dict):
                 remember_map_plan_progress(
                     session,
@@ -1412,6 +1437,7 @@ class QueryEngine:
             if (
                 tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
                 and str(result.error_code) == "map_revision_conflict"
+                and trusted_error_revision
             ):
                 _schedule_revision_conflict_reader(
                     session,

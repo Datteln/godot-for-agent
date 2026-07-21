@@ -25,6 +25,7 @@ const DEFAULT_CHAT_REQUEST_TIMEOUT_S := 300.0
 ## 这个硬上限是兜底：哪怕事件一直在零星地来、后端实际已经死循环/卡死，
 ## 单条 `/chat` 请求也不会无限续期下去。
 const DEFAULT_CHAT_REQUEST_HARD_CAP_S := 1800.0
+const MAX_TOOL_RESULT_RETRIES := 3
 
 var editor_interface: EditorInterface
 var service: Node
@@ -45,6 +46,7 @@ var _event_timer: Timer
 var _request_timeout_timer: Timer
 var _timeout_generation := -1
 var _inflight_started_at_msec := 0
+var _inflight_item: Dictionary = {}
 
 
 func _ready() -> void:
@@ -108,6 +110,7 @@ func _abandon_inflight_request() -> void:
 	_inflight_path = ""
 	_inflight_session_id = ""
 	_inflight_started_at_msec = 0
+	_inflight_item = {}
 	_request_timeout_timer.stop()
 
 
@@ -374,6 +377,7 @@ func _pump() -> void:
 			return
 		item = _queue.pop_front()
 	_busy = true
+	_inflight_item = item.duplicate(true)
 	_inflight_generation = int(item.get("generation", _request_generation))
 	_inflight_path = str(item["path"])
 	var payload: Dictionary = item.get("payload", {}) if item.get("payload", {}) is Dictionary else {}
@@ -492,11 +496,14 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 		_inflight_path = ""
 		_inflight_session_id = ""
 		_inflight_started_at_msec = 0
+		_inflight_item = {}
 		_request_timeout_timer.stop()
 		_pump()
 		return
 	_request_timeout_timer.stop()
 	_busy = false
+	var completed_item := _inflight_item.duplicate(true)
+	_inflight_item = {}
 	var text := body.get_string_from_utf8()
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
 		if _suppress_events:
@@ -505,6 +512,27 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 				"result": result
 			})
 			_pump()
+			return
+		var completed_payload = completed_item.get("payload", {})
+		var is_tool_result_request := (
+			str(completed_item.get("path", "")) == "/chat"
+			and completed_payload is Dictionary
+			and completed_payload.has("tool_results")
+		)
+		var retry_count := int(completed_item.get("retry_count", 0))
+		var retryable_failure := result != HTTPRequest.RESULT_SUCCESS or code >= 500
+		if is_tool_result_request and retryable_failure and retry_count < MAX_TOOL_RESULT_RETRIES:
+			completed_item["retry_count"] = retry_count + 1
+			var delay_s := 0.5 * pow(2.0, retry_count)
+			FrontendLogger.warn(editor_interface, "HTTP", "Retrying tool results with same request_id.", {
+				"attempt": retry_count + 1,
+				"delay_s": delay_s,
+				"code": code,
+			})
+			await get_tree().create_timer(delay_s).timeout
+			if completed_generation == _request_generation:
+				_queue.push_front(completed_item)
+				_pump()
 			return
 		# 后端对命令/记忆的参数错误改用 4xx + 结构化 body（含 ok/text）返回：HTTP
 		# 状态码语义正确，正文仍保留可读消息。这类"客户端错误"应按业务响应分发、
@@ -542,6 +570,33 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			"type": str(response.get("type", "data")),
 			"keys": response.keys()
 		})
+		var response_payload = completed_item.get("payload", {})
+		var response_is_tool_result := (
+			str(completed_item.get("path", "")) == "/chat"
+			and response_payload is Dictionary
+			and response_payload.has("tool_results")
+		)
+		var response_retry_count := int(completed_item.get("retry_count", 0))
+		var retryable_server_error := (
+			str(response.get("type", "")) == "error"
+			and str(response.get("text", "")).contains("会话状态已回滚")
+		)
+		if (
+			response_is_tool_result
+			and retryable_server_error
+			and response_retry_count < MAX_TOOL_RESULT_RETRIES
+		):
+			completed_item["retry_count"] = response_retry_count + 1
+			var response_delay_s := 0.5 * pow(2.0, response_retry_count)
+			FrontendLogger.warn(editor_interface, "HTTP", "Retrying rolled-back tool results.", {
+				"attempt": response_retry_count + 1,
+				"delay_s": response_delay_s,
+			})
+			await get_tree().create_timer(response_delay_s).timeout
+			if completed_generation == _request_generation:
+				_queue.push_front(completed_item)
+				_pump()
+			return
 		if response.has("cancelled") and response.has("last_event_seq"):
 			# `/chat/interrupt` 的确认：跳过中断前后后端可能残留写入的旧事件，
 			# 不把这条纯内部 ack 转发给 ChatPanel。
@@ -618,6 +673,7 @@ func _try_recover_tool_calls_response(event: Dictionary) -> void:
 	_inflight_path = ""
 	_inflight_session_id = ""
 	_inflight_started_at_msec = 0
+	_inflight_item = {}
 	_request_timeout_timer.stop()
 	current_turn_id = turn_id
 	response_received.emit({

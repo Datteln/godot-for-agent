@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
@@ -53,6 +54,8 @@ MAX_AGENT_DEPTH = 4
 EVENT_TEXT_PREVIEW_CHARS = 24_000
 EVENT_MATCH_PREVIEW_ITEMS = 20
 NOOP_SEARCH_TOOLS_HINT_THRESHOLD = 2
+_INTEGER_TEXT = re.compile(r"^-?(?:0|[1-9][0-9]*)$")
+_NUMBER_TEXT = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$")
 
 logger = logging.getLogger(__name__)
 
@@ -795,6 +798,70 @@ def _map_structured_output_error(frame: Frame, text: str) -> str | None:
     return None
 
 
+def _repair_map_structured_output(frame: Frame, text: str, error: str) -> str:
+    """把不合规地图输出保守修复为不可完成的合法结果。"""
+    source = _json_object_from_text(text) or {}
+    stage = source.get("stage")
+    if stage not in _MAP_WORKER_STAGES:
+        stage = _map_stage_for_frame(frame)
+    validation = source.get("validation")
+    if not isinstance(validation, dict):
+        validation = {}
+    raw_issues = validation.get("issues")
+    issues = list(raw_issues) if isinstance(raw_issues, list) else []
+    issues.append(f"structured_output_repaired: {error}")
+    raw_structured_issues = validation.get("structured_issues")
+    structured_issues = (
+        list(raw_structured_issues) if isinstance(raw_structured_issues, list) else []
+    )
+    structured_issues.append(
+        {
+            "code": "structured_output_repaired",
+            "message": error,
+            "agent": frame.agent.name,
+        }
+    )
+
+    def list_value(key: str) -> list[Any]:
+        """把指定字段规整为数组。"""
+        value = source.get(key)
+        if isinstance(value, list):
+            return value
+        if value is None:
+            return []
+        return [value]
+
+    map_revision = source.get("map_revision")
+    if isinstance(map_revision, bool) or not isinstance(map_revision, int):
+        map_revision = None
+    repaired = {
+        "stage": stage,
+        "worker": str(source.get("worker") or frame.agent.name),
+        "mode": str(source.get("mode") or "partial"),
+        "objective": str(source.get("objective") or _frame_objective(frame)),
+        "target_path": str(source.get("target_path") or ""),
+        "map_revision": map_revision,
+        "region": source.get("region") if isinstance(source.get("region"), dict) else {},
+        "summary": str(source.get("summary") or "地图子阶段输出已由服务端保守修复。"),
+        "facts": list_value("facts"),
+        "proposed_batches": list_value("proposed_batches"),
+        "write_results": list_value("write_results"),
+        "validation": {
+            "passed": False,
+            "completion_allowed": False,
+            "issues": issues,
+            "structured_issues": structured_issues,
+        },
+        "missing_inputs": list_value("missing_inputs"),
+        "risks": [
+            *list_value("risks"),
+            "结构化输出曾不合规，本结果不能作为任务完成依据。",
+        ],
+        "next_stage": "validator" if stage == "writer" else "planner",
+    }
+    return json.dumps(repaired, ensure_ascii=False)
+
+
 def _map_stage_for_frame(frame: Frame) -> str:
     """根据地图 agent/frame 名称推断结构化收尾阶段。"""
     name = frame.agent.name
@@ -1061,16 +1128,13 @@ async def _finish_frame(
                 frame.agent.name,
                 structured_error,
             )
-            frame.messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "你的上一条输出没有通过 map_worker_result_v1 结构化校验："
-                        f"{structured_error}\n请只输出一个符合 schema 的 JSON object，不要附加解释。"
-                    ),
-                }
+            text = _repair_map_structured_output(frame, text, structured_error)
+            logger.warning(
+                "Map structured output repaired session=%s frame=%s agent=%s",
+                session.session_id,
+                frame.id,
+                frame.agent.name,
             )
-            return None
 
         _apply_map_structured_completion_result(session, frame, text)
 
@@ -1161,8 +1225,74 @@ async def _handle_frame_turns_exhausted(
     return None
 
 
+def _coerce_schema_value(value: Any, schema: dict[str, Any]) -> tuple[Any, bool]:
+    """按工具 schema 安全转换模型字符串化的 JSON 值。"""
+    expected_type = schema.get("type")
+    normalized = value
+    changed = False
+    if isinstance(value, str):
+        stripped = value.strip()
+        if expected_type == "integer" and _INTEGER_TEXT.fullmatch(stripped):
+            normalized = int(stripped)
+            changed = True
+        elif expected_type == "number" and _NUMBER_TEXT.fullmatch(stripped):
+            normalized = float(stripped)
+            changed = True
+        elif expected_type == "boolean" and stripped.lower() in {"true", "false"}:
+            normalized = stripped.lower() == "true"
+            changed = True
+        elif expected_type in {"array", "object"}:
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if (expected_type == "array" and isinstance(parsed, list)) or (
+                expected_type == "object" and isinstance(parsed, dict)
+            ):
+                normalized = parsed
+                changed = True
+
+    if expected_type == "object" and isinstance(normalized, dict):
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            result = dict(normalized)
+            for key, child_schema in properties.items():
+                if key not in result or not isinstance(child_schema, dict):
+                    continue
+                child_value, child_changed = _coerce_schema_value(result[key], child_schema)
+                if child_changed:
+                    result[key] = child_value
+                    changed = True
+            normalized = result
+    elif expected_type == "array" and isinstance(normalized, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            result_items: list[Any] = []
+            for item in normalized:
+                child_value, child_changed = _coerce_schema_value(item, item_schema)
+                result_items.append(child_value)
+                changed = changed or child_changed
+            normalized = result_items
+    return normalized, changed
+
+
+def _normalize_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """使用已注册工具 schema 规范化模型生成的入参。"""
+    tool = REGISTRY.get(tool_name)
+    if tool is None:
+        return args
+    parameters = tool.schema.get("parameters")
+    if not isinstance(parameters, dict):
+        return args
+    normalized, changed = _coerce_schema_value(args, parameters)
+    if changed and isinstance(normalized, dict):
+        logger.info("Normalized tool arguments from schema tool=%s", tool_name)
+        return normalized
+    return args
+
+
 def _load_tool_args(
-    call_id: str, arguments: str
+    call_id: str, arguments: str, tool_name: str = ""
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """解析工具入参 JSON，返回 `(args, error_message)` 二元组。"""
     try:
@@ -1173,7 +1303,7 @@ def _load_tool_args(
     if not isinstance(loaded, dict):
         logger.warning("Tool arguments are not an object call_id=%s", call_id)
         return None, _tool_message(call_id, "工具入参必须是 JSON object", is_error=True)
-    return loaded, None
+    return _normalize_tool_args(tool_name, loaded), None
 
 
 def _append_delegate_protocol_errors(frame: Frame, calls: list[Any]) -> None:
@@ -1322,7 +1452,7 @@ def _append_map_write_protocol_errors(frame: Frame, calls: list[Any]) -> bool:
         return True
 
     for call in write_calls:
-        args, parse_error = _load_tool_args(call.id, call.arguments)
+        args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
         if parse_error is not None:
             frame.messages.append(parse_error)
             return True
@@ -1625,7 +1755,7 @@ def _append_map_write_followup_protocol_errors(
         return False
     for call in calls:
         if call.name in _MAP_VALIDATION_TOOL_NAMES:
-            args, parse_error = _load_tool_args(call.id, call.arguments)
+            args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
             if parse_error is not None:
                 frame.messages.append(parse_error)
                 return True
@@ -1636,7 +1766,7 @@ def _append_map_write_followup_protocol_errors(
                 return True
             continue
         if call.name in {"delegate", "delegate_many"}:
-            args, parse_error = _load_tool_args(call.id, call.arguments)
+            args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
             if parse_error is not None:
                 frame.messages.append(parse_error)
                 return True
@@ -1650,11 +1780,29 @@ def _append_map_write_followup_protocol_errors(
             frame.agent.name,
             call.name,
         )
+        allowed_tools = sorted(set(frame.agent.effective_tools) & set(_MAP_VALIDATION_TOOL_NAMES))
+        blocker = session.map_completion_blockers[0] if session.map_completion_blockers else {}
+        target = str(blocker.get("target", ""))
+        revision = blocker.get("required_revision")
+        next_action = (
+            f"请调用 {allowed_tools[0]}"
+            if allowed_tools
+            else "请单独 delegate 给 map-validator-agent 或 map-reviewer-agent"
+        )
+        context_hint = (
+            f"；target_path={target}, expected_revision={revision}"
+            if target and revision is not None
+            else ""
+        )
         for pending_call in calls:
             frame.messages.append(
                 _tool_message(
                     pending_call.id,
-                    "地图写入后下一阶段必须先执行 validator/reviewer 或验证工具；本轮工具未执行，请先验证同 revision 写入结果",
+                    (
+                        "地图写入后下一阶段必须先执行 validator/reviewer 或验证工具；"
+                        f"本轮工具未执行。{next_action}{context_hint}。"
+                        f"当前允许的验证工具：{allowed_tools or ['delegate(map-validator-agent)']}"
+                    ),
                     is_error=True,
                 )
             )
@@ -2697,7 +2845,7 @@ async def run_turn(
                 )
                 continue
 
-            args, parse_error = _load_tool_args(call.id, call.arguments)
+            args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
             if parse_error is not None:
                 frame.messages.append(parse_error)
                 continue
@@ -2786,7 +2934,7 @@ async def run_turn(
                 )
                 continue
 
-            args, parse_error = _load_tool_args(call.id, call.arguments)
+            args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
             if parse_error is not None:
                 frame.messages.append(parse_error)
                 continue
@@ -2837,7 +2985,7 @@ async def run_turn(
                 )
                 continue
 
-            args, parse_error = _load_tool_args(call.id, call.arguments)
+            args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
             if parse_error is not None:
                 pending_items.append(_PendingToolMessage(parse_error))
                 continue
