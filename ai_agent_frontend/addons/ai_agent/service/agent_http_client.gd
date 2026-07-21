@@ -513,14 +513,14 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			})
 			_pump()
 			return
-		var completed_payload = completed_item.get("payload", {})
-		var is_tool_result_request := (
+		var completed_payload: Variant = completed_item.get("payload", {})
+		var is_tool_result_request: bool = (
 			str(completed_item.get("path", "")) == "/chat"
 			and completed_payload is Dictionary
 			and completed_payload.has("tool_results")
 		)
 		var retry_count := int(completed_item.get("retry_count", 0))
-		var retryable_failure := result != HTTPRequest.RESULT_SUCCESS or code >= 500
+		var retryable_failure: bool = result != HTTPRequest.RESULT_SUCCESS or code >= 500
 		if is_tool_result_request and retryable_failure and retry_count < MAX_TOOL_RESULT_RETRIES:
 			completed_item["retry_count"] = retry_count + 1
 			var delay_s := 0.5 * pow(2.0, retry_count)
@@ -570,14 +570,14 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			"type": str(response.get("type", "data")),
 			"keys": response.keys()
 		})
-		var response_payload = completed_item.get("payload", {})
-		var response_is_tool_result := (
+		var response_payload: Variant = completed_item.get("payload", {})
+		var response_is_tool_result: bool = (
 			str(completed_item.get("path", "")) == "/chat"
 			and response_payload is Dictionary
 			and response_payload.has("tool_results")
 		)
 		var response_retry_count := int(completed_item.get("retry_count", 0))
-		var retryable_server_error := (
+		var retryable_server_error: bool = (
 			str(response.get("type", "")) == "error"
 			and str(response.get("text", "")).contains("会话状态已回滚")
 		)

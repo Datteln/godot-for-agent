@@ -2394,16 +2394,13 @@ def _delta_callback(
 
     reasoning_started_at = time.monotonic()
     accumulated_text: dict[str, str] = {"content": "", "reasoning": ""}
-    last_kind = ""
-    stream_segment = 0
-
+    # 上游 provider 可能把同一条 assistant 消息的 content 与
+    # reasoning_content 交错发送。message_index 已经是一次 LLM 调用的稳定
+    # 身份，不能再以通道切换作为正文分段边界，否则会截断正文并导致 final
+    # 无法收敛替换流式消息。
     def _on_delta(kind: str, text: str, token_count: int | None) -> None:
-        nonlocal last_kind, stream_segment
-        # 一个 reasoning phase 对应一个前端 Thought。正文之后再次收到
-        # reasoning_content 时，开始新的 Thought；同一 phase 的流式分片保持合并。
-        if kind == "reasoning" and last_kind != "reasoning":
-            stream_segment += 1
-        last_kind = kind
+        # 同一次 LLM 调用内的 reasoning/content 均使用同一个 segment。
+        # 前端据此把 reasoning 合并进同一 Thought，并持续累积同一正文块。
         event_type = "agent_reasoning_delta" if kind == "reasoning" else "agent_text_delta"
         accumulated_text[kind] = accumulated_text.get(kind, "") + text
         payload: dict[str, Any] = {
@@ -2412,7 +2409,7 @@ def _delta_callback(
             "message_index": message_index,
             "timeline_frame_id": timeline_frame_id,
             "timeline_message_index": timeline_message_index,
-            "stream_segment": stream_segment,
+            "stream_segment": 0,
             "text": text,
             "append_delta": True,
         }

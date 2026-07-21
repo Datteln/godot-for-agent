@@ -1910,11 +1910,12 @@ func _remember_delta_event(event: Dictionary, latest_delta: Dictionary, ordered_
 	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
 	# 同 `_stream_event_key()`：用 `message_index` 而不是会在每次 round-trip 重新清零
 	# 的 `loop` 去重，否则跨轮次合批时可能把两个不同轮次的增量错误合并成一条。
-	var key := "%s:%s:%s:%s" % [
+	# 与 `_stream_event_key()` 保持一致：同一 message_index 的正文/推理
+	# 分片即使带有旧版 stream_segment，也必须合并。
+	var key := "%s:%s:%s" % [
 		str(event.get("type", "")),
 		str(payload.get("frame_id", "")),
-		str(payload.get("message_index", "")),
-		str(payload.get("stream_segment", 0))
+		str(payload.get("message_index", ""))
 	]
 	if not latest_delta.has(key):
 		ordered_delta_keys.append(key)
@@ -2469,13 +2470,13 @@ func _render_text_delta_body(key: String, text: String) -> void:
 ## 导致不同轮次的 reasoning/text 流共享同一个 key，互相误判成"迟到的旧流"而被吞掉。
 ## `message_index`（= 这条增量即将写入 `frame.messages` 的下标）在整个 frame 生命周期
 ## 内只会单调增长，不会重置，才是真正稳定唯一的"这是哪一次 LLM 调用"标识。
-## `stream_segment` 仅在正文后进入新的 reasoning phase 时递增，用于让新 reasoning
-## 创建新 Thought，并使其后的正文写入该 Thought 后的新正文行。
+## provider 可能在同一条 assistant 消息内交错发送正文与 reasoning。它们共享
+## `message_index`，必须渲染为同一个正文块与同一个 Thought，不能按
+## `stream_segment` 拆开；否则会截断正文，且 final 无法替换此前固化的前缀。
 func _stream_event_key(payload: Dictionary) -> String:
-	return "%s:%s:%s" % [
+	return "%s:%s" % [
 		str(payload.get("frame_id", "")),
-		str(payload.get("message_index", "")),
-		str(payload.get("stream_segment", 0))
+		str(payload.get("message_index", ""))
 	]
 
 
