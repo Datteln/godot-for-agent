@@ -90,6 +90,19 @@ async def search_tools_handler(args: dict[str, Any], ctx: ToolContext) -> dict[s
             ranked.append((score, tool))
     ranked.sort(key=lambda item: (-item[0], item[1].name))
 
+    unavailable: list[dict[str, str]] = []
+    if ctx.effective_tools:
+        hidden = [
+            (score, tool)
+            for tool in REGISTRY.values()
+            if tool.name not in visible and (score := _score(tool, query)) > 0
+        ]
+        hidden.sort(key=lambda item: (-item[0], item[1].name))
+        unavailable = [
+            {"name": tool.name, "status": "registered_but_unavailable"}
+            for _, tool in hidden[:max_results]
+        ]
+
     matches = []
     activated: list[str] = []
     for _, tool in ranked[:max_results]:
@@ -117,6 +130,7 @@ async def search_tools_handler(args: dict[str, Any], ctx: ToolContext) -> dict[s
         "query": query,
         "tools": matches,
         "activated_tools": activated,
+        "unavailable_tools": unavailable,
         "note": "activated_tools 会在下一轮对话中加入当前 agent 的工具 schema。",
     }
 

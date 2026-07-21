@@ -444,6 +444,9 @@ async def _delegate_child_frame(
         if isinstance(child_or_error, str):
             return None
         child_agent = child_or_error
+        if is_map_worker_write_mode(worker_spec.get("mode")):
+            # 写 worker 必须先切换阶段，否则阶段裁剪会只留下读取工具。
+            session.map_task_state.stage = "write"
     else:
         if not isinstance(agent_name, str) or not agent_name:
             return None
