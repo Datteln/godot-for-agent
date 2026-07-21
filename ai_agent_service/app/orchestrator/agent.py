@@ -1384,6 +1384,7 @@ _MAP_STAGE_TOOLS: dict[str, frozenset[str]] = {
             "delegate_many",
             "describe_map_context",
             "describe_map_region",
+            "describe_tilemap_selection",
             "read_scene_tree",
             "read_file",
             "read_class_docs",
@@ -2938,11 +2939,17 @@ async def run_turn(
                 decision,
             )
             if decision == "deny":
+                denial_message = (
+                    f"当前地图工作流处于 {session.map_task_state.stage} 阶段，"
+                    f"不允许调用 {tool.name}"
+                    if tool.name not in permission_ctx.effective_tools
+                    else f"被拒绝：当前权限模式/安全边界不允许调用 {tool.name}"
+                )
                 pending_items.append(
                     _PendingToolMessage(
                         _tool_message(
                             call.id,
-                            f"被拒绝：当前权限模式/安全边界不允许调用 {tool.name}",
+                            denial_message,
                             is_error=True,
                         )
                     )

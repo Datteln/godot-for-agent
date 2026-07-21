@@ -49,11 +49,6 @@ def _matches_deny(rel: str, deny_patterns: list[str]) -> bool:
     return False
 
 
-def _is_readable_artifact(rel: str) -> bool:
-    """允许读取地图工具生成的只读 artifact 文件。"""
-    return rel.startswith(".ai_agent_service/artifacts/") and rel.endswith(".json")
-
-
 def path_ok(target: str, security: SecuritySettings, write: bool = False) -> bool:
     """校验目标路径是否落在工程根内且未被安全规则拒绝。
 
@@ -84,7 +79,7 @@ def path_ok(target: str, security: SecuritySettings, write: bool = False) -> boo
         return False  # 越界、绝对路径逃逸或跨盘符
 
     deny = security.deny_write_paths if write else security.deny_read_paths
-    if _matches_deny(rel, deny) and not (not write and _is_readable_artifact(rel)):
+    if _matches_deny(rel, deny):
         logger.debug("Path rejected reason=deny_pattern rel=%s write=%s", rel, write)
         return False
 

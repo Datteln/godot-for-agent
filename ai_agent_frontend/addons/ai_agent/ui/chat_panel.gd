@@ -108,6 +108,7 @@ var _history_session_ids: Array = []
 var _history_before := 0
 var _history_has_more := false
 var _history_loading := false
+var _history_refresh_needed := false
 var _history_replaying := false
 var _history_batch_messages: Array = []
 var _history_replay_events: Array = []
@@ -1643,6 +1644,7 @@ func _finish_history_replay() -> void:
 	_history_loading = false
 	_history_before = next_before
 	_history_has_more = bool(_history_replay_context.get("has_more", false)) and next_before > requested_before
+	_history_refresh_needed = false
 	_history_replay_events.clear()
 	_history_replay_cursor = 0
 	_history_replay_context.clear()
@@ -2449,9 +2451,12 @@ func _render_text_delta_body(key: String, text: String) -> void:
 			_stream_display_text += "\n\n" + rest
 	else:
 		_stream_display_text = rest if rest.strip_edges() != "" else stripped
-	_stream_text_dirty = true
 	if _stream_message_index < 0:
+		# _ensure_stream_message() 会清理旧流状态；保住刚收到的新 segment 首包。
+		var pending_text := _stream_display_text
 		_ensure_stream_message(key, true)
+		_stream_display_text = pending_text
+	_stream_text_dirty = true
 	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta]", {
 		"key": key, "text_len": text.length(), "display_len": _stream_display_text.length(),
 		"preview": text.left(40).replace("\n", "\\n")
@@ -2834,6 +2839,7 @@ func _clear_messages(reset_history := true) -> void:
 		_history_before = 0
 		_history_has_more = false
 		_history_loading = false
+		_history_refresh_needed = false
 		_history_replaying = false
 		_history_batch_messages.clear()
 		_history_replay_events.clear()
@@ -2874,6 +2880,7 @@ func _queue_message(data: Dictionary) -> int:
 		_history_batch_messages.append(data.duplicate(true))
 		return batch_index
 	_initialize_virtual_messages()
+	var evicted := false
 	while _message_store.size() >= MAX_MESSAGE_STORE_MESSAGES:
 		var removable := -1
 		for index in range(_message_store.size()):
@@ -2883,6 +2890,11 @@ func _queue_message(data: Dictionary) -> int:
 		if removable < 0:
 			break
 		_remove_queued_message(removable)
+		evicted = true
+	if evicted:
+		_history_before = 0
+		_history_has_more = true
+		_history_refresh_needed = true
 	var index := _message_store.add_message(data)
 	_virtual_scroller.notify_message_added(index, _auto_scroll or _force_scroll_once)
 	_scroll_to_bottom()
@@ -2933,17 +2945,29 @@ func _on_scroll_value_changed(value: float) -> void:
 		# 用户主动向上滚动——无论是否正在流式输出，都尊重用户意图。
 		_auto_scroll = false
 		_user_scrolled_up_ms = Time.get_ticks_msec()
-		if value <= 40.0 and _state == AgentState.IDLE and _history_has_more and not _history_loading and not _history_replaying:
-			FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] request_older", {
-				"value": value,
-				"history_before": _history_before,
-				"store_size": _message_store.size() if _message_store != null else -1,
-				"replaying": _history_replaying,
-			})
-			_history_loading = true
-			_http_client.fetch_session_history(HISTORY_PAGE_SIZE, _history_before)
+	var history_before := _history_request_before(value)
+	if history_before >= 0:
+		FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] request_history", {
+			"value": value,
+			"history_before": history_before,
+			"refresh": _history_refresh_needed,
+			"store_size": _message_store.size() if _message_store != null else -1,
+			"replaying": _history_replaying,
+		})
+		_history_loading = true
+		_http_client.fetch_session_history(HISTORY_PAGE_SIZE, history_before)
 	if _virtual_scroller != null:
 		_virtual_scroller.on_scroll_changed(value)
+
+
+func _history_request_before(value: float) -> int:
+	if _state != AgentState.IDLE or _history_loading or _history_replaying:
+		return -1
+	if _history_refresh_needed:
+		return 0
+	if value <= 40.0 and _history_has_more:
+		return _history_before
+	return -1
 
 
 func _on_scrollbar_button_down() -> void:

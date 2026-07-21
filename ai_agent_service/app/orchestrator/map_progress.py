@@ -344,6 +344,11 @@ def remember_map_plan_progress(
     """有效规划完成后允许执行阶段写入，但仍要求新 revision 后再 completion。"""
     if tool_name not in _MAP_PLAN_TOOL_NAMES or result.get("ok") is False:
         return
+    blocked_reason = result.get("blocked_reason")
+    if blocked_reason:
+        # 规划工具可成功返回诊断结果；它不是可执行计划，必须保留规划工具以便修复后重试。
+        session.map_task_state.stage = "plan"
+        return
     target_value = result.get("target", result.get("target_path", _target(tool_args)))
     target = target_value if isinstance(target_value, str) else ""
     workflow = session.map_validation_workflows.get(target)

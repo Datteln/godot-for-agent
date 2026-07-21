@@ -51,7 +51,6 @@ class SecuritySettings(BaseModel):
         default_factory=lambda: [
             ".git/",
             ".godot/",
-            ".ai_agent_service/",
             "addons/ai_agent/",
             "ai_agent_frontend/",
             "ai_agent_service/",
