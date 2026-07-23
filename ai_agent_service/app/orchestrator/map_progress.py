@@ -53,6 +53,9 @@ class MapTaskState:
     no_progress_streaks: dict[str, int] = field(default_factory=dict)
     latest_validations: dict[str, dict[str, Any]] = field(default_factory=dict)
     validation_failure_counts: dict[str, int] = field(default_factory=dict)
+    planning_attempts: dict[str, int] = field(default_factory=dict)
+    planning_fingerprints: dict[str, int] = field(default_factory=dict)
+    approved_platform_plans: dict[str, dict[str, Any]] = field(default_factory=dict)
     latest_revisions: dict[str, int] = field(default_factory=dict)
     latest_layers: dict[str, int] = field(default_factory=dict)
     region_reads: dict[str, int] = field(default_factory=dict)
@@ -94,6 +97,9 @@ class MapTaskState:
             "no_progress_streaks",
             "latest_validations",
             "validation_failure_counts",
+            "planning_attempts",
+            "planning_fingerprints",
+            "approved_platform_plans",
             "latest_revisions",
             "latest_layers",
             "region_reads",
@@ -179,8 +185,13 @@ def parse_map_plan_outcome(tool_name: str, result: dict[str, Any]) -> MapPlanOut
     )
 
     ok = result.get("ok") is not False and profile_plan.get("ok") is not False
-    platform_tool = tool_name in {"plan_platform_level", "plan_reachable_map_growth"}
+    platform_tool = tool_name in {"validate_platform_level_plan", "plan_reachable_map_growth"}
     if platform_tool:
+        defaults_value = result.get("ability_used_defaults")
+        if defaults_value is None:
+            defaults_value = profile_plan.get("ability_used_defaults")
+        if isinstance(defaults_value, list) and defaults_value:
+            blocked_reason = blocked_reason or "ability_defaults_used"
         jump_graph_value = result.get("jump_graph") or profile_plan.get("jump_graph")
         if isinstance(jump_graph_value, dict) and jump_graph_value.get("passed") is False:
             blocked_reason = blocked_reason or "jump_graph_failed"
@@ -207,10 +218,12 @@ _MAP_PLAN_TOOL_NAMES = frozenset(
     {
         "plan_map_layout",
         "plan_map_algorithms",
-        "plan_platform_level",
+        "validate_platform_level_plan",
         "plan_reachable_map_growth",
     }
 )
+_PLATFORM_PLAN_TOOL_NAMES = frozenset({"validate_platform_level_plan", "plan_reachable_map_growth"})
+MAP_PLATFORM_PLAN_MAX_ATTEMPTS = 3
 
 _CONTRACT_KEYS = (
     "target_path",
@@ -352,6 +365,97 @@ def _target(tool_args: dict[str, Any]) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _platform_plan_scope(tool_args: dict[str, Any]) -> str:
+    """为平台规划修订次数生成目标与图层隔离的作用域。"""
+    layer = tool_args.get("map_layer", 0)
+    layer_value = layer if isinstance(layer, int) and not isinstance(layer, bool) else 0
+    return f"{_target(tool_args)}::map_layer={layer_value}"
+
+
+def _platform_plan_fingerprint(tool_name: str, tool_args: dict[str, Any]) -> str | None:
+    """为 LLM 显式平台方案生成稳定指纹，缺少方案字段时不参与去重。"""
+    platforms = tool_args.get("platforms")
+    segments = tool_args.get("segments")
+    if not isinstance(platforms, list) or not platforms:
+        return None
+    if not isinstance(segments, list) or not segments:
+        return None
+    payload = {
+        "tool": tool_name,
+        "scope": _platform_plan_scope(tool_args),
+        "platforms": platforms,
+        "segments": segments,
+        "start": tool_args.get("start"),
+        "frontier": tool_args.get("frontier"),
+        "movement": {
+            key: tool_args.get(key)
+            for key in (
+                "movement_model",
+                "max_horizontal_gap",
+                "max_rise",
+                "max_fall",
+                "gravity_axis",
+                "gravity_sign",
+            )
+            if key in tool_args
+        },
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+
+def map_platform_plan_call_error(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> str | None:
+    """在执行前拒绝超限或完全相同的平台规划提交。"""
+    if tool_name not in _PLATFORM_PLAN_TOOL_NAMES:
+        return None
+    scope = _platform_plan_scope(tool_args)
+    attempts = session.map_task_state.planning_attempts.get(scope, 0)
+    if attempts >= MAP_PLATFORM_PLAN_MAX_ATTEMPTS:
+        return (
+            f"平台规划已达到 {MAP_PLATFORM_PLAN_MAX_ATTEMPTS} 次修订上限；"
+            "请停止调用工具并返回当前结构化失败原因。"
+        )
+    fingerprint = _platform_plan_fingerprint(tool_name, tool_args)
+    if fingerprint is None:
+        return None
+    fingerprint_key = f"{scope}::{fingerprint}"
+    if session.map_task_state.planning_fingerprints.get(fingerprint_key, 0) > 0:
+        return (
+            "该 platforms/segments 方案已经校验过，确定性结果不会因重复提交改变；"
+            "必须根据 issues/repair_plan 修改具体平台字段。"
+        )
+    return None
+
+
+def map_platform_plan_attempt_count(session: Session, tool_args: dict[str, Any]) -> int:
+    """返回当前目标和图层已经执行的平台规划次数。"""
+    return session.map_task_state.planning_attempts.get(_platform_plan_scope(tool_args), 0)
+
+
+def _remember_platform_plan_attempt(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> None:
+    """记录一次真实执行的平台规划及其显式方案指纹。"""
+    if tool_name not in _PLATFORM_PLAN_TOOL_NAMES:
+        return
+    scope = _platform_plan_scope(tool_args)
+    state = session.map_task_state
+    state.planning_attempts[scope] = state.planning_attempts.get(scope, 0) + 1
+    fingerprint = _platform_plan_fingerprint(tool_name, tool_args)
+    if fingerprint is None:
+        return
+    fingerprint_key = f"{scope}::{fingerprint}"
+    state.planning_fingerprints[fingerprint_key] = (
+        state.planning_fingerprints.get(fingerprint_key, 0) + 1
+    )
+
+
 def _validation_scope(tool_args: dict[str, Any]) -> str:
     """返回隔离 TileMap 图层的验证状态键。"""
     layer = tool_args.get("map_layer", 0)
@@ -422,18 +526,129 @@ def map_write_stage_error(
     tool_name: str,
     tool_args: dict[str, Any],
 ) -> str | None:
-    """诊断结束后，在新规划完成前拒绝地图写入。"""
+    """只允许平台写入执行同作用域内校验通过的编译批次。"""
     target = _target(tool_args)
     scope = _validation_scope(tool_args)
     workflow = session.map_validation_workflows.get(scope, {})
     revision = session.latest_map_revisions.get(target)
     if workflow.get("map_revision") == revision and workflow.get("next_stage") == "planner":
         record_no_progress(session, scope, "write_attempted_before_planning")
-        return (
-            f"map revision {revision} 的诊断阶段已经结束；必须先调用地图规划工具产生新方案，"
-            f"再执行 {tool_name}，不能直接试写。"
+        frontier = session.map_task_state.failure_frontier or {}
+        reason = str(
+            frontier.get("error_code") or frontier.get("blocked_reason") or "platform_plan_required"
         )
+        if reason == "entry_anchor_not_found":
+            recovery = (
+                "上次 validate_platform_level_plan 失败：entry_anchor_not_found。"
+                "请先 describe_map_region 读取相同 target_path/map_layer 的现有连接边界，"
+                "由 LLM 修订 entry_anchor/frontier.cell、首个平台和首段路线，再重新提交校验。"
+            )
+        else:
+            recovery = (
+                f"上次平台方案校验失败：{reason}。请由 LLM 根据 issues/repair_plan "
+                "修改显式 platforms/segments，并重新提交 validate_platform_level_plan。"
+            )
+        return (
+            f"map revision {revision} 的当前图层尚无可执行平台方案。{recovery}"
+            f"在校验通过前禁止调用 {tool_name}；该工具只能执行校验器返回的 edit_map_batches。"
+        )
+
+    approval = session.map_task_state.approved_platform_plans.get(scope)
+    if not isinstance(approval, dict):
+        if _looks_like_platform_route_write(tool_name, tool_args):
+            record_no_progress(session, scope, "platform_write_without_validated_plan")
+            return (
+                "拒绝平台路线写入：带有 platform/ground 语义的可站立瓦片必须来自 "
+                "validate_platform_level_plan 校验通过后返回的 edit_map_batches。"
+                "请勿让 writer 自行拼接 fill。"
+            )
+        return None
+    if approval.get("map_revision") != revision:
+        session.map_task_state.approved_platform_plans.pop(scope, None)
+        return (
+            f"平台方案基于 map revision {approval.get('map_revision')}，当前 revision 为 "
+            f"{revision}；旧编译批次已失效，请重新读取边界并提交 "
+            "validate_platform_level_plan。"
+        )
+    batches_value = approval.get("remaining_batches")
+    batches = batches_value if isinstance(batches_value, list) else []
+    matched_index = next(
+        (
+            index
+            for index, batch in enumerate(batches)
+            if _compiled_batch_matches(tool_name, tool_args, batch)
+        ),
+        None,
+    )
+    if matched_index is None:
+        record_no_progress(session, scope, "write_not_from_validated_platform_plan")
+        return (
+            "拒绝平台地图写入：当前调用不是 validate_platform_level_plan 校验通过后"
+            "编译出的剩余 edit_map_batches。禁止 coordinator/writer 临时拼接连续实心 "
+            "fill、修改批次 operations，或执行未获批准的可站立路线。"
+        )
+    approved_batch = batches.pop(matched_index)
+    tool_args["plan_version"] = approval.get("plan_version")
+    tool_args["batch_index"] = approved_batch.get("batch_index", matched_index)
+    tool_args["validated_platform_batch"] = True
+    if isinstance(revision, int) and not isinstance(revision, bool):
+        approval["map_revision"] = revision + 1
+    workflow["next_stage"] = "write"
+    session.map_validation_workflows[scope] = workflow
     return None
+
+
+def _compiled_batch_matches(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    batch: Any,
+) -> bool:
+    """判断实际写入是否逐字段对应一个校验器编译批次。"""
+    if not isinstance(batch, dict) or batch.get("tool") != tool_name:
+        return False
+    expected_operations = batch.get("operations")
+    actual_operations = tool_args.get("operations")
+    if expected_operations != actual_operations:
+        return False
+    expected_cells = batch.get("expected_cells")
+    return expected_cells is None or tool_args.get("expected_cells") == expected_cells
+
+
+def _looks_like_platform_route_write(
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> bool:
+    """识别声明为平台或可站立地面的直接瓦片写入。"""
+    if tool_name != "edit_map":
+        return False
+    operations = tool_args.get("operations")
+    if not isinstance(operations, list):
+        return False
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        semantic = str(operation.get("semantic_layer", "")).strip().lower()
+        tags_value = operation.get("tags")
+        tags = (
+            {str(tag).strip().lower() for tag in tags_value}
+            if isinstance(tags_value, list)
+            else set()
+        )
+        if semantic == "ground" or "platform" in tags:
+            return True
+    return False
+
+
+def _platform_edit_batches(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """提取平台校验结果中的可执行地图批次。"""
+    profile_value = result.get("profile_plan")
+    profile = profile_value if isinstance(profile_value, dict) else {}
+    batches_value = result.get("edit_map_batches")
+    if batches_value is None:
+        batches_value = profile.get("edit_map_batches")
+    if not isinstance(batches_value, list):
+        return []
+    return [deepcopy(batch) for batch in batches_value if isinstance(batch, dict)]
 
 
 def remember_map_plan_progress(
@@ -445,11 +660,26 @@ def remember_map_plan_progress(
     """有效规划完成后允许执行阶段写入，但仍要求新 revision 后再 completion。"""
     if tool_name not in _MAP_PLAN_TOOL_NAMES:
         return
+    _remember_platform_plan_attempt(session, tool_name, tool_args)
     outcome = parse_map_plan_outcome(tool_name, result)
+    target_value = result.get("target", result.get("target_path", _target(tool_args)))
+    target = target_value if isinstance(target_value, str) else ""
+    scope_args = {**tool_args, "target_path": target}
+    result_layer = result.get("map_layer")
+    if (
+        "map_layer" not in scope_args
+        and isinstance(result_layer, int)
+        and not isinstance(result_layer, bool)
+    ):
+        scope_args["map_layer"] = result_layer
+    scope = _validation_scope(scope_args)
+    current_revision = session.latest_map_revisions.get(target)
+
     if not outcome.executable:
         # 规划工具可能以成功响应承载诊断结果；任何失败都必须留在规划阶段恢复。
         state = session.map_task_state
         state.stage = "plan"
+        state.approved_platform_plans.pop(scope, None)
         state.failure_frontier = {
             "tool": tool_name,
             "blocked_reason": outcome.blocked_reason,
@@ -464,30 +694,54 @@ def remember_map_plan_progress(
                 "error_code": outcome.error_code,
             }
         ]
+        if tool_name in _PLATFORM_PLAN_TOOL_NAMES:
+            workflow = session.map_validation_workflows.get(scope, {})
+            workflow["map_revision"] = current_revision
+            workflow["next_stage"] = "planner"
+            workflow["plan_tool"] = tool_name
+            workflow["plan_error_code"] = outcome.error_code or outcome.blocked_reason
+            session.map_validation_workflows[scope] = workflow
         return
-    target_value = result.get("target", result.get("target_path", _target(tool_args)))
-    target = target_value if isinstance(target_value, str) else ""
-    scope_args = {**tool_args, "target_path": target}
-    result_layer = result.get("map_layer")
-    if (
-        "map_layer" not in scope_args
-        and isinstance(result_layer, int)
-        and not isinstance(result_layer, bool)
-    ):
-        scope_args["map_layer"] = result_layer
-    scope = _validation_scope(scope_args)
-    workflow = session.map_validation_workflows.get(scope)
-    if isinstance(workflow, dict) and workflow.get("next_stage") == "planner":
-        current_revision = session.latest_map_revisions.get(target)
-        if workflow.get("map_revision") != current_revision:
+
+    if tool_name not in _PLATFORM_PLAN_TOOL_NAMES:
+        locked_scope = next(
+            (
+                key
+                for key, value in session.map_validation_workflows.items()
+                if key.startswith(f"{target}::")
+                and isinstance(value, dict)
+                and value.get("map_revision") == current_revision
+                and value.get("next_stage") == "planner"
+            ),
+            None,
+        )
+        if locked_scope is not None:
+            session.map_task_state.stage = "plan"
             return
-        workflow["next_stage"] = "write"
-        workflow["plan_tool"] = tool_name
-        session.map_validation_workflows[scope] = workflow
-    session.map_task_state.stage = "write"
-    session.map_task_state.plan_version += 1
-    session.map_task_state.unresolved_issues.clear()
-    session.map_task_state.no_progress_streaks[scope] = 0
+
+    active_workflow = session.map_validation_workflows.get(scope)
+    if isinstance(active_workflow, dict) and active_workflow.get("next_stage") == "planner":
+        if active_workflow.get("map_revision") != current_revision:
+            return
+        active_workflow["next_stage"] = "write"
+        active_workflow["plan_tool"] = tool_name
+        session.map_validation_workflows[scope] = active_workflow
+    state = session.map_task_state
+    state.stage = "write"
+    state.plan_version += 1
+    state.failure_frontier = None
+    state.unresolved_issues.clear()
+    state.no_progress_streaks[scope] = 0
+    if tool_name in _PLATFORM_PLAN_TOOL_NAMES:
+        batches = _platform_edit_batches(result)
+        for index, batch in enumerate(batches):
+            batch["batch_index"] = index
+        state.approved_platform_plans[scope] = {
+            "tool": tool_name,
+            "map_revision": current_revision,
+            "plan_version": state.plan_version,
+            "remaining_batches": batches,
+        }
 
 
 def remember_validation_progress(
@@ -566,6 +820,10 @@ def reset_map_task_progress(session: Session, frame: Frame | None = None) -> Non
     state.validation_contracts.clear()
     state.validation_workflows.clear()
     state.no_progress_streaks.clear()
+    state.planning_attempts.clear()
+    state.planning_fingerprints.clear()
+    state.approved_platform_plans.clear()
+    state.context_state.pop("reader_exhausted", None)
     state.checkpoint = None
     state.resumed_from_checkpoint = False
     state.pause_reason = ""

@@ -1,7 +1,7 @@
 @tool
 extends RefCounted
 
-static func plan_platform_level(input: Dictionary, context: Dictionary = {}) -> Dictionary:
+static func validate_platform_level_plan(input: Dictionary, context: Dictionary = {}) -> Dictionary:
 	var region := _region_from_input(input)
 	var ability := _ability_from_input(input)
 	var ability_used_defaults := _ability_defaulted_keys(input)

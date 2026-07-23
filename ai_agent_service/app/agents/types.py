@@ -149,6 +149,11 @@ class Frame:
             轮数，与常规轮次预算分开计算。
         map_progress_revision: 上述预算对应的 map revision；真实写入推进 revision
             后预算自动进入新进展周期。
+        forced_completion_text: 编排器已经确定当前子阶段应结束时保存的结构化
+            收尾文本；`run_turn` 会在下一次调用 LLM 前消费它。
+        force_text_only: 当前阶段事实已经齐全、下一轮只能输出最终文本时为 True。
+        map_reader_detailed_region_ready: reader 已获得精确地图区域、只需完成一次
+           必要 artifact 读取即可收尾时为 True。
         compact_snapshot: 当前帧最近一次有效压缩的持久化快照；未压缩时为 None。
     """
 
@@ -167,4 +172,7 @@ class Frame:
     persistent_turn_count: int = 0
     persistent_edit_map_turn_count: int = 0
     map_progress_revision: int | None = None
+    forced_completion_text: str | None = None
+    force_text_only: bool = False
+    map_reader_detailed_region_ready: bool = False
     compact_snapshot: CompactSnapshot | None = None

@@ -2002,7 +2002,7 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
-            name="plan_platform_level",
+            name="validate_platform_level_plan",
             domain="map",
             side="front",
             reads_project=True,
@@ -2010,13 +2010,14 @@ def register_front_tools() -> None:
             is_concurrency_safe=True,
             render_kind="json",
             schema={
-                "name": "plan_platform_level",
+                "name": "validate_platform_level_plan",
                 "description": (
-                    "Validate and compile an explicit 2D platformer plan authored by the LLM. The caller MUST "
-                    "submit ordered platforms and route segments after reading the real map and player movement "
-                    "ability; this tool never invents, randomizes, or repairs level geometry. It checks jump "
-                    "reachability and design constraints, returns field-addressed issue_details/repair_plan when "
-                    "invalid, and emits preview-safe edit_map batches only when the submitted plan passes."
+                    "Validate and compile an explicit 2D platformer level plan already authored by the LLM. "
+                    "This is not a level planner or generator: the caller MUST submit ordered platforms and route "
+                    "segments after reading the real map and player movement ability. The tool never invents, "
+                    "randomizes, or repairs geometry. It checks entry connectivity, jump reachability, and design "
+                    "constraints; invalid submissions return field-addressed issue_details/repair_plan, while "
+                    "valid submissions are compiled into preview-safe edit_map batches."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2549,7 +2550,7 @@ def register_front_tools() -> None:
                     "batches and thin, non-blanket fills that look like broad map repair; split those into local "
                     "segments, or mark true backdrop/water/sky work with the matching semantic_layer/tags. For a "
                     "platformer level extension, do not invent a ground-fill wall here: first have the LLM submit "
-                    "explicit platforms/segments to plan_platform_level with measured player ability, then apply "
+                    "explicit platforms/segments to validate_platform_level_plan with measured player ability, then apply "
                     "only its validated route batches."
                 ),
                 "parameters": _object_schema(

@@ -46,6 +46,7 @@ from app.orchestrator.map_workers import (
 )
 from app.orchestrator.map_progress import (
     cached_validation_result,
+    map_platform_plan_call_error,
     map_write_stage_error,
     validation_call_error,
 )
@@ -685,6 +686,7 @@ _MAP_WORKER_RESULT_FIELDS = frozenset(
         "mode",
         "objective",
         "target_path",
+        "map_layer",
         "map_revision",
         "region",
         "summary",
@@ -713,6 +715,50 @@ _MAP_DELEGATE_DROP_KEYS = frozenset(
         "data_url",
     }
 )
+
+
+def _normalized_map_layers(payload: dict[str, Any]) -> tuple[int, ...]:
+    """把结构化地图结果中的单层或多层标识规整为真实图层索引。"""
+    value = payload.get("map_layer")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return (value,)
+    if isinstance(value, list):
+        layers = tuple(
+            layer for layer in value if isinstance(layer, int) and not isinstance(layer, bool)
+        )
+        if layers and len(layers) == len(value):
+            return tuple(dict.fromkeys(layers))
+        return ()
+    if not isinstance(value, str) or not value.strip().lower().startswith("all"):
+        return ()
+
+    facts = payload.get("facts")
+    if not isinstance(facts, list):
+        return ()
+    indexes: list[int] = []
+    for fact in facts:
+        if not isinstance(fact, dict):
+            continue
+        raw_layers = fact.get("layers")
+        if not isinstance(raw_layers, list):
+            continue
+        for layer in raw_layers:
+            if not isinstance(layer, dict):
+                continue
+            index = layer.get("index")
+            if isinstance(index, int) and not isinstance(index, bool):
+                indexes.append(index)
+    return tuple(dict.fromkeys(indexes))
+
+
+def _normalized_map_layer_value(payload: dict[str, Any]) -> int | list[int] | None:
+    """返回适合写回结构化结果的单层或多层值。"""
+    layers = _normalized_map_layers(payload)
+    if len(layers) == 1:
+        return layers[0]
+    if layers:
+        return list(layers)
+    return None
 
 
 def _map_output_schema_for_frame(frame: Frame) -> str | None:
@@ -795,6 +841,11 @@ def _map_structured_output_error(frame: Frame, text: str) -> str | None:
     for list_key in ("facts", "proposed_batches", "write_results", "missing_inputs", "risks"):
         if not isinstance(payload.get(list_key), list):
             return f"{list_key} 必须是 array。"
+    if _normalized_map_layer_value(payload) is None:
+        return (
+            "map_layer 必须是整数或非空整数数组；读取全部图层时可使用 "
+            '"all"，但 facts 必须包含 layers[].index 作为真实索引依据。'
+        )
     return None
 
 
@@ -834,12 +885,14 @@ def _repair_map_structured_output(frame: Frame, text: str, error: str) -> str:
     map_revision = source.get("map_revision")
     if isinstance(map_revision, bool) or not isinstance(map_revision, int):
         map_revision = None
+    map_layer = _normalized_map_layer_value(source)
     repaired = {
         "stage": stage,
         "worker": str(source.get("worker") or frame.agent.name),
         "mode": str(source.get("mode") or "partial"),
         "objective": str(source.get("objective") or _frame_objective(frame)),
         "target_path": str(source.get("target_path") or ""),
+        "map_layer": map_layer,
         "map_revision": map_revision,
         "region": source.get("region") if isinstance(source.get("region"), dict) else {},
         "summary": str(source.get("summary") or "地图子阶段输出已由服务端保守修复。"),
@@ -984,12 +1037,84 @@ def _append_map_blocker_once(
     return [*blockers, blocker]
 
 
+def _apply_reader_structured_completion(
+    session: Session,
+    payload: dict[str, Any],
+) -> None:
+    """仅在 reader 提交完整事实合同时把地图工作流推进到规划阶段。"""
+    target = payload.get("target_path")
+    map_layer = _normalized_map_layer_value(payload)
+    revision = _payload_revision(payload)
+    facts = payload.get("facts")
+    missing_inputs = payload.get("missing_inputs")
+    mode = str(payload.get("mode", ""))
+    complete = (
+        mode != "partial"
+        and isinstance(target, str)
+        and bool(target.strip())
+        and map_layer is not None
+        and revision is not None
+        and isinstance(facts, list)
+        and bool(facts)
+        and isinstance(missing_inputs, list)
+        and not missing_inputs
+    )
+    state = session.map_task_state
+    if complete:
+        payload["map_layer"] = map_layer
+        state.stage = "plan"
+        state.unresolved_issues.clear()
+        state.context_state["reader_result"] = _slim_map_delegate_value(payload)
+        state.context_state.pop("reader_exhausted", None)
+        logger.info(
+            "Map reader completion advanced workflow session=%s target=%s layer=%s revision=%s",
+            session.session_id,
+            target,
+            map_layer,
+            revision,
+        )
+        return
+
+    missing = list(missing_inputs) if isinstance(missing_inputs, list) else []
+    invalid_fields: list[str] = []
+    if not isinstance(target, str) or not target.strip():
+        invalid_fields.append("target_path")
+    if map_layer is None:
+        invalid_fields.append("map_layer")
+    if revision is None:
+        invalid_fields.append("map_revision")
+    if not isinstance(facts, list) or not facts:
+        invalid_fields.append("facts")
+    if mode == "partial":
+        invalid_fields.append("mode=partial")
+    if not isinstance(missing_inputs, list):
+        invalid_fields.append("missing_inputs")
+    state.stage = "read"
+    state.unresolved_issues = [
+        {
+            "kind": "reader_incomplete",
+            "missing_inputs": missing or invalid_fields,
+        }
+    ]
+    logger.info(
+        "Map reader completion kept workflow in read stage "
+        "session=%s mode=%s missing=%d invalid_fields=%s",
+        session.session_id,
+        mode,
+        len(missing),
+        invalid_fields,
+    )
+
+
 def _apply_map_structured_completion_result(session: Session, frame: Frame, text: str) -> None:
-    """把 validator/reviewer 的结构化 JSON 结果合并进地图完成门。"""
+    """把地图阶段 agent 的结构化结果合并进工作流状态和完成门。"""
     payload = _json_object_from_text(text)
     if payload is None:
         return
     stage = str(payload.get("stage", ""))
+    if stage == "reader":
+        _apply_reader_structured_completion(session, payload)
+        return
     if stage not in {"validator", "reviewer"}:
         return
     target = str(payload.get("target_path", ""))
@@ -1144,6 +1269,8 @@ async def _finish_frame(
             session.pending_plan = None
         return FinalResult(text=text)
     done = session.agent_stack.pop()
+    if done.agent.name == "map-reader-agent":
+        session.map_task_state.context_state.pop("reader_exhausted", None)
     logger.info(
         "Child frame finished session=%s frame=%s agent=%s text_length=%d",
         session.session_id,
@@ -1222,6 +1349,8 @@ async def _handle_frame_turns_exhausted(
         prompt_factory,
         event_callback,
     )
+    if frame.agent.name == "map-reader-agent":
+        session.map_task_state.context_state["reader_exhausted"] = True
     return None
 
 
@@ -1434,6 +1563,21 @@ def _requires_create_plan_before_map_delegate(
 def _append_map_write_protocol_errors(frame: Frame, calls: list[Any]) -> bool:
     """校验地图写工具单轮协议，失败时补工具错误并要求模型重试。"""
     write_calls = [call for call in calls if is_map_write_tool(call.name)]
+    if write_calls and frame.agent.name in {"coordinator", "map-agent"}:
+        message = (
+            "地图总控不得直接调用写工具或临时拼接地图块；请把已确认的规划批次委派给 "
+            "write_one_batch worker。平台路线只能执行 validate_platform_level_plan "
+            "校验通过后返回的 edit_map_batches。"
+        )
+        logger.warning(
+            "Blocked coordinator direct map write frame=%s agent=%s tools=%s",
+            frame.id,
+            frame.agent.name,
+            [call.name for call in write_calls],
+        )
+        for call in calls:
+            frame.messages.append(_tool_message(call.id, message, is_error=True))
+        return True
     if len(write_calls) > 1 and len(write_calls) != len(calls):
         logger.warning(
             "Map write protocol violation frame=%s agent=%s write_calls=%d",
@@ -1462,6 +1606,71 @@ def _append_map_write_protocol_errors(frame: Frame, calls: list[Any]) -> bool:
             frame.messages.append(_tool_message(call.id, error, is_error=True))
             return True
     return False
+
+
+def _append_map_plan_protocol_errors(
+    session: Session,
+    frame: Frame,
+    calls: list[Any],
+) -> bool:
+    """在前端执行前拒绝重复或超限的平台规划方案。"""
+    for call in calls:
+        if call.name not in {"validate_platform_level_plan", "plan_reachable_map_growth"}:
+            continue
+        args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
+        if parse_error is not None:
+            frame.messages.append(parse_error)
+            return True
+        assert args is not None
+        error = map_platform_plan_call_error(session, call.name, args)
+        if error is None:
+            continue
+        logger.warning(
+            "Map platform plan protocol violation session=%s frame=%s tool=%s error=%s",
+            session.session_id,
+            frame.id,
+            call.name,
+            error,
+        )
+        frame.messages.append(_tool_message(call.id, error, is_error=True))
+        return True
+    return False
+
+
+def _append_reader_fallback_protocol_errors(
+    session: Session,
+    frame: Frame,
+    calls: list[Any],
+) -> bool:
+    """reader 耗尽后阻止总控绕过专职 agent 重复读取同一批事实。"""
+    if frame.agent.name != "map-agent":
+        return False
+    if session.map_task_state.context_state.get("reader_exhausted") is not True:
+        return False
+    blocked_names = {
+        "describe_map_context",
+        "describe_map_region",
+        "read_scene_tree",
+        "read_file",
+        "query_spatial_index",
+    }
+    blocked_calls = [call for call in calls if call.name in blocked_names]
+    if not blocked_calls:
+        return False
+    message = (
+        "map-reader-agent 已达到轮次上限；总控不得绕过职责直接重复读取。"
+        "请根据 reader 的部分结构化结果缩小 missing_inputs 后重新委派一次，"
+        "或向用户返回明确缺失事实。"
+    )
+    for call in calls:
+        frame.messages.append(_tool_message(call.id, message, is_error=True))
+    logger.warning(
+        "Blocked map-agent direct read after reader exhaustion session=%s frame=%s tools=%s",
+        session.session_id,
+        frame.id,
+        [call.name for call in blocked_calls],
+    )
+    return True
 
 
 _MAP_VALIDATION_TOOL_NAMES = frozenset(
@@ -1535,7 +1744,7 @@ _MAP_STAGE_TOOLS: dict[str, frozenset[str]] = {
             "delegate_many",
             "plan_map_layout",
             "plan_map_algorithms",
-            "plan_platform_level",
+            "validate_platform_level_plan",
             "plan_reachable_map_growth",
             "compute_reachable_frontier",
             "sample_poisson_points",
@@ -1605,6 +1814,8 @@ _MAP_STAGE_TOOLS: dict[str, frozenset[str]] = {
 
 def _stage_effective_tools(session: Session, frame: Frame) -> list[str]:
     """按地图任务阶段裁剪工具，非地图帧保持原白名单。"""
+    if frame.force_text_only:
+        return []
     if not _uses_persistent_map_budget(frame):
         return list(frame.agent.effective_tools)
     stage = session.map_task_state.stage
@@ -2603,6 +2814,25 @@ async def run_turn(
             logger.error("Agent run_turn failed: empty frame stack session=%s", session.session_id)
             return ErrorResult(text="会话没有活跃的 agent 帧")
 
+        if frame.forced_completion_text is not None:
+            forced_text = frame.forced_completion_text
+            frame.forced_completion_text = None
+            logger.info(
+                "Finishing frame from deterministic completion gate session=%s frame=%s agent=%s",
+                session.session_id,
+                frame.id,
+                frame.agent.name,
+            )
+            forced_result = await _finish_frame(
+                session,
+                forced_text,
+                agent_prompt_factory,
+                event_callback,
+            )
+            if forced_result is not None:
+                return forced_result
+            continue
+
         persistent_map_budget = _uses_persistent_map_budget(frame)
         if persistent_map_budget:
             if session.map_task_state.status == "paused":
@@ -2763,6 +2993,10 @@ async def run_turn(
             },
         )
         if _append_map_write_protocol_errors(frame, turn.tool_calls):
+            continue
+        if _append_map_plan_protocol_errors(session, frame, turn.tool_calls):
+            continue
+        if _append_reader_fallback_protocol_errors(session, frame, turn.tool_calls):
             continue
         if _append_map_write_followup_protocol_errors(session, frame, turn.tool_calls):
             continue
@@ -3248,6 +3482,36 @@ async def run_turn(
                     sorted(activated),
                 )
             frame.messages.append(_tool_message(item.call_id, result, is_error=is_error))
+
+        if (
+            frame.agent.name == "map-reader-agent"
+            and frame.map_reader_detailed_region_ready
+            and not frame.force_text_only
+        ):
+            artifact_read_completed = any(
+                item.tool.name == "read_file"
+                and not results[item.call_id][1]
+                and ".ai_agent_service/artifacts/"
+                in str(item.args.get("path", "")).replace("\\", "/")
+                for item in server_calls
+            )
+            if artifact_read_completed:
+                frame.force_text_only = True
+                frame.messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "精确地图区域及其 artifact 已读取完成。下一轮禁止继续调用工具；"
+                            "立即把已确认的 target_path、map_layer、map_revision、边界、"
+                            "tile_size/cell_size 和资源事实整理为 map_worker_result_v1 JSON。"
+                        ),
+                    }
+                )
+                logger.info(
+                    "Map reader armed for text-only completion session=%s frame=%s",
+                    session.session_id,
+                    frame.id,
+                )
 
         if front_calls:
             if len(front_calls) > 1 and all(

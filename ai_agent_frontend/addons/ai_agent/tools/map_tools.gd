@@ -3856,7 +3856,7 @@ static func plan_map_algorithms(input: Dictionary, editor_interface: EditorInter
 
 
 ## Validate and compile an LLM-authored platform route into a jump graph, tile batches, and leap validation plan.
-static func plan_platform_level(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+static func validate_platform_level_plan(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	var context := describe_map_context({}, editor_interface)
 	if not bool(context.get("ok", false)):
 		return context
@@ -3877,7 +3877,7 @@ static func plan_platform_level(input: Dictionary, editor_interface: EditorInter
 				# 而不是只靠 prompt 提醒 agent "没有 entry_anchor 就别执行"。
 				platform_input["entry_anchor_scan_failed"] = true
 				platform_input["entry_sample"] = anchor_result
-	return MapPlatformPlanValidator.plan_platform_level(platform_input, context)
+	return MapPlatformPlanValidator.validate_platform_level_plan(platform_input, context)
 
 
 ## Build a profile-based reachable frontier growth plan for platformer/topdown/dungeon/3d maps.
@@ -4123,7 +4123,7 @@ static func _platform_entry_anchor(input: Dictionary, editor_interface: EditorIn
 		"entry_support": {"x": best_support.x, "y": best_support.y},
 		"entry_anchor": {"x": best_support.x, "y": best_support.y - 1},
 		"min_landing_width": min_landing_width,
-		"note": "The LLM-authored first platform submitted to plan_platform_level must be reachable from this existing foothold.",
+		"note": "The LLM-authored first platform submitted to validate_platform_level_plan must be reachable from this existing foothold.",
 	}
 
 

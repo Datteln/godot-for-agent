@@ -62,7 +62,7 @@ const MAP_READ_TOOLS := {
 	"describe_map_context": true,
 	"plan_map_layout": true,
 	"plan_map_algorithms": true,
-	"plan_platform_level": true,
+	"validate_platform_level_plan": true,
 	"plan_reachable_map_growth": true,
 	"compute_reachable_frontier": true,
 	"sample_poisson_points": true,
@@ -278,8 +278,8 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = MapTools.plan_map_layout(input, editor_interface)
 		"plan_map_algorithms":
 			result = MapTools.plan_map_algorithms(input, editor_interface)
-		"plan_platform_level":
-			result = MapTools.plan_platform_level(input, editor_interface)
+		"validate_platform_level_plan":
+			result = MapTools.validate_platform_level_plan(input, editor_interface)
 		"plan_reachable_map_growth":
 			result = MapTools.plan_reachable_map_growth(input, editor_interface)
 		"compute_reachable_frontier":

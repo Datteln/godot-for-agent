@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from app.agents.bundled import get_agent
-from app.agents.types import AgentDefinition
+from app.agents.types import AgentDefinition, Frame
 from app.api.schemas import (
     ChatErrorResponse,
     ChatFinalResponse,
@@ -50,6 +50,9 @@ from app.orchestrator.agent import (
 )
 from app.orchestrator.map_workers import MAP_REVISION_GUARDED_TOOL_NAMES
 from app.orchestrator.map_progress import (
+    MAP_PLATFORM_PLAN_MAX_ATTEMPTS,
+    map_platform_plan_attempt_count,
+    parse_map_plan_outcome,
     remember_validation_cache,
     remember_map_plan_progress,
     remember_validation_progress,
@@ -83,6 +86,7 @@ _MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
 _MAP_ARTIFACT_MAX_FILES_PER_SESSION = 128
 _MAP_ARTIFACT_MAX_BYTES_PER_SESSION = 100 * 1024 * 1024
 _MAP_MAX_AUTO_ITERATIONS = 3
+_PLATFORM_PLAN_TOOL_NAMES = frozenset({"validate_platform_level_plan", "plan_reachable_map_growth"})
 
 
 def _normalize_model_override(model: str | None) -> str | None:
@@ -134,6 +138,120 @@ def _step_to_response(step: StepResult) -> ChatResponse:
     if isinstance(step, ErrorResult):
         return ChatErrorResponse(text=step.text)
     raise TypeError(f"未知编排结果类型：{type(step)!r}")
+
+
+def _planner_completion_text(
+    frame: Frame,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    result: dict[str, Any],
+) -> str:
+    """把确定性平台校验结果转换为 planner 的结构化阶段输出。"""
+    outcome = parse_map_plan_outcome(tool_name, result)
+    profile_plan_value = result.get("profile_plan")
+    profile_plan = profile_plan_value if isinstance(profile_plan_value, dict) else {}
+    batches_value = result.get("edit_map_batches")
+    if batches_value is None:
+        batches_value = profile_plan.get("edit_map_batches")
+    proposed_batches = batches_value if isinstance(batches_value, list) else []
+    issues_value = (
+        result.get("issues")
+        or result.get("repair_plan")
+        or profile_plan.get("issues")
+        or profile_plan.get("repair_plan")
+    )
+    issues = issues_value if isinstance(issues_value, list) else []
+    target_value = result.get("target_path", result.get("target", tool_args.get("target_path", "")))
+    target_path = target_value if isinstance(target_value, str) else ""
+    revision_value = result.get("map_revision")
+    map_revision = (
+        revision_value
+        if isinstance(revision_value, int) and not isinstance(revision_value, bool)
+        else None
+    )
+    region = {
+        key: tool_args[key]
+        for key in ("x", "y", "z", "width", "height", "depth")
+        if key in tool_args
+    }
+    summary = (
+        "LLM 显式平台规划已通过确定性校验，规划阶段由服务端自动结束。"
+        if outcome.executable
+        else (f"平台规划在 {MAP_PLATFORM_PLAN_MAX_ATTEMPTS} 次修订内未通过，" "规划阶段已停止。")
+    )
+    payload = {
+        "stage": "planner",
+        "worker": frame.agent.name,
+        "mode": "propose_only" if outcome.executable else "partial",
+        "objective": frame.agent.description or frame.agent.name,
+        "target_path": target_path,
+        "map_layer": tool_args.get("map_layer"),
+        "map_revision": map_revision,
+        "region": region,
+        "summary": summary,
+        "facts": [
+            {
+                "kind": "llm_platform_plan",
+                "tool": tool_name,
+                "platforms": tool_args.get("platforms", []),
+                "segments": tool_args.get("segments", []),
+            }
+        ],
+        "proposed_batches": proposed_batches,
+        "write_results": [],
+        "validation": {
+            "passed": outcome.executable,
+            "completion_allowed": False,
+            "issues": issues,
+            "structured_issues": (
+                []
+                if outcome.executable
+                else [
+                    {
+                        "code": outcome.error_code
+                        or outcome.blocked_reason
+                        or "platform_plan_not_executable",
+                        "blocked_reason": outcome.blocked_reason,
+                    }
+                ]
+            ),
+        },
+        "missing_inputs": [],
+        "risks": [] if outcome.executable else ["平台路线尚不可执行，禁止进入写入阶段。"],
+        "next_stage": "writer" if outcome.executable else "planner",
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _map_reader_has_detailed_region(result: dict[str, Any]) -> bool:
+    """判断 reader 是否已拿到足以进入事实汇总阶段的精确区域。"""
+    if result.get("ok") is False:
+        return False
+    if result.get("cells_format") not in {"non_empty_only", "full"}:
+        return False
+    revision = result.get("map_revision")
+    return (
+        bool(result.get("target_path") or result.get("target"))
+        and isinstance(revision, int)
+        and not isinstance(revision, bool)
+    )
+
+
+def _arm_map_reader_text_completion(frame: Frame) -> None:
+    """把 reader 的下一轮限制为无工具的结构化事实输出。"""
+    if frame.force_text_only:
+        return
+    frame.force_text_only = True
+    frame.messages.append(
+        {
+            "role": "system",
+            "content": (
+                "精确地图事实已经齐全。下一轮禁止继续调用工具；立即输出 "
+                "map_worker_result_v1 JSON，并明确 target_path、map_layer、"
+                "map_revision、边界、tile_size/cell_size 和资源事实。"
+            ),
+        }
+    )
 
 
 def _map_batch_postcondition_error(
@@ -1312,6 +1430,28 @@ class QueryEngine:
                     tool_args,
                     result_for_gate,
                 )
+                if (
+                    frame.agent.name == "map-planner-agent"
+                    and tool_name in _PLATFORM_PLAN_TOOL_NAMES
+                ):
+                    plan_outcome = parse_map_plan_outcome(tool_name, result_for_gate)
+                    attempt_count = map_platform_plan_attempt_count(session, tool_args)
+                    if plan_outcome.executable or attempt_count >= MAP_PLATFORM_PLAN_MAX_ATTEMPTS:
+                        frame.forced_completion_text = _planner_completion_text(
+                            frame,
+                            tool_name,
+                            tool_args,
+                            result_for_gate,
+                        )
+                        logger.info(
+                            "Scheduled deterministic planner completion session=%s frame=%s "
+                            "tool=%s executable=%s attempts=%d",
+                            session.session_id,
+                            frame.id,
+                            tool_name,
+                            plan_outcome.executable,
+                            attempt_count,
+                        )
                 remember_validation_cache(
                     session,
                     tool_name,
@@ -1322,8 +1462,6 @@ class QueryEngine:
                     session.map_task_state.counters.reads += 1
                     target = str(result_for_gate.get("target", tool_args.get("target_path", "")))
                     session.map_task_state.no_progress_streaks[target] = 0
-                    if session.map_task_state.stage == "read":
-                        session.map_task_state.stage = "plan"
                 if (
                     tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
                     and result.status == "applied"
@@ -1334,7 +1472,7 @@ class QueryEngine:
                 if session.latest_context_used_tokens >= 32_000 and tool_name in {
                     "plan_map_layout",
                     "plan_map_algorithms",
-                    "plan_platform_level",
+                    "validate_platform_level_plan",
                     "plan_reachable_map_growth",
                     "validate_map_region",
                     *MAP_REVISION_GUARDED_TOOL_NAMES,
@@ -1348,6 +1486,19 @@ class QueryEngine:
                     result.error_code,
                     result_for_gate,
                 )
+                if (
+                    frame.agent.name == "map-reader-agent"
+                    and result.status == "applied"
+                    and isinstance(result_for_gate, dict)
+                    and _map_reader_has_detailed_region(result_for_gate)
+                ):
+                    frame.map_reader_detailed_region_ready = True
+                    logger.info(
+                        "Map reader detailed region ready session=%s frame=%s artifact=%s",
+                        session.session_id,
+                        frame.id,
+                        map_artifact_ref is not None,
+                    )
             blocker = _map_completion_blocker(
                 tool_name, result.status, result_for_gate, result.error_code
             )
@@ -1432,6 +1583,13 @@ class QueryEngine:
             frame.messages.append(
                 _tool_message(result.tool_use_id, history_payload, is_error=is_error)
             )
+            if (
+                frame.agent.name == "map-reader-agent"
+                and tool_name == "describe_map_region"
+                and frame.map_reader_detailed_region_ready
+                and map_artifact_ref is None
+            ):
+                _arm_map_reader_text_completion(frame)
             if isinstance(result_for_gate, dict):
                 _append_platform_planning_failure_hint(session, tool_name, result_for_gate)
             if (

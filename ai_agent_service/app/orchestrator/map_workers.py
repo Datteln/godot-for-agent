@@ -226,6 +226,8 @@ def _dynamic_map_worker_prompt(
         "- JSON 至少包含 stage、worker、mode、objective、target_path、map_layer、"
         "map_revision、region、summary、facts、proposed_batches、write_results、"
         "validation、missing_inputs、risks、next_stage。\n\n"
+        "- map_layer 必须是单个整数索引，或读取多层时使用非空整数数组；"
+        "禁止输出图层名称或说明文字。\n\n"
         "【错误恢复规则】\n"
         "1. map_revision_conflict（地图已变更）：\n"
         "   - 服务层会自动触发 map-reader-agent 重读冲突区域\n"

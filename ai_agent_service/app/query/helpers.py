@@ -175,8 +175,8 @@ def _append_platform_planning_failure_hint(
     tool_name: str,
     result: dict[str, Any],
 ) -> None:
-    """平台规划失败时追加恢复指引，避免继续执行空规划。"""
-    if tool_name not in {"plan_platform_level", "plan_reachable_map_growth"}:
+    """平台方案未通过校验时追加恢复指引，避免继续执行空批次。"""
+    if tool_name not in {"validate_platform_level_plan", "plan_reachable_map_growth"}:
         return
     outcome = parse_map_plan_outcome(tool_name, result)
     if outcome.executable:
@@ -197,7 +197,7 @@ def _append_platform_planning_failure_hint(
     if reason == "start_not_standable" and outcome.suggested_foothold is not None:
         recovery = (
             f"先用 suggested_foothold={json.dumps(outcome.suggested_foothold, ensure_ascii=False)} "
-            "小范围读取并核实下方支撑，再以该点作为 start 重新调用原规划工具。"
+            "小范围读取并核实下方支撑，再以该点作为 start 重新调用原校验工具。"
         )
     elif reason == "entry_anchor_not_found":
         recovery = (
@@ -232,9 +232,9 @@ def _append_platform_planning_failure_hint(
             "role": "user",
             "history_role": "error",
             "content": (
-                "出错：平台扩图规划失败，禁止执行空 edit_map_batches。"
+                "出错：LLM 提交的平台扩图方案未通过校验，禁止执行空 edit_map_batches。"
                 f"reason={reason}。{recovery}"
-                "当前是规划阶段；不要搜索写入工具，也不要要求用户批准工具。"
+                "当前必须由 LLM 修订方案；不要搜索写入工具，也不要要求用户批准工具。"
             ),
         }
     )
@@ -383,7 +383,7 @@ _HISTORY_FRONT_READ_TOOLS = frozenset(
         "describe_map_context",
         "plan_map_layout",
         "plan_map_algorithms",
-        "plan_platform_level",
+        "validate_platform_level_plan",
         "plan_reachable_map_growth",
         "compute_reachable_frontier",
         "describe_map_region",
@@ -459,7 +459,7 @@ _MAP_REGION_READ_GUARDED_TOOL_NAMES = (
         {
             "plan_map_layout",
             "plan_map_algorithms",
-            "plan_platform_level",
+            "validate_platform_level_plan",
             "plan_reachable_map_growth",
             "compute_reachable_frontier",
             "convert_map_coords",
@@ -744,7 +744,7 @@ def _map_tool_requires_map_layer(
 ) -> bool:
     """判断地图工具是否必须带 2D map_layer。"""
     if tool_name in {
-        "plan_platform_level",
+        "validate_platform_level_plan",
         "plan_reachable_map_growth",
         "compute_reachable_frontier",
     }:
@@ -1319,6 +1319,55 @@ def _update_map_context_state(
             break
 
 
+def _invalidate_stale_map_revision_state(
+    session: Session,
+    target: str,
+    previous_revision: int,
+    current_revision: int,
+) -> None:
+    """在前端 revision 重新计数时废弃旧规划、验证和写入状态。"""
+    scope_prefix = f"{target}::"
+    state = session.map_task_state
+    for mapping in (
+        session.map_validation_contracts,
+        session.map_validation_workflows,
+        state.no_progress_streaks,
+        state.planning_attempts,
+        state.approved_platform_plans,
+    ):
+        for key in tuple(mapping):
+            if key == target or key.startswith(scope_prefix):
+                mapping.pop(key, None)
+    state.planning_fingerprints = {
+        key: value
+        for key, value in state.planning_fingerprints.items()
+        if not key.startswith(scope_prefix)
+    }
+    state.pending_batches.clear()
+    state.executed_batches.clear()
+    state.validation_cache.clear()
+    state.failure_frontier = None
+    state.unresolved_issues.clear()
+    state.stage = "read"
+    state.plan_version = 0
+    session.latest_map_region_reads.clear()
+    session.latest_map_region_summaries.clear()
+    session.latest_map_validations.pop(target, None)
+    session.map_completion_blockers = [
+        blocker
+        for blocker in session.map_completion_blockers
+        if blocker.get("target") not in ("", target)
+    ]
+    logger.warning(
+        "Map revision epoch reset detected session=%s target=%s previous=%s current=%s; "
+        "invalidated stale plans and validation workflows",
+        session.session_id,
+        target,
+        previous_revision,
+        current_revision,
+    )
+
+
 def _remember_latest_map_revision(
     session: Session,
     tool_name: str,
@@ -1341,6 +1390,15 @@ def _remember_latest_map_revision(
         return
     if revision is not None:
         previous = session.latest_map_revisions.get(target)
+        if previous is not None and revision < previous and tool_name == "describe_map_region":
+            _invalidate_stale_map_revision_state(
+                session,
+                target,
+                previous,
+                revision,
+            )
+            session.latest_map_revisions[target] = revision
+            previous = revision
         if previous is None or revision > previous:
             touched_region = _map_write_touched_region(tool_args, result)
             if (
@@ -1822,7 +1880,7 @@ def _points_region(points: Any) -> dict[str, int] | None:
 
 def _map_region_from_tool_args(tool_name: str, tool_args: dict[str, Any]) -> dict[str, int] | None:
     """从地图工具入参推导它依赖的真实地图区域。"""
-    if tool_name in {"plan_platform_level", "plan_reachable_map_growth"}:
+    if tool_name in {"validate_platform_level_plan", "plan_reachable_map_growth"}:
         entry_region = _entry_sample_region_from_args(tool_args)
         if entry_region is not None:
             return entry_region
@@ -1989,7 +2047,7 @@ def _blocks_platform_plan_after_empty_region_read(
     session: Session,
     call: FrontToolCallDTO,
 ) -> bool:
-    if call.name not in {"plan_platform_level", "plan_reachable_map_growth"}:
+    if call.name not in {"validate_platform_level_plan", "plan_reachable_map_growth"}:
         return False
     summary = _latest_map_region_summary_for_call(session, call)
     if summary is None:
@@ -2124,7 +2182,11 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
     latest_layer = session.latest_map_layers.get(target_path)
     if (
         call.name
-        in {"plan_platform_level", "plan_reachable_map_growth", "compute_reachable_frontier"}
+        in {
+            "validate_platform_level_plan",
+            "plan_reachable_map_growth",
+            "compute_reachable_frontier",
+        }
         and latest_layer is not None
         and "map_layer" not in restored_input
     ):

@@ -376,6 +376,9 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
         "persistent_turn_count": frame.persistent_turn_count,
         "persistent_edit_map_turn_count": frame.persistent_edit_map_turn_count,
         "map_progress_revision": frame.map_progress_revision,
+        "forced_completion_text": frame.forced_completion_text,
+        "force_text_only": frame.force_text_only,
+        "map_reader_detailed_region_ready": frame.map_reader_detailed_region_ready,
         "compact_snapshot": (
             {
                 "revision": frame.compact_snapshot.revision,
@@ -452,6 +455,13 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
             and not isinstance(data.get("map_progress_revision"), bool)
             else None
         ),
+        forced_completion_text=(
+            data.get("forced_completion_text")
+            if isinstance(data.get("forced_completion_text"), str)
+            else None
+        ),
+        force_text_only=data.get("force_text_only") is True,
+        map_reader_detailed_region_ready=data.get("map_reader_detailed_region_ready") is True,
         compact_snapshot=compact_snapshot,
     )
 
