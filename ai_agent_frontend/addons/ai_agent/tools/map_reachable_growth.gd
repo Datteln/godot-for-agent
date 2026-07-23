@@ -1,13 +1,13 @@
 @tool
 extends RefCounted
 
-const MapPlatformComposer = preload("res://addons/ai_agent/tools/map_platform_composer.gd")
+const MapPlatformPlanValidator = preload("res://addons/ai_agent/tools/map_platform_plan_validator.gd")
 
 
 static func plan_growth(input: Dictionary, context: Dictionary = {}) -> Dictionary:
 	var profile := _profile_from_input(input)
 	if profile == "platformer":
-		var platform_plan := MapPlatformComposer.plan_platform_level(input, context)
+		var platform_plan := MapPlatformPlanValidator.plan_platform_level(input, context)
 		return _wrap_platform_plan(platform_plan, input, context)
 	var dimension := 3 if profile == "3d_grid" else 2
 	var region := _region_from_input(input, dimension)
@@ -58,11 +58,7 @@ static func _wrap_platform_plan(platform_plan: Dictionary, input: Dictionary, co
 		"accepted_motifs": accepted,
 		"edit_map_batches": platform_plan.get("edit_map_batches", []),
 		"validation": platform_plan.get("validation", {}),
-		"repair_strategies": [
-			{"name": "stepping_stones", "when": "gap exceeds max_horizontal_gap", "action": "insert connection_landing platforms"},
-			{"name": "landing_widen", "when": "landing width is too small", "action": "extend platform support cells"},
-			{"name": "stair_bridge", "when": "rise exceeds max_rise", "action": "insert stair_up/stair_down motifs"},
-		],
+		"repair_strategies": platform_plan.get("repair_plan", []),
 		"profile_plan": platform_plan,
 	}
 

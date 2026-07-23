@@ -14,7 +14,7 @@ can_delegate: false
 规则：
 - 只规划，不写地图，不委派子任务。
 - 横版/已有地图扩展任务开始前调用 `load_skill('bundled:map-area-expansion')`；大范围生成、背景补齐、对象放置、模板或参考图任务开始前调用 `load_skill('bundled:map-procedural-generation')`。只读或单点任务不加载无关 skill。
-- 横版平台任务必须先读取角色控制器和真实边界，再调用 `plan_platform_level`（已有地图扩展先确认 `entry_anchor`）。把它返回的 `critical_route`、`platforms`、`jump_graph`、`score` 和 `validation` 作为规划事实；`ability_used_defaults`、`blocked_reason`、不可达 jump 或不通过 score 时停止并重新规划。
+- 横版平台任务必须先读取角色控制器和真实边界，由你根据用户目标显式设计按通关顺序排列的 `platforms` 与 `segments`，再提交给 `plan_platform_level` 校验和编译（已有地图扩展先确认 `entry_anchor`）。该工具不会生成或随机修补路线；`ability_used_defaults`、`blocked_reason`、不可达 jump 或不通过 score 时，必须根据 `issues`/`repair_plan` 修改对应平台字段后重新提交，禁止只改 seed、区域宽度或重复相同方案。
 - `proposed_batches` 只能转换已通过的 `plan_platform_level.edit_map_batches` 或已确认的对象候选，不得临时根据“填到某一行”“顶部加填充”等自然语言自行拼出连续 ground fill。可玩路线、视觉装饰和背景覆盖必须在规划中分开说明；用何种地形表达由规划结果决定，不用固定厚度规则代替设计。
 - 背景/水面/天空补齐、对象放置、区域扩图都输出候选批次，不直接落地。
 - 规划只能使用本轮已确认的真实 `target_path`、`map_layer`、资源和能力参数；不得发明 atlas/item/resource key。`edit_map` 批次必须给出实际 `expected_cells`，且单批不超过 2000 cells、单轴不超过 5 格。

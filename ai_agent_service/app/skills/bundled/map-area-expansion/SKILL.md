@@ -24,15 +24,15 @@ paths: []
 
 ## 横版平台关卡专用规划
 
-横版平台跳跃关卡不要只用通用 zone/Poisson 算法。用户目标是平台游戏、Mario/Celeste 类跳跃、Brackeys 平台地图、关卡主路径、跳跃/落点/金币弧线/敌人槽位时，优先调用 `plan_platform_level`。它会先生成 critical route、platform motifs、jump_graph、`edit_map_batches`、`coin_arcs`、`enemy_slots` 和 `movement_model="leap"` 校验计划；再把批次转成小批 `edit_map`，把奖励弧线/敌人槽位转成真实资源放置。不要先随便铺瓦片再事后 A* 校验。
+横版平台跳跃关卡不要只用通用 zone/Poisson 算法。用户目标是平台游戏、Mario/Celeste 类跳跃、Brackeys 平台地图、关卡主路径、跳跃/落点/金币弧线/敌人槽位时，LLM 必须先根据真实地图与角色能力显式设计按通关顺序排列的 `platforms`、`segments`，以及可选的 `coin_arcs`、`enemy_slots`，再调用 `plan_platform_level` 做确定性校验和编译。该工具不生成、不随机化、也不自动修补路线；通过后才把返回批次转成小批 `edit_map`，把显式奖励弧线/敌人槽位转成真实资源放置。不要先随便铺瓦片再事后 A* 校验。
 
-`plan_platform_level` 不只判断能不能跳到：它输出可读的落点、挑战段、终点缓冲和形态评分。返回 `score.passed=false`、`blocked_reason` 非空或 `ability_used_defaults` 非空时，不执行 `edit_map_batches`；补齐真实能力参数或调整规划输入后重新规划。执行者只能采用这份规划中的路线批次，不能为了满足“地面/填充”描述手写一串上下相连的 `fill`。背景、装饰与可站立路线是不同区域：它们各自按规划语义落地，不能用固定厚度或批次拆分替代关卡设计。
+`plan_platform_level` 不只判断能不能跳到：它保留 LLM 提交的落点与挑战段，并输出跳跃图、终点缓冲和形态评分。返回 `score.passed=false`、`blocked_reason` 非空或 `ability_used_defaults` 非空时，不执行 `edit_map_batches`；补齐真实能力参数，或严格按照字段级 `issues`/`repair_plan` 修改对应的 `platforms`/`segments` 后重新提交。禁止只改 seed、区域宽度或重复相同计划。执行者只能采用通过校验后编译出的路线批次，不能为了满足“地面/填充”描述手写一串上下相连的 `fill`。背景、装饰与可站立路线是不同区域：它们各自按规划语义落地，不能用固定厚度或批次拆分替代关卡设计。
 
-扩展已有横版地图时，`plan_platform_level`/`plan_reachable_map_growth` 必须默认 `connect_from_existing=true`，并传 `target_path`/`map_layer` 让工具扫描左侧边界已有表面，返回 `entry_anchor`。返回的 `blocked_reason` 非空（`entry_anchor_not_found`/`jump_graph_failed`/`score_issues`）时，`edit_map_batches` 已经被工具结构性清空，不需要你自己再判断要不要执行——但仍要按 `blocked_reason` 处理：`entry_anchor_not_found` 时扩大/移动 `entry_sample_*` 重新找边界落脚点；`jump_graph_failed`/`score_issues` 时降低新平台起点高度、缩短 gap 或增大 landing_width 后重新规划。右侧新区内部可达不算完成，必须从左侧初始地图的真实落脚点一路可达。
+扩展已有横版地图时，`plan_platform_level`/`plan_reachable_map_growth` 必须默认 `connect_from_existing=true`，并传 `target_path`/`map_layer` 让工具扫描左侧边界已有表面，返回 `entry_anchor`。返回的 `blocked_reason` 非空（`entry_anchor_not_found`/`jump_graph_failed`/`score_issues`）时，`edit_map_batches` 已经被工具结构性清空，不需要你自己再判断要不要执行——但仍要按 `blocked_reason` 处理：`entry_anchor_not_found` 时扩大/移动 `entry_sample_*` 重新找边界落脚点；`jump_graph_failed`/`score_issues` 时根据 `repair_plan` 修改显式首个平台、相邻平台间距/高度、落脚宽度、角色序列或终点平台。右侧新区内部可达不算完成，必须从左侧初始地图的真实落脚点一路可达。
 
 `plan_platform_level` 返回的 `ability_used_defaults` 非空时，说明你没传 `max_horizontal_gap`/`max_rise`/`max_fall`/`min_landing_width` 中的某些字段，工具用了写死的默认值（4/2/6/3），这条规划**不能**当作"已验证可玩"——先按下面"能力校准"读真实角色脚本和 `tile_size` 补全这些参数再重新调用，不要因为它返回了 `ok:true` 就直接执行。
 
-调用 `plan_platform_level` 前也遵守同一条：先读取角色脚本和 tile_size，把 `max_horizontal_gap`、`max_rise`、`max_fall`、`min_landing_width` 传进去。`plan_platform_level` 返回的 `validation.validate_map_region.start` 必须是左侧已有 `entry_anchor`，不是新区第一块平台；返回的 `jump_graph.passed=false` 或 `score.issues` 不为空时，不要执行它的 `edit_map_batches`，先缩小 gap、增加 landing_width 或降低 vertical_delta 后重新规划。
+调用 `plan_platform_level` 前也遵守同一条：先读取角色脚本和 tile_size，把 `max_horizontal_gap`、`max_rise`、`max_fall`、`min_landing_width` 传进去，并提交完整 `platforms`/`segments`。`plan_platform_level` 返回的 `validation.validate_map_region.start` 必须是左侧已有 `entry_anchor`，不是新区第一块平台；返回的 `jump_graph.passed=false` 或 `score.issues` 不为空时，不要执行它的 `edit_map_batches`，先按字段级错误修改显式 gap、landing width、vertical delta 或终点宽度后重新调用。
 
 执行后用 `validate_map_region(movement_model="leap", check_platform_design=true)` 校验同一片区域。`platform_design.passed=false` 与可达性失败同级：长实心行、过高竖柱、大块实心体量或终点缓冲不足都必须通过重规划/拆薄/删柱修复，不能只靠 `repair_map_region` 补一条桥。
 

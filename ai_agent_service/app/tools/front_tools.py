@@ -2012,12 +2012,11 @@ def register_front_tools() -> None:
             schema={
                 "name": "plan_platform_level",
                 "description": (
-                    "Plan a 2D side-scrolling platformer level from player movement ability first. It builds "
-                    "a critical route of gameplay motifs, a jump reachability graph, preview-safe edit_map "
-                    "batches for thin support platforms, reward coin arcs, enemy slots, a score, and a "
-                    "validate_map_region plan using movement_model='leap'. It also applies platformer design "
-                    "grammar limits so routes avoid oversized solid blocks, repeated pillar patterns, and unsafe "
-                    "finish buffers. Use for Mario/Celeste/platform maps instead of generic zone/Poisson planning."
+                    "Validate and compile an explicit 2D platformer plan authored by the LLM. The caller MUST "
+                    "submit ordered platforms and route segments after reading the real map and player movement "
+                    "ability; this tool never invents, randomizes, or repairs level geometry. It checks jump "
+                    "reachability and design constraints, returns field-addressed issue_details/repair_plan when "
+                    "invalid, and emits preview-safe edit_map batches only when the submitted plan passes."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2033,14 +2032,85 @@ def register_front_tools() -> None:
                         "y": {"type": "integer"},
                         "width": {"type": "integer", "minimum": 8},
                         "height": {"type": "integer", "minimum": 8},
-                        "ground_y": {
-                            "type": "integer",
-                            "description": "Support-row y coordinate for the first platform; defaults to vertical center.",
+                        "platforms": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": (
+                                "LLM-authored platforms in traversal order. Coordinates identify the support "
+                                "row; every platform must stay inside x/y/width/height. The last platform is "
+                                "the finish buffer and must satisfy min_finish_buffer_width."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "width": {"type": "integer", "minimum": 1},
+                                    "role": {
+                                        "type": "string",
+                                        "description": (
+                                            "Semantic role such as safe_intro, takeoff, landing, stair, "
+                                            "hazard_entry, hazard_exit, rest, or finish."
+                                        ),
+                                    },
+                                    "existing": {
+                                        "type": "boolean",
+                                        "description": "True only for already-existing support that must not be emitted.",
+                                    },
+                                    "connection": {"type": "boolean"},
+                                },
+                                "required": ["x", "y", "width", "role"],
+                            },
                         },
-                        "seed": {"type": "integer"},
+                        "segments": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": (
+                                "LLM-authored critical-route segments in traversal order. They explain the "
+                                "intended gameplay between the submitted platforms; the tool preserves rather "
+                                "than generates them."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "index": {"type": "integer"},
+                                    "type": {"type": "string"},
+                                    "from_platform": {"type": "string"},
+                                    "to_platform": {"type": "string"},
+                                    "start": {
+                                        "type": "object",
+                                        "properties": {
+                                            "x": {"type": "integer"},
+                                            "y": {"type": "integer"},
+                                        },
+                                    },
+                                    "end": {
+                                        "type": "object",
+                                        "properties": {
+                                            "x": {"type": "integer"},
+                                            "y": {"type": "integer"},
+                                        },
+                                    },
+                                    "difficulty": {"type": "integer", "minimum": 0},
+                                    "note": {"type": "string"},
+                                },
+                                "required": ["type"],
+                            },
+                        },
+                        "coin_arcs": {
+                            "type": "array",
+                            "description": "Optional LLM-authored reward arcs; no arcs are generated automatically.",
+                            "items": {"type": "object"},
+                        },
+                        "enemy_slots": {
+                            "type": "array",
+                            "description": "Optional LLM-authored enemy placements; no slots are generated automatically.",
+                            "items": {"type": "object"},
+                        },
                         "connect_from_existing": {
                             "type": "boolean",
-                            "description": "When true, scan the left boundary and make the generated route reachable from the existing map. Defaults to true.",
+                            "description": "When true, scan the left boundary and validate the first submitted platform from that real foothold. Defaults to true.",
                         },
                         "entry_sample_x": {
                             "type": "integer",
@@ -2129,7 +2199,7 @@ def register_front_tools() -> None:
                             "description": "Fallback resource key for emitted platform fill drafts.",
                         },
                     },
-                    ["width", "height"],
+                    ["width", "height", "platforms", "segments"],
                 ),
             },
         )
@@ -2147,12 +2217,12 @@ def register_front_tools() -> None:
                 "name": "plan_reachable_map_growth",
                 "description": (
                     "Plan map expansion from a reachable frontier instead of generating isolated content. "
-                    "Supports profile='platformer' (delegates to platform reachability), 'topdown' "
+                    "Supports profile='platformer' (validates and compiles LLM-authored platforms/segments), 'topdown' "
                     "(connected roads/ground), 'dungeon' (rooms and corridors), and '3d_grid' "
                     "(connected floor strips). Returns candidates, accepted_motifs, preview-safe "
                     "edit_map_batches, validation, and repair strategies; it never edits the scene. For "
-                    "profile='platformer', the delegated plan uses platformer design grammar checks to prefer "
-                    "thin platforms, varied motifs, safe finish buffers, and reachable growth from the real frontier."
+                    "profile='platformer', platforms and segments are required and no geometry is generated "
+                    "automatically."
                 ),
                 "parameters": _object_schema(
                     {
@@ -2169,6 +2239,51 @@ def register_front_tools() -> None:
                         "width": {"type": "integer", "minimum": 1},
                         "height": {"type": "integer", "minimum": 1},
                         "depth": {"type": "integer", "minimum": 1},
+                        "platforms": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": "Required for profile='platformer': LLM-authored platforms in traversal order.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "width": {"type": "integer", "minimum": 1},
+                                    "role": {"type": "string"},
+                                    "existing": {"type": "boolean"},
+                                    "connection": {"type": "boolean"},
+                                },
+                                "required": ["x", "y", "width", "role"],
+                            },
+                        },
+                        "segments": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": "Required for profile='platformer': LLM-authored route segments.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "index": {"type": "integer"},
+                                    "type": {"type": "string"},
+                                    "from_platform": {"type": "string"},
+                                    "to_platform": {"type": "string"},
+                                    "difficulty": {"type": "integer", "minimum": 0},
+                                    "note": {"type": "string"},
+                                },
+                                "required": ["type"],
+                            },
+                        },
+                        "coin_arcs": {
+                            "type": "array",
+                            "description": "Optional LLM-authored reward arcs for profile='platformer'.",
+                            "items": {"type": "object"},
+                        },
+                        "enemy_slots": {
+                            "type": "array",
+                            "description": "Optional LLM-authored enemy slots for profile='platformer'.",
+                            "items": {"type": "object"},
+                        },
                         "frontier": {
                             "type": "object",
                             "description": "Optional known reachable frontier cell {x,y[,z]}; platformer can auto-sample it from the left boundary.",
@@ -2433,8 +2548,9 @@ def register_front_tools() -> None:
                     "instead of discovering the gap later in validate_map_region. The tool also rejects oversized "
                     "batches and thin, non-blanket fills that look like broad map repair; split those into local "
                     "segments, or mark true backdrop/water/sky work with the matching semantic_layer/tags. For a "
-                    "platformer level extension, do not invent a ground-fill wall here: first call "
-                    "plan_platform_level with measured player ability, then apply only its approved route batches."
+                    "platformer level extension, do not invent a ground-fill wall here: first have the LLM submit "
+                    "explicit platforms/segments to plan_platform_level with measured player ability, then apply "
+                    "only its validated route batches."
                 ),
                 "parameters": _object_schema(
                     {

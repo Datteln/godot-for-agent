@@ -8,7 +8,7 @@ const MapLayerScaffold = preload("res://addons/ai_agent/tools/map_layer_scaffold
 const MapIntentParser = preload("res://addons/ai_agent/tools/map_intent_parser.gd")
 const MapLayoutPlanner = preload("res://addons/ai_agent/tools/map_layout_planner.gd")
 const MapAlgorithms = preload("res://addons/ai_agent/tools/map_algorithms.gd")
-const MapPlatformComposer = preload("res://addons/ai_agent/tools/map_platform_composer.gd")
+const MapPlatformPlanValidator = preload("res://addons/ai_agent/tools/map_platform_plan_validator.gd")
 const MapReachableGrowth = preload("res://addons/ai_agent/tools/map_reachable_growth.gd")
 
 const MAX_EDITED_CELLS := 100000
@@ -3855,7 +3855,7 @@ static func plan_map_algorithms(input: Dictionary, editor_interface: EditorInter
 	return MapAlgorithms.build_algorithm_plan(input, context)
 
 
-## Build a platformer-specific critical path, jump graph, tile batches, reward arcs, and leap validation plan.
+## Validate and compile an LLM-authored platform route into a jump graph, tile batches, and leap validation plan.
 static func plan_platform_level(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	var context := describe_map_context({}, editor_interface)
 	if not bool(context.get("ok", false)):
@@ -3873,11 +3873,11 @@ static func plan_platform_level(input: Dictionary, editor_interface: EditorInter
 				platform_input["entry_support"] = anchor_result.get("entry_support", {})
 				platform_input["entry_sample"] = anchor_result
 			else:
-				# 没扫描到左侧已有落脚点：让 composer 把 edit_map_batches 结构性清空，
+				# 没扫描到左侧已有落脚点：让 validator/compiler 把 edit_map_batches 结构性清空，
 				# 而不是只靠 prompt 提醒 agent "没有 entry_anchor 就别执行"。
 				platform_input["entry_anchor_scan_failed"] = true
 				platform_input["entry_sample"] = anchor_result
-	return MapPlatformComposer.plan_platform_level(platform_input, context)
+	return MapPlatformPlanValidator.plan_platform_level(platform_input, context)
 
 
 ## Build a profile-based reachable frontier growth plan for platformer/topdown/dungeon/3d maps.
@@ -4123,7 +4123,7 @@ static func _platform_entry_anchor(input: Dictionary, editor_interface: EditorIn
 		"entry_support": {"x": best_support.x, "y": best_support.y},
 		"entry_anchor": {"x": best_support.x, "y": best_support.y - 1},
 		"min_landing_width": min_landing_width,
-		"note": "plan_platform_level must connect the first generated platform from this existing foothold.",
+		"note": "The LLM-authored first platform submitted to plan_platform_level must be reachable from this existing foothold.",
 	}
 
 

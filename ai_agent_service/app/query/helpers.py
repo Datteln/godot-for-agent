@@ -185,6 +185,15 @@ def _append_platform_planning_failure_hint(
     if frame is None:
         return
     reason = outcome.error_code or outcome.blocked_reason or "unknown"
+    profile_plan_value = result.get("profile_plan")
+    profile_plan = profile_plan_value if isinstance(profile_plan_value, dict) else {}
+    details_value = (
+        result.get("repair_plan")
+        or result.get("issues")
+        or profile_plan.get("repair_plan")
+        or profile_plan.get("issues")
+    )
+    details = details_value if isinstance(details_value, list) else []
     if reason == "start_not_standable" and outcome.suggested_foothold is not None:
         recovery = (
             f"先用 suggested_foothold={json.dumps(outcome.suggested_foothold, ensure_ascii=False)} "
@@ -195,8 +204,29 @@ def _append_platform_planning_failure_hint(
             "先 describe_map_region 读取正确 target_path/map_layer 的连接边界并重新选择入口；"
             "若确实没有入口，仅可委派带有受限 repair_plan 的 repair_write_one_batch worker。"
         )
+    elif reason in {
+        "explicit_platform_plan_required",
+        "explicit_route_segments_required",
+        "invalid_explicit_plan",
+        "platform_transition_unreachable",
+        "finish_buffer_too_short",
+        "route_too_short",
+        "platform_too_wide",
+        "challenge_roles_repeated",
+        "score_issues",
+        "score_failed",
+        "jump_graph_failed",
+    }:
+        recovery = (
+            "修改并重新提交显式 platforms/segments 中指出的字段；禁止通过更换 seed、"
+            "扩大区域或重复相同参数来碰运气。"
+            f" repair_plan={json.dumps(details[:6], ensure_ascii=False)}"
+        )
     else:
-        recovery = "根据结构化失败原因修正规划参数后重新规划。"
+        recovery = (
+            "根据结构化失败原因修改显式 platforms/segments 后重新校验；"
+            f" repair_plan={json.dumps(details[:6], ensure_ascii=False)}"
+        )
     frame.messages.append(
         {
             "role": "user",
