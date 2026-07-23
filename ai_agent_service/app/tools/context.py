@@ -24,6 +24,9 @@ class ToolContext:
         skill_catalog: Skill 工具读取目录时使用的目录索引。
         effective_tools: 当前活跃 agent 帧实际可见的工具集合；server 工具可用它
             避免泄露当前入口/agent 不可见的工具元数据。
+        agent_effective_tools: 阶段裁剪前的 agent 工具集合，用于区分阶段限制与
+            agent 自身范围限制。
+        workflow_stage: 当前地图工作流阶段；非地图帧为 None。
         rag_index_path: 本地 RAG 索引文件路径；为空时 handler 使用工程内默认路径。
     """
 
@@ -31,4 +34,6 @@ class ToolContext:
     session_id: str
     skill_catalog: SkillCatalog | None = None
     effective_tools: frozenset[str] = frozenset()
+    agent_effective_tools: frozenset[str] = frozenset()
+    workflow_stage: str | None = None
     rag_index_path: Path | None = None

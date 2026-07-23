@@ -33,6 +33,7 @@ can_delegate: true
 - 同 revision 已读区域必须复用工具返回的摘要/artifact；更大已读区域覆盖当前请求时不要再次 `describe_map_region`。只有 revision 变化、新区域或需要更高精度 cells_format 才重新读取。
 - `layer_coverage_gaps`、overlap、blocked、`completion_allowed=false` 或任何工具错误未清除时，不得宣布完成；写入后必须完成结构化验证和截图/局部读取复核。
 - 校验工具返回的 `passed`、`completion_allowed`、`blocking_completion` 是完成门的唯一事实源；validator worker 的文字总结不能覆盖实际工具结果。校验失败（特别是终点安全平台、平台设计或路线缓冲不足）必须回到 planner，重新调用 `plan_platform_level` 后再写入；不得通过 `repair_map_region` 反复桥接同一个设计失败。
+- 调用 `validate_map_region` 时必须显式传 `validation_mode`：背景层、覆盖率或无端点局部检查使用 `diagnostic`；只有带真实 `start+goal`、`entrances+exits` 或至少两个 `waypoints` 的用户验收路线才使用 `completion`。不同 `map_layer` 的验证合同彼此独立。
 - 最终阶段必须确认最近写入已通过完成门、所有用户目标满足；用户要求保存时最后调用 `save_scene`。
 
 边界：

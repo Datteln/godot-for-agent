@@ -3238,7 +3238,10 @@ def register_front_tools() -> None:
                             "description": (
                                 "Use diagnostic only to locate one failure frontier after completion fails. "
                                 "Use completion for the frozen user acceptance route; completion runs at most once "
-                                "per map revision and its start/goal/waypoints/movement limits cannot drift."
+                                "per map revision and its start/goal/waypoints/movement limits cannot drift. "
+                                "Completion requires start+goal, non-empty entrances+exits, or at least two "
+                                "waypoints. When omitted, calls with a real route infer completion; region/layer-only "
+                                "checks infer diagnostic and never freeze a completion contract."
                             ),
                         },
                         "start": {

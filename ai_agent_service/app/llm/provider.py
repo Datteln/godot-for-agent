@@ -380,6 +380,7 @@ class OpenAICompatibleProvider:
                     temperature=temperature,
                     extra_body=extra_body,
                     stream=True,
+                    reasoning_effort="xhigh",
                     stream_options={"include_usage": True},
                 )
                 async for chunk in stream:

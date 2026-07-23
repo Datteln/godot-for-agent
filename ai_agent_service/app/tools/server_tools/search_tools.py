@@ -90,7 +90,7 @@ async def search_tools_handler(args: dict[str, Any], ctx: ToolContext) -> dict[s
             ranked.append((score, tool))
     ranked.sort(key=lambda item: (-item[0], item[1].name))
 
-    unavailable: list[dict[str, str]] = []
+    unavailable: list[dict[str, Any]] = []
     if ctx.effective_tools:
         hidden = [
             (score, tool)
@@ -98,10 +98,28 @@ async def search_tools_handler(args: dict[str, Any], ctx: ToolContext) -> dict[s
             if tool.name not in visible and (score := _score(tool, query)) > 0
         ]
         hidden.sort(key=lambda item: (-item[0], item[1].name))
-        unavailable = [
-            {"name": tool.name, "status": "registered_but_unavailable"}
-            for _, tool in hidden[:max_results]
-        ]
+        unavailable = []
+        for _, tool in hidden[:max_results]:
+            excluded_by_stage = (
+                ctx.workflow_stage is not None and tool.name in ctx.agent_effective_tools
+            )
+            unavailable.append(
+                {
+                    "name": tool.name,
+                    "status": (
+                        "unavailable_in_current_stage"
+                        if excluded_by_stage
+                        else "unavailable_in_agent_scope"
+                    ),
+                    "reason": (
+                        "excluded_by_workflow_stage"
+                        if excluded_by_stage
+                        else "excluded_by_agent_scope"
+                    ),
+                    "current_stage": ctx.workflow_stage,
+                    "requires_user_approval": False,
+                }
+            )
 
     matches = []
     activated: list[str] = []
@@ -131,7 +149,10 @@ async def search_tools_handler(args: dict[str, Any], ctx: ToolContext) -> dict[s
         "tools": matches,
         "activated_tools": activated,
         "unavailable_tools": unavailable,
-        "note": "activated_tools 会在下一轮对话中加入当前 agent 的工具 schema。",
+        "note": (
+            "activated_tools 会在下一轮对话中加入当前 agent 的工具 schema。"
+            "unavailable_tools 是当前阶段或 agent 范围裁剪结果，不是用户待批准权限。"
+        ),
     }
 
 

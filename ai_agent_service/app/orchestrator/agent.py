@@ -1522,6 +1522,7 @@ _MAP_STAGE_TOOLS: dict[str, frozenset[str]] = {
             "read_file",
             "read_class_docs",
             "read_image_metadata",
+            "capture_viewport_screenshot",
             "query_spatial_index",
             "convert_map_coords",
             "load_skill",
@@ -1545,6 +1546,7 @@ _MAP_STAGE_TOOLS: dict[str, frozenset[str]] = {
             "find_placement_anchors",
             "read_file",
             "read_class_docs",
+            "capture_viewport_screenshot",
             "load_skill",
             "search_tools",
         }
@@ -2394,6 +2396,7 @@ def _delta_callback(
 
     reasoning_started_at = time.monotonic()
     accumulated_text: dict[str, str] = {"content": "", "reasoning": ""}
+
     # 上游 provider 可能把同一条 assistant 消息的 content 与
     # reasoning_content 交错发送。message_index 已经是一次 LLM 调用的稳定
     # 身份，不能再以通道切换作为正文分段边界，否则会截断正文并导致 final
@@ -3121,7 +3124,14 @@ async def run_turn(
 
         # 第二遍：执行 server 工具——`is_concurrency_safe` 的一组用
         # `asyncio.gather` 并发执行，其余按原始顺序串行执行。
-        call_ctx = replace(tool_ctx, effective_tools=frozenset(visible_effective_tools))
+        call_ctx = replace(
+            tool_ctx,
+            effective_tools=frozenset(visible_effective_tools),
+            agent_effective_tools=frozenset(frame.agent.effective_tools),
+            workflow_stage=(
+                session.map_task_state.stage if _uses_persistent_map_budget(frame) else None
+            ),
+        )
         server_calls = [item for item in pending_items if isinstance(item, _PendingServerCall)]
         concurrent_calls = [item for item in server_calls if item.tool.is_concurrency_safe]
         sequential_calls = [item for item in server_calls if not item.tool.is_concurrency_safe]

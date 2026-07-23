@@ -42,6 +42,7 @@ from app.api.schemas import (
 )
 from app.events.store import Event
 from app.llm.message_transformer import estimate_message_tokens, flatten_message_text
+from app.orchestrator.map_progress import parse_map_plan_outcome
 from app.orchestrator.map_workers import MAP_REVISION_GUARDED_TOOL_NAMES, MAP_WRITE_TOOL_NAMES
 from app.sessions.store import Session
 
@@ -177,28 +178,33 @@ def _append_platform_planning_failure_hint(
     """平台规划失败时追加恢复指引，避免继续执行空规划。"""
     if tool_name not in {"plan_platform_level", "plan_reachable_map_growth"}:
         return
-    blocked_reason = result.get("blocked_reason")
-    edit_batches = result.get("edit_map_batches")
-    jump_graph = result.get("jump_graph")
-    jump_failed = isinstance(jump_graph, dict) and jump_graph.get("passed") is False
-    empty_batches = isinstance(edit_batches, list) and not edit_batches
-    if blocked_reason not in {"entry_anchor_not_found", "jump_graph_failed"} and not (
-        jump_failed or (blocked_reason and empty_batches)
-    ):
+    outcome = parse_map_plan_outcome(tool_name, result)
+    if outcome.executable:
         return
     frame = session.top_frame()
     if frame is None:
         return
+    reason = outcome.error_code or outcome.blocked_reason or "unknown"
+    if reason == "start_not_standable" and outcome.suggested_foothold is not None:
+        recovery = (
+            f"先用 suggested_foothold={json.dumps(outcome.suggested_foothold, ensure_ascii=False)} "
+            "小范围读取并核实下方支撑，再以该点作为 start 重新调用原规划工具。"
+        )
+    elif reason == "entry_anchor_not_found":
+        recovery = (
+            "先 describe_map_region 读取正确 target_path/map_layer 的连接边界并重新选择入口；"
+            "若确实没有入口，仅可委派带有受限 repair_plan 的 repair_write_one_batch worker。"
+        )
+    else:
+        recovery = "根据结构化失败原因修正规划参数后重新规划。"
     frame.messages.append(
         {
             "role": "user",
             "history_role": "error",
             "content": (
                 "出错：平台扩图规划失败，禁止执行空 edit_map_batches。"
-                f"blocked_reason={blocked_reason or 'unknown'}。"
-                "请先 describe_map_region 读取正确 target_path/map_layer 的连接边界；"
-                "若没有满足 min_landing_width 的连续可站立入口，先用小批地图修复"
-                "补入口 landing，validate_map_region(movement_model='leap') 通过后再重新规划。"
+                f"reason={reason}。{recovery}"
+                "当前是规划阶段；不要搜索写入工具，也不要要求用户批准工具。"
             ),
         }
     )

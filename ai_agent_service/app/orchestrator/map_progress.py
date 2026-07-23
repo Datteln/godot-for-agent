@@ -137,6 +137,72 @@ class MapTaskState:
         return self.checkpoint
 
 
+@dataclass(frozen=True)
+class MapPlanOutcome:
+    """表示地图规划结果是否足以安全进入写入阶段。"""
+
+    ok: bool
+    executable: bool
+    blocked_reason: str | None
+    error_code: str | None
+    suggested_foothold: dict[str, Any] | None
+
+
+def parse_map_plan_outcome(tool_name: str, result: dict[str, Any]) -> MapPlanOutcome:
+    """统一解析顶层及平台子规划中的执行门信息。
+
+    Args:
+        tool_name: 返回结果的地图规划工具名。
+        result: 前端规划工具返回的结构化结果。
+
+    Returns:
+        归一化后的规划结果；只有满足对应工具执行门时才标记为可执行。
+    """
+    profile_plan_value = result.get("profile_plan")
+    profile_plan = profile_plan_value if isinstance(profile_plan_value, dict) else {}
+
+    blocked_reason_value = result.get("blocked_reason") or profile_plan.get("blocked_reason")
+    blocked_reason = (
+        blocked_reason_value
+        if isinstance(blocked_reason_value, str) and blocked_reason_value.strip()
+        else None
+    )
+    error_code_value = result.get("error_code") or profile_plan.get("error_code")
+    error_code = (
+        error_code_value if isinstance(error_code_value, str) and error_code_value.strip() else None
+    )
+    suggested_foothold_value = result.get("suggested_foothold") or profile_plan.get(
+        "suggested_foothold"
+    )
+    suggested_foothold = (
+        dict(suggested_foothold_value) if isinstance(suggested_foothold_value, dict) else None
+    )
+
+    ok = result.get("ok") is not False and profile_plan.get("ok") is not False
+    platform_tool = tool_name in {"plan_platform_level", "plan_reachable_map_growth"}
+    if platform_tool:
+        jump_graph_value = result.get("jump_graph") or profile_plan.get("jump_graph")
+        if isinstance(jump_graph_value, dict) and jump_graph_value.get("passed") is False:
+            blocked_reason = blocked_reason or "jump_graph_failed"
+        score_value = result.get("score") or profile_plan.get("score")
+        if isinstance(score_value, dict) and score_value.get("passed") is False:
+            blocked_reason = blocked_reason or "score_failed"
+        edit_batches_value = result.get("edit_map_batches")
+        if edit_batches_value is None:
+            edit_batches_value = profile_plan.get("edit_map_batches")
+        if not isinstance(edit_batches_value, list) or not edit_batches_value:
+            blocked_reason = blocked_reason or "empty_edit_map_batches"
+
+    executable = ok and blocked_reason is None and error_code is None
+    return MapPlanOutcome(
+        ok=ok,
+        executable=executable,
+        blocked_reason=blocked_reason,
+        error_code=error_code,
+        suggested_foothold=suggested_foothold,
+    )
+
+
 _MAP_PLAN_TOOL_NAMES = frozenset(
     {
         "plan_map_layout",
@@ -168,9 +234,30 @@ _CONTRACT_KEYS = (
 )
 
 
+def has_completion_route(tool_args: dict[str, Any]) -> bool:
+    """判断验证参数是否包含可冻结的真实路线约束。"""
+    start = tool_args.get("start")
+    goal = tool_args.get("goal")
+    if isinstance(start, dict) and isinstance(goal, dict):
+        return True
+
+    entrances = tool_args.get("entrances")
+    exits = tool_args.get("exits")
+    if isinstance(entrances, list) and entrances and isinstance(exits, list) and exits:
+        return True
+
+    waypoints = tool_args.get("waypoints")
+    return isinstance(waypoints, list) and len(waypoints) >= 2
+
+
 def validation_mode(tool_args: dict[str, Any]) -> ValidationMode:
-    """读取验证模式；旧调用默认保持 completion 语义。"""
-    return "diagnostic" if tool_args.get("validation_mode") == "diagnostic" else "completion"
+    """读取验证模式，并将无路线的旧调用安全降级为 diagnostic。"""
+    requested_mode = tool_args.get("validation_mode")
+    if requested_mode == "diagnostic":
+        return "diagnostic"
+    if requested_mode == "completion":
+        return "completion"
+    return "completion" if has_completion_route(tool_args) else "diagnostic"
 
 
 def validation_contract(tool_args: dict[str, Any]) -> dict[str, Any]:
@@ -265,6 +352,13 @@ def _target(tool_args: dict[str, Any]) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _validation_scope(tool_args: dict[str, Any]) -> str:
+    """返回隔离 TileMap 图层的验证状态键。"""
+    layer = tool_args.get("map_layer", 0)
+    layer_value = layer if isinstance(layer, int) and not isinstance(layer, bool) else 0
+    return f"{_target(tool_args)}::map_layer={layer_value}"
+
+
 def _revision(session: Session, tool_args: dict[str, Any]) -> int | None:
     """返回调用声明或会话已知的当前地图 revision。"""
     value = tool_args.get("expected_revision")
@@ -281,23 +375,29 @@ def validation_call_error(
     """拒绝同 revision 的重复 completion、重复 diagnostic 与验收条件漂移。"""
     if tool_name != "validate_map_region":
         return None
-    target = _target(tool_args)
+    scope = _validation_scope(tool_args)
     revision = _revision(session, tool_args)
     mode = validation_mode(tool_args)
-    workflow = session.map_validation_workflows.get(target, {})
+    workflow = session.map_validation_workflows.get(scope, {})
     same_revision = workflow.get("map_revision") == revision
 
     if mode == "completion":
+        if not has_completion_route(tool_args):
+            record_no_progress(session, scope, "completion_route_missing")
+            return (
+                "completion 验证必须提供 start+goal、非空 entrances+exits，或至少两个 waypoints；"
+                "无路线的图层/区域检查请使用 validation_mode='diagnostic'。"
+            )
         contract_hash = validation_contract_hash(tool_args)
-        frozen = session.map_validation_contracts.get(target)
+        frozen = session.map_validation_contracts.get(scope)
         if isinstance(frozen, dict) and frozen.get("hash") not in (None, contract_hash):
-            record_no_progress(session, target, "completion_contract_drift")
+            record_no_progress(session, scope, "completion_contract_drift")
             return (
                 "completion 验收合同已冻结；禁止修改 start/goal/waypoints/移动参数来绕过失败。"
                 "请修改地图，或由用户明确提交新的验收目标。"
             )
         if same_revision and workflow.get("completion_attempted") is True:
-            record_no_progress(session, target, "completion_repeated_without_revision")
+            record_no_progress(session, scope, "completion_repeated_without_revision")
             next_stage = str(workflow.get("next_stage", "planner"))
             return (
                 f"map revision {revision} 已执行过 completion 验证；确定性结果不会因重试改变。"
@@ -306,13 +406,13 @@ def validation_call_error(
         return None
 
     if same_revision and workflow.get("diagnostic_attempted") is True:
-        record_no_progress(session, target, "diagnostic_repeated_without_revision")
+        record_no_progress(session, scope, "diagnostic_repeated_without_revision")
         return (
             f"map revision {revision} 已完成 diagnostic；下一阶段必须是 planner，"
             "不得继续更换局部 goal 反复验证。"
         )
     if same_revision and workflow.get("next_stage") == "planner":
-        record_no_progress(session, target, "validation_repeated_before_planning")
+        record_no_progress(session, scope, "validation_repeated_before_planning")
         return f"map revision {revision} 已要求进入 planner；写入新 revision 前禁止继续验证。"
     return None
 
@@ -324,10 +424,11 @@ def map_write_stage_error(
 ) -> str | None:
     """诊断结束后，在新规划完成前拒绝地图写入。"""
     target = _target(tool_args)
-    workflow = session.map_validation_workflows.get(target, {})
+    scope = _validation_scope(tool_args)
+    workflow = session.map_validation_workflows.get(scope, {})
     revision = session.latest_map_revisions.get(target)
     if workflow.get("map_revision") == revision and workflow.get("next_stage") == "planner":
-        record_no_progress(session, target, "write_attempted_before_planning")
+        record_no_progress(session, scope, "write_attempted_before_planning")
         return (
             f"map revision {revision} 的诊断阶段已经结束；必须先调用地图规划工具产生新方案，"
             f"再执行 {tool_name}，不能直接试写。"
@@ -342,27 +443,51 @@ def remember_map_plan_progress(
     result: dict[str, Any],
 ) -> None:
     """有效规划完成后允许执行阶段写入，但仍要求新 revision 后再 completion。"""
-    if tool_name not in _MAP_PLAN_TOOL_NAMES or result.get("ok") is False:
+    if tool_name not in _MAP_PLAN_TOOL_NAMES:
         return
-    blocked_reason = result.get("blocked_reason")
-    if blocked_reason:
-        # 规划工具可成功返回诊断结果；它不是可执行计划，必须保留规划工具以便修复后重试。
-        session.map_task_state.stage = "plan"
+    outcome = parse_map_plan_outcome(tool_name, result)
+    if not outcome.executable:
+        # 规划工具可能以成功响应承载诊断结果；任何失败都必须留在规划阶段恢复。
+        state = session.map_task_state
+        state.stage = "plan"
+        state.failure_frontier = {
+            "tool": tool_name,
+            "blocked_reason": outcome.blocked_reason,
+            "error_code": outcome.error_code,
+            "suggested_foothold": outcome.suggested_foothold,
+        }
+        state.unresolved_issues = [
+            {
+                "kind": "map_plan_not_executable",
+                "tool": tool_name,
+                "blocked_reason": outcome.blocked_reason,
+                "error_code": outcome.error_code,
+            }
+        ]
         return
     target_value = result.get("target", result.get("target_path", _target(tool_args)))
     target = target_value if isinstance(target_value, str) else ""
-    workflow = session.map_validation_workflows.get(target)
+    scope_args = {**tool_args, "target_path": target}
+    result_layer = result.get("map_layer")
+    if (
+        "map_layer" not in scope_args
+        and isinstance(result_layer, int)
+        and not isinstance(result_layer, bool)
+    ):
+        scope_args["map_layer"] = result_layer
+    scope = _validation_scope(scope_args)
+    workflow = session.map_validation_workflows.get(scope)
     if isinstance(workflow, dict) and workflow.get("next_stage") == "planner":
         current_revision = session.latest_map_revisions.get(target)
         if workflow.get("map_revision") != current_revision:
             return
         workflow["next_stage"] = "write"
         workflow["plan_tool"] = tool_name
-        session.map_validation_workflows[target] = workflow
+        session.map_validation_workflows[scope] = workflow
     session.map_task_state.stage = "write"
     session.map_task_state.plan_version += 1
     session.map_task_state.unresolved_issues.clear()
-    session.map_task_state.no_progress_streaks[target] = 0
+    session.map_task_state.no_progress_streaks[scope] = 0
 
 
 def remember_validation_progress(
@@ -377,6 +502,15 @@ def remember_validation_progress(
         return
     target_value = result.get("target", result.get("target_path", _target(tool_args)))
     target = target_value if isinstance(target_value, str) else ""
+    scope_args = {**tool_args, "target_path": target}
+    result_layer = result.get("map_layer")
+    if (
+        "map_layer" not in scope_args
+        and isinstance(result_layer, int)
+        and not isinstance(result_layer, bool)
+    ):
+        scope_args["map_layer"] = result_layer
+    scope = _validation_scope(scope_args)
     revision_value = result.get("map_revision")
     revision = (
         revision_value
@@ -384,22 +518,22 @@ def remember_validation_progress(
         else _revision(session, tool_args)
     )
     mode = validation_mode(tool_args)
-    workflow = session.map_validation_workflows.get(target, {})
+    workflow = session.map_validation_workflows.get(scope, {})
     if workflow.get("map_revision") != revision:
         workflow = {"map_revision": revision}
 
     if mode == "completion":
-        contract = validation_contract(tool_args)
+        contract = validation_contract(scope_args)
         session.map_validation_contracts.setdefault(
-            target,
-            {"hash": validation_contract_hash(tool_args), "contract": contract},
+            scope,
+            {"hash": validation_contract_hash(scope_args), "contract": contract},
         )
         workflow["completion_attempted"] = True
         workflow["next_stage"] = "reviewer" if successful else "diagnostic"
         session.map_task_state.stage = "review" if successful else "diagnostic"
         session.map_task_state.unresolved_issues = list(result.get("issues", []))
         if successful:
-            session.map_task_state.completed_goals.append(validation_contract(tool_args))
+            session.map_task_state.completed_goals.append(contract)
     else:
         workflow["diagnostic_attempted"] = True
         workflow["next_stage"] = "planner"
@@ -410,9 +544,9 @@ def remember_validation_progress(
             "structured_issues": result.get("structured_issues", []),
         }
     workflow["issues"] = result.get("issues", [])
-    session.map_validation_workflows[target] = workflow
+    session.map_validation_workflows[scope] = workflow
     session.map_task_state.counters.validations += 1
-    session.map_task_state.no_progress_streaks[target] = 0
+    session.map_task_state.no_progress_streaks[scope] = 0
 
 
 def reset_map_task_progress(session: Session, frame: Frame | None = None) -> None:

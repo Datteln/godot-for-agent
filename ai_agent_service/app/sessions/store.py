@@ -62,9 +62,9 @@ class Session:
             worker 回填时防止旧上下文把失败误报为通过。
         map_validation_failure_counts: 校验失败指纹 → 无新地图 revision 时的重复次数；
             达到上限后停止自动续跑。
-        map_validation_contracts: 目标地图 → 当前用户任务冻结的 completion 验收合同；
+        map_validation_contracts: 目标地图与图层作用域 → 当前用户任务冻结的 completion 验收合同；
             模型不能靠修改 start/goal/移动参数绕过失败结果。
-        map_validation_workflows: 目标地图 → 当前 revision 的验证阶段状态；用于强制
+        map_validation_workflows: 目标地图与图层作用域 → 当前 revision 的验证阶段状态；用于强制
             completion → diagnostic → planner → write → 新 revision 的转换。
         map_no_progress_streaks: 目标地图 → 当前 revision 连续无进展次数；真实写入
             推进 revision 或新用户任务开始时清零。
