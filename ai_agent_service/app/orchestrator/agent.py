@@ -25,13 +25,14 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from app.agents.bundled import get_agent
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
 from app.llm.cache_decision_engine import CacheDecision, CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnapshot
-from app.llm.provider import AssistantTurn, LLMError, LLMProvider
+from app.llm.provider import AssistantTurn, LLMError, LLMProvider, ToolCallRequest
 from app.permissions.engine import PermissionContext, SessionAllowGrant, check
 from app.security.settings import SecuritySettings
 from app.sessions.store import Session
@@ -48,6 +49,7 @@ from app.orchestrator.map_progress import (
     cached_validation_result,
     map_platform_plan_call_error,
     map_write_stage_error,
+    platform_write_requires_validation,
     validation_call_error,
 )
 
@@ -435,6 +437,23 @@ async def _delegate_child_frame(
         return None
     parent = _find_frame(session, parent_id)
     worker_spec = args.get("worker_spec")
+    if (
+        isinstance(worker_spec, dict)
+        and isinstance(agent_name, str)
+        and agent_name not in {"map-agent", "map-worker"}
+    ):
+        try:
+            child_agent = get_agent(agent_name, set(REGISTRY))
+        except KeyError:
+            pass
+        else:
+            logger.warning(
+                "Ignoring worker_spec for permanent agent session=%s parent=%s agent=%s",
+                session.session_id,
+                parent_id,
+                agent_name,
+            )
+            worker_spec = None
     if isinstance(worker_spec, dict):
         if parent is None or parent.agent.name != "map-agent":
             return "只有 map-agent 可以创建动态地图 worker"
@@ -938,6 +957,429 @@ def _map_stage_for_frame(frame: Frame) -> str:
     if "repair" in frame.agent.prompt or "repair" in name:
         return "repairer"
     return "reader"
+
+
+def _integer(value: Any) -> int | None:
+    """把非布尔整数参数规范化为整数。"""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _whole_number(value: Any) -> int | None:
+    """把 JSON 中的整数或整数浮点数规范化为整数。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _registered_resource_for_operation(
+    project_root: Path,
+    operation: dict[str, Any],
+) -> str:
+    """从工程资源注册表中解析与原始瓦片坐标完全匹配的资源键。"""
+    source_id = _whole_number(operation.get("source_id"))
+    atlas_x = _whole_number(operation.get("atlas_x"))
+    atlas_y = _whole_number(operation.get("atlas_y"))
+    if source_id is None or atlas_x is None or atlas_y is None:
+        return ""
+
+    registry_path = (
+        project_root.resolve()
+        / ".ai_agent_service"
+        / "map_agent"
+        / "resource_registry.json"
+    )
+    try:
+        with registry_path.open("r", encoding="utf-8") as handle:
+            registry = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(registry, dict):
+        return ""
+
+    semantic = str(operation.get("semantic_layer", "")).strip().lower()
+    operation_tags_value = operation.get("tags")
+    operation_tags = (
+        {str(tag).strip().lower() for tag in operation_tags_value}
+        if isinstance(operation_tags_value, list)
+        else set()
+    )
+    candidates: list[tuple[int, str]] = []
+    for key, value in registry.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        coords_value = value.get("atlas_coords")
+        coords = coords_value if isinstance(coords_value, dict) else {}
+        entry_source = _whole_number(value.get("source_id"))
+        entry_x = _whole_number(value.get("atlas_x", coords.get("x")))
+        entry_y = _whole_number(value.get("atlas_y", coords.get("y")))
+        if (entry_source, entry_x, entry_y) != (source_id, atlas_x, atlas_y):
+            continue
+        tags_value = value.get("tags")
+        tags = (
+            {str(tag).strip().lower() for tag in tags_value}
+            if isinstance(tags_value, list)
+            else set()
+        )
+        score = len(operation_tags & tags)
+        if semantic and semantic in tags:
+            score += 4
+        candidates.append((score, key))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda candidate: (-candidate[0], candidate[1]))
+    return candidates[0][1]
+
+
+def _platform_role(
+    index: int,
+    count: int,
+    operation: dict[str, Any],
+    previous_y: int | None,
+) -> str:
+    """根据写入顺序和几何关系确定平台的验证角色。"""
+    if index == 0:
+        return "safe_intro"
+    if index == count - 1:
+        return "finish"
+    tags_value = operation.get("tags")
+    tags = (
+        {str(tag).strip().lower() for tag in tags_value}
+        if isinstance(tags_value, list)
+        else set()
+    )
+    y = _integer(operation.get("y"))
+    if "staircase" in tags or (previous_y is not None and y is not None and y != previous_y):
+        return "stair"
+    return ("takeoff", "landing", "rest")[(index - 1) % 3]
+
+
+def _platform_validation_args(
+    session: Session,
+    edit_calls: list[dict[str, Any]],
+    project_root: Path,
+) -> dict[str, Any] | None:
+    """把同一地图图层的平台写入意图确定性转换为校验器入参。"""
+    if not edit_calls:
+        return None
+    first_input = edit_calls[0].get("input")
+    if not isinstance(first_input, dict):
+        return None
+
+    operation_entries: list[tuple[int, dict[str, Any]]] = []
+    sequence = 0
+    ground_resource = ""
+    fallback_ground_resource = ""
+    for call in edit_calls:
+        call_input = call.get("input")
+        if not isinstance(call_input, dict):
+            continue
+        operations = call_input.get("operations")
+        if not isinstance(operations, list):
+            continue
+        for operation in operations:
+            if not isinstance(operation, dict):
+                continue
+            semantic = str(operation.get("semantic_layer", "")).strip().lower()
+            tags_value = operation.get("tags")
+            tags = (
+                {str(tag).strip().lower() for tag in tags_value}
+                if isinstance(tags_value, list)
+                else set()
+            )
+            if semantic != "ground" and "platform" not in tags:
+                continue
+            if operation.get("action") != "fill":
+                continue
+            x = _integer(operation.get("x"))
+            y = _integer(operation.get("y"))
+            width = _integer(operation.get("width"))
+            if x is None or y is None or width is None or width < 1:
+                continue
+            operation_entries.append((sequence, operation))
+            sequence += 1
+            if not ground_resource:
+                resource = operation.get("resource", operation.get("resource_key"))
+                if isinstance(resource, str):
+                    ground_resource = resource.strip()
+                if not ground_resource:
+                    ground_resource = _registered_resource_for_operation(
+                        project_root,
+                        operation,
+                    )
+            if not fallback_ground_resource:
+                fallback = operation.get("fallback_resource")
+                if isinstance(fallback, str):
+                    fallback_ground_resource = fallback.strip()
+
+    if not operation_entries:
+        return None
+    operation_entries.sort(
+        key=lambda entry: (
+            int(entry[1]["x"]),
+            int(entry[1]["y"]),
+            entry[0],
+        )
+    )
+
+    platforms: list[dict[str, Any]] = []
+    previous_y: int | None = None
+    for index, (_, operation) in enumerate(operation_entries):
+        x = int(operation["x"])
+        y = int(operation["y"])
+        width = int(operation["width"])
+        platforms.append(
+            {
+                "id": f"auto_p{index}",
+                "x": x,
+                "y": y,
+                "width": width,
+                "role": _platform_role(index, len(operation_entries), operation, previous_y),
+                "connection": index == 0,
+            }
+        )
+        previous_y = y
+
+    segments: list[dict[str, Any]] = []
+    for index in range(len(platforms) - 1):
+        current = platforms[index]
+        following = platforms[index + 1]
+        horizontal_gap = max(
+            0,
+            int(following["x"]) - (int(current["x"]) + int(current["width"]) - 1),
+        )
+        vertical_delta = int(current["y"]) - int(following["y"])
+        if vertical_delta > 0:
+            segment_type = "jump_up"
+        elif vertical_delta < 0:
+            segment_type = "drop"
+        elif horizontal_gap > 1:
+            segment_type = "gap_jump"
+        else:
+            segment_type = "walk"
+        segments.append(
+            {
+                "index": index,
+                "type": segment_type,
+                "from_platform": current["id"],
+                "to_platform": following["id"],
+                "start": {
+                    "x": int(current["x"]) + int(current["width"]) - 1,
+                    "y": int(current["y"]) - 1,
+                },
+                "end": {
+                    "x": int(following["x"]),
+                    "y": int(following["y"]) - 1,
+                },
+                "difficulty": 0 if segment_type == "walk" else 1,
+                "note": "由服务层根据待执行 edit_map 几何生成。",
+            }
+        )
+    if not segments:
+        only = platforms[0]
+        segments.append(
+            {
+                "index": 0,
+                "type": "stand",
+                "from_platform": only["id"],
+                "to_platform": only["id"],
+                "difficulty": 0,
+                "note": "单个平台写入的前置结构校验。",
+            }
+        )
+
+    min_x = min(int(platform["x"]) for platform in platforms)
+    max_x = max(
+        int(platform["x"]) + int(platform["width"]) - 1 for platform in platforms
+    )
+    min_y = min(int(platform["y"]) for platform in platforms)
+    max_y = max(int(platform["y"]) for platform in platforms)
+    region_x = min_x - 4
+    region_y = min_y - 4
+    target = str(first_input.get("target_path", "")).strip()
+    map_layer = _integer(first_input.get("map_layer"))
+    revision = session.latest_map_revisions.get(target)
+    if revision is None:
+        revision = _integer(first_input.get("expected_revision"))
+
+    args: dict[str, Any] = {
+        "target_path": target,
+        "map_layer": map_layer if map_layer is not None else 0,
+        "x": region_x,
+        "y": region_y,
+        "width": max(8, max_x - region_x + 5),
+        "height": max(8, max_y - region_y + 5),
+        "platforms": platforms,
+        "segments": segments,
+        "connect_from_existing": True,
+        "entry_sample_x": min_x - 24,
+        "entry_sample_y": region_y,
+        "entry_sample_width": 24,
+        "entry_sample_height": max(30, max_y - region_y + 5),
+        "max_horizontal_gap": 4,
+        "max_rise": 2,
+        "max_fall": 6,
+        "min_landing_width": 3,
+        "platform_thickness": 1,
+        "max_platform_thickness": 2,
+        "max_platform_width": max(8, max(int(item["width"]) for item in platforms)),
+        "min_finish_buffer_width": 6,
+        "__auto_platform_validation": True,
+    }
+    if revision is not None:
+        args["expected_revision"] = revision
+    if ground_resource:
+        args["ground_resource"] = ground_resource
+    if fallback_ground_resource:
+        args["fallback_ground_resource"] = fallback_ground_resource
+    return args
+
+
+def _replace_assistant_with_front_call(
+    frame: Frame,
+    text: str,
+    call: FrontToolCall,
+) -> None:
+    """把当前 assistant 的原始写调用替换为服务层生成的前端调用。"""
+    if not frame.messages:
+        return
+    message = frame.messages[-1]
+    if message.get("role") != "assistant":
+        return
+    message["content"] = text
+    message["tool_calls"] = [
+        {
+            "id": call.id,
+            "type": "function",
+            "function": {
+                "name": call.name,
+                "arguments": json.dumps(call.input, ensure_ascii=False),
+            },
+        }
+    ]
+
+
+def _route_unvalidated_platform_writes_to_validator(
+    *,
+    session: Session,
+    frame: Frame,
+    calls: list[ToolCallRequest],
+    project_root: Path,
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> tuple[bool, ToolCallsResult | None]:
+    """在平台写入缺少批准批次时由服务层直接下发平台方案校验。"""
+    parsed_calls: list[dict[str, Any]] = []
+    deferred_calls: list[dict[str, Any]] = []
+    target = ""
+    map_layer = 0
+    for call in calls:
+        args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
+        if parse_error is not None or args is None:
+            continue
+        deferred_calls.append({"id": call.id, "tool": call.name, "input": args})
+        if call.name != "edit_map":
+            continue
+        if not platform_write_requires_validation(session, call.name, args):
+            continue
+        call_target = str(args.get("target_path", "")).strip()
+        call_layer = _integer(args.get("map_layer"))
+        if not parsed_calls:
+            target = call_target
+            map_layer = call_layer if call_layer is not None else 0
+        if call_target != target or (call_layer if call_layer is not None else 0) != map_layer:
+            continue
+        parsed_calls.append({"id": call.id, "tool": call.name, "input": args})
+
+    if not parsed_calls:
+        return False, None
+
+    validation_args = _platform_validation_args(session, parsed_calls, project_root)
+    if validation_args is None:
+        for call in calls:
+            frame.messages.append(
+                _tool_message(
+                    call.id,
+                    (
+                        "服务层无法从本轮 edit_map 提取有效的平台 fill 几何，"
+                        "因此未执行写入或前置校验。"
+                    ),
+                    is_error=True,
+                )
+            )
+        return True, None
+    validation_args["__deferred_tool_calls"] = deferred_calls
+
+    validation_error = map_platform_plan_call_error(
+        session,
+        "validate_platform_level_plan",
+        validation_args,
+    )
+    if validation_error is not None:
+        for call in calls:
+            frame.messages.append(_tool_message(call.id, validation_error, is_error=True))
+        return True, None
+
+    validator = REGISTRY.get("validate_platform_level_plan")
+    if validator is None or validator.side != "front":
+        for call in calls:
+            frame.messages.append(
+                _tool_message(
+                    call.id,
+                    "validate_platform_level_plan 前端工具未注册，本轮 edit_map 未执行。",
+                    is_error=True,
+                )
+            )
+        return True, None
+
+    source_ids = [str(call["id"]) for call in parsed_calls]
+    validator_call = FrontToolCall(
+        id=f"{source_ids[0]}__platform_validation",
+        name=validator.name,
+        input=validation_args,
+        needs_confirm=False,
+        frame_id=frame.id,
+        agent=frame.agent.name,
+        render_kind=validator.render_kind,
+    )
+    text = (
+        "服务层检测到平台 edit_map 尚无当前 revision 的批准批次，"
+        "已直接生成并下发 validate_platform_level_plan；本轮原始写入暂不执行。"
+    )
+    _replace_assistant_with_front_call(frame, text, validator_call)
+    session.map_task_state.stage = "plan"
+    turn_id = session.new_turn_id()
+    session.set_pending(
+        turn_id,
+        [validator_call.id],
+        {
+            validator_call.id: {
+                "name": validator_call.name,
+                "input": validator_call.input,
+                "frame_id": validator_call.frame_id,
+                "agent": validator_call.agent,
+            }
+        },
+    )
+    logger.info(
+        "Platform write auto-routed directly to validator session=%s frame=%s calls=%d",
+        session.session_id,
+        frame.id,
+        len(parsed_calls),
+    )
+    _emit_orchestration_event(
+        event_callback,
+        "map_platform_validation_auto_called",
+        {
+            "frame_id": frame.id,
+            "validator_call_id": validator_call.id,
+            "source_call_ids": source_ids,
+            "count": len(parsed_calls),
+        },
+    )
+    return True, ToolCallsResult(turn_id=turn_id, text=text, calls=[validator_call])
 
 
 def _frame_objective(frame: Frame) -> str:
@@ -3220,6 +3662,20 @@ async def run_turn(
                 args=args,
                 event_callback=event_callback,
             )
+            continue
+
+        platform_route_handled, platform_validation_response = (
+            _route_unvalidated_platform_writes_to_validator(
+                session=session,
+                frame=frame,
+                calls=turn.tool_calls,
+                project_root=tool_ctx.security.project_root,
+                event_callback=event_callback,
+            )
+        )
+        if platform_validation_response is not None:
+            return platform_validation_response
+        if platform_route_handled:
             continue
 
         front_calls: list[FrontToolCall] = []

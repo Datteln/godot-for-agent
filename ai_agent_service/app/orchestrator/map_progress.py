@@ -639,6 +639,41 @@ def _looks_like_platform_route_write(
     return False
 
 
+def platform_write_requires_validation(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> bool:
+    """判断平台写入是否必须先执行或重新执行平台方案校验。
+
+    Args:
+        session: 当前地图任务会话。
+        tool_name: 待执行的地图写工具名。
+        tool_args: 待执行工具的结构化参数。
+
+    Returns:
+        当前写入属于未批准的平台路线时返回 True，否则返回 False。
+    """
+    if not _looks_like_platform_route_write(tool_name, tool_args):
+        return False
+
+    target = _target(tool_args)
+    scope = _validation_scope(tool_args)
+    approval = session.map_task_state.approved_platform_plans.get(scope)
+    if not isinstance(approval, dict):
+        return True
+
+    revision = session.latest_map_revisions.get(target)
+    if approval.get("map_revision") != revision:
+        return True
+
+    batches_value = approval.get("remaining_batches")
+    batches = batches_value if isinstance(batches_value, list) else []
+    return not any(
+        _compiled_batch_matches(tool_name, tool_args, batch) for batch in batches
+    )
+
+
 def _platform_edit_batches(result: dict[str, Any]) -> list[dict[str, Any]]:
     """提取平台校验结果中的可执行地图批次。"""
     profile_value = result.get("profile_plan")

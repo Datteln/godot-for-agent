@@ -151,6 +151,8 @@ def register_front_tools() -> None:
                         "worker_spec": {
                             "description": (
                                 "Optional dynamic map worker spec. Only map-agent may use this. "
+                                "Use agent=map-worker (or legacy agent=map-agent) with this field; "
+                                "do not combine it with a permanent specialist agent name. "
                                 "Fields include name, objective, mode, allowed_tools, operations, constraints, "
                                 "skills, output_schema, stage_id, max_turns."
                             ),
