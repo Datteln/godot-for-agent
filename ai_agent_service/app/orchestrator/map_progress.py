@@ -55,6 +55,7 @@ class MapTaskState:
     validation_failure_counts: dict[str, int] = field(default_factory=dict)
     planning_attempts: dict[str, int] = field(default_factory=dict)
     planning_fingerprints: dict[str, int] = field(default_factory=dict)
+    tool_failure_fingerprints: dict[str, dict[str, Any]] = field(default_factory=dict)
     approved_platform_plans: dict[str, dict[str, Any]] = field(default_factory=dict)
     latest_revisions: dict[str, int] = field(default_factory=dict)
     latest_layers: dict[str, int] = field(default_factory=dict)
@@ -99,6 +100,7 @@ class MapTaskState:
             "validation_failure_counts",
             "planning_attempts",
             "planning_fingerprints",
+            "tool_failure_fingerprints",
             "approved_platform_plans",
             "latest_revisions",
             "latest_layers",
@@ -402,6 +404,77 @@ def _platform_plan_fingerprint(tool_name: str, tool_args: dict[str, Any]) -> str
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+
+_TOOL_FAILURE_VOLATILE_KEYS = frozenset(
+    {
+        "batch_index",
+        "frame_id",
+        "mode",
+        "plan_version",
+        "task_summary",
+        "worker",
+        "workflow_constraints",
+        "workflow_operations",
+        "write_batch_id",
+    }
+)
+
+
+def map_tool_call_fingerprint(
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> str:
+    """生成忽略编排元数据的稳定地图工具调用指纹。"""
+    normalized = {
+        key: value
+        for key, value in tool_args.items()
+        if key not in _TOOL_FAILURE_VOLATILE_KEYS
+    }
+    encoded = json.dumps(
+        {"tool": tool_name, "args": normalized},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+
+def remember_map_tool_failure(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    error_code: str,
+    message: str,
+) -> None:
+    """记录一次地图工具失败，供后续相同调用在服务层直接阻断。"""
+    fingerprint = map_tool_call_fingerprint(tool_name, tool_args)
+    session.map_task_state.tool_failure_fingerprints[fingerprint] = {
+        "tool": tool_name,
+        "error_code": error_code,
+        "message": message,
+    }
+    while len(session.map_task_state.tool_failure_fingerprints) > 128:
+        first_key = next(iter(session.map_task_state.tool_failure_fingerprints))
+        del session.map_task_state.tool_failure_fingerprints[first_key]
+
+
+def repeated_map_tool_failure_error(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> str | None:
+    """在相同地图工具调用已失败时返回不重复下发的阻断消息。"""
+    fingerprint = map_tool_call_fingerprint(tool_name, tool_args)
+    failure = session.map_task_state.tool_failure_fingerprints.get(fingerprint)
+    if not isinstance(failure, dict):
+        return None
+    return (
+        "duplicate_tool_failure_blocked：相同参数的地图工具调用已经失败过，"
+        "服务层不会再次下发。"
+        f"previous_error_code={failure.get('error_code', 'unknown')}。"
+        "必须修改资源键、操作参数或重新规划，禁止原样重试。"
+    )
 
 
 def map_platform_plan_call_error(
@@ -857,6 +930,7 @@ def reset_map_task_progress(session: Session, frame: Frame | None = None) -> Non
     state.no_progress_streaks.clear()
     state.planning_attempts.clear()
     state.planning_fingerprints.clear()
+    state.tool_failure_fingerprints.clear()
     state.approved_platform_plans.clear()
     state.context_state.pop("reader_exhausted", None)
     state.checkpoint = None

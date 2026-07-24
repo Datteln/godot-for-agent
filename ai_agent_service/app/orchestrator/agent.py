@@ -50,8 +50,11 @@ from app.orchestrator.map_progress import (
     map_platform_plan_call_error,
     map_write_stage_error,
     platform_write_requires_validation,
+    remember_map_tool_failure,
+    repeated_map_tool_failure_error,
     validation_call_error,
 )
+from app.orchestrator.map_resources import normalize_edit_map_resources
 
 MAX_AGENT_DEPTH = 4
 EVENT_TEXT_PREVIEW_CHARS = 24_000
@@ -964,76 +967,6 @@ def _integer(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _whole_number(value: Any) -> int | None:
-    """把 JSON 中的整数或整数浮点数规范化为整数。"""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return None
-
-
-def _registered_resource_for_operation(
-    project_root: Path,
-    operation: dict[str, Any],
-) -> str:
-    """从工程资源注册表中解析与原始瓦片坐标完全匹配的资源键。"""
-    source_id = _whole_number(operation.get("source_id"))
-    atlas_x = _whole_number(operation.get("atlas_x"))
-    atlas_y = _whole_number(operation.get("atlas_y"))
-    if source_id is None or atlas_x is None or atlas_y is None:
-        return ""
-
-    registry_path = (
-        project_root.resolve()
-        / ".ai_agent_service"
-        / "map_agent"
-        / "resource_registry.json"
-    )
-    try:
-        with registry_path.open("r", encoding="utf-8") as handle:
-            registry = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return ""
-    if not isinstance(registry, dict):
-        return ""
-
-    semantic = str(operation.get("semantic_layer", "")).strip().lower()
-    operation_tags_value = operation.get("tags")
-    operation_tags = (
-        {str(tag).strip().lower() for tag in operation_tags_value}
-        if isinstance(operation_tags_value, list)
-        else set()
-    )
-    candidates: list[tuple[int, str]] = []
-    for key, value in registry.items():
-        if not isinstance(key, str) or not isinstance(value, dict):
-            continue
-        coords_value = value.get("atlas_coords")
-        coords = coords_value if isinstance(coords_value, dict) else {}
-        entry_source = _whole_number(value.get("source_id"))
-        entry_x = _whole_number(value.get("atlas_x", coords.get("x")))
-        entry_y = _whole_number(value.get("atlas_y", coords.get("y")))
-        if (entry_source, entry_x, entry_y) != (source_id, atlas_x, atlas_y):
-            continue
-        tags_value = value.get("tags")
-        tags = (
-            {str(tag).strip().lower() for tag in tags_value}
-            if isinstance(tags_value, list)
-            else set()
-        )
-        score = len(operation_tags & tags)
-        if semantic and semantic in tags:
-            score += 4
-        candidates.append((score, key))
-    if not candidates:
-        return ""
-    candidates.sort(key=lambda candidate: (-candidate[0], candidate[1]))
-    return candidates[0][1]
-
-
 def _platform_role(
     index: int,
     count: int,
@@ -1060,7 +993,6 @@ def _platform_role(
 def _platform_validation_args(
     session: Session,
     edit_calls: list[dict[str, Any]],
-    project_root: Path,
 ) -> dict[str, Any] | None:
     """把同一地图图层的平台写入意图确定性转换为校验器入参。"""
     if not edit_calls:
@@ -1105,11 +1037,6 @@ def _platform_validation_args(
                 resource = operation.get("resource", operation.get("resource_key"))
                 if isinstance(resource, str):
                     ground_resource = resource.strip()
-                if not ground_resource:
-                    ground_resource = _registered_resource_for_operation(
-                        project_root,
-                        operation,
-                    )
             if not fallback_ground_resource:
                 fallback = operation.get("fallback_resource")
                 if isinstance(fallback, str):
@@ -1279,6 +1206,10 @@ def _route_unvalidated_platform_writes_to_validator(
         args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
         if parse_error is not None or args is None:
             continue
+        if call.name == "edit_map":
+            normalization = normalize_edit_map_resources(project_root, args)
+            if normalization.error_code is None:
+                args = normalization.args
         deferred_calls.append({"id": call.id, "tool": call.name, "input": args})
         if call.name != "edit_map":
             continue
@@ -1296,7 +1227,7 @@ def _route_unvalidated_platform_writes_to_validator(
     if not parsed_calls:
         return False, None
 
-    validation_args = _platform_validation_args(session, parsed_calls, project_root)
+    validation_args = _platform_validation_args(session, parsed_calls)
     if validation_args is None:
         for call in calls:
             frame.messages.append(
@@ -3704,6 +3635,99 @@ async def run_turn(
                 pending_items.append(_PendingToolMessage(parse_error))
                 continue
             assert args is not None
+            if tool.name in MAP_WRITE_TOOL_NAMES:
+                repeated_error = repeated_map_tool_failure_error(
+                    session,
+                    tool.name,
+                    args,
+                )
+                if repeated_error is not None:
+                    logger.warning(
+                        "Repeated map tool failure blocked session=%s frame=%s tool=%s",
+                        session.session_id,
+                        frame.id,
+                        tool.name,
+                    )
+                    pending_items.append(
+                        _PendingToolMessage(
+                            _tool_message(call.id, repeated_error, is_error=True)
+                        )
+                    )
+                    continue
+            if tool.name == "edit_map":
+                normalization = normalize_edit_map_resources(
+                    tool_ctx.security.project_root,
+                    args,
+                )
+                if normalization.error_code is not None:
+                    error_message = normalization.error_message or (
+                        "地图资源规范化失败，edit_map 未下发。"
+                    )
+                    remember_map_tool_failure(
+                        session,
+                        tool.name,
+                        args,
+                        normalization.error_code,
+                        error_message,
+                    )
+                    logger.warning(
+                        "Map resource normalization blocked session=%s frame=%s "
+                        "error_code=%s",
+                        session.session_id,
+                        frame.id,
+                        normalization.error_code,
+                    )
+                    _emit_orchestration_event(
+                        event_callback,
+                        "map_resource_normalization_blocked",
+                        {
+                            "frame_id": frame.id,
+                            "tool": tool.name,
+                            "error_code": normalization.error_code,
+                        },
+                    )
+                    pending_items.append(
+                        _PendingToolMessage(
+                            _tool_message(call.id, error_message, is_error=True)
+                        )
+                    )
+                    continue
+                args = normalization.args
+                repeated_error = repeated_map_tool_failure_error(
+                    session,
+                    tool.name,
+                    args,
+                )
+                if repeated_error is not None:
+                    logger.warning(
+                        "Normalized repeated map tool failure blocked "
+                        "session=%s frame=%s tool=%s",
+                        session.session_id,
+                        frame.id,
+                        tool.name,
+                    )
+                    pending_items.append(
+                        _PendingToolMessage(
+                            _tool_message(call.id, repeated_error, is_error=True)
+                        )
+                    )
+                    continue
+                if normalization.rewritten_operations:
+                    logger.info(
+                        "Map resources normalized session=%s frame=%s operations=%d",
+                        session.session_id,
+                        frame.id,
+                        normalization.rewritten_operations,
+                    )
+                    _emit_orchestration_event(
+                        event_callback,
+                        "map_resources_normalized",
+                        {
+                            "frame_id": frame.id,
+                            "tool": tool.name,
+                            "rewritten_operations": normalization.rewritten_operations,
+                        },
+                    )
             args = _with_map_write_metadata(
                 session=session,
                 frame=frame,

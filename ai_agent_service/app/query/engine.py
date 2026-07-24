@@ -53,6 +53,7 @@ from app.orchestrator.map_progress import (
     MAP_PLATFORM_PLAN_MAX_ATTEMPTS,
     map_platform_plan_attempt_count,
     parse_map_plan_outcome,
+    remember_map_tool_failure,
     remember_validation_cache,
     remember_map_plan_progress,
     remember_validation_progress,
@@ -220,6 +221,37 @@ def _planner_completion_text(
         "risks": [] if outcome.executable else ["平台路线尚不可执行，禁止进入写入阶段。"],
         "next_stage": "writer" if outcome.executable else "planner",
     }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _is_dynamic_map_writer(frame: Frame) -> bool:
+    """判断当前帧是否为一次性地图写入 worker。"""
+    return bool(frame.agent.workflow_operations) and frame.agent.edit_map_max_turns is not None
+
+
+def _writer_platform_validation_failure_text(
+    frame: Frame,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    result: dict[str, Any],
+) -> str:
+    """把写入前平台校验失败转换为确定性的 Writer 阶段结果。"""
+    payload_value = json.loads(_planner_completion_text(frame, tool_name, tool_args, result))
+    payload = payload_value if isinstance(payload_value, dict) else {}
+    payload.update(
+        {
+            "stage": "writer",
+            "worker": frame.agent.name,
+            "mode": "partial",
+            "summary": (
+                "平台写入前校验未通过；Writer 未执行 edit_map，"
+                "已停止当前写入帧并返回 planner。"
+            ),
+            "proposed_batches": [],
+            "write_results": [],
+            "next_stage": "planner",
+        }
+    )
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -1382,6 +1414,28 @@ class QueryEngine:
                     "result": result.result,
                 }
             result_for_gate = payload.get("result") if isinstance(payload, dict) else None
+            if (
+                result.status == "error"
+                and tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
+            ):
+                result_error = result.result if isinstance(result.result, dict) else {}
+                error_code = str(
+                    result.error_code
+                    or result_error.get("error_code")
+                    or "map_tool_error"
+                )
+                error_message = str(
+                    result_error.get("message")
+                    or payload.get("message", "")
+                    or error_code
+                )
+                remember_map_tool_failure(
+                    session,
+                    tool_name,
+                    tool_args,
+                    error_code,
+                    error_message,
+                )
             _remember_map_batch_result(
                 session,
                 tool_name,
@@ -1452,6 +1506,24 @@ class QueryEngine:
                             plan_outcome.executable,
                             attempt_count,
                         )
+                elif (
+                    _is_dynamic_map_writer(frame)
+                    and tool_name in _PLATFORM_PLAN_TOOL_NAMES
+                    and not parse_map_plan_outcome(tool_name, result_for_gate).executable
+                ):
+                    frame.forced_completion_text = _writer_platform_validation_failure_text(
+                        frame,
+                        tool_name,
+                        tool_args,
+                        result_for_gate,
+                    )
+                    logger.info(
+                        "Scheduled deterministic writer stop after platform validation "
+                        "failure session=%s frame=%s tool=%s",
+                        session.session_id,
+                        frame.id,
+                        tool_name,
+                    )
                 remember_validation_cache(
                     session,
                     tool_name,

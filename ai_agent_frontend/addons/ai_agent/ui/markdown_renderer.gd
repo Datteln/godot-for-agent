@@ -71,7 +71,9 @@ static func markdown_to_bbcode(text: String, theme_colors: Dictionary) -> String
 			var tree_range: Vector2i = tree_ranges[tree_range_index]
 			result.append("[bgcolor=%s][code]" % theme_color_tag("code_bg", theme_colors))
 			for tree_index in range(tree_range.x, tree_range.y):
-				result.append(escape_bbcode(str(lines[tree_index])))
+				# [code] 内部不解析任何嵌套 BBCode（包括 [lb]/[rb]），
+				# 因此不需要 escape_bbcode；原始 [ ] 字符会原样显示。
+				result.append(str(lines[tree_index]))
 			result.append("[/code][/bgcolor]")
 			index = tree_range.y
 			tree_range_index += 1
@@ -290,8 +292,9 @@ static func highlight_code_line(line: String, lang: String, theme_colors: Dictio
 		if comment_index >= 0:
 			var code_part := line.substr(0, comment_index)
 			var comment_part := line.substr(comment_index)
+			# [code] 内部不解析嵌套 BBCode，因此不需要 escape_bbcode
 			return highlight_code_segment(code_part, lang, theme_colors) \
-				+ "[color=%s]%s[/color]" % [theme_color_tag("syntax_comment", theme_colors), escape_bbcode(comment_part)]
+				+ "[color=%s]%s[/color]" % [theme_color_tag("syntax_comment", theme_colors), comment_part]
 	return highlight_code_segment(line, lang, theme_colors)
 
 
@@ -338,7 +341,9 @@ static func highlight_code_segment(text: String, lang: String, theme_colors: Dic
 				if next_char == quote:
 					break
 			var literal := text.substr(index, end - index)
-			result += "[color=%s]%s[/color]" % [theme_color_tag("syntax_string", theme_colors), escape_bbcode(literal)]
+			# 调用方保证此函数只在 [code]…[/code] 内部使用；
+			# [code] 不解析任何嵌套 BBCode，因此无需 escape_bbcode。
+			result += "[color=%s]%s[/color]" % [theme_color_tag("syntax_string", theme_colors), literal]
 			index = end
 			continue
 		if (code >= 65 and code <= 90) or (code >= 97 and code <= 122) or code == 95:
@@ -354,9 +359,9 @@ static func highlight_code_segment(text: String, lang: String, theme_colors: Dic
 				end += 1
 			var word := text.substr(index, end - index)
 			if keywords.has(word):
-				result += "[color=%s]%s[/color]" % [theme_color_tag("syntax_keyword", theme_colors), escape_bbcode(word)]
+				result += "[color=%s]%s[/color]" % [theme_color_tag("syntax_keyword", theme_colors), word]
 			else:
-				result += escape_bbcode(word)
+				result += word
 			index = end
 			continue
 		if code >= 48 and code <= 57:
@@ -367,9 +372,9 @@ static func highlight_code_segment(text: String, lang: String, theme_colors: Dic
 					end += 1
 				else:
 					break
-			result += "[color=%s]%s[/color]" % [theme_color_tag("syntax_number", theme_colors), escape_bbcode(text.substr(index, end - index))]
+			result += "[color=%s]%s[/color]" % [theme_color_tag("syntax_number", theme_colors), text.substr(index, end - index)]
 			index = end
 			continue
-		result += escape_bbcode(character)
+		result += character
 		index += 1
 	return result

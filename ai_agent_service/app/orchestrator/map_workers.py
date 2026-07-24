@@ -171,11 +171,9 @@ def build_dynamic_map_worker(
     if not is_map_worker_write_mode(mode):
         effective -= MAP_WRITE_TOOL_NAMES
     else:
-        effective = {
-            tool_name
-            for tool_name in effective
-            if tool_name in MAP_WRITE_TOOL_NAMES or not REGISTRY[tool_name].mutating
-        }
+        # 写入 worker 只负责执行已确认批次。所需的 revision/region 读取由
+        # QueryEngine 的地图状态门自动注入，不能再交给 LLM 自行读取或重规划。
+        effective &= MAP_WRITE_TOOL_NAMES
     effective -= {"delegate", "delegate_many", "create_plan"}
     if not effective:
         return "worker_spec.allowed_tools 经 mode 裁剪后为空"
@@ -222,9 +220,13 @@ def _dynamic_map_worker_prompt(
         "规则：\n"
         "- 严格执行 objective，不扩大范围。\n"
         "- can_delegate=false；禁止调用 delegate、delegate_many、create_plan。\n"
-        "- 非写入 mode 禁止写地图；写入 mode 可在同一轮提交多个有序地图写工具，"
-        "但本轮不得混入读取、验证或服务端工具；服务层会逐批执行并在失败时停止队列。\n"
+        "- 非写入 mode 禁止写地图；写入 mode 的第一次响应必须直接提交 objective "
+        "指定的有序地图写工具，不得读取、搜索、验证或重新规划；缺少的地图状态由"
+        "服务层自动读取，服务层会逐批执行并在失败时停止队列。\n"
         "- 改地图区域的写工具必须携带 expected_revision；write_batch_id/worker/frame/mode 由服务层补齐。\n"
+        "- edit_map fill 必须使用 resource/resource_key；不得提交 source_id、atlas_x、"
+        "atlas_y 等裸 TileSet 坐标。只能从已注册候选中选择，候选不唯一时按服务层"
+        "返回的 resource_key 列表选择一次。\n"
         "- 写入后必须把 next_stage 设为 validator 或 reviewer，不得直接宣布完成。\n"
         "- 最终只输出 JSON，schema 为 map_worker_result_v1。\n"
         "- JSON 至少包含 stage、worker、mode、objective、target_path、map_layer、"
@@ -244,25 +246,30 @@ def _dynamic_map_worker_prompt(
         "   - 示例：x=64..86 是 23 列，y=21..23 是 3 行，总计 23×3=69 格\n"
         "   - 重试时必须把 expected_cells 设为错误信息中的 actual_cells 值\n"
         "3. 连续失败处理：\n"
-        "   - 如果同一类型错误连续出现 2 次，必须切换策略或提前终止\n"
-        "   - 禁止用相同参数盲目重试第 3 次\n"
+        "   - 同一参数失败一次后必须立即修改方案或提前终止\n"
+        "   - 服务层会阻止第二次下发完全相同的失败调用；禁止原样重试\n"
     )
 
 
 def restore_project_agent(data: dict[str, Any], available_tools: set[str]) -> AgentDefinition:
     """从会话持久化数据恢复一次性 project agent。"""
+    workflow_operations = [
+        str(operation)
+        for operation in data.get("workflow_operations", [])
+        if isinstance(operation, str)
+    ]
+    edit_map_max_turns = data.get("edit_map_max_turns")
+    tools = [str(tool) for tool in data.get("tools", []) if isinstance(tool, str)]
+    if workflow_operations and edit_map_max_turns is not None:
+        tools = [tool for tool in tools if tool in MAP_WRITE_TOOL_NAMES]
     agent = AgentDefinition(
         name=str(data.get("name", "dynamic-map-worker")),
         source="project",
         description=str(data.get("description", "")),
         prompt=str(data.get("prompt", "")),
-        tools=[str(tool) for tool in data.get("tools", []) if isinstance(tool, str)],
+        tools=tools,
         skills=[str(skill) for skill in data.get("skills", []) if isinstance(skill, str)],
-        workflow_operations=[
-            str(operation)
-            for operation in data.get("workflow_operations", [])
-            if isinstance(operation, str)
-        ],
+        workflow_operations=workflow_operations,
         workflow_constraints=[
             dict(constraint)
             for constraint in data.get("workflow_constraints", [])
@@ -271,7 +278,7 @@ def restore_project_agent(data: dict[str, Any], available_tools: set[str]) -> Ag
         model=str(data.get("model", "inherit")),
         effort=data.get("effort", "standard"),
         max_turns=int(data.get("max_turns", 6)),
-        edit_map_max_turns=data.get("edit_map_max_turns"),
+        edit_map_max_turns=edit_map_max_turns,
         can_delegate=False,
     )
     return resolve_effective_tools(replace(agent, can_delegate=False), available_tools)

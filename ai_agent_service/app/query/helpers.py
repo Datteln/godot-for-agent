@@ -1368,6 +1368,19 @@ def _invalidate_stale_map_revision_state(
     )
 
 
+def _map_revision_identity_is_authoritative(
+    tool_args: dict[str, Any],
+    result: dict[str, Any],
+    target: str,
+) -> bool:
+    """判断 revision 是否明确属于解析后的目标地图节点。"""
+    revision_key = result.get("revision_key")
+    if isinstance(revision_key, str) and revision_key.strip():
+        return revision_key.strip() == target
+    explicit_target = tool_args.get("target_path")
+    return isinstance(explicit_target, str) and explicit_target.strip() == target
+
+
 def _remember_latest_map_revision(
     session: Session,
     tool_name: str,
@@ -1391,15 +1404,27 @@ def _remember_latest_map_revision(
     if revision is not None:
         previous = session.latest_map_revisions.get(target)
         if previous is not None and revision < previous and tool_name == "describe_map_region":
-            _invalidate_stale_map_revision_state(
-                session,
-                target,
-                previous,
-                revision,
-            )
-            session.latest_map_revisions[target] = revision
-            previous = revision
-        if previous is None or revision > previous:
+            if _map_revision_identity_is_authoritative(tool_args, result, target):
+                _invalidate_stale_map_revision_state(
+                    session,
+                    target,
+                    previous,
+                    revision,
+                )
+                session.latest_map_revisions[target] = revision
+                previous = revision
+            else:
+                logger.warning(
+                    "Ignored ambiguous lower map revision session=%s target=%s "
+                    "previous=%s candidate=%s revision_key=%s",
+                    session.session_id,
+                    target,
+                    previous,
+                    revision,
+                    result.get("revision_key"),
+                )
+                revision = None
+        if revision is not None and (previous is None or revision > previous):
             touched_region = _map_write_touched_region(tool_args, result)
             if (
                 previous is not None

@@ -2594,10 +2594,26 @@ def register_front_tools() -> None:
                                     "depth": {"type": "integer", "minimum": 1},
                                     "source_id": {
                                         "type": "integer",
-                                        "description": "2D TileSet source id for fill. Raw ids are rejected unless resolved through a registered resource.",
+                                        "description": (
+                                            "Legacy readback metadata only. Do not send raw TileSet ids "
+                                            "for fill; select resource/resource_key from the verified "
+                                            "resource registry."
+                                        ),
                                     },
-                                    "atlas_x": {"type": "integer"},
-                                    "atlas_y": {"type": "integer"},
+                                    "atlas_x": {
+                                        "type": "integer",
+                                        "description": (
+                                            "Legacy readback metadata only; fill must use a registered "
+                                            "resource/resource_key."
+                                        ),
+                                    },
+                                    "atlas_y": {
+                                        "type": "integer",
+                                        "description": (
+                                            "Legacy readback metadata only; fill must use a registered "
+                                            "resource/resource_key."
+                                        ),
+                                    },
                                     "reference_cell": {
                                         "type": "object",
                                         "description": (
@@ -2622,7 +2638,11 @@ def register_front_tools() -> None:
                                     },
                                     "resource": {
                                         "type": "string",
-                                        "description": "Optional semantic resource key from resource_registry.json.",
+                                        "description": (
+                                            "Registered semantic resource key from "
+                                            "resource_registry.json. Required for fill operations; "
+                                            "never invent a key or replace it with raw atlas ids."
+                                        ),
                                     },
                                     "resource_key": {
                                         "type": "string",

@@ -572,7 +572,13 @@ func _finish_aux_write_batch(_tool_name: String, input: Dictionary, result: Dict
 func _attach_map_revision(result: Dictionary, key: String) -> void:
 	if not bool(result.get("ok", true)):
 		return
-	result["map_revision"] = _current_map_revision(key)
+	var resolved_key := str(result.get("target_path", "")).strip_edges()
+	if resolved_key == "":
+		resolved_key = str(result.get("target", "")).strip_edges()
+	if resolved_key == "":
+		resolved_key = key
+	result["revision_key"] = resolved_key
+	result["map_revision"] = _current_map_revision(resolved_key)
 
 
 func _map_write_undo_description(tool_name: String, input: Dictionary, tool_call: Dictionary, key: String) -> String:
