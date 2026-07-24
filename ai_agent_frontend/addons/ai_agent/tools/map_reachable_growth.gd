@@ -212,6 +212,13 @@ static func _validation_for_profile(profile: String, frontier: Dictionary, accep
 	var dimension := 3 if profile == "3d_grid" else 2
 	var start = frontier.get("cell", {"x": region.get("x", 0), "y": region.get("y", 0)})
 	var goal = _motif_end(accepted.back(), dimension)
+	var start_payload: Dictionary = {}
+	if start is Dictionary:
+		start_payload = (start as Dictionary).duplicate(true)
+	start_payload["role"] = "actor_cell"
+	var goal_payload := {"x": goal.x, "y": goal.y, "role": "actor_cell"}
+	if dimension == 3:
+		goal_payload["z"] = goal.z
 	# topdown/dungeon/3d_grid 在这里生成的都是连续填实的地板/走廊（每个 motif 内部不留缝），
 	# 角色走在这些"地板即可走区域"上不涉及跳跃/失重，统一用 grid 即可；
 	# "free" 是给飞行/游泳/幽灵类无重力移动用的（见 map-agent.md），3D 室内地板导航不该套这个，
@@ -225,10 +232,12 @@ static func _validation_for_profile(profile: String, frontier: Dictionary, accep
 			"width": region.get("width", 1),
 			"height": region.get("height", 1),
 			"depth": region.get("depth", 1) if dimension == 3 else null,
-			"start": start,
-			"goal": {"x": goal.x, "y": goal.y, "z": goal.z} if dimension == 3 else {"x": goal.x, "y": goal.y},
+			"start": start_payload,
+			"goal": goal_payload,
 			"movement_model": movement,
-			"walkable_is_filled": true,
+			"cell_occupancy": "filled",
+			"requires_support": false,
+			"support_occupancy": "filled",
 			"path_algorithm": "astar",
 			"check_overlaps": true,
 			"check_blocked_objects": true,

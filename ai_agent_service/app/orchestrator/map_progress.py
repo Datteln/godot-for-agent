@@ -225,7 +225,7 @@ _MAP_PLAN_TOOL_NAMES = frozenset(
     }
 )
 _PLATFORM_PLAN_TOOL_NAMES = frozenset({"validate_platform_level_plan", "plan_reachable_map_growth"})
-MAP_PLATFORM_PLAN_MAX_ATTEMPTS = 3
+MAP_PLATFORM_PLAN_MAX_ATTEMPTS = 2
 
 _CONTRACT_KEYS = (
     "target_path",
@@ -236,7 +236,9 @@ _CONTRACT_KEYS = (
     "entrances",
     "exits",
     "movement_model",
-    "walkable_is_filled",
+    "cell_occupancy",
+    "requires_support",
+    "support_occupancy",
     "max_horizontal_gap",
     "max_rise",
     "max_fall",
@@ -396,9 +398,11 @@ def _platform_plan_fingerprint(tool_name: str, tool_args: dict[str, Any]) -> str
                 "max_horizontal_gap",
                 "max_rise",
                 "max_fall",
-                "gravity_axis",
-                "gravity_sign",
-            )
+    "gravity_axis",
+    "gravity_sign",
+    "frontier_axis",
+    "frontier_sign",
+)
             if key in tool_args
         },
     }

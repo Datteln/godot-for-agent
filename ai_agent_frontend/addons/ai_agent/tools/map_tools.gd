@@ -13,7 +13,7 @@ const MapReachableGrowth = preload("res://addons/ai_agent/tools/map_reachable_gr
 
 const MAX_EDITED_CELLS := 100000
 const MAX_EDIT_MAP_BATCH_CELLS := 2000
-const MAX_DESCRIBED_CELLS := 800
+const MAX_DESCRIBED_CELLS := 1600
 const DEFAULT_DESCRIBE_RETURNED_CELLS := 120
 ## describe_map_region 主要按总 cells 限制，允许关卡常见的细长区域一次读取；
 ## 单轴仅保留绝对护栏，防止极端坐标范围拖慢编辑器。
@@ -2968,6 +2968,11 @@ static func _validate_placement_reachability(map_node: Node, coords: Vector3i, p
 			"error_code": "placement_reachability_start_required",
 			"coords": MapValidator.coord_payload(coords, dimension),
 		}
+	var traversal := _placement_traversal_input(input)
+	var movement_error := MapValidator.movement_input_error(traversal, dimension, true)
+	if not movement_error.is_empty():
+		movement_error["ok"] = false
+		return movement_error
 	var region := MapValidator.region_from_input(input, dimension)
 	var goal := _placement_reachability_point(coords, profile, dimension)
 	if not MapValidator.in_region(goal, region):
@@ -2991,7 +2996,7 @@ static func _validate_placement_reachability(map_node: Node, coords: Vector3i, p
 			"coords": MapValidator.coord_payload(coords, dimension),
 			"goal": MapValidator.coord_payload(goal, dimension),
 			"start": input.get("start", {}),
-			"movement_model": str(MapValidator.movement_from_input(input, dimension).get("model", "grid")),
+			"movement_model": str(MapValidator.movement_from_input(traversal, dimension).get("model", "grid")),
 		}
 	return {"ok": true, "goal": MapValidator.coord_payload(goal, dimension)}
 
@@ -3006,25 +3011,37 @@ static func _placement_reachability_point(coords: Vector3i, profile: Dictionary,
 
 
 static func _reachable_cells_for_input(map_node: Node, input: Dictionary, region: Dictionary, dimension: int, map_layer: int) -> Dictionary:
-	var cache_key := "_placement_reachable_%s_%s_%s_%s_%s_%s" % [
+	var traversal := _placement_traversal_input(input)
+	var cache_key := "_placement_reachable_%s_%s_%s_%s_%s_%s_%s_%s_%s_%s_%s" % [
 		str(input.get("start", {})),
-		str(input.get("movement_model", "grid")),
+		str(traversal.get("movement_model", "grid")),
+		str(traversal.get("cell_occupancy", "empty")),
+		str(traversal.get("requires_support", false)),
+		str(traversal.get("support_occupancy", "filled")),
 		str(region.get("x", 0)),
 		str(region.get("y", 0)),
+		str(region.get("z", 0)),
 		str(region.get("width", 1)),
 		str(region.get("height", 1)),
+		str(region.get("depth", 1)),
 	]
 	if input.has(cache_key):
 		return input[cache_key]
-	var start := MapValidator.coord_from_input(input.get("start", {}), dimension)
-	var movement := MapValidator.movement_from_input(input, dimension)
+	var movement := MapValidator.movement_from_input(traversal, dimension)
+	var start := MapValidator.coord_for_movement(input.get("start", {}), dimension, movement)
 	var filled := _collect_filled_cells(map_node, region, dimension, map_layer)
 	if not MapValidator.in_region(start, region):
 		var out_of_region := {"ok": false, "message": "placement reachability start is outside region", "error_code": "placement_reachability_start_out_of_region"}
 		input[cache_key] = out_of_region
 		return out_of_region
 	if not MapValidator.is_standable(filled, start, region, movement):
-		var not_standable := {"ok": false, "message": "placement reachability start is not standable", "error_code": "placement_reachability_start_not_standable"}
+		var not_standable := MapValidator._foothold_failure(filled, start, region, movement, "start")
+		not_standable.merge({
+			"ok": false,
+			"message": "placement reachability start is not standable",
+			"error_code": "placement_reachability_start_not_standable",
+			"start_anchor": MapValidator.anchor_payload(input.get("start", {}), dimension, movement),
+		}, true)
 		input[cache_key] = not_standable
 		return not_standable
 	var reachable := {}
@@ -3043,6 +3060,15 @@ static func _reachable_cells_for_input(map_node: Node, input: Dictionary, region
 	var result := {"ok": true, "reachable": reachable, "count": reachable.size()}
 	input[cache_key] = result
 	return result
+
+
+static func _placement_traversal_input(input: Dictionary) -> Dictionary:
+	var traversal_value = input.get("traversal", {})
+	var traversal: Dictionary = {}
+	if traversal_value is Dictionary:
+		traversal = (traversal_value as Dictionary).duplicate(true)
+	traversal["start"] = input.get("start", {})
+	return traversal
 
 
 static func _placement_candidate_cells(input: Dictionary, region: Dictionary, profile: Dictionary, dimension: int) -> Dictionary:
@@ -3855,13 +3881,232 @@ static func plan_map_algorithms(input: Dictionary, editor_interface: EditorInter
 	return MapAlgorithms.build_algorithm_plan(input, context)
 
 
+static func _planning_region_error(input: Dictionary, dimension: int) -> Dictionary:
+	var required: Array[String] = ["x", "y", "width", "height"]
+	if dimension == 3:
+		required.append("z")
+		required.append("depth")
+	var missing: Array[String] = []
+	for field_name in required:
+		if not input.has(field_name):
+			missing.append(field_name)
+	if missing.is_empty():
+		return {}
+	return {
+		"ok": false,
+		"message": "Planning region origin and extent must be explicit; missing: %s." % ", ".join(missing),
+		"error_code": "missing_region_fields",
+		"missing_fields": missing,
+		"required_fields": required,
+		"dimension": dimension,
+	}
+
+
+static func _planning_target_error(input: Dictionary, target: Node, dimension: int) -> Dictionary:
+	if target.get_class() != "TileMap" and (input.has("map_layer") or input.has("ground_map_layer")):
+		return {
+			"ok": false,
+			"message": "map_layer applies only to a legacy TileMap; omit it for TileMapLayer and GridMap targets.",
+			"error_code": "map_layer_not_applicable",
+			"target_type": target.get_class(),
+			"dimension": dimension,
+		}
+	return _planning_region_error(input, dimension)
+
+
+static func _region_with_points(region: Dictionary, points: Array, dimension: int) -> Dictionary:
+	var min_x := int(region["min_x"])
+	var max_x := int(region["max_x"])
+	var min_y := int(region["min_y"])
+	var max_y := int(region["max_y"])
+	var min_z := int(region["min_z"])
+	var max_z := int(region["max_z"])
+	for value in points:
+		var coords: Vector3i = value
+		min_x = mini(min_x, coords.x)
+		max_x = maxi(max_x, coords.x)
+		min_y = mini(min_y, coords.y)
+		max_y = maxi(max_y, coords.y)
+		if dimension == 3:
+			min_z = mini(min_z, coords.z)
+			max_z = maxi(max_z, coords.z)
+	var suggested := {
+		"x": min_x,
+		"y": min_y,
+		"width": max_x - min_x + 1,
+		"height": max_y - min_y + 1,
+	}
+	if dimension == 3:
+		suggested["z"] = min_z
+		suggested["depth"] = max_z - min_z + 1
+	return suggested
+
+
+static func _region_limit_error(region: Dictionary, dimension: int, operation: String) -> Dictionary:
+	var cells := int(region["width"]) * int(region["height"]) * int(region["depth"])
+	if cells <= MAX_DESCRIBED_CELLS:
+		return {}
+	var origin := Vector3i(int(region["x"]), int(region["y"]), int(region["z"]))
+	return {
+		"ok": false,
+		"message": "%s region has %d cells, over the %d-cell limit." % [operation, cells, MAX_DESCRIBED_CELLS],
+		"error_code": "region_too_large",
+		"cells": cells,
+		"max_cells": MAX_DESCRIBED_CELLS,
+		"suggested_regions": _split_region(
+			origin,
+			int(region["width"]),
+			int(region["height"]),
+			int(region["depth"]),
+			dimension,
+			MAX_DESCRIBED_CELLS,
+			MAX_DESCRIBED_CELLS
+		),
+	}
+
+
+static func _contract_region(region: Dictionary, dimension: int) -> Dictionary:
+	var payload := {
+		"x": int(region["x"]),
+		"y": int(region["y"]),
+		"width": int(region["width"]),
+		"height": int(region["height"]),
+	}
+	if dimension == 3:
+		payload["z"] = int(region["z"])
+		payload["depth"] = int(region["depth"])
+	return payload
+
+
+static func _planning_contract(
+	target_result: Dictionary,
+	target: Node,
+	region: Dictionary,
+	dimension: int,
+	map_layer: int,
+	movement: Dictionary,
+	anchor_value
+) -> Dictionary:
+	var contract := {
+		"target": {
+			"path": str(target_result.get("path", "")),
+			"type": target.get_class(),
+			"dimension": dimension,
+			"map_layer": map_layer if target.get_class() == "TileMap" else null,
+		},
+		"region": _contract_region(region, dimension),
+		"anchor": MapValidator.anchor_payload(anchor_value, dimension, movement),
+		"traversal": {
+			"movement_model": str(movement.get("model", "grid")),
+			"cell_occupancy": str(movement.get("cell_occupancy", "empty")),
+			"requires_support": bool(movement.get("requires_support", false)),
+			"support_occupancy": str(movement.get("support_occupancy", "filled")),
+			"gravity_axis": str(movement.get("gravity_axis", "y")),
+			"gravity_sign": int(movement.get("gravity_sign", 1)),
+			"frontier_axis": str(movement.get("frontier_axis", "x")),
+			"frontier_sign": int(movement.get("frontier_sign", 1)),
+			"max_horizontal_gap": int(movement.get("max_horizontal_gap", 1)),
+			"max_rise": int(movement.get("max_rise", 1)),
+			"max_fall": int(movement.get("max_fall", 64)),
+			"max_step": int(movement.get("max_step", 1)),
+		},
+	}
+	contract["facts_hash"] = _dictionary_sha256(contract)
+	return contract
+
+
+static func _dictionary_sha256(value: Dictionary) -> String:
+	var context := HashingContext.new()
+	context.start(HashingContext.HASH_SHA256)
+	context.update(JSON.stringify(value).to_utf8_buffer())
+	return context.finish().hex_encode()
+
+
+static func _planning_contract_error(input: Dictionary, current: Dictionary) -> Dictionary:
+	if not input.has("planning_contract"):
+		return {}
+	var supplied_value = input.get("planning_contract")
+	if not (supplied_value is Dictionary):
+		return {
+			"ok": false,
+			"message": "planning_contract must be an object returned by a previous planning/read tool.",
+			"error_code": "invalid_planning_contract",
+		}
+	var supplied: Dictionary = (supplied_value as Dictionary).duplicate(true)
+	var supplied_hash := str(supplied.get("facts_hash", ""))
+	supplied.erase("facts_hash")
+	if supplied_hash != "" and supplied_hash != _dictionary_sha256(supplied):
+		return {
+			"ok": false,
+			"message": "planning_contract facts_hash does not match its facts.",
+			"error_code": "planning_contract_hash_mismatch",
+		}
+	var supplied_revision = supplied.get("map_revision", null)
+	supplied.erase("map_revision")
+	var expected := current.duplicate(true)
+	expected.erase("facts_hash")
+	expected.erase("map_revision")
+	if supplied != expected:
+		return {
+			"ok": false,
+			"message": "Planning inputs drifted from the frozen target/region/anchor/traversal contract.",
+			"error_code": "planning_contract_conflict",
+			"supplied_contract": supplied_value,
+			"current_contract": current,
+			"map_revision": supplied_revision,
+		}
+	return {}
+
+
 ## Validate and compile an LLM-authored platform route into a jump graph, tile batches, and leap validation plan.
 static func validate_platform_level_plan(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface, true)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	if target.get_class() == "GridMap":
+		return {"ok": false, "message": "validate_platform_level_plan requires a 2D TileMap/TileMapLayer target", "error_code": "unsupported_map_type"}
+	var target_error := _planning_target_error(input, target, 2)
+	if not target_error.is_empty():
+		return target_error
+	var region := MapValidator.region_from_input(input, 2)
+	var limit_error := _region_limit_error(region, 2, "platform plan")
+	if not limit_error.is_empty():
+		return limit_error
 	var context := describe_map_context({}, editor_interface)
 	if not bool(context.get("ok", false)):
 		return context
+	var explicit_movement_error := MapValidator.movement_input_error(input, 2, true)
+	if not explicit_movement_error.is_empty():
+		explicit_movement_error["ok"] = false
+		return explicit_movement_error
 	var platform_input := input.duplicate(true)
 	platform_input["mode"] = "2d"
+	platform_input["target_path"] = str(target_result.get("path", ""))
+	platform_input["movement_model"] = "leap"
+	platform_input["cell_occupancy"] = str(platform_input.get("cell_occupancy", "empty"))
+	platform_input["requires_support"] = bool(platform_input.get("requires_support", true))
+	platform_input["support_occupancy"] = str(platform_input.get("support_occupancy", "filled"))
+	if str(platform_input["cell_occupancy"]).to_lower() != "empty" \
+			or not bool(platform_input["requires_support"]) \
+			or str(platform_input["support_occupancy"]).to_lower() != "filled":
+		return {
+			"ok": false,
+			"message": "2D platform plans require empty actor cells with filled support cells.",
+			"error_code": "invalid_platform_traversal_occupancy",
+			"required": {
+				"cell_occupancy": "empty",
+				"requires_support": true,
+				"support_occupancy": "filled",
+			},
+		}
+	var movement_error := MapValidator.movement_input_error(platform_input, 2, true)
+	if not movement_error.is_empty():
+		movement_error["ok"] = false
+		return movement_error
+	var movement := MapValidator.movement_from_input(platform_input, 2)
 	_ensure_entry_anchor_from_frontier(platform_input)
 	if bool(platform_input.get("connect_from_existing", true)):
 		if _has_coord_dict(platform_input.get("entry_anchor", {})):
@@ -3877,26 +4122,95 @@ static func validate_platform_level_plan(input: Dictionary, editor_interface: Ed
 				# 而不是只靠 prompt 提醒 agent "没有 entry_anchor 就别执行"。
 				platform_input["entry_anchor_scan_failed"] = true
 				platform_input["entry_sample"] = anchor_result
-	return MapPlatformPlanValidator.validate_platform_level_plan(platform_input, context)
+	_normalize_anchor_field(platform_input, "entry_anchor", 2, movement)
+	var anchor_value = platform_input.get("entry_anchor", {})
+	if not _has_coord_dict(anchor_value):
+		return {
+			"ok": false,
+			"message": "A platform plan needs an explicit entry_anchor/frontier, or a discoverable existing surface.",
+			"error_code": "missing_entry_anchor",
+			"entry_sample": platform_input.get("entry_sample", {}),
+		}
+	var map_layer := int(platform_input.get("map_layer", 0))
+	var contract := _planning_contract(target_result, target, region, 2, map_layer, movement, anchor_value)
+	var contract_error := _planning_contract_error(platform_input, contract)
+	if not contract_error.is_empty():
+		return contract_error
+	var result := MapPlatformPlanValidator.validate_platform_level_plan(platform_input, context)
+	result["planning_contract"] = contract
+	return result
 
 
 ## Build a profile-based reachable frontier growth plan for platformer/topdown/dungeon/3d maps.
 static func plan_reachable_map_growth(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null:
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
+	var target_result := _resolve_map_target(input, editor_interface, true)
+	if not bool(target_result.get("ok", false)):
+		return target_result
+	var target: Node = target_result["node"]
+	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var target_error := _planning_target_error(input, target, dimension)
+	if not target_error.is_empty():
+		return target_error
+	var region := MapValidator.region_from_input(input, dimension)
+	var limit_error := _region_limit_error(region, dimension, "reachable growth")
+	if not limit_error.is_empty():
+		return limit_error
 	var context := describe_map_context({}, editor_interface)
 	if not bool(context.get("ok", false)):
 		return context
+	var explicit_movement_error := MapValidator.movement_input_error(input, dimension, true)
+	if not explicit_movement_error.is_empty():
+		explicit_movement_error["ok"] = false
+		return explicit_movement_error
 	var growth_input := input.duplicate(true)
 	var profile := str(growth_input.get("profile", "")).to_lower()
+	var platform_profile := profile in ["platform", "platformer", "side_scroller", "side-scroller"]
+	if profile == "3d_grid" and dimension != 3:
+		return {"ok": false, "message": "profile='3d_grid' requires a GridMap target", "error_code": "profile_target_dimension_mismatch"}
+	if profile != "3d_grid" and dimension == 3:
+		return {"ok": false, "message": "A GridMap target requires profile='3d_grid'", "error_code": "profile_target_dimension_mismatch"}
+	growth_input["target_path"] = str(target_result.get("path", ""))
+	growth_input["movement_model"] = str(growth_input.get("movement_model", "leap" if platform_profile else "grid"))
+	growth_input["cell_occupancy"] = str(growth_input.get("cell_occupancy", "empty" if platform_profile else "filled"))
+	growth_input["requires_support"] = bool(growth_input.get("requires_support", platform_profile))
+	growth_input["support_occupancy"] = str(growth_input.get("support_occupancy", "filled"))
+	var expected_cell_occupancy := "empty" if platform_profile else "filled"
+	var expected_requires_support := platform_profile
+	var expected_movement_model := "leap" if platform_profile else "grid"
+	if str(growth_input["movement_model"]).to_lower() != expected_movement_model \
+			or str(growth_input["cell_occupancy"]).to_lower() != expected_cell_occupancy \
+			or bool(growth_input["requires_support"]) != expected_requires_support \
+			or str(growth_input["support_occupancy"]).to_lower() != "filled":
+		return {
+			"ok": false,
+			"message": "Traversal occupancy does not match the selected growth profile.",
+			"error_code": "profile_traversal_occupancy_mismatch",
+			"required": {
+				"movement_model": expected_movement_model,
+				"cell_occupancy": expected_cell_occupancy,
+				"requires_support": expected_requires_support,
+				"support_occupancy": "filled",
+			},
+		}
+	var movement_error := MapValidator.movement_input_error(growth_input, dimension, true)
+	if not movement_error.is_empty():
+		movement_error["ok"] = false
+		return movement_error
+	var movement := MapValidator.movement_from_input(growth_input, dimension)
+	_normalize_anchor_field(growth_input, "frontier", dimension, movement)
+	_normalize_anchor_field(growth_input, "entry_anchor", dimension, movement)
 	if growth_input.has("start"):
 		var frontier_result := compute_reachable_frontier(growth_input, editor_interface)
 		if not bool(frontier_result.get("ok", false)):
 			return frontier_result
-		growth_input["frontier"] = frontier_result.get("rightmost_frontier", {})
+		growth_input["frontier"] = frontier_result.get("reachable_frontier", frontier_result.get("rightmost_frontier", {}))
 		growth_input["reachable_frontier"] = frontier_result
-		if profile in ["platform", "platformer", "side_scroller", "side-scroller"]:
-			growth_input["entry_anchor"] = frontier_result.get("rightmost_frontier", {})
+		if platform_profile:
+			growth_input["entry_anchor"] = frontier_result.get("reachable_frontier", frontier_result.get("rightmost_frontier", {}))
 	_ensure_entry_anchor_from_frontier(growth_input)
-	if profile in ["platform", "platformer", "side_scroller", "side-scroller"] and bool(growth_input.get("connect_from_existing", true)):
+	if platform_profile and bool(growth_input.get("connect_from_existing", true)):
 		if not _has_coord_dict(growth_input.get("entry_anchor", {})):
 			var anchor_result := _platform_entry_anchor(growth_input, editor_interface)
 			if bool(anchor_result.get("ok", false)):
@@ -3906,7 +4220,38 @@ static func plan_reachable_map_growth(input: Dictionary, editor_interface: Edito
 			else:
 				growth_input["entry_anchor_scan_failed"] = true
 				growth_input["entry_sample"] = anchor_result
-	return MapReachableGrowth.plan_growth(growth_input, context)
+	elif bool(growth_input.get("connect_from_existing", true)) and not _has_coord_dict(growth_input.get("frontier", {})):
+		return {
+			"ok": false,
+			"message": "Extending an existing non-platform map requires an explicit reachable frontier or start.",
+			"error_code": "existing_frontier_required",
+		}
+	_normalize_anchor_field(growth_input, "frontier", dimension, movement)
+	_normalize_anchor_field(growth_input, "entry_anchor", dimension, movement)
+	if not bool(growth_input.get("connect_from_existing", true)) \
+			and not _has_coord_dict(growth_input.get("frontier", {})) \
+			and not _has_coord_dict(growth_input.get("entry_anchor", {})):
+		return {
+			"ok": false,
+			"message": "New map growth requires an explicit frontier/entry_anchor seed.",
+			"error_code": "seed_anchor_required",
+		}
+	var anchor_value = growth_input.get("start", growth_input.get("entry_anchor", growth_input.get("frontier", {})))
+	if not _has_coord_dict(anchor_value):
+		return {
+			"ok": false,
+			"message": "No usable actor-cell anchor was resolved for map growth.",
+			"error_code": "missing_growth_anchor",
+			"entry_sample": growth_input.get("entry_sample", {}),
+		}
+	var map_layer := int(growth_input.get("map_layer", 0))
+	var contract := _planning_contract(target_result, target, region, dimension, map_layer, movement, anchor_value)
+	var contract_error := _planning_contract_error(growth_input, contract)
+	if not contract_error.is_empty():
+		return contract_error
+	var result := MapReachableGrowth.plan_growth(growth_input, context)
+	result["planning_contract"] = contract
+	return result
 
 
 static func _ensure_entry_anchor_from_frontier(input: Dictionary) -> void:
@@ -3921,7 +4266,21 @@ static func _ensure_entry_anchor_from_frontier(input: Dictionary) -> void:
 		"x": int((frontier as Dictionary).get("x", 0)),
 		"y": int((frontier as Dictionary).get("y", 0)),
 	}
+	if (frontier as Dictionary).has("z"):
+		input["entry_anchor"]["z"] = int((frontier as Dictionary).get("z", 0))
+	if (frontier as Dictionary).has("role"):
+		input["entry_anchor"]["role"] = str((frontier as Dictionary).get("role", "actor_cell"))
 	input["entry_anchor_source"] = "frontier"
+
+
+static func _normalize_anchor_field(input: Dictionary, field_name: String, dimension: int, movement: Dictionary) -> void:
+	var value = input.get(field_name)
+	if not _has_coord_dict(value):
+		return
+	var actor := MapValidator.coord_for_movement(value, dimension, movement)
+	var payload := MapValidator.coord_payload(actor, dimension)
+	payload["role"] = "actor_cell"
+	input[field_name] = payload
 
 
 static func _has_coord_dict(value) -> bool:
@@ -3932,26 +4291,62 @@ static func _has_coord_dict(value) -> bool:
 static func compute_reachable_frontier(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
 	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var target_error := _planning_target_error(input, target, dimension)
+	if not target_error.is_empty():
+		return target_error
 	var map_layer := int(input.get("map_layer", 0))
 	var region := MapValidator.region_from_input(input, dimension)
-	if int(region["width"]) * int(region["height"]) * int(region["depth"]) > MAX_DESCRIBED_CELLS:
-		return {
-			"ok": false,
-			"message": "frontier region exceeds the %d-cell limit; compute frontier in a smaller region" % MAX_DESCRIBED_CELLS,
-			"error_code": "region_too_large",
-		}
+	var limit_error := _region_limit_error(region, dimension, "frontier")
+	if not limit_error.is_empty():
+		return limit_error
 	if not input.has("start"):
 		return {"ok": false, "message": "start is required to compute a real reachable frontier", "error_code": "missing_start"}
-	var start := MapValidator.coord_from_input(input.get("start", {}), dimension)
+	var movement_error := MapValidator.movement_input_error(input, dimension, true)
+	if not movement_error.is_empty():
+		movement_error["ok"] = false
+		return movement_error
 	var movement := MapValidator.movement_from_input(input, dimension)
+	var frontier_axis := str(input.get("frontier_axis", "x")).strip_edges().to_lower()
+	if not (frontier_axis in ["x", "y", "z"]) or (dimension == 2 and frontier_axis == "z"):
+		return {
+			"ok": false,
+			"message": "frontier_axis must be x/y for 2D or x/y/z for 3D.",
+			"error_code": "invalid_frontier_axis",
+		}
+	var frontier_sign := 1 if int(input.get("frontier_sign", 1)) >= 0 else -1
+	var start_value = input.get("start", {})
+	var start := MapValidator.coord_for_movement(start_value, dimension, movement)
+	var required_points: Array = [start]
+	if bool(movement.get("requires_support", false)):
+		required_points.append(start + (movement.get("support_offset", Vector3i(0, 1, 0)) as Vector3i))
 	var filled := _collect_filled_cells(target, region, dimension, map_layer)
 	if not MapValidator.in_region(start, region):
-		return {"ok": false, "message": "start is outside the frontier region", "error_code": "start_out_of_region"}
+		return {
+			"ok": false,
+			"message": "start actor cell is outside the frontier region",
+			"error_code": "start_out_of_region",
+			"start_anchor": MapValidator.anchor_payload(start_value, dimension, movement),
+			"region": region,
+			"suggested_region": _region_with_points(region, required_points, dimension),
+		}
+	if bool(movement.get("requires_support", false)) and not MapValidator.in_region(required_points[1], region):
+		return {
+			"ok": false,
+			"message": "start support cell is outside the frontier region",
+			"error_code": "start_support_out_of_region",
+			"start_anchor": MapValidator.anchor_payload(start_value, dimension, movement),
+			"region": region,
+			"suggested_region": _region_with_points(region, required_points, dimension),
+		}
+	var contract := _planning_contract(target_result, target, region, dimension, map_layer, movement, start_value)
+	var contract_error := _planning_contract_error(input, contract)
+	if not contract_error.is_empty():
+		return contract_error
 	if not MapValidator.is_standable(filled, start, region, movement):
 		var failure := MapValidator._foothold_failure(filled, start, region, movement, "start")
 		failure.merge({
@@ -3959,6 +4354,7 @@ static func compute_reachable_frontier(input: Dictionary, editor_interface: Edit
 			"message": "start is not standable under the requested movement model",
 			"error_code": "start_not_standable",
 			"start": MapValidator.coord_payload(start, dimension),
+			"start_anchor": MapValidator.anchor_payload(start_value, dimension, movement),
 			"movement_model": movement.get("model", "grid"),
 		}, true)
 		return failure
@@ -3978,20 +4374,20 @@ static func compute_reachable_frontier(input: Dictionary, editor_interface: Edit
 			queue.append(next)
 	var reachable_cells: Array = []
 	var reachable_footholds: Array = []
-	var rightmost := start
+	var frontier := start
 	var reachable_vectors: Array = []
 	for key in visited.keys():
 		var coords: Vector3i = visited[key]
 		reachable_vectors.append(coords)
-		if coords.x > rightmost.x or (coords.x == rightmost.x and coords.y < rightmost.y):
-			rightmost = coords
+		if _frontier_score(coords, frontier_axis, frontier_sign) > _frontier_score(frontier, frontier_axis, frontier_sign):
+			frontier = coords
 		if reachable_cells.size() < max_returned:
 			reachable_cells.append(MapValidator.coord_payload(coords, dimension))
 		if MapValidator.is_standable(filled, coords, region, movement):
 			if reachable_footholds.size() < max_returned:
 				reachable_footholds.append(MapValidator.coord_payload(coords, dimension))
-	var frontier_candidates := _rightmost_frontier_candidates(reachable_vectors, filled, region, movement, dimension, max_returned)
-	var first_blocked_gap := _first_blocked_gap(filled, rightmost, region, movement, visited, dimension)
+	var frontier_candidates := _frontier_candidates(reachable_vectors, filled, region, movement, dimension, max_returned, frontier_axis, frontier_sign)
+	var first_blocked_gap := _first_blocked_gap(filled, frontier, region, movement, visited, dimension, frontier_axis, frontier_sign)
 	return {
 		"ok": true,
 		"target": str(target_result.get("path", "")),
@@ -4000,38 +4396,66 @@ static func compute_reachable_frontier(input: Dictionary, editor_interface: Edit
 		"map_layer": map_layer if target.get_class() == "TileMap" else null,
 		"region": region,
 		"movement_model": movement.get("model", "grid"),
+		"frontier_axis": frontier_axis,
+		"frontier_sign": frontier_sign,
 		"start": MapValidator.coord_payload(start, dimension),
+		"start_anchor": MapValidator.anchor_payload(start_value, dimension, movement),
 		"reachable_count": visited.size(),
 		"returned_count": reachable_cells.size(),
 		"reachable_cells": reachable_cells,
 		"reachable_footholds": reachable_footholds,
-		"rightmost_frontier": MapValidator.coord_payload(rightmost, dimension),
+		"reachable_frontier": MapValidator.coord_payload(frontier, dimension),
+		"rightmost_frontier": MapValidator.coord_payload(frontier, dimension),
 		"frontier_candidates": frontier_candidates,
 		"first_blocked_gap": first_blocked_gap,
-		"note": "Use rightmost_frontier as plan_reachable_map_growth.frontier; it was computed from the real start and real map cells.",
+		"planning_contract": contract,
+		"note": "Use reachable_frontier as plan_reachable_map_growth.frontier; it was computed from the real start and real map cells.",
 	}
 
 
-static func _rightmost_frontier_candidates(reachable: Array, filled: Dictionary, region: Dictionary, movement: Dictionary, dimension: int, limit: int) -> Array:
+static func _frontier_score(coords: Vector3i, axis: String, sign_value: int) -> int:
+	match axis:
+		"y":
+			return coords.y * sign_value
+		"z":
+			return coords.z * sign_value
+		_:
+			return coords.x * sign_value
+
+
+static func _frontier_direction(axis: String, sign_value: int) -> Vector3i:
+	match axis:
+		"y":
+			return Vector3i(0, sign_value, 0)
+		"z":
+			return Vector3i(0, 0, sign_value)
+		_:
+			return Vector3i(sign_value, 0, 0)
+
+
+static func _frontier_candidates(reachable: Array, filled: Dictionary, region: Dictionary, movement: Dictionary, dimension: int, limit: int, axis: String, sign_value: int) -> Array:
 	if reachable.is_empty():
 		return []
-	var max_x := -2147483648
+	var max_score := -2147483648
 	for coords_value in reachable:
 		var coords: Vector3i = coords_value
-		if coords.x > max_x and MapValidator.is_standable(filled, coords, region, movement):
-			max_x = coords.x
+		var score := _frontier_score(coords, axis, sign_value)
+		if score > max_score and MapValidator.is_standable(filled, coords, region, movement):
+			max_score = score
 	var candidates: Array = []
 	for coords_value in reachable:
 		var coords: Vector3i = coords_value
-		if coords.x < max_x - 2:
+		if _frontier_score(coords, axis, sign_value) < max_score - 2:
 			continue
 		if not MapValidator.is_standable(filled, coords, region, movement):
 			continue
 		candidates.append(coords)
 	candidates.sort_custom(func(a: Vector3i, b: Vector3i) -> bool:
-		if a.x == b.x:
-			return a.y < b.y
-		return a.x > b.x
+		var score_a := _frontier_score(a, axis, sign_value)
+		var score_b := _frontier_score(b, axis, sign_value)
+		if score_a == score_b:
+			return MapValidator.coord_key(a) < MapValidator.coord_key(b)
+		return score_a > score_b
 	)
 	var payload: Array = []
 	for coords in candidates:
@@ -4041,24 +4465,31 @@ static func _rightmost_frontier_candidates(reachable: Array, filled: Dictionary,
 	return payload
 
 
-static func _first_blocked_gap(filled: Dictionary, rightmost: Vector3i, region: Dictionary, movement: Dictionary, visited: Dictionary, dimension: int) -> Dictionary:
+static func _first_blocked_gap(filled: Dictionary, frontier: Vector3i, region: Dictionary, movement: Dictionary, visited: Dictionary, dimension: int, axis: String, sign_value: int) -> Dictionary:
 	var probe_limit := max(1, int(movement.get("max_horizontal_gap", movement.get("max_step", 4))))
+	var direction := _frontier_direction(axis, sign_value)
 	for dx in range(1, probe_limit + 1):
-		var probe := rightmost + Vector3i(dx, 0, 0)
+		var probe := frontier + direction * dx
 		if not MapValidator.in_region(probe, region):
-			return {"reason": "region_boundary", "after": MapValidator.coord_payload(rightmost, dimension), "probe": MapValidator.coord_payload(probe, dimension)}
+			return {"reason": "region_boundary", "after": MapValidator.coord_payload(frontier, dimension), "probe": MapValidator.coord_payload(probe, dimension)}
 		if MapValidator.is_standable(filled, probe, region, movement) and not visited.has(MapValidator.coord_key(probe)):
-			return {"reason": "standable_but_unreachable", "after": MapValidator.coord_payload(rightmost, dimension), "probe": MapValidator.coord_payload(probe, dimension)}
+			return {"reason": "standable_but_unreachable", "after": MapValidator.coord_payload(frontier, dimension), "probe": MapValidator.coord_payload(probe, dimension)}
 	return {}
 
 
 static func _platform_entry_anchor(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
-	var target_result := _resolve_map_target(input, editor_interface)
+	var target_result := _resolve_map_target(input, editor_interface, true)
 	if not bool(target_result.get("ok", false)):
 		return target_result
 	var target: Node = target_result["node"]
 	if target.get_class() == "GridMap":
 		return {"ok": false, "message": "platform entry anchor requires a 2D TileMap/TileMapLayer", "error_code": "unsupported_map_type"}
+	if target.get_class() != "TileMap" and (input.has("map_layer") or input.has("ground_map_layer")):
+		return {
+			"ok": false,
+			"message": "map_layer applies only to a legacy TileMap; omit it for TileMapLayer.",
+			"error_code": "map_layer_not_applicable",
+		}
 	var dimension := 2
 	var map_layer := int(input.get("map_layer", 0))
 	var region_x := int(input.get("x", 0))
@@ -4220,6 +4651,9 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 		return target_result
 	var target: Node = target_result["node"]
 	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var target_error := _planning_target_error(input, target, dimension)
+	if not target_error.is_empty():
+		return target_error
 	var map_layer := int(input.get("map_layer", 0))
 	var region := MapValidator.region_from_input(input, dimension)
 	var allowed_bounds := _bounds_from_input(input, dimension)
@@ -4241,8 +4675,21 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 			"error_code": "region_too_large",
 			"cells": validate_cells,
 			"max_cells": MAX_DESCRIBED_CELLS,
+			"suggested_regions": _split_region(
+				Vector3i(int(region["x"]), int(region["y"]), int(region["z"])),
+				int(region["width"]),
+				int(region["height"]),
+				int(region["depth"]),
+				dimension,
+				MAX_DESCRIBED_CELLS,
+				MAX_DESCRIBED_CELLS
+			),
 		}, "region_too_large")
 
+	var movement_error := MapValidator.movement_input_error(input, dimension, true)
+	if not movement_error.is_empty():
+		movement_error["ok"] = false
+		return movement_error
 	var filled := _collect_filled_cells(target, region, dimension, map_layer)
 	var result := {
 		"ok": true,
@@ -4252,6 +4699,12 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 		"region": region,
 	}
 	var movement := MapValidator.movement_from_input(input, dimension)
+	if input.has("start"):
+		var contract := _planning_contract(target_result, target, region, dimension, map_layer, movement, input.get("start", {}))
+		var contract_error := _planning_contract_error(input, contract)
+		if not contract_error.is_empty():
+			return contract_error
+		result["planning_contract"] = contract
 	if bool(input.get("check_platform_design", false)) and str(movement.get("model", "grid")) != "leap":
 		return _merge_map_completion_blocker({
 			"ok": false,
@@ -4363,6 +4816,13 @@ static func repair_map_region(input: Dictionary, editor_interface: EditorInterfa
 		return target_result
 	var target: Node = target_result["node"]
 	var dimension := 3 if target.get_class() == "GridMap" else 2
+	var target_error := _planning_target_error(input, target, dimension)
+	if not target_error.is_empty():
+		return target_error
+	var movement_error := MapValidator.movement_input_error(input, dimension, true)
+	if not movement_error.is_empty():
+		movement_error["ok"] = false
+		return movement_error
 	var map_layer := int(input.get("map_layer", 0))
 	var region := MapValidator.region_from_input(input, dimension)
 	var repair_cells := int(region["width"]) * int(region["height"]) * int(region["depth"])

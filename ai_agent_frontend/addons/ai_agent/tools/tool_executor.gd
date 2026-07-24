@@ -77,6 +77,13 @@ const MAP_READ_TOOLS := {
 	"sample_noise_grid": true,
 }
 
+const PLANNING_CONTRACT_TOOLS := {
+	"compute_reachable_frontier": true,
+	"plan_reachable_map_growth": true,
+	"validate_platform_level_plan": true,
+	"validate_map_region": true,
+}
+
 const MAP_REVISIONS_PATH := "res://.ai_agent_service/map_agent/revisions.json"
 
 var editor_interface: EditorInterface
@@ -121,6 +128,16 @@ func execute(tool_call: Dictionary) -> Dictionary:
 	var map_revision_key := _map_revision_key(name, input)
 	var is_map_write := MAP_WRITE_TOOLS.has(name)
 	var requires_map_revision := MAP_REVISION_GUARDED_TOOLS.has(name)
+	if PLANNING_CONTRACT_TOOLS.has(name) and input.has("planning_contract"):
+		var contract_revision_error := _validate_planning_contract_revision(input, map_revision_key)
+		if not contract_revision_error.is_empty():
+			return AgentDTO.tool_result(
+				str(tool_call.get("id", "")),
+				str(tool_call.get("frame_id", "")),
+				"error",
+				contract_revision_error,
+				str(contract_revision_error.get("error_code", "planning_contract_revision_conflict"))
+			)
 
 	# ── 排查日志：记录原始 tool_call 结构 ──
 	var _raw_id := tool_call.get("id", "")
@@ -413,7 +430,13 @@ func execute(tool_call: Dictionary) -> Dictionary:
 
 
 func _map_revision_key(tool_name: String, input: Dictionary) -> String:
-	var target_path := str(input.get("target_path", "")).strip_edges()
+	var target_path := ""
+	if input.get("planning_contract") is Dictionary:
+		var contract: Dictionary = input.get("planning_contract", {})
+		if contract.get("target") is Dictionary:
+			target_path = str((contract.get("target") as Dictionary).get("path", "")).strip_edges()
+	if target_path == "":
+		target_path = str(input.get("target_path", "")).strip_edges()
 	if target_path != "":
 		return target_path
 	var parent_path := str(input.get("parent_path", "")).strip_edges()
@@ -428,6 +451,37 @@ func _map_revision_key(tool_name: String, input: Dictionary) -> String:
 			return "res://.ai_agent_service/map_agent/spatial_index.json"
 		_:
 			return "__selected_map__"
+
+
+func _validate_planning_contract_revision(input: Dictionary, key: String) -> Dictionary:
+	var contract_value = input.get("planning_contract")
+	if not (contract_value is Dictionary):
+		return {
+			"ok": false,
+			"error_code": "invalid_planning_contract",
+			"message": "planning_contract must be an object returned by a planning/read tool.",
+		}
+	var contract: Dictionary = contract_value
+	if not contract.has("map_revision") or not (contract.get("map_revision") is int):
+		return {
+			"ok": false,
+			"error_code": "planning_contract_revision_required",
+			"message": "planning_contract is missing its integer map_revision; recompute the frontier/plan.",
+			"actual_revision": _current_map_revision(key),
+			"revision_key": key,
+		}
+	var expected := int(contract.get("map_revision"))
+	var actual := _current_map_revision(key)
+	if expected == actual:
+		return {}
+	return {
+		"ok": false,
+		"error_code": "planning_contract_revision_conflict",
+		"message": "The map changed after this planning contract was created; recompute the frontier/plan.",
+		"expected_revision": expected,
+		"actual_revision": actual,
+		"revision_key": key,
+	}
 
 
 func _current_map_revision(key: String) -> int:
@@ -578,7 +632,21 @@ func _attach_map_revision(result: Dictionary, key: String) -> void:
 	if resolved_key == "":
 		resolved_key = key
 	result["revision_key"] = resolved_key
-	result["map_revision"] = _current_map_revision(resolved_key)
+	var revision := _current_map_revision(resolved_key)
+	result["map_revision"] = revision
+	if result.get("planning_contract") is Dictionary:
+		var contract: Dictionary = (result.get("planning_contract") as Dictionary).duplicate(true)
+		contract["map_revision"] = revision
+		contract.erase("facts_hash")
+		contract["facts_hash"] = _dictionary_sha256(contract)
+		result["planning_contract"] = contract
+
+
+func _dictionary_sha256(value: Dictionary) -> String:
+	var context := HashingContext.new()
+	context.start(HashingContext.HASH_SHA256)
+	context.update(JSON.stringify(value).to_utf8_buffer())
+	return context.finish().hex_encode()
 
 
 func _map_write_undo_description(tool_name: String, input: Dictionary, tool_call: Dictionary, key: String) -> String:

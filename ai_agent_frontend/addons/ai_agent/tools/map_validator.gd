@@ -12,16 +12,23 @@ extends RefCounted
 # 才真正等价于「这套移动能力下到得了」，而不是「天空是连续的」。
 
 
-## 把工具输入解析成一个移动模型配置。未指定时回退到与历史行为一致的 "grid" 模型。
+## 把已校验的工具输入解析成统一移动模型；专用内部规划器可使用确定性的 profile 默认值。
 static func movement_from_input(input: Dictionary, dimension: int) -> Dictionary:
 	var model := str(input.get("movement_model", "grid")).strip_edges().to_lower()
 	if not (model in ["grid", "leap", "free"]):
 		model = "grid"
+	var support_offset := _support_offset_from_input(input, dimension)
 	return {
 		"model": model,
 		"dimension": dimension,
-		"walkable_is_filled": bool(input.get("walkable_is_filled", false)),
-		"support_offset": _support_offset_from_input(input, dimension),
+		"cell_occupancy": str(input.get("cell_occupancy", "empty")).strip_edges().to_lower(),
+		"requires_support": bool(input.get("requires_support", model == "leap")),
+		"support_occupancy": str(input.get("support_occupancy", "filled")).strip_edges().to_lower(),
+		"support_offset": support_offset,
+		"gravity_axis": _axis_name(_down_axis(support_offset)),
+		"gravity_sign": _axis_value(support_offset, _down_axis(support_offset)),
+		"frontier_axis": str(input.get("frontier_axis", "x")).strip_edges().to_lower(),
+		"frontier_sign": 1 if int(input.get("frontier_sign", 1)) >= 0 else -1,
 		# leap：跳跃/攀爬能力（按格计）。水平间隔与上升高度通常受跳跃距离/高度限制；
 		# 下落默认给一个较宽松的上限（下落一般不是限制因素），但仍可显式收紧。
 		"max_horizontal_gap": maxi(1, int(input.get("max_horizontal_gap", 1))),
@@ -29,6 +36,138 @@ static func movement_from_input(input: Dictionary, dimension: int) -> Dictionary
 		"max_fall": maxi(0, int(input.get("max_fall", 64))),
 		# free：单步最大移动距离（曼哈顿格数）。
 		"max_step": maxi(1, int(input.get("max_step", 1))),
+	}
+
+
+static func movement_input_error(input: Dictionary, dimension: int, require_explicit: bool = false) -> Dictionary:
+	if input.has("walkable_is_filled"):
+		return {
+			"error_code": "legacy_walkability_field_removed",
+			"message": "'walkable_is_filled' was removed. Specify cell_occupancy, requires_support, and support_occupancy explicitly.",
+			"required_fields": ["cell_occupancy", "requires_support", "support_occupancy"],
+		}
+	if require_explicit:
+		var missing: Array[String] = []
+		for occupancy_field_name in ["movement_model", "cell_occupancy", "requires_support", "support_occupancy"]:
+			if not input.has(occupancy_field_name):
+				missing.append(occupancy_field_name)
+		if not missing.is_empty():
+			return {
+				"error_code": "missing_traversal_occupancy_fields",
+				"message": "Traversal occupancy must be explicit; missing: %s." % ", ".join(missing),
+				"missing_fields": missing,
+			}
+	var model := str(input.get("movement_model", "grid")).strip_edges().to_lower()
+	if not (model in ["grid", "leap", "free"]):
+		return {
+			"error_code": "invalid_movement_model",
+			"message": "movement_model must be one of: grid, leap, free.",
+		}
+	for occupancy_name in ["cell_occupancy", "support_occupancy"]:
+		var default_occupancy := "empty" if occupancy_name == "cell_occupancy" else "filled"
+		var occupancy := str(input.get(occupancy_name, default_occupancy)).strip_edges().to_lower()
+		if not (occupancy in ["empty", "filled"]):
+			return {
+				"error_code": "invalid_occupancy",
+				"field": occupancy_name,
+				"message": "%s must be 'empty' or 'filled'." % occupancy_name,
+			}
+	if input.has("requires_support") and typeof(input.get("requires_support")) != TYPE_BOOL:
+		return {
+			"error_code": "invalid_requires_support",
+			"message": "requires_support must be a boolean.",
+		}
+	var axis := str(input.get("gravity_axis", "")).strip_edges().to_lower()
+	if axis != "" and not (axis in ["x", "y", "z"]):
+		return {
+			"error_code": "invalid_gravity_axis",
+			"message": "gravity_axis must be x, y, or z.",
+		}
+	if dimension == 2 and axis == "z":
+		return {
+			"error_code": "invalid_gravity_axis",
+			"message": "gravity_axis z is not valid for a 2D map.",
+		}
+	var frontier_axis := str(input.get("frontier_axis", "x")).strip_edges().to_lower()
+	if not (frontier_axis in ["x", "y", "z"]) or (dimension == 2 and frontier_axis == "z"):
+		return {
+			"error_code": "invalid_frontier_axis",
+			"message": "frontier_axis must be x/y for 2D or x/y/z for 3D.",
+		}
+	for sign_field in ["gravity_sign", "frontier_sign"]:
+		if input.has(sign_field) and not (int(input.get(sign_field)) in [-1, 1]):
+			return {
+				"error_code": "invalid_direction_sign",
+				"field": sign_field,
+				"message": "%s must be -1 or 1." % sign_field,
+			}
+	for anchor_field_name in ["start", "goal", "frontier", "entry_anchor"]:
+		var single_coordinate_error := _anchor_coordinate_error(input.get(anchor_field_name), anchor_field_name, dimension)
+		if not single_coordinate_error.is_empty():
+			return single_coordinate_error
+		if require_explicit and input.get(anchor_field_name) is Dictionary \
+				and not (input.get(anchor_field_name) as Dictionary).is_empty() \
+				and not (input.get(anchor_field_name) as Dictionary).has("role"):
+			return {
+				"error_code": "missing_anchor_role",
+				"field": anchor_field_name,
+				"message": "%s.role must explicitly say 'actor_cell' or 'support_cell'." % anchor_field_name,
+			}
+		var single_role_error := _anchor_role_error(input.get(anchor_field_name), anchor_field_name)
+		if not single_role_error.is_empty():
+			return single_role_error
+	for array_field_name in ["waypoints", "entrances", "exits"]:
+		var values = input.get(array_field_name)
+		if not (values is Array):
+			continue
+		for index in range((values as Array).size()):
+			var anchor_value = (values as Array)[index]
+			var array_coordinate_error := _anchor_coordinate_error(anchor_value, "%s[%d]" % [array_field_name, index], dimension)
+			if not array_coordinate_error.is_empty():
+				return array_coordinate_error
+			if require_explicit and anchor_value is Dictionary \
+					and not (anchor_value as Dictionary).has("role"):
+				return {
+					"error_code": "missing_anchor_role",
+					"field": "%s[%d]" % [array_field_name, index],
+					"message": "%s[%d].role must explicitly say 'actor_cell' or 'support_cell'." % [array_field_name, index],
+				}
+			var array_role_error := _anchor_role_error(anchor_value, "%s[%d]" % [array_field_name, index])
+			if not array_role_error.is_empty():
+				return array_role_error
+	return {}
+
+
+static func _anchor_coordinate_error(value, field_name: String, dimension: int) -> Dictionary:
+	if not (value is Dictionary) or (value as Dictionary).is_empty():
+		return {}
+	var required: Array[String] = ["x", "y"]
+	if dimension == 3:
+		required.append("z")
+	var missing: Array[String] = []
+	for coordinate_name in required:
+		if not (value as Dictionary).has(coordinate_name):
+			missing.append(coordinate_name)
+	if missing.is_empty():
+		return {}
+	return {
+		"error_code": "missing_anchor_coordinates",
+		"field": field_name,
+		"message": "%s is missing coordinate fields: %s." % [field_name, ", ".join(missing)],
+		"missing_fields": missing,
+	}
+
+
+static func _anchor_role_error(value, field_name: String) -> Dictionary:
+	if not (value is Dictionary) or not (value as Dictionary).has("role"):
+		return {}
+	var role := str((value as Dictionary).get("role", "")).strip_edges().to_lower()
+	if role in ["actor_cell", "support_cell"]:
+		return {}
+	return {
+		"error_code": "invalid_anchor_role",
+		"field": field_name,
+		"message": "%s.role must be 'actor_cell' or 'support_cell'." % field_name,
 	}
 
 
@@ -90,8 +229,8 @@ static func validate_region(
 	if start_value == null or goal_value == null:
 		return result
 
-	var start := coord_from_input(start_value, dimension)
-	var goal := coord_from_input(goal_value, dimension)
+	var start := coord_for_movement(start_value, dimension, movement)
+	var goal := coord_for_movement(goal_value, dimension, movement)
 	var connectivity := check_connectivity(filled, start, goal, region, dimension, movement, path_algorithm)
 	result["connectivity"] = connectivity
 	if not bool(connectivity.get("reachable", false)):
@@ -160,7 +299,7 @@ static func analyze_platform_design(
 
 	var finish_buffer := {}
 	if input.has("goal"):
-		var goal := coord_from_input(input.get("goal", {}), 2)
+		var goal := coord_for_movement(input.get("goal", {}), 2, movement)
 		var buffer_width := _standable_run_width_at(filled, region, movement, goal)
 		finish_buffer = {
 			"goal": coord_payload(goal, 2),
@@ -209,9 +348,9 @@ static func check_multi_point_connectivity(
 	entrances_value,
 	exits_value
 ) -> Dictionary:
-	var waypoints := coords_array_from_input(waypoints_value, dimension)
-	var entrances := coords_array_from_input(entrances_value, dimension)
-	var exits := coords_array_from_input(exits_value, dimension)
+	var waypoints := coords_array_from_input(waypoints_value, dimension, movement)
+	var entrances := coords_array_from_input(entrances_value, dimension, movement)
+	var exits := coords_array_from_input(exits_value, dimension, movement)
 	var result := {"reachable": true, "segments": [], "pairs": []}
 	if not waypoints.is_empty():
 		for i in range(waypoints.size() - 1):
@@ -314,23 +453,32 @@ static func build_connectivity_repair_plan(
 		path = []
 		for point in routed.get("path", []):
 			path.append(coord_from_input(point, dimension))
-	if str(movement.get("model", "grid")) == "leap":
+	if bool(movement.get("requires_support", false)):
 		# leap 失败的本质是「脚下没有连续支撑」，靠清空空气没用——要在脚下那一行补地面/平台。
 		# 把脚步路径每一格正下方的支撑格收集出来，建议 fill 成地面，搭出一条可走的桥。
 		var support_offset: Vector3i = movement.get("support_offset", Vector3i(0, 1, 0))
 		var seen := {}
 		var bridge: Array = []
+		var actor_cells: Array = []
 		for coords in path:
+			if in_region(coords, region):
+				actor_cells.append(coord_payload(coords, dimension))
 			var support: Vector3i = coords + support_offset
 			if in_region(support, region) and not seen.has(coord_key(support)):
 				seen[coord_key(support)] = true
 				bridge.append(coord_payload(support, dimension))
 		return [{
+			"type": "connectivity_actor_corridor",
+			"action": "fill" if str(movement.get("cell_occupancy", "empty")) == "filled" else "erase",
+			"cells": actor_cells,
+			"cells_count": actor_cells.size(),
+			"note": "Set actor cells to the requested actor occupancy.",
+		}, {
 			"type": "connectivity_bridge",
-			"action": "fill",
+			"action": "fill" if str(movement.get("support_occupancy", "filled")) == "filled" else "erase",
 			"cells": bridge,
 			"cells_count": bridge.size(),
-			"note": "Fill these support cells with ground/platform tiles (supply source_id/atlas for 2D or item for 3D) to bridge the gap, then validate again.",
+			"note": "Set these support cells to the requested support occupancy, then validate again.",
 		}]
 	var cells: Array = []
 	for coords in path:
@@ -338,7 +486,7 @@ static func build_connectivity_repair_plan(
 			cells.append(coord_payload(coords, dimension))
 	return [{
 		"type": "connectivity_corridor",
-		"action": "fill" if bool(movement.get("walkable_is_filled", false)) else "erase",
+		"action": "fill" if str(movement.get("cell_occupancy", "empty")) == "filled" else "erase",
 		"cells": cells,
 		"cells_count": cells.size(),
 		"note": "Apply this corridor to connect start and goal, then validate again.",
@@ -355,8 +503,22 @@ static func check_connectivity(
 	path_algorithm: String = "bfs"
 ) -> Dictionary:
 	var model := str(movement.get("model", "grid"))
-	if not in_region(start, region) or not in_region(goal, region):
-		return {"reachable": false, "reason": "start or goal is outside the validated region"}
+	if not in_region(start, region):
+		return {
+			"reachable": false,
+			"reason": "start actor cell is outside the validated region",
+			"reason_code": "start_out_of_region",
+			"actor_cell": coord_payload(start, dimension),
+			"region": region,
+		}
+	if not in_region(goal, region):
+		return {
+			"reachable": false,
+			"reason": "goal actor cell is outside the validated region",
+			"reason_code": "goal_out_of_region",
+			"actor_cell": coord_payload(goal, dimension),
+			"region": region,
+		}
 	if not is_standable(filled, start, region, movement):
 		return _foothold_failure(filled, start, region, movement, "start")
 	if not is_standable(filled, goal, region, movement):
@@ -398,8 +560,24 @@ static func find_path_astar(
 	movement: Dictionary
 ) -> Dictionary:
 	var model := str(movement.get("model", "grid"))
-	if not in_region(start, region) or not in_region(goal, region):
-		return {"reachable": false, "algorithm": "astar", "reason": "start or goal is outside the validated region"}
+	if not in_region(start, region):
+		return {
+			"reachable": false,
+			"algorithm": "astar",
+			"reason": "start actor cell is outside the validated region",
+			"reason_code": "start_out_of_region",
+			"actor_cell": coord_payload(start, dimension),
+			"region": region,
+		}
+	if not in_region(goal, region):
+		return {
+			"reachable": false,
+			"algorithm": "astar",
+			"reason": "goal actor cell is outside the validated region",
+			"reason_code": "goal_out_of_region",
+			"actor_cell": coord_payload(goal, dimension),
+			"region": region,
+		}
 	if not is_standable(filled, start, region, movement):
 		return _foothold_failure(filled, start, region, movement, "start", "astar")
 	if not is_standable(filled, goal, region, movement):
@@ -438,28 +616,54 @@ static func find_path_astar(
 	return {"reachable": false, "algorithm": "astar", "movement_model": model, "reason": "no reachable path connects start and goal under the '%s' movement model" % model, "visited": g_score.size()}
 
 
-static func _not_standable_reason(which: String, model: String) -> String:
-	if model == "leap":
-		return "%s cell is not a valid foothold (must be empty with solid support directly below)" % which
-	return "%s cell is not walkable" % which
+static func _not_standable_reason(which: String, movement: Dictionary) -> String:
+	if bool(movement.get("requires_support", false)):
+		return "%s actor cell does not satisfy the requested cell and support occupancy model" % which
+	return "%s actor cell does not satisfy the requested cell occupancy" % which
 
 
 ## 把"起点/终点不是合法落脚点"从一句话升级成结构化诊断：这一格本身是不是实心、以及同一列里
 ## 最近的那个真正能站的格子在哪。模型不用再从原始瓦片数据反推（这正是反复"Wait...Hmm"绕圈的根因）。
 static func _foothold_diagnostic(filled: Dictionary, coords: Vector3i, region: Dictionary, movement: Dictionary, which: String) -> Dictionary:
-	var model := str(movement.get("model", "grid"))
 	var dimension := int(movement.get("dimension", 2))
+	var actor_filled := filled.has(coord_key(coords))
+	var expected_actor_filled := str(movement.get("cell_occupancy", "empty")) == "filled"
+	var support_offset: Vector3i = movement.get("support_offset", Vector3i(0, 1, 0))
+	var support := coords + support_offset
 	var diag := {
-		"reason": _not_standable_reason(which, model),
+		"reason": _not_standable_reason(which, movement),
 		"which": which,
-		"cell": coord_payload(coords, dimension),
-		"cell_filled": filled.has(coord_key(coords)),
+		"actor_cell": coord_payload(coords, dimension),
+		"actor_cell_filled": actor_filled,
+		"expected_actor_occupancy": str(movement.get("cell_occupancy", "empty")),
+		"requires_support": bool(movement.get("requires_support", false)),
+		"gravity_axis": str(movement.get("gravity_axis", "y")),
+		"gravity_sign": int(movement.get("gravity_sign", 1)),
 	}
-	if model == "leap":
-		var suggested := _nearest_standable_on_axis(filled, coords, region, movement)
-		if suggested != coords:
-			diag["suggested_foothold"] = coord_payload(suggested, dimension)
-			diag["reason"] = "%s; nearest valid foothold in this column is %s (empty cell with solid support directly below)" % [diag["reason"], str(diag["suggested_foothold"])]
+	if actor_filled != expected_actor_filled:
+		diag["reason_code"] = "actor_cell_blocked" if not expected_actor_filled else "actor_cell_empty"
+	elif bool(movement.get("requires_support", false)):
+		var support_in_region := in_region(support, region)
+		var support_filled := filled.has(coord_key(support))
+		var expected_support_filled := str(movement.get("support_occupancy", "filled")) == "filled"
+		diag["support_cell"] = coord_payload(support, dimension)
+		diag["support_cell_in_region"] = support_in_region
+		diag["support_cell_filled"] = support_filled
+		diag["expected_support_occupancy"] = str(movement.get("support_occupancy", "filled"))
+		if not support_in_region:
+			diag["reason_code"] = "support_outside_region"
+		elif support_filled != expected_support_filled:
+			diag["reason_code"] = "missing_support" if expected_support_filled else "unexpected_support"
+		else:
+			diag["reason_code"] = "not_standable"
+	else:
+		diag["reason_code"] = "not_walkable"
+	var suggested := _nearest_standable_on_axis(filled, coords, region, movement)
+	if suggested != coords:
+		var suggested_payload := coord_payload(suggested, dimension)
+		diag["suggested_foothold"] = suggested_payload
+		diag["suggested_anchors"] = [{"role": "actor_cell", "cell": suggested_payload}]
+		diag["reason"] = "%s; nearest valid actor cell is %s" % [diag["reason"], str(suggested_payload)]
 	return diag
 
 
@@ -562,13 +766,38 @@ static func coord_from_input(value, dimension: int) -> Vector3i:
 	return Vector3i.ZERO
 
 
-static func coords_array_from_input(value, dimension: int) -> Array:
+static func coord_for_movement(value, dimension: int, movement: Dictionary) -> Vector3i:
+	var coords := coord_from_input(value, dimension)
+	if value is Dictionary and str(value.get("role", "actor_cell")).strip_edges().to_lower() == "support_cell":
+		var support_offset: Vector3i = movement.get("support_offset", Vector3i(0, 1, 0))
+		return coords - support_offset
+	return coords
+
+
+static func anchor_payload(value, dimension: int, movement: Dictionary) -> Dictionary:
+	var role := "actor_cell"
+	if value is Dictionary:
+		role = str(value.get("role", "actor_cell")).strip_edges().to_lower()
+	var raw_cell := coord_from_input(value, dimension)
+	var actor_cell := coord_for_movement(value, dimension, movement)
+	var payload := {
+		"source_role": role,
+		"source_cell": coord_payload(raw_cell, dimension),
+		"actor_cell": coord_payload(actor_cell, dimension),
+	}
+	if bool(movement.get("requires_support", false)):
+		var support_offset: Vector3i = movement.get("support_offset", Vector3i(0, 1, 0))
+		payload["support_cell"] = coord_payload(actor_cell + support_offset, dimension)
+	return payload
+
+
+static func coords_array_from_input(value, dimension: int, movement: Dictionary = {}) -> Array:
 	var coords: Array = []
 	if not (value is Array):
 		return coords
 	for item in value:
 		if item is Dictionary:
-			coords.append(coord_from_input(item, dimension))
+			coords.append(coord_for_movement(item, dimension, movement) if not movement.is_empty() else coord_from_input(item, dimension))
 	return coords
 
 
@@ -588,10 +817,10 @@ static func in_region(coords: Vector3i, region: Dictionary) -> bool:
 		and coords.z >= int(region["min_z"]) and coords.z <= int(region["max_z"])
 
 
-## 某格在「基础含义」上是否可走：默认空格可走；walkable_is_filled=true 时反转为实心可走。
+## Actor-cell occupancy is independent from the support-cell predicate.
 static func _base_walkable(filled: Dictionary, coords: Vector3i, movement: Dictionary) -> bool:
 	var is_filled := filled.has(coord_key(coords))
-	return is_filled if bool(movement.get("walkable_is_filled", false)) else not is_filled
+	return is_filled == (str(movement.get("cell_occupancy", "empty")) == "filled")
 
 
 ## leap 模型下「脚下是否有支撑」：正下方那一格是实心（不可走）才算站得住。
@@ -600,15 +829,16 @@ static func _base_walkable(filled: Dictionary, coords: Vector3i, movement: Dicti
 static func _has_support(filled: Dictionary, coords: Vector3i, region: Dictionary, movement: Dictionary) -> bool:
 	var support: Vector3i = coords + (movement.get("support_offset", Vector3i(0, 1, 0)) as Vector3i)
 	if not in_region(support, region):
-		return true
-	return not _base_walkable(filled, support, movement)
+		return false
+	var support_is_filled := filled.has(coord_key(support))
+	return support_is_filled == (str(movement.get("support_occupancy", "filled")) == "filled")
 
 
 ## 某格能否作为一个「落脚点」被站立/占据。grid/free 只要基础可走；leap 还要求脚下有支撑。
 static func is_standable(filled: Dictionary, coords: Vector3i, region: Dictionary, movement: Dictionary) -> bool:
 	if not _base_walkable(filled, coords, movement):
 		return false
-	if str(movement.get("model", "grid")) == "leap":
+	if bool(movement.get("requires_support", false)):
 		return _has_support(filled, coords, region, movement)
 	return true
 
@@ -690,6 +920,16 @@ static func _down_axis(support_offset: Vector3i) -> int:
 	if support_offset.z != 0:
 		return 2
 	return 1
+
+
+static func _axis_name(axis: int) -> String:
+	match axis:
+		0:
+			return "x"
+		2:
+			return "z"
+		_:
+			return "y"
 
 
 static func _axis_value(v: Vector3i, axis: int) -> int:

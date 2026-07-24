@@ -267,19 +267,23 @@ static func _validation_plan(region: Dictionary, platforms: Array, ability: Dict
 		max_x = maxi(max_x, int(platform.get("x", max_x)) + int(platform.get("width", 1)) - 1)
 		min_y = mini(min_y, int(platform.get("y", min_y)) - 3)
 		max_y = maxi(max_y, int(platform.get("y", max_y)) + 1)
+	var validation_start: Dictionary = start.duplicate(true)
+	validation_start["role"] = "actor_cell"
 	return {
 		"validate_map_region": {
 			"x": min_x,
 			"y": min_y,
 			"width": max_x - min_x + 1,
 			"height": max_y - min_y + 1,
-			"start": start,
-			"goal": {"x": int(last["x"]) + int(last["width"]) - 1, "y": int(last["y"]) - 1},
+			"start": validation_start,
+			"goal": {"x": int(last["x"]) + int(last["width"]) - 1, "y": int(last["y"]) - 1, "role": "actor_cell"},
 			"movement_model": "leap",
 			"max_horizontal_gap": ability["max_horizontal_gap"],
 			"max_rise": ability["max_rise"],
 			"max_fall": ability["max_fall"],
-			"walkable_is_filled": false,
+			"cell_occupancy": "empty",
+			"requires_support": true,
+			"support_occupancy": "filled",
 			"path_algorithm": "astar",
 			"check_overlaps": true,
 			"check_blocked_objects": true,

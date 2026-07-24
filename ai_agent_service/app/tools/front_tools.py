@@ -1953,6 +1953,7 @@ def register_front_tools() -> None:
                                 "x": {"type": "integer"},
                                 "y": {"type": "integer"},
                                 "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                             },
                         },
                         "goal": {
@@ -1961,6 +1962,7 @@ def register_front_tools() -> None:
                                 "x": {"type": "integer"},
                                 "y": {"type": "integer"},
                                 "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                             },
                         },
                         "waypoints": {
@@ -1971,6 +1973,7 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                                 },
                             },
                         },
@@ -1982,6 +1985,7 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                                 },
                             },
                         },
@@ -1993,6 +1997,7 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                                 },
                             },
                         },
@@ -2035,6 +2040,22 @@ def register_front_tools() -> None:
                         "y": {"type": "integer"},
                         "width": {"type": "integer", "minimum": 8},
                         "height": {"type": "integer", "minimum": 8},
+                        "entry_anchor": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                            },
+                        },
+                        "frontier": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                            },
+                        },
                         "platforms": {
                             "type": "array",
                             "minItems": 1,
@@ -2148,6 +2169,11 @@ def register_front_tools() -> None:
                             "minimum": 1,
                             "description": "Maximum acceptable downward landing difference in cells.",
                         },
+                        "movement_model": {"type": "string", "enum": ["leap"]},
+                        "cell_occupancy": {"type": "string", "enum": ["empty", "filled"]},
+                        "requires_support": {"type": "boolean"},
+                        "support_occupancy": {"type": "string", "enum": ["empty", "filled"]},
+                        "planning_contract": {"type": "object"},
                         "min_landing_width": {
                             "type": "integer",
                             "minimum": 2,
@@ -2202,7 +2228,18 @@ def register_front_tools() -> None:
                             "description": "Fallback resource key for emitted platform fill drafts.",
                         },
                     },
-                    ["width", "height", "platforms", "segments"],
+                    [
+                        "x",
+                        "y",
+                        "width",
+                        "height",
+                        "platforms",
+                        "segments",
+                        "movement_model",
+                        "cell_occupancy",
+                        "requires_support",
+                        "support_occupancy",
+                    ],
                 ),
             },
         )
@@ -2294,19 +2331,33 @@ def register_front_tools() -> None:
                                 "x": {"type": "integer"},
                                 "y": {"type": "integer"},
                                 "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                             },
                         },
-                        "start": {
+                        "entry_anchor": {
                             "type": "object",
-                            "description": "Optional real player/unit start. When provided, plan_reachable_map_growth first computes rightmost_frontier from real map reachability.",
+                            "description": "Optional explicit growth anchor, using actor_cell or support_cell coordinates.",
                             "properties": {
                                 "x": {"type": "integer"},
                                 "y": {"type": "integer"},
                                 "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                            },
+                        },
+                        "start": {
+                            "type": "object",
+                            "description": "Optional real player/unit start. When provided, plan_reachable_map_growth first computes reachable_frontier from real map reachability.",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                                "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                             },
                         },
                         "frontier_type": {"type": "string"},
-                        "walkable_is_filled": {"type": "boolean"},
+                        "cell_occupancy": {"type": "string", "enum": ["empty", "filled"]},
+                        "requires_support": {"type": "boolean"},
+                        "support_occupancy": {"type": "string", "enum": ["empty", "filled"]},
                         "movement_model": {
                             "type": "string",
                             "enum": ["grid", "leap", "free"],
@@ -2333,6 +2384,9 @@ def register_front_tools() -> None:
                         "max_step": {"type": "integer", "minimum": 1},
                         "gravity_axis": {"type": "string", "enum": ["x", "y", "z"]},
                         "gravity_sign": {"type": "integer", "enum": [-1, 1]},
+                        "frontier_axis": {"type": "string", "enum": ["x", "y", "z"]},
+                        "frontier_sign": {"type": "integer", "enum": [-1, 1]},
+                        "planning_contract": {"type": "object"},
                         "max_returned_cells": {"type": "integer", "minimum": 1},
                         "min_landing_width": {"type": "integer", "minimum": 2},
                         "max_platform_thickness": {"type": "integer", "minimum": 1},
@@ -2347,7 +2401,17 @@ def register_front_tools() -> None:
                         "fallback_road_resource": {"type": "string"},
                         "fallback_floor_resource": {"type": "string"},
                     },
-                    ["profile", "width", "height"],
+                    [
+                        "profile",
+                        "x",
+                        "y",
+                        "width",
+                        "height",
+                        "movement_model",
+                        "cell_occupancy",
+                        "requires_support",
+                        "support_occupancy",
+                    ],
                 ),
             },
         )
@@ -2366,7 +2430,7 @@ def register_front_tools() -> None:
                 "description": (
                     "Read the real TileMap/TileMapLayer/GridMap cells and compute all cells reachable from a "
                     "real player/unit start under movement_model='grid', 'leap', or 'free'. Returns "
-                    "reachable_cells, reachable_footholds, rightmost_frontier, frontier_candidates, and "
+                    "reachable_cells, reachable_footholds, reachable_frontier, frontier_candidates, and "
                     "first_blocked_gap. Use before plan_reachable_map_growth when extending an existing playable map."
                 ),
                 "parameters": _object_schema(
@@ -2381,17 +2445,17 @@ def register_front_tools() -> None:
                         "depth": {"type": "integer", "minimum": 1},
                         "start": {
                             "type": "object",
-                            "description": "Real player/unit start cell {x,y[,z]} in map coordinates.",
+                            "description": "Real start anchor. role='actor_cell' means the occupied character cell; role='support_cell' means the ground/support cell.",
                             "properties": {
                                 "x": {"type": "integer"},
                                 "y": {"type": "integer"},
                                 "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                             },
                         },
-                        "walkable_is_filled": {
-                            "type": "boolean",
-                            "description": "When true, filled cells are walkable; otherwise empty cells are walkable.",
-                        },
+                        "cell_occupancy": {"type": "string", "enum": ["empty", "filled"]},
+                        "requires_support": {"type": "boolean"},
+                        "support_occupancy": {"type": "string", "enum": ["empty", "filled"]},
                         "movement_model": {
                             "type": "string",
                             "enum": ["grid", "leap", "free"],
@@ -2403,13 +2467,26 @@ def register_front_tools() -> None:
                         "max_step": {"type": "integer", "minimum": 1},
                         "gravity_axis": {"type": "string", "enum": ["x", "y", "z"]},
                         "gravity_sign": {"type": "integer", "enum": [-1, 1]},
+                        "frontier_axis": {"type": "string", "enum": ["x", "y", "z"]},
+                        "frontier_sign": {"type": "integer", "enum": [-1, 1]},
+                        "planning_contract": {"type": "object"},
                         "max_returned_cells": {
                             "type": "integer",
                             "minimum": 1,
                             "description": "Caps returned reachable_cells/footholds payload size; search still visits the whole region.",
                         },
                     },
-                    ["start", "width", "height"],
+                    [
+                        "start",
+                        "x",
+                        "y",
+                        "width",
+                        "height",
+                        "movement_model",
+                        "cell_occupancy",
+                        "requires_support",
+                        "support_occupancy",
+                    ],
                 ),
             },
         )
@@ -3000,7 +3077,7 @@ def register_front_tools() -> None:
         "min_distance_from_same_kind": {"type": "integer", "minimum": 0},
         "requires_reachable": {
             "type": "boolean",
-            "description": "When true, the anchor/interaction/entrance point must be reachable from start under movement_model.",
+            "description": "When true, the anchor/interaction/entrance point must be reachable from start under traversal.",
         },
         "reachability_point": {
             "type": "string",
@@ -3011,14 +3088,33 @@ def register_front_tools() -> None:
         "entrance_offset": {"type": "object"},
         "map_layer": {"type": "integer"},
         "ground_map_layer": {"type": "integer"},
-        "start": {"type": "object"},
-        "movement_model": {"type": "string", "enum": ["grid", "leap", "free"]},
-        "path_algorithm": {"type": "string", "enum": ["bfs", "astar", "a*"]},
-        "walkable_is_filled": {"type": "boolean"},
-        "max_horizontal_gap": {"type": "integer", "minimum": 1},
-        "max_rise": {"type": "integer", "minimum": 0},
-        "max_fall": {"type": "integer", "minimum": 0},
-        "max_step": {"type": "integer", "minimum": 1},
+        "start": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "z": {"type": "integer"},
+                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+            },
+        },
+        "traversal": {
+            "type": "object",
+            "description": "Character reachability rules, separate from the object's requires_support placement rule.",
+            "properties": {
+                "movement_model": {"type": "string", "enum": ["grid", "leap", "free"]},
+                "path_algorithm": {"type": "string", "enum": ["bfs", "astar", "a*"]},
+                "cell_occupancy": {"type": "string", "enum": ["empty", "filled"]},
+                "requires_support": {"type": "boolean"},
+                "support_occupancy": {"type": "string", "enum": ["empty", "filled"]},
+                "max_horizontal_gap": {"type": "integer", "minimum": 1},
+                "max_rise": {"type": "integer", "minimum": 0},
+                "max_fall": {"type": "integer", "minimum": 0},
+                "max_step": {"type": "integer", "minimum": 1},
+                "gravity_axis": {"type": "string", "enum": ["x", "y", "z"]},
+                "gravity_sign": {"type": "integer", "enum": [-1, 1]},
+            },
+            "required": ["movement_model", "cell_occupancy", "requires_support", "support_occupancy"],
+        },
         "protected_cells": {"type": "array", "items": {"type": "object"}},
         "path_cells": {"type": "array", "items": {"type": "object"}},
         "route_cells": {"type": "array", "items": {"type": "object"}},
@@ -3330,8 +3426,9 @@ def register_front_tools() -> None:
                     "'grid' only proves cells are adjacent, NOT that the character can actually traverse — for any "
                     "jump/gravity gameplay you MUST pass movement_model='leap' with jump limits measured from the real "
                     "character controller, otherwise a level of floating platforms over open air will wrongly pass. "
-                    "By default empty cells are walkable and filled cells are obstacles; set walkable_is_filled=true to "
-                    "invert. Optionally override gravity direction via gravity_axis/gravity_sign. It can also enforce "
+                    "Declare actor occupancy with cell_occupancy, support requirements with requires_support, and "
+                    "support occupancy with support_occupancy. Optionally override gravity direction via "
+                    "gravity_axis/gravity_sign. It can also enforce "
                     "allowed_bounds, check spatial-index overlaps, and detect objects on water/blocked cells. Returns "
                     "issues, passed, path/multi_connectivity, and repair_plan, but never edits. For leap/platformer "
                     "validation it can also run platform_design checks for oversized solid rows, tall columns, filled "
@@ -3348,7 +3445,7 @@ def register_front_tools() -> None:
                     "allowed after a validation with real route endpoints/waypoints (or entrances/exits) passes and "
                     "`completion_allowed=true`. Oversized validation returns `blocking_completion=true` and must be "
                     "split into route segments instead of being ignored. HARD LIMIT: the region width*height (*depth) "
-                    "must be <= 800 cells per call; a larger region is rejected with error_code='region_too_large'. "
+                    "must be <= 1600 cells per call; a larger region is rejected with error_code='region_too_large'. "
                     "Plan for this BEFORE calling — split a long route into segments and validate each with its own "
                     "start/goal, keeping each segment's support row inside its region, rather than sending one big "
                     "region and reacting to the error."
@@ -3363,7 +3460,7 @@ def register_front_tools() -> None:
                         },
                         "map_layer": {
                             "type": "integer",
-                            "description": "Layer index for a legacy TileMap; ignored by TileMapLayer and GridMap.",
+                            "description": "Layer index for a legacy TileMap. Omit for TileMapLayer and GridMap.",
                         },
                         "x": {"type": "integer"},
                         "y": {"type": "integer"},
@@ -3390,6 +3487,7 @@ def register_front_tools() -> None:
                                 "x": {"type": "integer"},
                                 "y": {"type": "integer"},
                                 "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                             },
                         },
                         "goal": {
@@ -3399,6 +3497,7 @@ def register_front_tools() -> None:
                                 "x": {"type": "integer"},
                                 "y": {"type": "integer"},
                                 "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                             },
                         },
                         "waypoints": {
@@ -3410,6 +3509,7 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                                 },
                             },
                         },
@@ -3422,6 +3522,7 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                                 },
                             },
                         },
@@ -3434,13 +3535,14 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                                 },
                             },
                         },
-                        "walkable_is_filled": {
-                            "type": "boolean",
-                            "description": "When true, filled cells are walkable and empty cells are obstacles.",
-                        },
+                        "cell_occupancy": {"type": "string", "enum": ["empty", "filled"]},
+                        "requires_support": {"type": "boolean"},
+                        "support_occupancy": {"type": "string", "enum": ["empty", "filled"]},
+                        "planning_contract": {"type": "object"},
                         "movement_model": {
                             "type": "string",
                             "enum": ["grid", "leap", "free"],
@@ -3536,7 +3638,16 @@ def register_front_tools() -> None:
                             },
                         },
                     },
-                    [],
+                    [
+                        "x",
+                        "y",
+                        "width",
+                        "height",
+                        "movement_model",
+                        "cell_occupancy",
+                        "requires_support",
+                        "support_occupancy",
+                    ],
                 ),
             },
         )
@@ -3555,8 +3666,8 @@ def register_front_tools() -> None:
                 "description": (
                     "Apply automatic repairs for validate_map_region failures. Pass the SAME movement_model (and jump "
                     "limits) you validated with so the repair matches how the character actually moves. For 'grid'/'free' "
-                    "connectivity it erases a corridor by default (empty space becomes walkable); with "
-                    "walkable_is_filled=true it fills the corridor. For 'leap' failures it instead proposes filling the "
+                    "connectivity it applies cell_occupancy to the corridor. When requires_support=true it instead "
+                    "applies support_occupancy to the SUPPORT row beneath the path. For leap failures this normally fills the "
                     "SUPPORT row beneath the path (a ground/platform bridge across the gap), so it requires "
                     "source_id/atlas_x/atlas_y for 2D or item for 3D. With repair_overlaps/repair_blocked_objects it "
                     "moves indexed object nodes to nearby free cells and updates the spatial index. Re-run "
@@ -3579,6 +3690,7 @@ def register_front_tools() -> None:
                                 "x": {"type": "integer"},
                                 "y": {"type": "integer"},
                                 "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                             },
                         },
                         "goal": {
@@ -3587,6 +3699,7 @@ def register_front_tools() -> None:
                                 "x": {"type": "integer"},
                                 "y": {"type": "integer"},
                                 "z": {"type": "integer"},
+                                "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                             },
                         },
                         "waypoints": {
@@ -3597,6 +3710,7 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                                 },
                             },
                         },
@@ -3608,6 +3722,7 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                                 },
                             },
                         },
@@ -3619,10 +3734,13 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
+                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
                                 },
                             },
                         },
-                        "walkable_is_filled": {"type": "boolean"},
+                        "cell_occupancy": {"type": "string", "enum": ["empty", "filled"]},
+                        "requires_support": {"type": "boolean"},
+                        "support_occupancy": {"type": "string", "enum": ["empty", "filled"]},
                         "movement_model": {
                             "type": "string",
                             "enum": ["grid", "leap", "free"],
@@ -3682,7 +3800,16 @@ def register_front_tools() -> None:
                         "orientation": {"type": "integer"},
                         "update_spatial_index": {"type": "boolean"},
                     },
-                    [],
+                    [
+                        "x",
+                        "y",
+                        "width",
+                        "height",
+                        "movement_model",
+                        "cell_occupancy",
+                        "requires_support",
+                        "support_occupancy",
+                    ],
                 ),
             },
         )

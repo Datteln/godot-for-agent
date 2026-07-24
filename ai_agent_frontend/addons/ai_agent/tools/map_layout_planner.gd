@@ -129,24 +129,39 @@ static func _operation_drafts(intent: Dictionary, region: Dictionary, missing_re
 static func _validation_plan(intent: Dictionary, region: Dictionary) -> Dictionary:
 	var layout := _layout_for_mode(intent, region)
 	var anchors: Dictionary = layout.get("anchors", {})
+	var entry := _actor_anchor(anchors.get("entry", {}))
+	var exit := _actor_anchor(anchors.get("exit", {}))
+	var waypoint_values: Array = []
+	for waypoint in _path_constraints(intent, region).get("waypoints", []):
+		waypoint_values.append(_actor_anchor(waypoint))
 	return {
 		"tool": "validate_map_region",
 		"target": "planned_target_path",
 		"region": region,
-		"start": anchors.get("entry", {}),
-		"goal": anchors.get("exit", {}),
-		"entrances": [anchors.get("entry", {})],
-		"exits": [anchors.get("exit", {})],
-		"waypoints": _path_constraints(intent, region).get("waypoints", []),
+		"start": entry,
+		"goal": exit,
+		"entrances": [entry],
+		"exits": [exit],
+		"waypoints": waypoint_values,
 		# 默认按模式给一个 movement_model 提示：2D 多为跳跃玩法 → leap，3D 房间地面导航 → grid。
-		# leap 下脚步格是空格、地面在脚下（walkable_is_filled=false）。
+		# leap 下角色格为空、支撑格为实心；3D 地面导航则直接在实心 GridMap 单元上行走。
 		"movement_model": "grid" if str(intent.get("mode", "2d")) == "3d" else "leap",
-		"walkable_is_filled": false,
+		"cell_occupancy": "filled" if str(intent.get("mode", "2d")) == "3d" else "empty",
+		"requires_support": str(intent.get("mode", "2d")) != "3d",
+		"support_occupancy": "filled",
 		"path_algorithm": "astar",
 		"check_overlaps": true,
 		"check_blocked_objects": true,
 		"note": "确认 movement_model 是否符合真实玩法：带跳跃/重力用 leap，并按角色控制器真实的移动速度、跳跃初速度、重力换算出 max_horizontal_gap/max_rise/max_fall（格数）后再校验，不要用默认值。",
 	}
+
+
+static func _actor_anchor(value) -> Dictionary:
+	if not (value is Dictionary):
+		return {"role": "actor_cell"}
+	var anchor: Dictionary = (value as Dictionary).duplicate(true)
+	anchor["role"] = "actor_cell"
+	return anchor
 
 
 static func _path_constraints(intent: Dictionary, region: Dictionary) -> Dictionary:
