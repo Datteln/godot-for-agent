@@ -427,8 +427,8 @@ async def _delegate_child_frame(
     args: dict[str, Any],
     depth: int,
     prompt_factory: AgentPromptFactory | None,
-) -> Frame | None:
-    """根据委派参数创建一个子 agent 帧。"""
+) -> Frame | str | None:
+    """根据委派参数创建子 agent 帧，并保留动态 worker 的具体错误。"""
     agent_name = args.get("agent")
     task = args.get("task")
     if not isinstance(task, str) or not task.strip():
@@ -437,7 +437,7 @@ async def _delegate_child_frame(
     worker_spec = args.get("worker_spec")
     if isinstance(worker_spec, dict):
         if parent is None or parent.agent.name != "map-agent":
-            return None
+            return "只有 map-agent 可以创建动态地图 worker"
         worker_spec = dict(worker_spec)
         worker_spec.setdefault(
             "stage_id",
@@ -446,7 +446,7 @@ async def _delegate_child_frame(
         worker_spec.setdefault("lifecycle_scope", "delegate_frame")
         child_or_error = build_dynamic_map_worker(parent.agent, worker_spec)
         if isinstance(child_or_error, str):
-            return None
+            return child_or_error
         child_agent = child_or_error
         if is_map_worker_write_mode(worker_spec.get("mode")):
             # 写 worker 必须先切换阶段，否则阶段裁剪会只留下读取工具。
@@ -454,6 +454,11 @@ async def _delegate_child_frame(
     else:
         if not isinstance(agent_name, str) or not agent_name:
             return None
+        if parent is not None and parent.agent.name == "map-agent" and agent_name == "map-agent":
+            return (
+                "map-agent 不得递归委派普通 map-agent；"
+                "写入请创建带 worker_spec.mode=write_one_batch 的动态地图 worker"
+            )
         try:
             child_agent = get_agent(agent_name, set(REGISTRY))
         except KeyError:
@@ -634,7 +639,7 @@ async def _continue_delegate_group(
             depth=int(group["depth"]),
             prompt_factory=prompt_factory,
         )
-        if child is not None:
+        if isinstance(child, Frame):
             session.agent_stack.append(child)
             _plan_step_started(session, child, event_callback)
             logger.info(
@@ -646,10 +651,14 @@ async def _continue_delegate_group(
                 len(remaining),
             )
             return
+        if isinstance(child, str):
+            summary = child
+        else:
+            summary = "子任务参数不合法或 agent 不存在，已跳过"
         group["results"].append(
             {
                 "agent": str(next_task.get("agent", "")),
-                "summary": "子任务参数不合法或 agent 不存在，已跳过",
+                "summary": summary,
                 "error": True,
             }
         )
@@ -2292,18 +2301,23 @@ async def _start_delegate_frame(
         depth=frame.depth + 1,
         prompt_factory=prompt_factory,
     )
+    if isinstance(child, str):
+        logger.warning(
+            "Delegate rejected: invalid child session=%s frame=%s agent=%s error=%s",
+            session.session_id,
+            frame.id,
+            agent_name,
+            child,
+        )
+        frame.messages.append(_tool_message(call_id, child, is_error=True))
+        return False
     if child is None:
         logger.warning(
             "Delegate rejected: unknown child agent session=%s agent=%s",
             session.session_id,
             agent_name,
         )
-        if has_worker_spec:
-            frame.messages.append(_tool_message(call_id, "动态 worker spec 不合法", is_error=True))
-        else:
-            frame.messages.append(
-                _tool_message(call_id, f"未知子 agent：{agent_name}", is_error=True)
-            )
+        frame.messages.append(_tool_message(call_id, f"未知子 agent：{agent_name}", is_error=True))
         return False
     session.agent_stack.append(child)
     _plan_step_started(session, child, event_callback)
@@ -2423,6 +2437,16 @@ async def _start_delegate_group(
         depth=frame.depth + 1,
         prompt_factory=prompt_factory,
     )
+    if isinstance(child, str):
+        session.delegate_groups.pop(group_id, None)
+        logger.warning(
+            "Delegate_many rejected: invalid first task session=%s frame=%s error=%s",
+            session.session_id,
+            frame.id,
+            child,
+        )
+        frame.messages.append(_tool_message(call_id, child, is_error=True))
+        return False
     if child is None:
         session.delegate_groups.pop(group_id, None)
         logger.warning(

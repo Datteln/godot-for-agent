@@ -159,7 +159,11 @@ def build_dynamic_map_worker(
     if not requested_tools:
         return "worker_spec.allowed_tools 必须包含工具名字符串"
 
-    denied = requested_tools - parent_tools
+    delegable_tools = set(parent_tools)
+    if parent.name == "map-agent" and is_map_worker_write_mode(mode):
+        # map-agent 自身不能直接写地图，但可把受控写工具委派给一次性 writer。
+        delegable_tools.update(MAP_WRITE_TOOL_NAMES)
+    denied = requested_tools - delegable_tools
     if denied:
         return f"动态 worker 工具不能超过父 agent 权限：{', '.join(sorted(denied))}"
 

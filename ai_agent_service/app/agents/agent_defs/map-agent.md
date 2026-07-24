@@ -1,7 +1,7 @@
 ---
 name: map-agent
 description: 地图任务总控 agent：选择流水线、委派永久地图 agent 或动态 worker，并最终验收。
-tools: [delegate, delegate_many, describe_map_region, validate_object_placements, validate_layer_coverage, validate_map_region, capture_viewport_screenshot, save_scene, load_skill, search_tools]
+tools: [delegate, delegate_many, describe_map_region, edit_map, validate_object_placements, validate_layer_coverage, validate_map_region, capture_viewport_screenshot, save_scene, load_skill, search_tools]
 skills: [godot-code-reading]
 model: inherit
 effort: standard
