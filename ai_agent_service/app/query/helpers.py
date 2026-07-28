@@ -6,10 +6,12 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
-from app.agents.types import CompactSnapshot, Frame
+from app.agents.bundled import get_agent
+from app.agents.types import AgentDefinition, CompactSnapshot, Frame
 from app.api.schemas import (
     ChatRequest,
     ChatToolCallsResponse,
@@ -41,10 +43,41 @@ from app.api.schemas import (
     VerifyStartedHistoryBlock,
 )
 from app.events.store import Event
+# history 限流相关常量和工具函数已迁移到 app.history_bounds 共享模块，
+# 避免 helpers 与 history_bounds 之间重复维护同一套阈值/截断逻辑。
+from app.history_bounds import (
+    HISTORY_MAX_JSON_CHARS as _HISTORY_TOOL_MAX_JSON_CHARS,
+    bounded_history_value as _bounded_history_value,
+    bounded_tool_message_body as _bounded_tool_message_body,
+    json_char_size as _json_char_size,
+    summarize_history_text as _summarize_history_text,
+)
 from app.llm.message_transformer import estimate_message_tokens, flatten_message_text
-from app.orchestrator.map_progress import parse_map_plan_outcome
-from app.orchestrator.map_workers import MAP_REVISION_GUARDED_TOOL_NAMES, MAP_WRITE_TOOL_NAMES
+from app.orchestrator.map_progress import (
+    latest_map_revision,
+    map_revision_scope_key,
+    parse_map_plan_outcome,
+)
+# 子 Frame 创建统一走 frame_factory，保证 history_anchor / parent_id 等字段的一致性
+from app.orchestrator.frame_factory import create_child_frame, typed_child_task_text
+from app.orchestrator.map_workers import (
+    MAP_REVISION_GUARDED_TOOL_NAMES,
+    # MAP_VALIDATION_TOOL_NAMES 原本定义在本文件（_MAP_VALIDATION_TOOL_NAMES），
+    # 现统一收归 map_workers 管理，避免多处维护同一组工具名集合。
+    MAP_VALIDATION_TOOL_NAMES,
+    MAP_WRITE_TOOL_NAMES,
+)
+from app.orchestrator.map_workflow import (
+    record_map_revision,
+    record_map_validation,
+    replace_map_state_field,
+)
 from app.sessions.store import Session
+from app.tools.registry import REGISTRY
+
+# 用于向调度函数注入 prompt 生成回调：接收 AgentDefinition + task_text，返回最终 prompt。
+# 调用方可以传入异步函数以支持动态 prompt 拼装（例如注入上下文快照）。
+AgentPromptFactory = Callable[[AgentDefinition, str], Awaitable[str]]
 
 logger = logging.getLogger(__name__)
 _MAP_CONTEXT_MAX_TARGETS = 8
@@ -53,13 +86,6 @@ _MAP_CONTEXT_MAX_SUMMARY_CHARS = 2048
 _MAP_CONTEXT_MAX_TOTAL_CHARS = 262_144
 _MAP_ATLAS_SUMMARY_LIMIT = 12
 _MAP_MATCH_SUMMARY_LIMIT = 12
-_HISTORY_TOOL_MAX_JSON_CHARS = 80_000
-_HISTORY_TOOL_MAX_STRING_CHARS = 16_000
-_HISTORY_TOOL_MAX_LIST_ITEMS = 80
-_HISTORY_TOOL_MAX_DICT_ITEMS = 120
-_HISTORY_TOOL_DROP_KEYS = frozenset(
-    {"data_url", "base64", "image_base64", "screenshot_base64", "binary", "bytes"}
-)
 _MAP_VALIDATION_REPEAT_LIMIT = 2
 
 
@@ -440,9 +466,6 @@ _HISTORY_FRONT_RUN_TOOLS = frozenset(
 _HISTORY_FRONT_TOOLS = (
     _HISTORY_FRONT_READ_TOOLS | _HISTORY_FRONT_SCENE_EDIT_TOOLS | _HISTORY_FRONT_RUN_TOOLS
 )
-_MAP_VALIDATION_TOOL_NAMES = frozenset(
-    {"validate_map_region", "validate_layer_coverage", "validate_object_placements"}
-)
 _MAP_OBJECT_PLACEMENT_TOOL_NAMES = frozenset(
     {
         "place_map_objects",
@@ -451,10 +474,10 @@ _MAP_OBJECT_PLACEMENT_TOOL_NAMES = frozenset(
         "repair_placements",
     }
 )
-_MAP_COMPLETION_TOOL_NAMES = MAP_REVISION_GUARDED_TOOL_NAMES | _MAP_VALIDATION_TOOL_NAMES
+_MAP_COMPLETION_TOOL_NAMES = MAP_REVISION_GUARDED_TOOL_NAMES | MAP_VALIDATION_TOOL_NAMES
 _MAP_REGION_READ_GUARDED_TOOL_NAMES = (
     MAP_WRITE_TOOL_NAMES
-    | _MAP_VALIDATION_TOOL_NAMES
+    | MAP_VALIDATION_TOOL_NAMES
     | frozenset(
         {
             "plan_map_layout",
@@ -711,8 +734,14 @@ def _map_target_from_result(tool_args: dict[str, Any], result: dict[str, Any]) -
 
 def _single_known_map_target(session: Session) -> str:
     """返回当前会话唯一已知地图目标；多目标时不猜。"""
-    targets: set[str] = set(session.latest_map_revisions) | set(session.latest_map_layers)
-    state_targets = session.map_context_state.get("targets")
+    # latest_revisions 的 key 可能是 "target" 或 "target::map_layer=N"，
+    # 这里取 "::map_layer=" 前的 target_path 部分，再与 latest_layers 合并，
+    # 得到去重后的目标集合。
+    targets = {
+        key.split("::map_layer=", 1)[0]
+        for key in session.map_task_state.latest_revisions
+    } | set(session.map_task_state.latest_layers)
+    state_targets = session.map_task_state.context_state.get("targets")
     if isinstance(state_targets, dict):
         targets.update(str(target) for target in state_targets if str(target))
     return next(iter(targets)) if len(targets) == 1 else ""
@@ -731,7 +760,7 @@ def _resolved_map_tool_args(session: Session, tool_args: dict[str, Any]) -> dict
         resolved["map_layer"] = layer
         return resolved
     if isinstance(target, str) and target:
-        latest_layer = session.latest_map_layers.get(target)
+        latest_layer = session.map_task_state.latest_layers.get(target)
         if latest_layer is not None:
             resolved["map_layer"] = latest_layer
     return resolved
@@ -752,7 +781,7 @@ def _map_tool_requires_map_layer(
     if "map_layer" in tool_args or "ground_map_layer" in tool_args:
         return True
     target = tool_args.get("target_path")
-    return isinstance(target, str) and target in session.latest_map_layers
+    return isinstance(target, str) and target in session.map_task_state.latest_layers
 
 
 def _map_tool_missing_required_context(
@@ -776,86 +805,6 @@ def _safe_artifact_name(value: str) -> str:
     if cleaned:
         return cleaned[:80]
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-
-
-def _json_char_size(value: Any) -> int:
-    """粗略计算 JSON 值序列化后的字符长度。"""
-    try:
-        return len(json.dumps(value, ensure_ascii=False, default=str))
-    except (TypeError, ValueError):
-        return len(str(value))
-
-
-def _summarize_history_text(text: str, max_chars: int = _HISTORY_TOOL_MAX_STRING_CHARS) -> str:
-    """保留长文本的开头和结尾，中间省略以控制 history 体积。"""
-    if len(text) <= max_chars:
-        return text
-    head = max_chars // 2
-    tail = max_chars - head
-    omitted = len(text) - max_chars
-    return text[:head] + f"\n... ({omitted} chars omitted for history) ...\n" + text[-tail:]
-
-
-def _bounded_history_value(
-    value: Any,
-    *,
-    max_string_chars: int = _HISTORY_TOOL_MAX_STRING_CHARS,
-    max_list_items: int = _HISTORY_TOOL_MAX_LIST_ITEMS,
-    max_dict_items: int = _HISTORY_TOOL_MAX_DICT_ITEMS,
-) -> Any:
-    """递归压缩任意工具结果，作为写入 LLM history 的最后防线。"""
-    if isinstance(value, str):
-        return _summarize_history_text(value, max_string_chars)
-    if isinstance(value, list):
-        bounded = [
-            _bounded_history_value(
-                item,
-                max_string_chars=max_string_chars,
-                max_list_items=max_list_items,
-                max_dict_items=max_dict_items,
-            )
-            for item in value[:max_list_items]
-        ]
-        omitted = len(value) - max_list_items
-        if omitted > 0:
-            bounded.append({"history_omitted_items": omitted})
-        return bounded
-    if not isinstance(value, dict):
-        return value
-    bounded_dict: dict[str, Any] = {}
-    for index, (key, item) in enumerate(value.items()):
-        key_str = str(key)
-        if key_str in _HISTORY_TOOL_DROP_KEYS:
-            bounded_dict[f"{key_str}_omitted_for_history"] = True
-            continue
-        if index >= max_dict_items:
-            bounded_dict["history_omitted_keys"] = len(value) - max_dict_items
-            break
-        bounded_dict[key_str] = _bounded_history_value(
-            item,
-            max_string_chars=max_string_chars,
-            max_list_items=max_list_items,
-            max_dict_items=max_dict_items,
-        )
-    return bounded_dict
-
-
-def _bounded_tool_message_body(body: Any) -> Any:
-    """限制单条 tool message 的最大体积，避免新工具绕过专用摘要。"""
-    if isinstance(body, str):
-        return _summarize_history_text(body, _HISTORY_TOOL_MAX_JSON_CHARS)
-    if _json_char_size(body) <= _HISTORY_TOOL_MAX_JSON_CHARS:
-        return body
-    bounded = _bounded_history_value(body)
-    if _json_char_size(bounded) <= _HISTORY_TOOL_MAX_JSON_CHARS:
-        return bounded
-    return {
-        "history_truncated": True,
-        "summary": _summarize_history_text(
-            json.dumps(bounded, ensure_ascii=False, default=str),
-            _HISTORY_TOOL_MAX_JSON_CHARS,
-        ),
-    }
 
 
 def _region_summary_from_value(value: Any) -> dict[str, Any]:
@@ -892,6 +841,8 @@ def _map_result_summary(
     tool_name: str,
     result: dict[str, Any],
     artifact_ref: str | None,
+    artifact_locator: dict[str, str] | None = None,
+    effective_tools: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """把大型地图工具结果压缩成可进入 LLM history 的小摘要。"""
     if tool_name == "capture_viewport_screenshot":
@@ -918,6 +869,8 @@ def _map_result_summary(
                 summary[f"{key}_omitted"] = max(0, len(value) - _MAP_MATCH_SUMMARY_LIMIT)
         if artifact_ref is not None:
             summary["artifact_ref"] = artifact_ref
+        if artifact_locator is not None:
+            summary.update(artifact_locator)
         return summary
 
     if tool_name == "describe_map_region":
@@ -953,11 +906,18 @@ def _map_result_summary(
             summary["atlas_summary"] = atlas_summary
             summary["atlas_summary_top"] = atlas_summary
             summary["atlas_summary_omitted"] = True
-        if artifact_ref is not None and (
+        if artifact_locator is not None:
+            summary.update(artifact_locator)
+        if (
+            artifact_locator is not None
+            and "read_map_artifact" in effective_tools
+            and (
             result.get("cells_omitted") or result.get("cells_returned") != result.get("cells_total")
+            )
         ):
             summary["exact_cells_hint"] = (
-                "需要精确 cell 坐标/atlas 时，调用 read_file 读取 artifact_ref；"
+                "需要精确 cell 坐标/atlas 时，调用 read_map_artifact，传入 "
+                "artifact_ref、artifact_turn_id、artifact_entry_id，并用 field='cells' 分页；"
                 "不要从 cells_total/non_empty_count/atlas_summary 推断具体坐标。"
             )
         for key in (
@@ -980,6 +940,8 @@ def _map_result_summary(
             summary["matches_omitted"] = max(0, len(matches) - _MAP_MATCH_SUMMARY_LIMIT)
         if artifact_ref is not None:
             summary["artifact_ref"] = artifact_ref
+        if artifact_locator is not None:
+            summary.update(artifact_locator)
         return summary
 
     if tool_name in _MAP_OBJECT_PLACEMENT_TOOL_NAMES:
@@ -1038,7 +1000,7 @@ def _map_result_summary(
             summary["artifact_ref"] = artifact_ref
         return summary
 
-    if tool_name in _MAP_VALIDATION_TOOL_NAMES:
+    if tool_name in MAP_VALIDATION_TOOL_NAMES:
         keep_keys = (
             "ok",
             "passed",
@@ -1189,6 +1151,8 @@ def _history_payload_for_front_tool(
     tool_name: str,
     payload: dict[str, Any],
     artifact_ref: str | None,
+    artifact_locator: dict[str, str] | None = None,
+    effective_tools: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """生成写入 agent tool history 的瘦 payload。"""
     result = payload.get("result")
@@ -1206,7 +1170,13 @@ def _history_payload_for_front_tool(
         "repair_placements",
     }:
         slim = dict(payload)
-        slim["result"] = _map_result_summary(tool_name, result, artifact_ref)
+        slim["result"] = _map_result_summary(
+            tool_name,
+            result,
+            artifact_ref,
+            artifact_locator,
+            effective_tools,
+        )
         return _bounded_tool_message_body(slim)
     if (
         tool_name
@@ -1254,6 +1224,7 @@ def _update_map_context_state(
     tool_args: dict[str, Any],
     result: Any,
     artifact_ref: str | None,
+    artifact_locator: dict[str, str] | None = None,
 ) -> None:
     """维护每 session 地图小索引；只保存摘要和 artifact_ref。"""
     if tool_name != "describe_map_region" or not isinstance(result, dict):
@@ -1263,7 +1234,7 @@ def _update_map_context_state(
         return
     layer = _map_layer_from_result(result, prefer_layers=True)
     layer_key = str(layer if layer is not None else tool_args.get("map_layer", "default"))
-    state = session.map_context_state
+    state = session.map_task_state.context_state
     targets = state.setdefault("targets", {})
     if not isinstance(targets, dict):
         targets = {}
@@ -1288,7 +1259,12 @@ def _update_map_context_state(
     if "used_bounds" in result:
         layer_state["used_bounds"] = result.get("used_bounds")
     entry = _trim_text_fields(
-        _map_result_summary("describe_map_region", result, artifact_ref),
+        _map_result_summary(
+            "describe_map_region",
+            result,
+            artifact_ref,
+            artifact_locator,
+        ),
         _MAP_CONTEXT_MAX_SUMMARY_CHARS,
     )
     regions = layer_state.setdefault("recent_regions", [])
@@ -1328,36 +1304,80 @@ def _invalidate_stale_map_revision_state(
     """在前端 revision 重新计数时废弃旧规划、验证和写入状态。"""
     scope_prefix = f"{target}::"
     state = session.map_task_state
-    for mapping in (
-        session.map_validation_contracts,
-        session.map_validation_workflows,
-        state.no_progress_streaks,
-        state.planning_attempts,
-        state.approved_platform_plans,
+    # 清理所有以 target 或 "target::map_layer=N" 为 key 的派生状态，
+    # 包括验证契约、验证工作流、无进展计数、规划尝试、已批准规划等，
+    # 确保 revision 重置后不会残留旧数据导致误判。
+    for field_name in (
+        "validation_contracts",
+        "validation_workflows",
+        "no_progress_streaks",
+        "planning_attempts",
+        "approved_platform_plans",
     ):
-        for key in tuple(mapping):
-            if key == target or key.startswith(scope_prefix):
-                mapping.pop(key, None)
-    state.planning_fingerprints = {
+        mapping = getattr(state, field_name)
+        replace_map_state_field(
+            state,
+            field_name,
+            {
+                key: value
+                for key, value in mapping.items()
+                if key != target and not key.startswith(scope_prefix)
+            },
+            target=target,
+            revision=current_revision,
+        )
+    replace_map_state_field(
+        state,
+        "planning_fingerprints",
+        {
         key: value
         for key, value in state.planning_fingerprints.items()
         if not key.startswith(scope_prefix)
-    }
-    state.pending_batches.clear()
-    state.executed_batches.clear()
-    state.validation_cache.clear()
-    state.failure_frontier = None
-    state.unresolved_issues.clear()
-    state.stage = "read"
+        },
+        target=target,
+        revision=current_revision,
+    )
+    for field_name, empty_value in (
+        ("pending_batches", []),
+        ("executed_batches", []),
+        ("validation_cache", {}),
+        ("failure_frontier", None),
+        ("unresolved_issues", []),
+        ("region_reads", {}),
+        ("region_summaries", {}),
+    ):
+        replace_map_state_field(
+            state,
+            field_name,
+            empty_value,
+            target=target,
+            revision=current_revision,
+        )
+    # 使用 transition_stage() 而非直接赋值 stage，确保阶段转换钩子（如日志/事件）正常触发
+    state.transition_stage("read")
     state.plan_version = 0
-    session.latest_map_region_reads.clear()
-    session.latest_map_region_summaries.clear()
-    session.latest_map_validations.pop(target, None)
-    session.map_completion_blockers = [
-        blocker
-        for blocker in session.map_completion_blockers
-        if blocker.get("target") not in ("", target)
-    ]
+    replace_map_state_field(
+        state,
+        "latest_validations",
+        {
+            key: value
+            for key, value in state.latest_validations.items()
+            if key != target
+        },
+        target=target,
+        revision=current_revision,
+    )
+    replace_map_state_field(
+        state,
+        "completion_blockers",
+        [
+            blocker
+            for blocker in state.completion_blockers
+            if blocker.get("target") not in ("", target)
+        ],
+        target=target,
+        revision=current_revision,
+    )
     logger.warning(
         "Map revision epoch reset detected session=%s target=%s previous=%s current=%s; "
         "invalidated stale plans and validation workflows",
@@ -1373,12 +1393,32 @@ def _map_revision_identity_is_authoritative(
     result: dict[str, Any],
     target: str,
 ) -> bool:
-    """判断 revision 是否明确属于解析后的目标地图节点。"""
+    """判断 revision 是否明确属于解析后的目标地图节点。
+
+    改动说明：旧实现只比较 revision_key == target，忽略了多图层场景。
+    现在通过 map_revision_scope_key(target, map_layer) 生成带图层的 scope key，
+    同时兼容 "纯 target" 和 "target::map_layer=N" 两种匹配形式。
+    当 revision_key 缺失时，要求 explicit_target 精确匹配且无 map_layer，
+    避免在多图层情况下错误地将结果归属到其他图层的 revision。
+    """
+    # 优先从 result 提取 map_layer，回退到 tool_args 中的显式传参
+    map_layer = _map_layer_from_result(result)
+    if map_layer is None:
+        raw_layer = tool_args.get("map_layer")
+        if isinstance(raw_layer, int) and not isinstance(raw_layer, bool):
+            map_layer = raw_layer
+    expected_key = map_revision_scope_key(target, map_layer)
     revision_key = result.get("revision_key")
+    # revision_key 存在时，允许匹配纯 target 或带图层的 scope key
     if isinstance(revision_key, str) and revision_key.strip():
-        return revision_key.strip() == target
+        return revision_key.strip() in {target, expected_key}
+    # revision_key 缺失时，仅在无图层维度时按 target_path 匹配
     explicit_target = tool_args.get("target_path")
-    return isinstance(explicit_target, str) and explicit_target.strip() == target
+    return (
+        isinstance(explicit_target, str)
+        and explicit_target.strip() == target
+        and map_layer is None
+    )
 
 
 def _remember_latest_map_revision(
@@ -1402,7 +1442,17 @@ def _remember_latest_map_revision(
     if not target:
         return
     if revision is not None:
-        previous = session.latest_map_revisions.get(target)
+        # 优先使用 result 中携带的 revision_key，否则根据 target + map_layer 构造 scope key。
+        # 这样可以在多图层场景下正确区分同一 target 的不同图层 revision。
+        revision_key_value = result.get("revision_key")
+        revision_key = (
+            revision_key_value.strip()
+            if isinstance(revision_key_value, str) and revision_key_value.strip()
+            else map_revision_scope_key(target, map_layer)
+        )
+        # 注意：latest_revisions 现在同时以 revision_key 和纯 target 两种 key 存储，
+        # revision_key 用于精确的图层级查询，纯 target 用于向后兼容无图层的查询路径。
+        previous = session.map_task_state.latest_revisions.get(revision_key)
         if previous is not None and revision < previous and tool_name == "describe_map_region":
             if _map_revision_identity_is_authoritative(tool_args, result, target):
                 _invalidate_stale_map_revision_state(
@@ -1411,7 +1461,17 @@ def _remember_latest_map_revision(
                     previous,
                     revision,
                 )
-                session.latest_map_revisions[target] = revision
+                revisions = dict(session.map_task_state.latest_revisions)
+                revisions[revision_key] = revision
+                revisions[target] = revision
+                replace_map_state_field(
+                    session.map_task_state,
+                    "latest_revisions",
+                    revisions,
+                    target=target,
+                    revision=revision,
+                )
+                record_map_revision(session.map_task_state, target, revision)
                 previous = revision
             else:
                 logger.warning(
@@ -1439,8 +1499,28 @@ def _remember_latest_map_revision(
                     touched_region,
                     map_layer,
                 )
-            session.latest_map_revisions[target] = revision
-            session.map_no_progress_streaks[target] = 0
+            # 双 key 写入：revision_key（精确到图层）+ target（向后兼容），
+            # 保证 latest_map_revision() 无论按哪种 key 查询都能拿到最新值。
+            revisions = dict(session.map_task_state.latest_revisions)
+            revisions[revision_key] = revision
+            revisions[target] = revision
+            replace_map_state_field(
+                session.map_task_state,
+                "latest_revisions",
+                revisions,
+                target=target,
+                revision=revision,
+            )
+            record_map_revision(session.map_task_state, target, revision)
+            streaks = dict(session.map_task_state.no_progress_streaks)
+            streaks[target] = 0
+            replace_map_state_field(
+                session.map_task_state,
+                "no_progress_streaks",
+                streaks,
+                target=target,
+                revision=revision,
+            )
             session.map_task_state.counters.revision_advances += 1
             logger.info(
                 "Latest map revision updated session=%s target=%s previous=%s current=%s",
@@ -1450,8 +1530,8 @@ def _remember_latest_map_revision(
                 revision,
             )
     if map_layer is not None:
-        previous_layer = session.latest_map_layers.get(target)
-        session.latest_map_layers[target] = map_layer
+        previous_layer = session.map_task_state.latest_layers.get(target)
+        session.map_task_state.latest_layers[target] = map_layer
         logger.info(
             "Latest map layer updated session=%s target=%s previous=%s current=%s",
             session.session_id,
@@ -1505,7 +1585,9 @@ def _promote_unaffected_map_region_cache(
     touched_layer: int | None,
 ) -> None:
     """写入后仅失效相交区域，并把未相交缓存提升到新 revision。"""
-    for signature, cached_revision in list(session.latest_map_region_reads.items()):
+    region_reads = dict(session.map_task_state.region_reads)
+    region_summaries = dict(session.map_task_state.region_summaries)
+    for signature, cached_revision in list(region_reads.items()):
         parsed = _parsed_map_region_read_signature(signature)
         if parsed is None or cached_revision != previous_revision or parsed[0] != target:
             continue
@@ -1522,12 +1604,26 @@ def _promote_unaffected_map_region_cache(
             region, touched_region
         )
         if intersects:
-            session.latest_map_region_reads.pop(signature, None)
-            session.latest_map_region_summaries.pop(signature, None)
+            region_reads.pop(signature, None)
+            region_summaries.pop(signature, None)
         else:
-            session.latest_map_region_reads[signature] = current_revision
+            region_reads[signature] = current_revision
+    replace_map_state_field(
+        session.map_task_state,
+        "region_reads",
+        region_reads,
+        target=target,
+        revision=current_revision,
+    )
+    replace_map_state_field(
+        session.map_task_state,
+        "region_summaries",
+        region_summaries,
+        target=target,
+        revision=current_revision,
+    )
 
-    targets = session.map_context_state.get("targets", {})
+    targets = session.map_task_state.context_state.get("targets", {})
     target_state = targets.get(target, {}) if isinstance(targets, dict) else {}
     layers = target_state.get("layers", {}) if isinstance(target_state, dict) else {}
     if not isinstance(layers, dict):
@@ -1562,11 +1658,7 @@ def _map_validation_is_successful(result: dict[str, Any]) -> bool:
     """判断一次地图校验是否真的允许完成，不采信规划器的口头结论。"""
     passed = result.get("passed")
     passed_ok = passed is True if isinstance(passed, bool) else False
-    return (
-        passed_ok
-        and result.get("completion_allowed", True) is True
-        and result.get("blocking_completion") is not True
-    )
+    return passed_ok and result.get("blocking_completion") is not True
 
 
 def _map_validation_fingerprint(
@@ -1587,7 +1679,6 @@ def _map_validation_fingerprint(
         "issues": issues if isinstance(issues, list) else [],
         "structured_issues": (structured_issues if isinstance(structured_issues, list) else []),
         "passed": result.get("passed"),
-        "completion_allowed": result.get("completion_allowed"),
         "blocking_completion": result.get("blocking_completion"),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -1607,17 +1698,17 @@ def _remember_map_validation(
         revision if isinstance(revision, int) and not isinstance(revision, bool) else None
     )
     fingerprint = _map_validation_fingerprint(tool_name, result, target, revision_value)
-    previous = session.latest_map_validations.get(target)
+    previous = session.map_task_state.latest_validations.get(target)
     previous_fingerprint = previous.get("fingerprint") if isinstance(previous, dict) else None
     previous_revision = previous.get("map_revision") if isinstance(previous, dict) else None
-    count = session.map_validation_failure_counts.get(fingerprint, 0)
+    count = session.map_task_state.validation_failure_counts.get(fingerprint, 0)
     if not _map_validation_is_successful(result):
         count = (
             count + 1
             if previous_fingerprint == fingerprint and previous_revision == revision_value
             else 1
         )
-        session.map_validation_failure_counts[fingerprint] = count
+        session.map_task_state.validation_failure_counts[fingerprint] = count
     else:
         count = 0
     state = {
@@ -1625,7 +1716,6 @@ def _remember_map_validation(
         "map_revision": revision_value,
         "region": result.get("region", {}),
         "passed": result.get("passed") is True,
-        "completion_allowed": result.get("completion_allowed", True) is True,
         "blocking_completion": result.get("blocking_completion") is True,
         "issues": result.get("issues", []),
         "structured_issues": result.get("structured_issues", []),
@@ -1633,7 +1723,12 @@ def _remember_map_validation(
         "repeat_count": count,
         "next_stage": "reviewer" if _map_validation_is_successful(result) else "planner",
     }
-    session.latest_map_validations[target] = state
+    record_map_validation(
+        session.map_task_state,
+        target,
+        revision_value or 0,
+        state,
+    )
     return state
 
 
@@ -1677,7 +1772,10 @@ def _map_completion_blocker(
             "required_revision": revision_value,
             "workflow_constraints": workflow_constraints,
         }
-    if result_dict.get("completion_allowed") is False:
+    if (
+        tool_name not in MAP_VALIDATION_TOOL_NAMES
+        and result_dict.get("completion_allowed") is False
+    ):
         return {
             "tool": tool_name,
             "reason": "completion_not_allowed",
@@ -1773,14 +1871,24 @@ def _has_review_blocker(blockers: list[dict[str, Any]], target: str, revision: i
     return False
 
 
-def _review_required_blocker(tool_name: str, target: str, revision: int | None) -> dict[str, Any]:
-    """生成验证通过后的视觉复核阻断项。"""
+def _review_required_blocker(
+    tool_name: str,
+    target: str,
+    revision: int | None,
+    region: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """生成验证通过后的视觉复核阻断项。
+
+    region 参数用于携带触发复核的具体区域坐标，供 reviewer 子帧
+    在 map_stage_contract 中获取需要截图检查的精确范围。
+    """
     return {
         "tool": tool_name,
         "reason": "map_review_required",
         "issues": ["same-revision validation passed; reviewer visual check is still required"],
         "target": target,
         "required_revision": revision,
+        "region": dict(region or {}),
     }
 
 
@@ -1998,8 +2106,12 @@ def _current_map_region_signature(
     target: str,
 ) -> str | None:
     """查找当前 revision 下精确或完整覆盖请求的已读区域签名。"""
-    latest_revision = session.latest_map_revisions.get(target)
-    for signature, revision in reversed(session.latest_map_region_reads.items()):
+    # 从请求签名中解析出 map_layer，用于获取图层感知的最新 revision，
+    # 避免多图层场景下拿到错误图层的 revision 导致缓存命中失败。
+    parsed = _parsed_map_region_read_signature(requested_signature)
+    map_layer = parsed[1] if parsed is not None else None
+    latest_revision = latest_map_revision(session, target, map_layer)
+    for signature, revision in reversed(session.map_task_state.region_reads.items()):
         if latest_revision is not None and revision != latest_revision:
             continue
         if signature == requested_signature or _map_region_signature_contains(
@@ -2040,14 +2152,31 @@ def _remember_latest_map_region_read(
         if isinstance(result, dict)
         else None
     )
+    region_reads = dict(session.map_task_state.region_reads)
+    region_summaries = dict(session.map_task_state.region_summaries)
     for signature in signatures:
-        session.latest_map_region_reads[signature] = revision
+        region_reads[signature] = revision
         if summary is not None:
-            session.latest_map_region_summaries[signature] = summary
-    while len(session.latest_map_region_reads) > 64:
-        first_key = next(iter(session.latest_map_region_reads))
-        del session.latest_map_region_reads[first_key]
-        session.latest_map_region_summaries.pop(first_key, None)
+            region_summaries[signature] = summary
+    while len(region_reads) > 64:
+        first_key = next(iter(region_reads))
+        del region_reads[first_key]
+        region_summaries.pop(first_key, None)
+    target = str(tool_args.get("target_path", ""))
+    replace_map_state_field(
+        session.map_task_state,
+        "region_reads",
+        region_reads,
+        target=target or None,
+        revision=revision,
+    )
+    replace_map_state_field(
+        session.map_task_state,
+        "region_summaries",
+        region_summaries,
+        target=target or None,
+        revision=revision,
+    )
 
 
 def _latest_map_region_summary_for_call(
@@ -2064,7 +2193,7 @@ def _latest_map_region_summary_for_call(
     cached_signature = _current_map_region_signature(session, signature, target)
     if cached_signature is None:
         return None
-    summary = session.latest_map_region_summaries.get(cached_signature)
+    summary = session.map_task_state.region_summaries.get(cached_signature)
     return summary if isinstance(summary, dict) else None
 
 
@@ -2110,7 +2239,7 @@ def _map_tool_region_read_current(session: Session, call: FrontToolCallDTO) -> b
         return True
     target = resolved_input.get("target_path")
     if not isinstance(target, str) or not target:
-        return signature in session.latest_map_region_reads
+        return signature in session.map_task_state.region_reads
     return _current_map_region_signature(session, signature, target) is not None
 
 
@@ -2177,6 +2306,7 @@ def _defer_map_tool_for_region_read(
                 "input": read_call.input,
                 "frame_id": read_call.frame_id,
                 "agent": read_call.agent,
+                "needs_confirm": False,
             }
         },
     )
@@ -2203,8 +2333,16 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
     restored_input = _resolved_map_tool_args(session, call.input)
     target = restored_input.get("target_path")
     target_path = target if isinstance(target, str) else ""
-    latest_revision = session.latest_map_revisions.get(target_path)
-    latest_layer = session.latest_map_layers.get(target_path)
+    # 恢复时优先使用调用自身携带的 map_layer，回退到会话中记录的最近图层，
+    # 再据此查询图层感知的最新 revision，保证多图层场景下恢复正确的上下文。
+    latest_layer = session.map_task_state.latest_layers.get(target_path)
+    input_layer = restored_input.get("map_layer", latest_layer)
+    scoped_layer = (
+        input_layer
+        if isinstance(input_layer, int) and not isinstance(input_layer, bool)
+        else None
+    )
+    latest_revision = latest_map_revision(session, target_path, scoped_layer)
     if (
         call.name
         in {
@@ -2240,7 +2378,7 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
             missing_context,
         )
         return None
-    if call.name in _MAP_VALIDATION_TOOL_NAMES and "map_layer" not in restored_input:
+    if call.name in MAP_VALIDATION_TOOL_NAMES and "map_layer" not in restored_input:
         session.pending_map_tool_after_read = None
         _append_map_state_read_error(session, call.name, target_path, "map_layer")
         return None
@@ -2269,6 +2407,7 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
                     "input": read_call.input,
                     "frame_id": read_call.frame_id,
                     "agent": read_call.agent,
+                    "needs_confirm": False,
                 }
             },
         )
@@ -2298,6 +2437,7 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
                 "input": restored_call.input,
                 "frame_id": restored_call.frame_id,
                 "agent": restored_call.agent,
+                "needs_confirm": restored_call.needs_confirm,
             }
         },
     )
@@ -2313,14 +2453,29 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
 
 
 def _needs_map_state_read_before_write(session: Session, call: FrontToolCallDTO) -> bool:
-    """判断地图写工具是否需要先自动读取 map_layer/map_revision。"""
+    """判断地图写工具是否需要先自动读取 map_layer/map_revision。
+
+    改动说明：revision 查询改为图层感知——优先使用 call.input 中显式传入的 map_layer，
+    回退到 session 中记录的 latest_layers，再通过 latest_map_revision() 按 scope key 查询，
+    确保多图层场景下不会误判 revision 缺失。
+    """
     if call.name not in MAP_REVISION_GUARDED_TOOL_NAMES:
         return False
     target = call.input.get("target_path")
     if not isinstance(target, str) or not target:
         return False
-    missing_revision = target not in session.latest_map_revisions
-    missing_layer = "map_layer" not in call.input and target not in session.latest_map_layers
+    # 优先取显式 map_layer，回退到会话记录的最新图层
+    input_layer = call.input.get("map_layer")
+    map_layer = (
+        input_layer
+        if isinstance(input_layer, int) and not isinstance(input_layer, bool)
+        else session.map_task_state.latest_layers.get(target)
+    )
+    missing_revision = latest_map_revision(session, target, map_layer) is None
+    missing_layer = (
+        "map_layer" not in call.input
+        and target not in session.map_task_state.latest_layers
+    )
     return missing_revision or missing_layer
 
 
@@ -2334,7 +2489,7 @@ def _map_state_read_call_for_write(
         "target_path": target,
         "__auto_map_state_read": True,
     }
-    latest_layer = session.latest_map_layers.get(target)
+    latest_layer = session.map_task_state.latest_layers.get(target)
     if latest_layer is not None:
         read_input["map_layer"] = latest_layer
     region = _map_region_from_write_args(write_call.input, {})
@@ -2381,6 +2536,7 @@ def _defer_map_write_for_state_read(
                 "input": read_call.input,
                 "frame_id": read_call.frame_id,
                 "agent": read_call.agent,
+                "needs_confirm": False,
             }
         },
     )
@@ -2408,8 +2564,16 @@ def _resume_pending_map_write_after_read(session: Session) -> ChatToolCallsRespo
     if not isinstance(target, str) or not target:
         session.pending_map_write_after_read = None
         return None
-    latest_revision = session.latest_map_revisions.get(target)
-    latest_layer = session.latest_map_layers.get(target)
+    # 与 _resume_pending_map_tool_after_read 相同逻辑：
+    # 根据写调用自身的 map_layer 或会话记录的最新图层，查询图层感知的 revision。
+    latest_layer = session.map_task_state.latest_layers.get(target)
+    input_layer = write_call.input.get("map_layer", latest_layer)
+    map_layer = (
+        input_layer
+        if isinstance(input_layer, int) and not isinstance(input_layer, bool)
+        else None
+    )
+    latest_revision = latest_map_revision(session, target, map_layer)
     if latest_revision is None or ("map_layer" not in write_call.input and latest_layer is None):
         missing = []
         if latest_revision is None:
@@ -2437,6 +2601,7 @@ def _resume_pending_map_write_after_read(session: Session) -> ChatToolCallsRespo
                 "input": restored_call.input,
                 "frame_id": restored_call.frame_id,
                 "agent": restored_call.agent,
+                "needs_confirm": restored_call.needs_confirm,
             }
         },
     )
@@ -2453,14 +2618,14 @@ def _resume_pending_map_write_after_read(session: Session) -> ChatToolCallsRespo
 
 def _needs_map_state_read_before_validation(session: Session, call: FrontToolCallDTO) -> bool:
     """判断地图校验工具是否需要先自动读取 map_layer。"""
-    if call.name not in _MAP_VALIDATION_TOOL_NAMES:
+    if call.name not in MAP_VALIDATION_TOOL_NAMES:
         return False
     target = call.input.get("target_path")
     return (
         isinstance(target, str)
         and bool(target)
         and "map_layer" not in call.input
-        and target not in session.latest_map_layers
+        and target not in session.map_task_state.latest_layers
     )
 
 
@@ -2497,6 +2662,7 @@ def _defer_map_validation_for_state_read(
                 "input": read_call.input,
                 "frame_id": read_call.frame_id,
                 "agent": read_call.agent,
+                "needs_confirm": False,
             }
         },
     )
@@ -2518,7 +2684,7 @@ def _bind_map_validation_to_pending_write(
     pending = next(
         (
             blocker
-            for blocker in session.map_completion_blockers
+            for blocker in session.map_task_state.completion_blockers
             if blocker.get("reason") == "map_write_requires_validation"
             and isinstance(blocker.get("target"), str)
             and blocker["target"]
@@ -2533,7 +2699,7 @@ def _bind_map_validation_to_pending_write(
     calls: list[FrontToolCallDTO] = []
     changed = False
     for call in response.calls:
-        if call.name not in _MAP_VALIDATION_TOOL_NAMES:
+        if call.name not in MAP_VALIDATION_TOOL_NAMES:
             calls.append(call)
             continue
         input_data = dict(call.input)
@@ -2573,7 +2739,7 @@ def _resume_pending_map_validation_after_read(session: Session) -> ChatToolCalls
     if not isinstance(target, str) or not target:
         session.pending_map_validation_after_read = None
         return None
-    latest_layer = session.latest_map_layers.get(target)
+    latest_layer = session.map_task_state.latest_layers.get(target)
     if latest_layer is None:
         session.pending_map_validation_after_read = None
         _append_map_state_read_error(session, validation_call.name, target, "map_layer")
@@ -2594,6 +2760,7 @@ def _resume_pending_map_validation_after_read(session: Session) -> ChatToolCalls
                 "input": restored_call.input,
                 "frame_id": restored_call.frame_id,
                 "agent": restored_call.agent,
+                "needs_confirm": restored_call.needs_confirm,
             }
         },
     )
@@ -2607,30 +2774,28 @@ def _resume_pending_map_validation_after_read(session: Session) -> ChatToolCalls
     return ChatToolCallsResponse(turn_id=turn_id, text=text, calls=[restored_call])
 
 
-def _schedule_revision_conflict_reader(
+async def _schedule_revision_conflict_reader(
     session: Session,
     frame: Frame,
     tool_name: str,
     tool_args: dict[str, Any],
     result: Any,
+    prompt_factory: AgentPromptFactory | None = None,
 ) -> None:
-    """在 revision 冲突后自动压入 map-reader-agent 重读帧。"""
+    """在 revision 冲突后自动压入 map-reader-agent 重读帧。
+
+    改动说明：
+    - 改为 async 以支持 prompt_factory 异步生成 prompt。
+    - 子帧创建统一走 frame_factory.create_child_frame，不再手动拼装 Frame，
+      确保 history_anchor、parent_id 等字段由工厂统一管理。
+    - 任务描述从硬编码的 instruction 字段改为 objective 字段，
+      具体 prompt 拼装由 prompt_factory（运行时注入）负责，实现调度与提示词解耦。
+    - 通过 map_stage_contract 将 stage/target/revision 等上下文传递给子帧，
+      由运行时统一消费，不再依赖 prompt 文本中的隐式指令。
+    """
     result_dict = result if isinstance(result, dict) else {}
     target = str(tool_args.get("target_path", result_dict.get("target_path", "")))
     region = _map_region_from_write_args(tool_args, result_dict)
-    task_payload = {
-        "reason": "map_revision_conflict",
-        "failed_tool": tool_name,
-        "target_path": target,
-        "region": region,
-        "expected_revision": result_dict.get("expected_revision"),
-        "actual_revision": result_dict.get("actual_revision"),
-        "next_expected_revision": result_dict.get("actual_revision"),
-        "instruction": (
-            "重读冲突区域并只输出 map_worker_result_v1 JSON；"
-            "不要写入，next_stage 设为 planner 或 validator。"
-        ),
-    }
     try:
         reader = get_agent("map-reader-agent", set(REGISTRY))
     except KeyError:
@@ -2641,22 +2806,47 @@ def _schedule_revision_conflict_reader(
             }
         )
         return
-    task_text = json.dumps(task_payload, ensure_ascii=False)
-    child = Frame(
-        id=session.new_frame_id(),
+    task_text = typed_child_task_text(
+        "重新读取 revision 冲突影响的地图区域。",
+        {
+            "reason": "map_revision_conflict",
+            "failed_tool": tool_name,
+            "target_path": target,
+            "region": region,
+            "expected_revision": result_dict.get("expected_revision"),
+            "actual_revision": result_dict.get("actual_revision"),
+        },
+    )
+    # 通过 prompt_factory 动态生成 reader prompt；若未提供则回退到 agent 默认 prompt。
+    # ValueError 表示 prompt 构建失败（如缺少必要上下文），此时写入错误消息并中止调度。
+    try:
+        prompt = (
+            await prompt_factory(reader, task_text)
+            if prompt_factory is not None
+            else reader.prompt
+        )
+    except ValueError as exc:
+        frame.messages.append(
+            {
+                "role": "system",
+                "internal": True,
+                "content": f"自动 revision reader 创建失败：{exc}",
+            }
+        )
+        return
+    reader = replace(reader, prompt=prompt)
+    # 使用 frame_factory 创建子帧，自动继承父帧的 history_anchor 等上下文
+    child = create_child_frame(
+        session=session,
+        parent=frame,
         agent=reader,
-        messages=[
-            {"role": "system", "content": reader.prompt},
-            {"role": "user", "content": task_text},
-        ],
-        parent_id=frame.id,
+        task_text=task_text,
         depth=frame.depth + 1,
-        history_anchor_frame_id=frame.history_anchor_frame_id or frame.id,
-        history_anchor_message_index=(
-            frame.history_anchor_message_index
-            if frame.history_anchor_message_index is not None
-            else len(frame.messages)
-        ),
+        map_stage_contract={
+            "stage": "reader",
+            "target_path": target,
+            "map_revision": result_dict.get("actual_revision"),
+        },
     )
     session.agent_stack.append(child)
 
@@ -2671,15 +2861,26 @@ def _pop_last_assistant_final(session: Session) -> None:
         frame.messages.pop()
 
 
-def _schedule_map_reviewer_if_required(session: Session) -> bool:
-    """把 map_review_required 阻断转换为 reviewer 子帧继续执行。"""
+async def _schedule_map_reviewer_if_required(
+    session: Session,
+    prompt_factory: AgentPromptFactory | None = None,
+) -> bool:
+    """把 map_review_required 阻断转换为 reviewer 子帧继续执行。
+
+    改动说明：与 _schedule_revision_conflict_reader 相同的模式——
+    改 async、走 frame_factory、通过 prompt_factory 注入 prompt、
+    用 map_stage_contract 传递结构化上下文，不再依赖 prompt 中的硬编码指令。
+    通过 frame.agent.map_stage（而非 agent.name）判断是否已在 reviewer 帧中，
+    避免对 agent 名称的硬编码依赖。
+    """
     frame = session.top_frame()
-    if frame is None or frame.agent.name == "map-reviewer-agent":
+    # 使用 map_stage 而非 agent.name 判断，更健壮地防止 reviewer 帧内重复调度
+    if frame is None or frame.agent.map_stage == "reviewer":
         return False
     blocker = next(
         (
             item
-            for item in session.map_completion_blockers
+            for item in session.map_task_state.completion_blockers
             if item.get("reason") == "map_review_required"
         ),
         None,
@@ -2691,32 +2892,45 @@ def _schedule_map_reviewer_if_required(session: Session) -> bool:
     except KeyError:
         return False
     _pop_last_assistant_final(session)
-    task_payload = {
-        "reason": "map_review_required",
-        "target_path": str(blocker.get("target", "")),
-        "required_revision": blocker.get("required_revision"),
-        "instruction": (
-            "继续完成地图视觉复核，不要结束任务。使用 capture_viewport_screenshot "
-            "检查当前地图；必要时用 describe_map_region/validate_map_region 复核。"
-            "只输出 map_worker_result_v1 JSON，stage='reviewer'，"
-            "并在 validation.completion_allowed 中给出是否允许完成。"
-        ),
-    }
-    child = Frame(
-        id=session.new_frame_id(),
+    # 任务载荷只携带结构化字段（reason/target/revision/region/objective），
+    # 具体的 prompt 文本由 prompt_factory 负责拼装，实现调度逻辑与提示词解耦。
+    task_text = typed_child_task_text(
+        "复核当前 revision 的地图视觉结果并提交证据。",
+        {
+            "reason": "map_review_required",
+            "target_path": str(blocker.get("target", "")),
+            "required_revision": blocker.get("required_revision"),
+            "region": blocker.get("region", {}),
+        },
+    )
+    try:
+        prompt = (
+            await prompt_factory(reviewer, task_text)
+            if prompt_factory is not None
+            else reviewer.prompt
+        )
+    except ValueError as exc:
+        frame.messages.append(
+            {
+                "role": "system",
+                "internal": True,
+                "content": f"自动 reviewer 创建失败：{exc}",
+            }
+        )
+        return False
+    reviewer = replace(reviewer, prompt=prompt)
+    child = create_child_frame(
+        session=session,
+        parent=frame,
         agent=reviewer,
-        messages=[
-            {"role": "system", "content": reviewer.prompt},
-            {"role": "user", "content": json.dumps(task_payload, ensure_ascii=False)},
-        ],
-        parent_id=frame.id,
+        task_text=task_text,
         depth=frame.depth + 1,
-        history_anchor_frame_id=frame.history_anchor_frame_id or frame.id,
-        history_anchor_message_index=(
-            frame.history_anchor_message_index
-            if frame.history_anchor_message_index is not None
-            else len(frame.messages)
-        ),
+        map_stage_contract={
+            "stage": "reviewer",
+            "target_path": str(blocker.get("target", "")),
+            "map_revision": blocker.get("required_revision"),
+            "region": blocker.get("region", {}),
+        },
     )
     session.agent_stack.append(child)
     return True
@@ -2769,17 +2983,19 @@ def _schedule_map_completion_continuation(session: Session, *, discard_final: bo
             isinstance(blocker.get("repeat_count"), int)
             and blocker.get("repeat_count", 0) >= _MAP_VALIDATION_REPEAT_LIMIT
         )
-        for blocker in session.map_completion_blockers
+        for blocker in session.map_task_state.completion_blockers
     ):
         logger.warning(
             "Stopped repeated map validation continuation session=%s blockers=%s",
             session.session_id,
-            session.map_completion_blockers,
+            session.map_task_state.completion_blockers,
         )
         return False
     if discard_final:
         _pop_last_assistant_final(session)
-    blocker_text = _format_map_completion_blockers_for_prompt(session.map_completion_blockers)
+    blocker_text = _format_map_completion_blockers_for_prompt(
+        session.map_task_state.completion_blockers
+    )
     frame.messages.append(
         {
             "role": "user",
@@ -2795,8 +3011,9 @@ def _schedule_map_completion_continuation(session: Session, *, discard_final: bo
                 "completion at the same revision, change start/goal to evade the frozen contract, or "
                 "route a goal buffer/design failure through repair_map_region. The actual validator "
                 "result is authoritative, and the planner must not claim validation passed without it. "
-                "Only final-answer after a same-revision result has passed=true, "
-                "completion_allowed=true, and blocking_completion is not true."
+                "Only final-answer after the runtime Completion Gate has accepted "
+                "same-revision validation, reviewer observations, scoped evidence, "
+                "blockers, and workflow state."
             ),
         }
     )
@@ -2819,7 +3036,7 @@ def _map_completion_gate_text(blockers: list[dict[str, Any]]) -> str:
         "地图任务还不能标记为完成。\n\n"
         f"{details}\n\n"
         "需要继续按小批编辑、分段 validate_map_region、截图复核的流程修完；"
-        "在 completion_allowed=true 前，最终回复已被服务层拦截。"
+        "在运行时 Completion Gate 接受同 revision 证据前，最终回复已被服务层拦截。"
     )
 
 

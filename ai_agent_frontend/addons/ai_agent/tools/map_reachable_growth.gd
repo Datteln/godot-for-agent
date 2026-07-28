@@ -4,10 +4,18 @@ extends RefCounted
 const MapPlatformPlanValidator = preload("res://addons/ai_agent/tools/map_platform_plan_validator.gd")
 
 
-static func plan_growth(input: Dictionary, context: Dictionary = {}) -> Dictionary:
+static func plan_growth(
+	input: Dictionary,
+	context: Dictionary = {},
+	collision_facts: Dictionary = {}
+) -> Dictionary:
 	var profile := _profile_from_input(input)
 	if profile == "platformer":
-		var platform_plan := MapPlatformPlanValidator.validate_platform_level_plan(input, context)
+		var platform_plan := MapPlatformPlanValidator.validate_platform_level_plan(
+			input,
+			context,
+			collision_facts
+		)
 		return _wrap_platform_plan(platform_plan, input, context)
 	var dimension := 3 if profile == "3d_grid" else 2
 	var region := _region_from_input(input, dimension)

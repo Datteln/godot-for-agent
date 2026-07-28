@@ -52,6 +52,8 @@ static func ensure_standard_layers(input: Dictionary, editor_interface: EditorIn
 		"ok": true,
 		"parent_path": str(root.get_path_to(parent)) if parent != root else ".",
 		"dimension": dimension,
+		## changed 标记本次是否有新建图层；ToolExecutor 据此判断是否需要递增 revision。
+		"changed": not created.is_empty(),
 		"created": created,
 		"existing": existing,
 		"standard_layers": specs,

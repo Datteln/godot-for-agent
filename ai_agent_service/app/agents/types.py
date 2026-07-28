@@ -44,6 +44,10 @@ class AgentDefinition:
             system prompt 末尾的提醒文本，由 `prompt/builder.py` 注入。
         effective_tools: 解析后的工具交集，由 `resolve_effective_tools` 填充。
         warnings: 解析过程中产生的告警（如声明了不存在的工具）。
+        pipeline_kind: 稳定的工作流类别；权限和预算不得从展示名称推断。
+        role: 稳定的编排角色；运行时权限不得从可改名的展示名称推断。
+        map_stage: 地图流水线角色；非地图 Agent 为 None。
+        worker_mode: 动态地图 Worker 的受控 mode；永久 Agent 为 None。
     """
 
     name: str
@@ -61,6 +65,15 @@ class AgentDefinition:
     hooks: dict[str, str] | None = None
     workflow_operations: list[str] = field(default_factory=list)
     workflow_constraints: list[dict[str, Any]] = field(default_factory=list)
+    # 稳定的编排元数据字段：
+    # - pipeline_kind: 工作流类别（"general" / "map"），权限和预算不依赖展示名称
+    # - role: 编排角色（"specialist" / "map_worker" 等），运行时权限判断用此字段
+    # - map_stage: 地图流水线阶段（reader/planner/writer/reviewer/repairer），非地图 Agent 为 None
+    # - worker_mode: 动态地图 Worker 的受控 mode（read_only/write_one_batch 等），永久 Agent 为 None
+    pipeline_kind: str = "general"
+    role: str = "specialist"
+    map_stage: str | None = None
+    worker_mode: str | None = None
     effective_tools: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -154,6 +167,12 @@ class Frame:
         force_text_only: 当前阶段事实已经齐全、下一轮只能输出最终文本时为 True。
         map_reader_detailed_region_ready: reader 已获得精确地图区域、只需完成一次
            必要 artifact 读取即可收尾时为 True。
+        map_stage_contract: 地图子 Frame 的可信阶段、目标与 revision 合同；为空表示
+            该 Frame 不参与结构化地图流水线。
+        map_request_lineage_id: 创建该 Frame 的当前用户请求 lineage；用于防止
+            历史地图任务的 Frame 或工具结果污染无关请求。
+        map_task_id: 该 Frame 绑定的地图任务 id；非地图编辑请求为空。
+        map_evidence: 当前 Frame 中由运行时记录的地图工具证据。
         compact_snapshot: 当前帧最近一次有效压缩的持久化快照；未压缩时为 None。
     """
 
@@ -175,4 +194,15 @@ class Frame:
     forced_completion_text: str | None = None
     force_text_only: bool = False
     map_reader_detailed_region_ready: bool = False
+    # 地图子 Frame 的可信阶段合同：包含阶段、目标路径、revision 等运行时可信信息，
+    # 为空 dict 表示该 Frame 不参与结构化地图流水线
+    map_stage_contract: dict[str, Any] = field(default_factory=dict)
+    map_request_lineage_id: str | None = None
+    map_task_id: str | None = None
+    contract_id: str | None = None
+    worker_instance_id: str | None = None
+    result_schema: str | None = None
+    allowed_next_stages: tuple[str, ...] = ()
+    # 当前 Frame 中由运行时记录的地图工具证据（如截图引用、validation 结果等）
+    map_evidence: list[dict[str, Any]] = field(default_factory=list)
     compact_snapshot: CompactSnapshot | None = None

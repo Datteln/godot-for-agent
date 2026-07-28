@@ -1,7 +1,14 @@
 @tool
 extends RefCounted
 
-static func validate_platform_level_plan(input: Dictionary, context: Dictionary = {}) -> Dictionary:
+const MapValidator = preload("res://addons/ai_agent/tools/map_validator.gd")
+
+
+static func validate_platform_level_plan(
+	input: Dictionary,
+	context: Dictionary = {},
+	collision_facts: Dictionary = {}
+) -> Dictionary:
 	var region := _region_from_input(input)
 	var ability := _ability_from_input(input)
 	var ability_used_defaults := _ability_defaulted_keys(input)
@@ -11,6 +18,8 @@ static func validate_platform_level_plan(input: Dictionary, context: Dictionary 
 	var segments := _dictionary_array(input.get("segments", []))
 	var coin_arcs := _dictionary_array(input.get("coin_arcs", []))
 	var enemy_slots := _dictionary_array(input.get("enemy_slots", []))
+	## 碰撞事实只能由调用模块单独传入，永远不从 public input 读取。
+	var collision_lookup: Dictionary = collision_facts.get("cells", {})
 	var plan_issues := _validate_explicit_plan(platforms, segments, region)
 	var graph_platforms := platforms.duplicate(true)
 	if requires_entry_anchor and not entry_anchor.is_empty():
@@ -23,7 +32,16 @@ static func validate_platform_level_plan(input: Dictionary, context: Dictionary 
 		existing_entry["id"] = "__existing_entry"
 		existing_entry["existing"] = true
 		graph_platforms.push_front(existing_entry)
-	var jump_graph := _build_jump_graph(graph_platforms, ability)
+	var combined_collision := _planned_collision_lookup(
+		graph_platforms,
+		collision_lookup
+	)
+	var jump_graph := _build_jump_graph(
+		graph_platforms,
+		ability,
+		combined_collision,
+		_expanded_transition_region(input, graph_platforms, ability)
+	)
 	var edit_batches := _emit_platform_tile_batches(platforms, input)
 	var design_limits := _design_limits_from_input(input, ability)
 	var validation := _validation_plan(region, platforms, ability, design_limits, entry_anchor)
@@ -33,6 +51,10 @@ static func validate_platform_level_plan(input: Dictionary, context: Dictionary 
 	if not plan_issues.is_empty():
 		blocked_reason = "invalid_explicit_plan"
 		error_code = str((plan_issues.front() as Dictionary).get("error_code", "invalid_explicit_plan"))
+	## 若能力参数使用了默认值（未从真实角色控制器读取），阻断执行并提示 agent 先读取控制器数据。
+	elif not ability_used_defaults.is_empty():
+		blocked_reason = "ability_parameters_unverified"
+		error_code = blocked_reason
 	elif bool(input.get("entry_anchor_scan_failed", false)) or (requires_entry_anchor and entry_anchor.is_empty()):
 		blocked_reason = "entry_anchor_not_found"
 		error_code = blocked_reason
@@ -45,22 +67,65 @@ static func validate_platform_level_plan(input: Dictionary, context: Dictionary 
 		error_code = str((score_details.front() as Dictionary).get("error_code", blocked_reason)) if not score_details.is_empty() else blocked_reason
 	if blocked_reason != "":
 		edit_batches = []
+	## executable 统一结论：所有校验（显式计划、能力参数、入口锚点、跳跃图、评分）都通过才为 true。
+	var executable := blocked_reason == ""
+	var reported_issues := plan_issues.duplicate(true)
+	## 将能力参数默认值警告追加到 issues 列表，提醒 agent 需读取真实控制器数据。
+	if not ability_used_defaults.is_empty():
+		reported_issues.append({
+			"error_code": "ability_parameters_unverified",
+			"path": "movement_ability",
+			"actual": ability_used_defaults,
+			"required": "all movement limits measured from the project controller",
+			"action": "Read the real controller and resubmit every listed movement field.",
+		})
+	var missing_inputs: Array = []
+	for missing_key in ability_used_defaults:
+		missing_inputs.append({
+			"field": str(missing_key),
+			"source": "player_controller_or_collision_shape",
+			"reason": "default_value_cannot_authorize_platform_execution",
+		})
 	return {
-		"ok": plan_issues.is_empty(),
+		"ok": executable,
+		"executable": executable,
+		"completion_allowed": executable,
+		"blocking_completion": not executable,
 		"algorithm": "explicit_platform_plan_validator",
 		"plan_source": "llm_explicit",
 		"region": region,
 		"ability": ability,
 		"ability_used_defaults": ability_used_defaults,
+		"missing_inputs": missing_inputs,
+		"collision_facts": {
+			"source": collision_facts.get("source", ""),
+			"target_path": collision_facts.get("target_path", ""),
+			"map_layer": collision_facts.get("map_layer"),
+			"map_revision": collision_facts.get("map_revision"),
+			"digest": collision_facts.get("digest", ""),
+		},
 		"context_summary": _context_summary(context),
 		"entry_anchor": entry_anchor,
 		"critical_route": segments,
 		"platforms": platforms,
 		"jump_graph": jump_graph,
+		"traversal_validation": {
+			"schema_version": 2,
+			"movement_model": "leap",
+			"passed": plan_issues.is_empty()
+				and bool(jump_graph.get("passed", false))
+				and ability_used_defaults.is_empty(),
+			"issues": reported_issues,
+			"transitions": jump_graph.get("edges", []),
+			"actor_footprint": {
+				"width_cells": ability.get("actor_width_cells"),
+				"height_cells": ability.get("actor_clearance_cells"),
+			},
+		},
 		"edit_map_batches": edit_batches,
 		"blocked_reason": blocked_reason,
 		"error_code": error_code,
-		"issues": plan_issues,
+		"issues": reported_issues,
 		"repair_plan": _repair_plan(plan_issues, jump_graph, score),
 		"coin_arcs": coin_arcs,
 		"enemy_slots": enemy_slots,
@@ -127,6 +192,9 @@ static func _validate_explicit_plan(platforms: Array, segments: Array, region: D
 	var min_y := int(region.get("y", 0))
 	var max_y := min_y + int(region.get("height", 1)) - 1
 	var ids := {}
+	var platforms_by_id := {}
+	## 记录平台 id 的插入顺序，后续用于校验 route segments 的遍历顺序是否与平台一致。
+	var ordered_ids: Array[String] = []
 	for index in range(platforms.size()):
 		var platform: Dictionary = platforms[index]
 		var platform_id := str(platform.get("id", "p%d" % index))
@@ -142,6 +210,8 @@ static func _validate_explicit_plan(platforms: Array, segments: Array, region: D
 				"action": "Rename this platform and update segment references.",
 			})
 		ids[platform_id] = true
+		platforms_by_id[platform_id] = platform
+		ordered_ids.append(platform_id)
 		if width <= 0:
 			issues.append({
 				"error_code": "invalid_platform_width",
@@ -166,16 +236,166 @@ static func _validate_explicit_plan(platforms: Array, segments: Array, region: D
 				"required": "semantic role such as safe_intro, takeoff, landing, stair, rest, or finish",
 				"action": "Assign a role so design validation can evaluate the route.",
 			})
+	## ── 校验 route segments 的顺序、索引、引用合法性 ──
+	for index in range(segments.size()):
+		var segment: Dictionary = segments[index]
+		var from_id := str(segment.get("from_platform", ""))
+		var to_id := str(segment.get("to_platform", ""))
+		if segment.has("index") and int(segment.get("index", -1)) != index:
+			issues.append({
+				"error_code": "route_segment_index_mismatch",
+				"path": "segments[%d].index" % index,
+				"actual": segment.get("index"),
+				"required": index,
+				"action": "Keep route segment indices contiguous and in traversal order.",
+			})
+		if not ids.has(from_id) or not ids.has(to_id):
+			issues.append({
+				"error_code": "unknown_route_platform",
+				"path": "segments[%d]" % index,
+				"actual": {"from_platform": from_id, "to_platform": to_id},
+				"required": "both ids must reference submitted platforms",
+				"action": "Use platform ids from the ordered platforms array.",
+			})
+			continue
+		if index >= ordered_ids.size() - 1:
+			issues.append({
+				"error_code": "extra_route_segment",
+				"path": "segments[%d]" % index,
+				"actual": {"from_platform": from_id, "to_platform": to_id},
+				"required": "exactly one segment between each consecutive platform",
+				"action": "Remove the extra segment or add its missing platform.",
+			})
+		elif from_id != ordered_ids[index] or to_id != ordered_ids[index + 1]:
+			issues.append({
+				"error_code": "route_segment_order_mismatch",
+				"path": "segments[%d]" % index,
+				"actual": {"from_platform": from_id, "to_platform": to_id},
+				"required": {
+					"from_platform": ordered_ids[index],
+					"to_platform": ordered_ids[index + 1],
+				},
+				"action": "Make segments follow the same traversal order as platforms.",
+			})
+		for point_name in ["start", "end"]:
+			var point = segment.get(point_name)
+			if not (point is Dictionary):
+				issues.append({
+					"error_code": "route_endpoint_required",
+					"path": "segments[%d].%s" % [index, point_name],
+					"actual": point,
+					"required": "explicit actor-cell coordinate on the referenced platform",
+					"action": "Provide both start and end coordinates.",
+				})
+				continue
+			var point_x := int((point as Dictionary).get("x", min_x - 1))
+			var point_y := int((point as Dictionary).get("y", min_y - 1))
+			if point_x < min_x or point_x > max_x or point_y < min_y or point_y > max_y:
+				issues.append({
+					"error_code": "route_point_out_of_bounds",
+					"path": "segments[%d].%s" % [index, point_name],
+					"actual": {"x": point_x, "y": point_y},
+					"required": region,
+					"action": "Move the route point inside the validated region.",
+				})
+		var from_platform: Dictionary = platforms_by_id.get(from_id, {})
+		var to_platform: Dictionary = platforms_by_id.get(to_id, {})
+		if segment.get("start") is Dictionary:
+			var start_issue := _segment_endpoint_issue(
+				segment.get("start"),
+				from_platform,
+				"start",
+				index
+			)
+			if not start_issue.is_empty():
+				issues.append(start_issue)
+		if segment.get("end") is Dictionary:
+			var end_issue := _segment_endpoint_issue(
+				segment.get("end"),
+				to_platform,
+				"end",
+				index
+			)
+			if not end_issue.is_empty():
+				issues.append(end_issue)
+		if segment.get("start") is Dictionary and segment.get("end") is Dictionary:
+			var start_x := int((segment.get("start") as Dictionary).get("x", 0))
+			var end_x := int((segment.get("end") as Dictionary).get("x", 0))
+			var expected_direction := signi(end_x - start_x)
+			if not segment.has("direction"):
+				issues.append({
+					"error_code": "route_direction_required",
+					"path": "segments[%d].direction" % index,
+					"actual": null,
+					"required": expected_direction,
+					"action": "Declare direction as -1, 0, or 1 from start to end.",
+				})
+			elif int(segment.get("direction", 0)) != expected_direction:
+				issues.append({
+					"error_code": "route_direction_mismatch",
+					"path": "segments[%d].direction" % index,
+					"actual": segment.get("direction"),
+					"required": expected_direction,
+					"action": "Make direction agree with endpoint ordering.",
+				})
+	if not platforms.is_empty() and segments.size() != maxi(0, platforms.size() - 1):
+		issues.append({
+			"error_code": "route_segment_count_mismatch",
+			"path": "segments",
+			"actual": segments.size(),
+			"required": maxi(0, platforms.size() - 1),
+			"action": "Provide one ordered segment between every consecutive platform.",
+		})
 	return issues
 
 
-static func _build_jump_graph(platforms: Array, ability: Dictionary) -> Dictionary:
+static func _segment_endpoint_issue(
+	point_value: Variant,
+	platform: Dictionary,
+	point_name: String,
+	segment_index: int
+) -> Dictionary:
+	var point: Dictionary = point_value
+	var x := int(point.get("x", 0))
+	var y := int(point.get("y", 0))
+	var platform_x := int(platform.get("x", 0))
+	var platform_width := int(platform.get("width", 0))
+	var expected_y := int(platform.get("y", 0)) - 1
+	if x < platform_x or x >= platform_x + platform_width or y != expected_y:
+		return {
+			"error_code": "route_endpoint_geometry_mismatch",
+			"path": "segments[%d].%s" % [segment_index, point_name],
+			"actual": {"x": x, "y": y},
+			"required": {
+				"min_x": platform_x,
+				"max_x": platform_x + platform_width - 1,
+				"y": expected_y,
+				"platform_id": platform.get("id", ""),
+			},
+			"action": "Place the endpoint actor cell directly above its referenced platform.",
+		}
+	return {}
+
+
+## 构建平台间跳跃可达性图。collision_lookup 用于抛物线轨迹净空检测。
+static func _build_jump_graph(
+	platforms: Array,
+	ability: Dictionary,
+	collision_lookup: Dictionary,
+	region: Dictionary
+) -> Dictionary:
 	var edges: Array = []
 	var required_unreachable: Array = []
 	var optional_unreachable: Array = []
 	for i in range(platforms.size()):
 		for j in range(i + 1, mini(platforms.size(), i + 4)):
-			var edge := _jump_edge(platforms[i], platforms[j], ability)
+			var edge := _jump_edge(
+				platforms[i],
+				platforms[j],
+				ability,
+				collision_lookup,
+				region
+			)
 			edge["required"] = j == i + 1
 			edges.append(edge)
 			if not bool(edge.get("reachable", false)):
@@ -193,22 +413,143 @@ static func _build_jump_graph(platforms: Array, ability: Dictionary) -> Dictiona
 	}
 
 
-static func _jump_edge(from_platform: Dictionary, to_platform: Dictionary, ability: Dictionary) -> Dictionary:
-	var from_x := int(from_platform["x"]) + int(from_platform["width"]) - 1
+## 判断两个平台间的跳跃是否可达：计算起跳/落点边缘坐标、方向、水平距离、
+## 垂直距离、落点宽度，并用抛物线轨迹采样检查沿途净空。
+static func _jump_edge(
+	from_platform: Dictionary,
+	to_platform: Dictionary,
+	ability: Dictionary,
+	collision_lookup: Dictionary,
+	region: Dictionary
+) -> Dictionary:
+	var from_left := int(from_platform["x"])
+	var from_right := from_left + int(from_platform["width"]) - 1
 	var from_y := int(from_platform["y"]) - 1
-	var to_x := int(to_platform["x"])
+	var to_left := int(to_platform["x"])
+	var to_right := to_left + int(to_platform["width"]) - 1
 	var to_y := int(to_platform["y"]) - 1
-	var horizontal := maxi(0, to_x - from_x)
+	## 根据两平台的相对位置确定跳跃方向和起跳/落点的 x 坐标。
+	var direction := 0
+	var from_x := from_left
+	var to_x := to_left
+	var horizontal := 0
+	if to_left > from_right:
+		## 目标在右侧：从右边缘起跳到目标左边缘。
+		direction = 1
+		from_x = from_right
+		to_x = to_left
+		horizontal = to_left - from_right
+	elif to_right < from_left:
+		## 目标在左侧：从左边缘起跳到目标右边缘。
+		direction = -1
+		from_x = from_left
+		to_x = to_right
+		horizontal = from_left - to_right
 	var vertical := from_y - to_y
-	var reachable := horizontal <= int(ability["max_horizontal_gap"]) and vertical <= int(ability["max_rise"]) and -vertical <= int(ability["max_fall"])
+	## 落点宽度校验：目标平台必须足够宽才能安全着陆。
+	var landing_width := int(to_platform.get("width", 0))
+	var required_landing_width := maxi(
+		int(ability["min_landing_width"]),
+		int(ability["actor_width_cells"])
+	)
+	var landing_width_ok := landing_width >= required_landing_width
+	var movement := {
+		"model": "leap",
+		"dimension": 2,
+		"cell_occupancy": "empty",
+		"requires_support": true,
+		"support_occupancy": "filled",
+		"support_offset": Vector3i(0, 1, 0),
+		"max_horizontal_gap": ability["max_horizontal_gap"],
+		"max_rise": ability["max_rise"],
+		"max_fall": ability["max_fall"],
+		"actor_width_cells": ability["actor_width_cells"],
+		"actor_clearance_cells": ability["actor_clearance_cells"],
+	}
+	var trajectory := MapValidator.validate_leap_transition(
+		collision_lookup,
+		Vector3i(from_x, from_y, 0),
+		Vector3i(to_x, to_y, 0),
+		region,
+		movement
+	)
+	## 可达性判定：水平距离、垂直距离、落点宽度、轨迹净空全部满足才视为可达。
+	var reachable := horizontal <= int(ability["max_horizontal_gap"]) \
+		and vertical <= int(ability["max_rise"]) \
+		and -vertical <= int(ability["max_fall"]) \
+		and landing_width_ok \
+		and bool(trajectory.get("passed", false))
 	return {
 		"from": from_platform.get("id", ""),
 		"to": to_platform.get("id", ""),
 		"from_cell": {"x": from_x, "y": from_y},
 		"to_cell": {"x": to_x, "y": to_y},
 		"horizontal_gap": horizontal,
+		"direction": direction,
 		"vertical_delta": vertical,
+		"landing_width": landing_width,
+		"required_landing_width": required_landing_width,
+		"landing_width_ok": landing_width_ok,
+		"trajectory_clear": bool(trajectory.get("trajectory_clear", false)),
+		"takeoff_clearance": bool(trajectory.get("takeoff_clearance", false)),
+		"landing_clearance": bool(trajectory.get("landing_clearance", false)),
+		"actor_footprint": trajectory.get("actor_footprint", {}),
+		"obstructed_samples": trajectory.get("obstructed_samples", []),
 		"reachable": reachable,
+	}
+
+
+static func _planned_collision_lookup(
+	platforms: Array,
+	base_collision: Dictionary
+) -> Dictionary:
+	var collision := base_collision.duplicate(true)
+	for platform_value in platforms:
+		var platform: Dictionary = platform_value
+		var x := int(platform.get("x", 0))
+		var y := int(platform.get("y", 0))
+		for offset in range(maxi(0, int(platform.get("width", 0)))):
+			collision["%d,%d,0" % [x + offset, y]] = true
+	return collision
+
+
+static func _expanded_transition_region(
+	input: Dictionary,
+	platforms: Array,
+	ability: Dictionary
+) -> Dictionary:
+	var region := MapValidator.region_from_input(input, 2)
+	var min_x := int(region["min_x"])
+	var max_x := int(region["max_x"])
+	var min_y := int(region["min_y"])
+	var max_y := int(region["max_y"])
+	for platform_value in platforms:
+		var platform: Dictionary = platform_value
+		min_x = mini(min_x, int(platform.get("x", min_x)))
+		max_x = maxi(
+			max_x,
+			int(platform.get("x", max_x)) + int(platform.get("width", 1)) - 1
+		)
+		min_y = mini(
+			min_y,
+			int(platform.get("y", min_y))
+			- int(ability.get("max_rise", 0))
+			- int(ability.get("actor_clearance_cells", 1))
+		)
+		max_y = maxi(max_y, int(platform.get("y", max_y)))
+	return {
+		"x": min_x,
+		"y": min_y,
+		"z": 0,
+		"width": max_x - min_x + 1,
+		"height": max_y - min_y + 1,
+		"depth": 1,
+		"min_x": min_x,
+		"max_x": max_x,
+		"min_y": min_y,
+		"max_y": max_y,
+		"min_z": 0,
+		"max_z": 0,
 	}
 
 
@@ -281,6 +622,8 @@ static func _validation_plan(region: Dictionary, platforms: Array, ability: Dict
 			"max_horizontal_gap": ability["max_horizontal_gap"],
 			"max_rise": ability["max_rise"],
 			"max_fall": ability["max_fall"],
+			"actor_clearance_cells": ability["actor_clearance_cells"],
+			"actor_width_cells": ability["actor_width_cells"],
 			"cell_occupancy": "empty",
 			"requires_support": true,
 			"support_occupancy": "filled",
@@ -422,14 +765,24 @@ static func _ability_from_input(input: Dictionary) -> Dictionary:
 		"max_rise": maxi(0, int(input.get("max_rise", 2))),
 		"max_fall": maxi(1, int(input.get("max_fall", 6))),
 		"min_landing_width": maxi(2, int(input.get("min_landing_width", 3))),
+		"actor_clearance_cells": maxi(1, int(input.get("actor_clearance_cells", 2))),
+		"actor_width_cells": maxi(1, int(input.get("actor_width_cells", 1))),
 	}
 
 
 ## 哪些跳跃能力字段是调用方没传、被静默填了默认值的——返回非空说明这次规划
 ## 没有用到真实角色脚本数据，调用方/agent 看到这个字段不该直接执行 edit_map_batches。
+## actor_clearance_cells 也纳入检查，确保角色碰撞体积也从真实控制器读取。
 static func _ability_defaulted_keys(input: Dictionary) -> Array:
 	var defaulted: Array = []
-	for key in ["max_horizontal_gap", "max_rise", "max_fall", "min_landing_width"]:
+	for key in [
+		"max_horizontal_gap",
+		"max_rise",
+		"max_fall",
+		"min_landing_width",
+		"actor_clearance_cells",
+		"actor_width_cells",
+	]:
 		if not input.has(key):
 			defaulted.append(key)
 	return defaulted

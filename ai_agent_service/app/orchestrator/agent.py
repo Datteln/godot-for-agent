@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -33,19 +34,39 @@ from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
 from app.llm.cache_decision_engine import CacheDecision, CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnapshot
 from app.llm.provider import AssistantTurn, LLMError, LLMProvider, ToolCallRequest
+# ── 本轮整改：将 history 体积控制工具下沉到独立模块，避免 agent.py 膨胀 ──
+from app.history_bounds import (
+    bounded_history_value as _bounded_history_value,
+    bounded_tool_message_body as _bounded_tool_message_body,
+    json_char_size as _json_char_size,
+    summarize_history_text as _summarize_history_text,
+)
 from app.permissions.engine import PermissionContext, SessionAllowGrant, check
 from app.security.settings import SecuritySettings
 from app.sessions.store import Session
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY, ToolDef, tools_for
+# ── 本轮整改：新增模块导入，支持 capability contract、artifact 存储、stage contract ──
+from app.orchestrator.delegate_artifacts import DelegateArtifactStore
+from app.orchestrator.map_capabilities import map_tools_for_stage
+from app.orchestrator.map_contracts import (
+    MAP_WORKER_NEXT_STAGES,
+    MAP_WORKER_RESULT_SCHEMA,
+    MAP_WORKER_STAGES,
+)
 from app.orchestrator.map_workers import (
+    # 本轮整改：验证工具名与 mode→stage 映射表集中定义，避免硬编码散落
+    MAP_VALIDATION_TOOL_NAMES,
     MAP_WRITE_TOOL_NAMES,
+    MAP_WORKER_MODE_STAGES,
     build_dynamic_map_worker,
     is_map_worker_write_mode,
     is_map_write_tool,
     validate_map_write_args,
 )
 from app.orchestrator.map_progress import (
+    # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
+    latest_map_revision,
     cached_validation_result,
     map_platform_plan_call_error,
     map_write_stage_error,
@@ -54,7 +75,23 @@ from app.orchestrator.map_progress import (
     repeated_map_tool_failure_error,
     validation_call_error,
 )
+from app.orchestrator.map_recovery import (
+    SEMANTIC_RETRY_MAX_ATTEMPTS,
+    STRUCTURED_REPAIR_MAX_ATTEMPTS,
+    record_semantic_retry,
+    retry_pause_report,
+    safe_structured_diagnostic,
+    structured_error_category,
+    structured_repair_actions,
+)
+# 本轮整改：子帧创建统一走 frame_factory，确保 history_anchor / stage_contract 等字段一致
+from app.orchestrator.frame_factory import create_child_frame
+from app.orchestrator.frame_contracts import validate_frame_result
+from app.orchestrator.evidence import scoped_evidence
 from app.orchestrator.map_resources import normalize_edit_map_resources
+from app.orchestrator.plan_scheduler import PlanGraph, PlanGraphError
+from app.orchestrator.runtime_contracts import PlanStepResult, UnapprovedWriteRejection
+from app.orchestrator.map_workflow import replace_map_state_field
 
 MAX_AGENT_DEPTH = 4
 EVENT_TEXT_PREVIEW_CHARS = 24_000
@@ -66,6 +103,61 @@ _NUMBER_TEXT = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)
 logger = logging.getLogger(__name__)
 
 AgentPromptFactory = Callable[[AgentDefinition, str], Awaitable[str]]
+def _map_stage_contract(
+    agent: AgentDefinition,
+    task_text: str,
+    worker_spec: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """根据可信委派元数据构造地图子 Frame 合同。
+
+    本轮整改新增：合同在子帧创建时一次性绑定 stage / target_path /
+    map_revision / region，后续 _map_structured_output_error 据此做
+    一致性校验，防止 worker 越权写入非预期的图层或 revision。
+    """
+    # 动态 worker 以 worker_spec.mode 为准（mode→stage 映射由 map_contracts 集中维护），
+    # 静态 agent 则直接读取 agent.map_stage 元数据
+    stage = agent.map_stage
+    if isinstance(worker_spec, dict):
+        stage = MAP_WORKER_MODE_STAGES.get(str(worker_spec.get("mode", "")))
+    if stage is None:
+        return {}
+    # 尝试从 task_text 解析 JSON 载荷，提取 target/revision/region 等合同字段
+    payload: dict[str, Any] = {}
+    try:
+        parsed = json.loads(task_text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        payload = parsed
+    approved_batch = (
+        worker_spec.get("approved_batch")
+        if isinstance(worker_spec, dict)
+        and isinstance(worker_spec.get("approved_batch"), dict)
+        else {}
+    )
+    contract: dict[str, Any] = {"stage": stage}
+    target = payload.get("target_path", approved_batch.get("target_path"))
+    if isinstance(target, str) and target.strip():
+        contract["target_path"] = target.strip()
+    # 兼容 map_revision 与旧字段 required_revision
+    revision = payload.get(
+        "map_revision",
+        payload.get("required_revision", approved_batch.get("map_revision")),
+    )
+    if isinstance(revision, int) and not isinstance(revision, bool):
+        contract["map_revision"] = revision
+    region = payload.get("region")
+    if isinstance(region, dict):
+        # 只保留整数坐标，过滤掉非数值脏数据
+        contract["region"] = {
+            str(key): value
+            for key, value in region.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+    if approved_batch:
+        contract["approved_batch_ref"] = approved_batch.get("artifact_ref")
+        contract["approved_batch_id"] = approved_batch.get("batch_id")
+    return contract
 
 
 @dataclass(frozen=True)
@@ -309,95 +401,6 @@ async def _invoke_server_tool(
         return str(exc), True
 
 
-_TOOL_HISTORY_MAX_JSON_CHARS = 80_000
-_TOOL_HISTORY_MAX_STRING_CHARS = 16_000
-_TOOL_HISTORY_MAX_LIST_ITEMS = 80
-_TOOL_HISTORY_MAX_DICT_ITEMS = 120
-_TOOL_HISTORY_DROP_KEYS = frozenset(
-    {"data_url", "base64", "image_base64", "screenshot_base64", "binary", "bytes"}
-)
-
-
-def _json_char_size(value: Any) -> int:
-    """粗略计算 JSON 值序列化后的字符长度。"""
-    try:
-        return len(json.dumps(value, ensure_ascii=False, default=str))
-    except (TypeError, ValueError):
-        return len(str(value))
-
-
-def _summarize_history_text(text: str, max_chars: int = _TOOL_HISTORY_MAX_STRING_CHARS) -> str:
-    """保留长文本的开头和结尾，中间省略以控制 history 体积。"""
-    if len(text) <= max_chars:
-        return text
-    head = max_chars // 2
-    tail = max_chars - head
-    omitted = len(text) - max_chars
-    return text[:head] + f"\n... ({omitted} chars omitted for history) ...\n" + text[-tail:]
-
-
-def _bounded_history_value(
-    value: Any,
-    *,
-    max_string_chars: int = _TOOL_HISTORY_MAX_STRING_CHARS,
-    max_list_items: int = _TOOL_HISTORY_MAX_LIST_ITEMS,
-    max_dict_items: int = _TOOL_HISTORY_MAX_DICT_ITEMS,
-) -> Any:
-    """递归压缩任意 server/delegate 工具结果，作为写入 history 的最后防线。"""
-    if isinstance(value, str):
-        return _summarize_history_text(value, max_string_chars)
-    if isinstance(value, list):
-        bounded = [
-            _bounded_history_value(
-                item,
-                max_string_chars=max_string_chars,
-                max_list_items=max_list_items,
-                max_dict_items=max_dict_items,
-            )
-            for item in value[:max_list_items]
-        ]
-        omitted = len(value) - max_list_items
-        if omitted > 0:
-            bounded.append({"history_omitted_items": omitted})
-        return bounded
-    if not isinstance(value, dict):
-        return value
-    bounded_dict: dict[str, Any] = {}
-    for index, (key, item) in enumerate(value.items()):
-        key_str = str(key)
-        if key_str in _TOOL_HISTORY_DROP_KEYS:
-            bounded_dict[f"{key_str}_omitted_for_history"] = True
-            continue
-        if index >= max_dict_items:
-            bounded_dict["history_omitted_keys"] = len(value) - max_dict_items
-            break
-        bounded_dict[key_str] = _bounded_history_value(
-            item,
-            max_string_chars=max_string_chars,
-            max_list_items=max_list_items,
-            max_dict_items=max_dict_items,
-        )
-    return bounded_dict
-
-
-def _bounded_tool_message_body(body: Any) -> Any:
-    """限制单条 tool message 的最大体积，避免工具结果撑爆上下文。"""
-    if isinstance(body, str):
-        return _summarize_history_text(body, _TOOL_HISTORY_MAX_JSON_CHARS)
-    if _json_char_size(body) <= _TOOL_HISTORY_MAX_JSON_CHARS:
-        return body
-    bounded = _bounded_history_value(body)
-    if _json_char_size(bounded) <= _TOOL_HISTORY_MAX_JSON_CHARS:
-        return bounded
-    return {
-        "history_truncated": True,
-        "summary": _summarize_history_text(
-            json.dumps(bounded, ensure_ascii=False, default=str),
-            _TOOL_HISTORY_MAX_JSON_CHARS,
-        ),
-    }
-
-
 def _tool_message(tool_call_id: str, result: Any, *, is_error: bool = False) -> dict[str, Any]:
     """构造一条 OpenAI `role=tool` 消息。
 
@@ -423,6 +426,18 @@ def _find_frame(session: Session, frame_id: str) -> Frame | None:
     return None
 
 
+def _frame_in_active_map_edit(session: Session, frame: Frame | None) -> bool:
+    """Return whether a Frame belongs to the current authorized map-edit request."""
+    scope = session.map_request_scope
+    return (
+        frame is not None
+        and scope.activates_map_gate
+        and scope.map_task_id == session.map_task_state.task_id
+        and frame.map_request_lineage_id == scope.lineage_id
+        and frame.map_task_id == scope.map_task_id
+    )
+
+
 async def _delegate_child_frame(
     *,
     session: Session,
@@ -433,32 +448,32 @@ async def _delegate_child_frame(
     depth: int,
     prompt_factory: AgentPromptFactory | None,
 ) -> Frame | str | None:
-    """根据委派参数创建子 agent 帧，并保留动态 worker 的具体错误。"""
+    """根据委派参数创建子 agent 帧，并保留动态 worker 的具体错误。
+
+    本轮整改要点：
+    - 改用 ``agent.role`` / ``agent.map_stage`` 做权限判断，不再硬编码 agent name；
+    - 写阶段切换延迟到 prompt/skill 绑定成功后（``transition_stage``），
+      避免 worker 创建失败时污染 ``map_task_state.stage``；
+    - 子帧创建统一委托给 ``frame_factory.create_child_frame``，
+      由其负责 history_anchor 继承与 stage_contract 注入。
+    """
     agent_name = args.get("agent")
     task = args.get("task")
     if not isinstance(task, str) or not task.strip():
         return None
     parent = _find_frame(session, parent_id)
     worker_spec = args.get("worker_spec")
-    if (
-        isinstance(worker_spec, dict)
-        and isinstance(agent_name, str)
-        and agent_name not in {"map-agent", "map-worker"}
-    ):
-        try:
-            child_agent = get_agent(agent_name, set(REGISTRY))
-        except KeyError:
-            pass
-        else:
-            logger.warning(
-                "Ignoring worker_spec for permanent agent session=%s parent=%s agent=%s",
-                session.session_id,
-                parent_id,
-                agent_name,
-            )
-            worker_spec = None
+    # 本轮整改：记录 worker_mode 供后续延迟阶段切换使用
+    worker_mode: str | None = None
     if isinstance(worker_spec, dict):
-        if parent is None or parent.agent.name != "map-agent":
+        if agent_name not in {"map-worker", "map-agent"}:
+            return (
+                "动态地图 worker 必须使用 agent=map-worker；"
+                "不得把 worker_spec 与永久 Agent 名组合"
+            )
+        # 本轮整改：用 map_stage 代替硬编码 name=="map-agent"，
+        # 使 capability contract 派生的动态 agent 也能成为合法父帧
+        if parent is None or parent.agent.map_stage != "orchestrator":
             return "只有 map-agent 可以创建动态地图 worker"
         worker_spec = dict(worker_spec)
         worker_spec.setdefault(
@@ -466,57 +481,106 @@ async def _delegate_child_frame(
             f"{group_id or call_id or parent_id}:{worker_spec.get('mode', 'stage')}",
         )
         worker_spec.setdefault("lifecycle_scope", "delegate_frame")
+        requested_worker_name = str(worker_spec.get("name", "")).strip()
+        if requested_worker_name:
+            try:
+                get_agent(requested_worker_name, set(REGISTRY))
+            except KeyError:
+                pass
+            else:
+                return (
+                    "动态 worker 名称与永久 Agent 定义冲突："
+                    f"{requested_worker_name}"
+                )
         child_or_error = build_dynamic_map_worker(parent.agent, worker_spec)
         if isinstance(child_or_error, str):
             return child_or_error
-        child_agent = child_or_error
-        if is_map_worker_write_mode(worker_spec.get("mode")):
-            # 写 worker 必须先切换阶段，否则阶段裁剪会只留下读取工具。
-            session.map_task_state.stage = "write"
+        reserved_identity = (
+            f"__map_worker__:{session.session_id}:"
+            f"{worker_spec['stage_id']}:{requested_worker_name}"
+        )
+        child_agent = replace(
+            child_or_error,
+            name=reserved_identity,
+            description=(
+                f"{child_or_error.description}; display_name={requested_worker_name}"
+            ),
+        )
+        worker_mode = str(worker_spec.get("mode", ""))
     else:
         if not isinstance(agent_name, str) or not agent_name:
             return None
-        if parent is not None and parent.agent.name == "map-agent" and agent_name == "map-agent":
-            return (
-                "map-agent 不得递归委派普通 map-agent；"
-                "写入请创建带 worker_spec.mode=write_one_batch 的动态地图 worker"
-            )
         try:
             child_agent = get_agent(agent_name, set(REGISTRY))
         except KeyError:
             return None
+        # 本轮整改：改用 role=="map_orchestrator" 做递归守卫，
+        # 不再依赖 agent name 字符串匹配
+        if (
+            parent is not None
+            and parent.agent.role == "map_orchestrator"
+            and child_agent.role == "map_orchestrator"
+        ):
+            return (
+                "地图总控不得递归委派另一个地图总控；"
+                "写入请创建带 worker_spec.mode=write_one_batch 的动态地图 worker"
+            )
     task_text = task.strip()
-    prompt = (
-        await prompt_factory(child_agent, task_text)
-        if prompt_factory is not None
-        else child_agent.prompt
-    )
+    scheduler_inputs = args.get("scheduler_inputs")
+    if isinstance(scheduler_inputs, dict) and scheduler_inputs:
+        task_text = (
+            f"{task_text}\n\n"
+            "[SCHEDULER_INPUTS]\n"
+            f"{json.dumps(scheduler_inputs, ensure_ascii=False, sort_keys=True, default=str)}"
+        )
+    try:
+        prompt = (
+            await prompt_factory(child_agent, task_text)
+            if prompt_factory is not None
+            else child_agent.prompt
+        )
+    except ValueError as exc:
+        # 本轮整改：prompt_factory 失败时直接返回错误，不再创建残缺子帧
+        return str(exc)
+    if is_map_worker_write_mode(worker_mode):
+        if not _frame_in_active_map_edit(session, parent):
+            return "当前用户请求未显式授权地图内容编辑，不能创建写入 worker"
+        # Skill 与 prompt 完整绑定成功后再进入写阶段，失败创建不得污染状态。
+        # 本轮整改：改用 transition_stage() 受控状态机切换，替代直接赋值 stage
+        session.map_task_state.transition_stage("write")
     child_agent = replace(child_agent, prompt=prompt)
-    history_anchor_frame_id = parent_id
-    history_anchor_message_index = len(parent.messages) if parent is not None else None
-    if parent is not None and parent.history_anchor_frame_id is not None:
-        history_anchor_frame_id = parent.history_anchor_frame_id
-        history_anchor_message_index = parent.history_anchor_message_index
-    return Frame(
-        id=session.new_frame_id(),
+    if parent is None:
+        return None
+    # 本轮整改：子帧创建统一走 frame_factory，自动继承 history_anchor
+    # 并注入 _map_stage_contract 用于后续输出一致性校验
+    return create_child_frame(
+        session=session,
+        parent=parent,
         agent=child_agent,
-        messages=[
-            {"role": "system", "content": child_agent.prompt},
-            {"role": "user", "content": task_text},
-        ],
-        parent_id=parent_id,
+        task_text=task_text,
+        depth=depth,
         pending_delegate_call_id=call_id,
         pending_delegate_group_id=group_id,
-        depth=depth,
-        history_anchor_frame_id=history_anchor_frame_id,
-        history_anchor_message_index=history_anchor_message_index,
+        map_stage_contract=_map_stage_contract(child_agent, task_text, worker_spec),
     )
+
+
+def _with_plan_runtime_metadata(
+    payload: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve request lineage fields omitted by ``PlanGraph.to_dict``."""
+    for key in ("owner_frame_id", "request_lineage_id", "map_task_id"):
+        if key in source:
+            payload[key] = source.get(key)
+    return payload
 
 
 def _plan_step_started(
     session: Session,
     child: Frame,
     event_callback: Callable[[str, dict[str, Any]], None] | None,
+    step_id: str | None = None,
 ) -> None:
     """若当前会话有活跃 `create_plan` 计划，记录新子帧对应的步骤并发出 `plan_step_started`。
 
@@ -528,13 +592,28 @@ def _plan_step_started(
     plan = session.pending_plan
     if plan is None:
         return
-    steps = plan.get("steps", [])
-    idx = int(plan.get("next_step_index", 0))
-    if idx >= len(steps):
+    try:
+        graph = PlanGraph.from_dict(plan)
+    except PlanGraphError as exc:
+        logger.error("Invalid pending plan session=%s error=%s", session.session_id, exc)
         return
-    plan.setdefault("frame_steps", {})[child.id] = idx
-    plan["next_step_index"] = idx + 1
-    step = steps[idx]
+    runnable = graph.runnable_steps()
+    selected_id = step_id or (runnable[0].step_id if runnable else None)
+    if selected_id is None:
+        return
+    try:
+        graph = graph.start(selected_id, child.id)
+        step = graph.step(selected_id)
+    except PlanGraphError as exc:
+        logger.error(
+            "Plan step start rejected session=%s frame=%s step=%s error=%s",
+            session.session_id,
+            child.id,
+            selected_id,
+            exc,
+        )
+        return
+    session.pending_plan = _with_plan_runtime_metadata(graph.to_dict(), plan)
     _emit_orchestration_event(
         event_callback,
         "plan_step_started",
@@ -542,10 +621,11 @@ def _plan_step_started(
             "frame_id": child.id,
             "message_index": len(child.messages),
             **_history_timeline_payload(child),
-            "step_index": idx + 1,
-            "total_steps": len(steps),
-            "agent": step.get("agent", ""),
-            "title": step.get("title", ""),
+            "step_id": step.step_id,
+            "step_index": step.order + 1,
+            "total_steps": len(graph.steps),
+            "agent": step.agent,
+            "title": step.title,
         },
     )
 
@@ -553,7 +633,7 @@ def _plan_step_started(
 def _plan_step_completed(
     session: Session,
     done: Frame,
-    text: str,
+    result_payload: dict[str, Any],
     event_callback: Callable[[str, dict[str, Any]], None] | None,
 ) -> None:
     """若已完成的子帧对应某个计划步骤，发出 `plan_step_completed`。
@@ -567,11 +647,165 @@ def _plan_step_completed(
     plan = session.pending_plan
     if plan is None:
         return
-    frame_steps: dict[str, int] = plan.get("frame_steps", {})
-    idx = frame_steps.pop(done.id, None)
-    if idx is None:
+    try:
+        graph = PlanGraph.from_dict(plan)
+    except PlanGraphError as exc:
+        logger.error("Invalid pending plan session=%s error=%s", session.session_id, exc)
         return
-    full_summary = text.strip()
+    running = next(
+        (step for step in graph.steps if step.frame_id == done.id and step.status == "running"),
+        None,
+    )
+    if running is None:
+        return
+    output = (
+        dict(result_payload.get("result", {}))
+        if isinstance(result_payload.get("result"), dict)
+        else {"summary": str(result_payload.get("summary", ""))}
+    )
+    artifact_ref = result_payload.get("artifact_ref")
+    stage = str(output.get("stage", done.agent.map_stage or ""))
+    missing_inputs = output.get("missing_inputs")
+    is_reader_recovery = "__reader__attempt_" in running.step_id
+    if (
+        isinstance(missing_inputs, list)
+        and missing_inputs
+        and stage in {"planner", "validator"}
+    ):
+        target = str(
+            output.get(
+                "target_path",
+                done.map_stage_contract.get("target_path", ""),
+            )
+        )
+        revision_value = output.get(
+            "map_revision",
+            done.map_stage_contract.get("map_revision", 0),
+        )
+        revision = (
+            revision_value
+            if isinstance(revision_value, int)
+            and not isinstance(revision_value, bool)
+            else 0
+        )
+        retry = record_semantic_retry(
+            session.map_task_state,
+            category="missing_input",
+            error_category="typed_missing_inputs",
+            root_cause="planner_or_validator_missing_typed_inputs",
+            stage=stage,
+            target=target,
+            revision=revision,
+            operation={
+                "step_id": running.step_id,
+                "task": running.task,
+                "worker_spec": running.worker_spec,
+            },
+            missing_inputs=missing_inputs,
+            threshold=SEMANTIC_RETRY_MAX_ATTEMPTS,
+        )
+        if not bool(retry["exhausted"]):
+            try:
+                graph = graph.inject_reader_recovery(
+                    running.step_id,
+                    missing_inputs=missing_inputs,
+                    target=target,
+                    revision=revision,
+                )
+            except PlanGraphError as exc:
+                logger.error(
+                    "Reader recovery injection failed session=%s step=%s error=%s",
+                    session.session_id,
+                    running.step_id,
+                    exc,
+                )
+            else:
+                session.pending_plan = _with_plan_runtime_metadata(graph.to_dict(), plan)
+                _emit_orchestration_event(
+                    event_callback,
+                    "plan_reader_recovery_scheduled",
+                    {
+                        "step_id": running.step_id,
+                        "missing_inputs": missing_inputs,
+                        "target": target,
+                        "revision": revision,
+                        "attempt": retry["attempt"],
+                        "retry_key": retry["retry_key"],
+                    },
+                )
+                return
+        report = retry_pause_report(
+            session.map_task_state,
+            stage=stage,
+            target=target,
+            revision=revision,
+            last_attempt=retry,
+        )
+        output["error"] = "map_retry_exhausted"
+        output["retry_result"] = report
+        if session.map_task_state.status == "running":
+            session.map_task_state.make_checkpoint(
+                "map_retry_exhausted",
+                report,
+            )
+        else:
+            session.map_task_state.pause_reason = "map_retry_exhausted"
+            replace_map_state_field(
+                session.map_task_state,
+                "pause_report",
+                report,
+                target=target or None,
+                revision=revision,
+            )
+    failed = result_payload.get("error") is True or "error" in output
+    repair = output.get("repair")
+    if isinstance(repair, dict) and repair.get("status") == "exhausted":
+        failed = True
+        output["error"] = "structured_output_repair_exhausted"
+    if is_reader_recovery:
+        reader_missing = (
+            list(missing_inputs) if isinstance(missing_inputs, list) else ["missing_inputs"]
+        )
+        has_typed_facts = isinstance(artifact_ref, str) or bool(output.get("facts"))
+        if reader_missing or not has_typed_facts:
+            failed = True
+            output["error"] = "reader_recovery_incomplete"
+            output["reader_recovery_blocked"] = {
+                "missing_inputs": reader_missing,
+                "artifact_ref_present": isinstance(artifact_ref, str),
+                "facts_present": bool(output.get("facts")),
+            }
+    error_code = str(output.get("error", "")) or None
+    if not failed and isinstance(running.expected_result_schema, dict):
+        required = running.expected_result_schema.get("required", [])
+        if isinstance(required, list):
+            missing = [
+                str(field)
+                for field in required
+                if isinstance(field, str) and field not in output
+            ]
+            if missing:
+                failed = True
+                error_code = "result_schema_mismatch"
+                output["missing_required_fields"] = missing
+    result = PlanStepResult(
+        status="failed" if failed else "succeeded",
+        output=output,
+        artifact_refs=(str(artifact_ref),) if isinstance(artifact_ref, str) else (),
+        error_code=error_code,
+    )
+    try:
+        graph = graph.finish(running.step_id, result)
+    except PlanGraphError as exc:
+        logger.error(
+            "Plan step finish rejected session=%s frame=%s error=%s",
+            session.session_id,
+            done.id,
+            exc,
+        )
+        return
+    session.pending_plan = _with_plan_runtime_metadata(graph.to_dict(), plan)
+    full_summary = str(result_payload.get("summary", "")).strip()
     summary = " ".join(full_summary.split())
     if len(summary) > 240:
         summary = summary[:240] + "..."
@@ -582,25 +816,96 @@ def _plan_step_completed(
             "frame_id": done.id,
             "message_index": len(done.messages),
             **_history_timeline_payload(done),
-            "step_index": idx + 1,
-            "total_steps": len(plan.get("steps", [])),
+            "step_id": running.step_id,
+            "step_index": running.order + 1,
+            "total_steps": len(graph.steps),
+            "status": result.status,
             "summary": summary,
             "full_summary": full_summary,
         },
     )
 
 
-def _map_delegate_result_payload(done: Frame, text: str) -> dict[str, Any]:
-    """把地图子 worker 结果压缩为结构化载荷，避免向父帧透传完整自然语言历史。"""
+def _map_delegate_result_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """提取父 Frame 推进阶段所需的最小地图结果摘要。
+
+    本轮整改新增：当 artifact_store 成功落盘后，父帧只需保留摘要字段
+    和列表计数（artifact_list_counts），完整数据通过 artifact_ref 回溯，
+    大幅减少父帧 context 体积。
+    """
+    summary_fields = (
+        "stage",
+        "worker",
+        "mode",
+        "objective",
+        "target_path",
+        "map_layer",
+        "map_revision",
+        "region",
+        "summary",
+        "validation",
+        "missing_inputs",
+        "risks",
+        "next_stage",
+    )
+    summary = {
+        key: _slim_map_delegate_value(payload[key])
+        for key in summary_fields
+        if key in payload
+    }
+    # 只保留列表长度，父帧据此判断是否需要回查 artifact
+    summary["artifact_list_counts"] = {
+        key: len(payload[key])
+        for key in ("facts", "proposed_batches", "write_results")
+        if isinstance(payload.get(key), list)
+    }
+    return summary
+
+
+def _map_delegate_result_payload(
+    done: Frame,
+    text: str,
+    artifact_store: DelegateArtifactStore | None = None,
+) -> dict[str, Any]:
+    """把地图子 worker 结果压缩为结构化载荷，避免向父帧透传完整自然语言历史。
+
+    本轮整改：新增 artifact_store 参数。若落盘成功则只回传最小摘要
+    （_map_delegate_result_summary）和 artifact_ref；失败时回退到
+    preserve_lists=True 的完整瘦身载荷，保证父帧仍能拿到 proposed_batches
+    等关键列表。
+    """
     output_schema = _map_output_schema_for_frame(done)
     payload = _json_object_from_text(text)
     if payload is not None and output_schema == _MAP_OUTPUT_SCHEMA_V1:
-        slim_payload = _slim_map_delegate_value(payload)
+        # 尝试将完整结果写入 artifact store，换取一个可回溯引用
+        artifact_ref: str | None = None
+        if artifact_store is not None:
+            try:
+                artifact_ref = artifact_store.store(
+                    frame_id=done.id,
+                    agent_name=done.agent.name,
+                    result_schema=str(output_schema),
+                    result=payload,
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                logger.warning(
+                    "Delegate artifact store failed frame=%s agent=%s error=%s",
+                    done.id,
+                    done.agent.name,
+                    exc,
+                )
+        # artifact_ref 成功 → 最小摘要；失败 → 保留列表的完整瘦身
+        result_payload = (
+            _map_delegate_result_summary(payload)
+            if artifact_ref is not None
+            else _slim_map_delegate_value(payload, preserve_lists=True)
+        )
         return {
             "agent": done.agent.name,
             "frame_id": done.id,
             "summary": _summarize_history_text(str(payload.get("summary", "")), 4000),
-            "result": slim_payload if isinstance(slim_payload, dict) else payload,
+            "result": result_payload,
+            "artifact_ref": artifact_ref,
         }
     if output_schema == _MAP_OUTPUT_SCHEMA_V1:
         return {
@@ -625,10 +930,10 @@ async def _continue_delegate_group(
     text: str,
     prompt_factory: AgentPromptFactory | None,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    artifact_store: DelegateArtifactStore | None = None,
 ) -> None:
     """记录一个 `delegate_many` 子任务结果，并按需启动下一个子任务。"""
     assert done.pending_delegate_group_id is not None
-    _plan_step_completed(session, done, text, event_callback)
     group = session.delegate_groups.get(done.pending_delegate_group_id)
     if group is None:
         logger.warning(
@@ -639,7 +944,247 @@ async def _continue_delegate_group(
         )
         return
 
-    group.setdefault("results", []).append(_map_delegate_result_payload(done, text))
+    delegate_result = _map_delegate_result_payload(done, text, artifact_store)
+    group.setdefault("results", []).append(delegate_result)
+    _plan_step_completed(session, done, delegate_result, event_callback)
+
+    if group.get("plan_driven") is True and session.pending_plan is not None:
+        try:
+            graph = PlanGraph.from_dict(session.pending_plan)
+        except PlanGraphError as exc:
+            logger.error(
+                "Delegate plan continuation failed session=%s group=%s error=%s",
+                session.session_id,
+                done.pending_delegate_group_id,
+                exc,
+            )
+            graph = None
+        runnable = graph.runnable_steps() if graph is not None else ()
+        if runnable:
+            next_step = runnable[0]
+            next_task = graph.task_payload(next_step.step_id)
+            child = await _delegate_child_frame(
+                session=session,
+                parent_id=str(group["parent_frame_id"]),
+                call_id=None,
+                group_id=done.pending_delegate_group_id,
+                args=next_task,
+                depth=int(group["depth"]),
+                prompt_factory=prompt_factory,
+            )
+            if isinstance(child, Frame):
+                session.agent_stack.append(child)
+                _plan_step_started(
+                    session,
+                    child,
+                    event_callback,
+                    next_step.step_id,
+                )
+                logger.info(
+                    "Plan delegate group continued session=%s group_id=%s "
+                    "step=%s child_frame=%s",
+                    session.session_id,
+                    done.pending_delegate_group_id,
+                    next_step.step_id,
+                    child.id,
+                )
+                return
+            failure_text = (
+                child
+                if isinstance(child, str)
+                else "调度器已解锁的子任务参数不合法或 agent 不存在"
+            )
+            group["results"].append(
+                {
+                    "agent": next_step.agent,
+                    "summary": failure_text,
+                    "error": True,
+                }
+            )
+            failed_graph = graph.fail_unstarted(
+                next_step.step_id,
+                "child_frame_creation_failed",
+            )
+            session.pending_plan = _with_plan_runtime_metadata(
+                failed_graph.to_dict(),
+                session.pending_plan,
+            )
+    elif isinstance(group.get("scheduler_plan"), dict):
+        try:
+            group_graph = PlanGraph.from_dict(group["scheduler_plan"])
+            running = next(
+                (
+                    step
+                    for step in group_graph.steps
+                    if step.frame_id == done.id and step.status == "running"
+                ),
+                None,
+            )
+            if running is None:
+                raise PlanGraphError(f"no running step owns frame {done.id}")
+            output = (
+                dict(delegate_result.get("result", {}))
+                if isinstance(delegate_result.get("result"), dict)
+                else {"summary": str(delegate_result.get("summary", ""))}
+            )
+            recovery_injected = False
+            missing_inputs = output.get("missing_inputs")
+            output_stage = str(output.get("stage", done.agent.map_stage or ""))
+            if (
+                isinstance(missing_inputs, list)
+                and missing_inputs
+                and output_stage in {"planner", "validator"}
+            ):
+                target = str(
+                    output.get(
+                        "target_path",
+                        done.map_stage_contract.get("target_path", ""),
+                    )
+                )
+                revision_value = output.get(
+                    "map_revision",
+                    done.map_stage_contract.get("map_revision", 0),
+                )
+                revision = (
+                    revision_value
+                    if isinstance(revision_value, int)
+                    and not isinstance(revision_value, bool)
+                    else 0
+                )
+                retry = record_semantic_retry(
+                    session.map_task_state,
+                    category="missing_input",
+                    error_category="typed_missing_inputs",
+                    root_cause="planner_or_validator_missing_typed_inputs",
+                    stage=output_stage,
+                    target=target,
+                    revision=revision,
+                    operation={
+                        "step_id": running.step_id,
+                        "task": running.task,
+                        "worker_spec": running.worker_spec,
+                    },
+                    missing_inputs=missing_inputs,
+                    threshold=SEMANTIC_RETRY_MAX_ATTEMPTS,
+                )
+                if not bool(retry["exhausted"]):
+                    group_graph = group_graph.inject_reader_recovery(
+                        running.step_id,
+                        missing_inputs=missing_inputs,
+                        target=target,
+                        revision=revision,
+                    )
+                    recovery_injected = True
+                else:
+                    output["error"] = "map_retry_exhausted"
+                    output["retry_result"] = retry_pause_report(
+                        session.map_task_state,
+                        stage=output_stage,
+                        target=target,
+                        revision=revision,
+                        last_attempt=retry,
+                    )
+            failed = delegate_result.get("error") is True or "error" in output
+            error_code = str(output.get("error", "")) or None
+            if "__reader__attempt_" in running.step_id:
+                reader_missing = (
+                    list(missing_inputs)
+                    if isinstance(missing_inputs, list)
+                    else ["missing_inputs"]
+                )
+                artifact_ref_value = delegate_result.get("artifact_ref")
+                if reader_missing or (
+                    not isinstance(artifact_ref_value, str)
+                    and not bool(output.get("facts"))
+                ):
+                    failed = True
+                    error_code = "reader_recovery_incomplete"
+                    output["reader_recovery_blocked"] = {
+                        "missing_inputs": reader_missing,
+                        "artifact_ref_present": isinstance(artifact_ref_value, str),
+                        "facts_present": bool(output.get("facts")),
+                    }
+            if not failed and isinstance(running.expected_result_schema, dict):
+                required = running.expected_result_schema.get("required", [])
+                if isinstance(required, list):
+                    missing = [
+                        str(field)
+                        for field in required
+                        if isinstance(field, str) and field not in output
+                    ]
+                    if missing:
+                        failed = True
+                        error_code = "result_schema_mismatch"
+                        output["missing_required_fields"] = missing
+            artifact_ref = delegate_result.get("artifact_ref")
+            if not recovery_injected:
+                group_graph = group_graph.finish(
+                    running.step_id,
+                    PlanStepResult(
+                        status="failed" if failed else "succeeded",
+                        output=output,
+                        artifact_refs=(
+                            (str(artifact_ref),)
+                            if isinstance(artifact_ref, str)
+                            else ()
+                        ),
+                        error_code=error_code,
+                    ),
+                )
+            group["scheduler_plan"] = group_graph.to_dict()
+        except PlanGraphError as exc:
+            logger.error(
+                "Delegate group scheduler update failed session=%s group=%s error=%s",
+                session.session_id,
+                done.pending_delegate_group_id,
+                exc,
+            )
+            group_graph = None
+        runnable = group_graph.runnable_steps() if group_graph is not None else ()
+        if runnable:
+            next_step = runnable[0]
+            next_task = group_graph.task_payload(next_step.step_id)
+            child = await _delegate_child_frame(
+                session=session,
+                parent_id=str(group["parent_frame_id"]),
+                call_id=None,
+                group_id=done.pending_delegate_group_id,
+                args=next_task,
+                depth=int(group["depth"]),
+                prompt_factory=prompt_factory,
+            )
+            if isinstance(child, Frame):
+                session.agent_stack.append(child)
+                group["scheduler_plan"] = group_graph.start(
+                    next_step.step_id,
+                    child.id,
+                ).to_dict()
+                logger.info(
+                    "Delegate scheduler continued session=%s group_id=%s "
+                    "step=%s child_frame=%s",
+                    session.session_id,
+                    done.pending_delegate_group_id,
+                    next_step.step_id,
+                    child.id,
+                )
+                return
+            failure_text = (
+                child
+                if isinstance(child, str)
+                else "调度器已解锁的子任务参数不合法或 agent 不存在"
+            )
+            group["results"].append(
+                {
+                    "agent": next_step.agent,
+                    "summary": failure_text,
+                    "error": True,
+                }
+            )
+            group["scheduler_plan"] = group_graph.fail_unstarted(
+                next_step.step_id,
+                "child_frame_creation_failed",
+            ).to_dict()
+
     remaining = group.setdefault("remaining", [])
     while isinstance(remaining, list) and remaining:
         next_task = remaining.pop(0)
@@ -702,14 +1247,6 @@ async def _continue_delegate_group(
     session.delegate_groups.pop(done.pending_delegate_group_id, None)
 
 
-_MAP_STRUCTURED_OUTPUT_AGENTS = frozenset(
-    {
-        "map-reader-agent",
-        "map-planner-agent",
-        "map-validator-agent",
-        "map-reviewer-agent",
-    }
-)
 _MAP_WORKER_RESULT_FIELDS = frozenset(
     {
         "stage",
@@ -730,8 +1267,8 @@ _MAP_WORKER_RESULT_FIELDS = frozenset(
         "next_stage",
     }
 )
-_MAP_WORKER_STAGES = frozenset({"reader", "planner", "writer", "validator", "repairer", "reviewer"})
-_MAP_OUTPUT_SCHEMA_V1 = "map_worker_result_v1"
+_MAP_WORKER_STAGES = MAP_WORKER_STAGES
+_MAP_OUTPUT_SCHEMA_V1 = MAP_WORKER_RESULT_SCHEMA
 _MAP_DELEGATE_LIST_LIMIT = 12
 _MAP_DELEGATE_TEXT_LIMIT = 1200
 _MAP_DELEGATE_DROP_KEYS = frozenset(
@@ -793,10 +1330,16 @@ def _normalized_map_layer_value(payload: dict[str, Any]) -> int | list[int] | No
 
 
 def _map_output_schema_for_frame(frame: Frame) -> str | None:
-    """解析当前地图 frame 需要执行的结构化输出 schema。"""
-    if frame.agent.name in _MAP_STRUCTURED_OUTPUT_AGENTS:
+    """解析当前地图 frame 需要执行的结构化输出 schema。
+
+    本轮整改：不再维护 _MAP_STRUCTURED_OUTPUT_AGENTS 硬编码名称集合，
+    改为两路 capability contract 派生：
+    1. frame.map_stage_contract 非空 → 说明子帧已绑定阶段合同；
+    2. agent.map_stage 属于已知阶段 → 静态声明式元数据兜底。
+    """
+    if frame.map_stage_contract:
         return _MAP_OUTPUT_SCHEMA_V1
-    if frame.agent.source == "project" and _MAP_OUTPUT_SCHEMA_V1 in frame.agent.prompt:
+    if frame.agent.map_stage in _MAP_WORKER_STAGES:
         return _MAP_OUTPUT_SCHEMA_V1
     return None
 
@@ -822,8 +1365,18 @@ def _json_object_from_text(text: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _slim_map_delegate_value(value: Any) -> Any:
-    """递归瘦身地图子任务结果，避免父 agent 继承大数组。"""
+def _slim_map_delegate_value(
+    value: Any,
+    field_name: str = "",
+    preserve_lists: bool = False,
+) -> Any:
+    """递归瘦身地图子任务结果，避免父 agent 继承大数组。
+
+    本轮整改新增 preserve_lists 参数：当 artifact_store 不可用时，
+    父帧仍需完整拿到 proposed_batches / write_results 等关键列表，
+    此时 preserve_lists=True 跳过列表截断。对于其他字段名则保持
+    原有的 _MAP_DELEGATE_LIST_LIMIT 截断策略。
+    """
     if isinstance(value, str):
         return (
             value
@@ -831,7 +1384,20 @@ def _slim_map_delegate_value(value: Any) -> Any:
             else value[:_MAP_DELEGATE_TEXT_LIMIT] + "..."
         )
     if isinstance(value, list):
-        return [_slim_map_delegate_value(item) for item in value[:_MAP_DELEGATE_LIST_LIMIT]]
+        # proposed_batches 和 write_results 是下游编排的关键数据，不可截断
+        preserve_lists = preserve_lists or field_name in {
+            "proposed_batches",
+            "write_results",
+        }
+        items = (
+            value
+            if preserve_lists
+            else value[:_MAP_DELEGATE_LIST_LIMIT]
+        )
+        return [
+            _slim_map_delegate_value(item, preserve_lists=preserve_lists)
+            for item in items
+        ]
     if not isinstance(value, dict):
         return value
     slim: dict[str, Any] = {}
@@ -840,12 +1406,23 @@ def _slim_map_delegate_value(value: Any) -> Any:
         if key_str in _MAP_DELEGATE_DROP_KEYS:
             slim[f"{key_str}_omitted"] = True
             continue
-        slim[key_str] = _slim_map_delegate_value(item)
+        slim[key_str] = _slim_map_delegate_value(item, key_str, preserve_lists)
     return slim
 
 
-def _map_structured_output_error(frame: Frame, text: str) -> str | None:
-    """校验地图阶段 agent 的 map_worker_result_v1 输出。"""
+def _map_structured_output_error(
+    session: Session,
+    frame: Frame,
+    text: str,
+) -> str | None:
+    """校验地图阶段 agent 的 map_worker_result_v1 输出。
+
+    本轮整改大幅增强校验逻辑：
+    - stage/target_path/map_revision 必须与 Frame 创建时注入的合同一致；
+    - next_stage 必须满足 MAP_WORKER_NEXT_STAGES 定义的合法状态转换；
+    - reviewer 阶段必须引用当前 Frame 的截图证据（tool_use_id），
+      且截图的 target/revision/region 也要与合同匹配。
+    """
     output_schema = _map_output_schema_for_frame(frame)
     if output_schema is None:
         return None
@@ -859,12 +1436,65 @@ def _map_structured_output_error(frame: Frame, text: str) -> str | None:
         return "map_worker_result_v1 缺少字段：" + ", ".join(missing)
     if payload.get("stage") not in _MAP_WORKER_STAGES:
         return "stage 必须是 reader/planner/writer/validator/repairer/reviewer 之一。"
+    violations = validate_frame_result(frame, payload)
+    if violations:
+        violation = violations[0]
+        return f"{violation.code}: {violation.message}; {violation.to_dict()}"
     validation = payload.get("validation")
     if not isinstance(validation, dict):
         return "validation 必须是 object。"
+    # ── 本轮整改：reviewer 必须引用截图证据，且证据与合同字段保持一致 ──
+    if payload.get("stage") == "reviewer":
+        raw_evidence_refs = validation.get("evidence_refs")
+        evidence_refs = (
+            {str(item) for item in raw_evidence_refs}
+            if isinstance(raw_evidence_refs, list)
+            else set()
+        )
+        target_for_evidence = str(
+            frame.map_stage_contract.get("target_path", payload.get("target_path", ""))
+        )
+        revision_for_evidence = frame.map_stage_contract.get(
+            "map_revision",
+            payload.get("map_revision"),
+        )
+        registered_evidence = (
+            scoped_evidence(
+                session.map_task_state,
+                target_for_evidence,
+                revision_for_evidence,
+                "viewport_screenshot",
+            )
+            if isinstance(revision_for_evidence, int)
+            and not isinstance(revision_for_evidence, bool)
+            else []
+        )
+        matching_evidence = [
+            item
+            for item in registered_evidence
+            if str(item.get("metadata", {}).get("tool_use_id", "")) in evidence_refs
+            and item.get("metadata", {}).get("frame_id") == frame.id
+        ]
+        if not matching_evidence:
+            return "reviewer 必须引用当前 Frame 成功截图的 tool_use_id。"
+        contracted_target = frame.map_stage_contract.get("target_path")
+        contracted_revision = frame.map_stage_contract.get("map_revision")
+        if isinstance(contracted_target, str) and contracted_target:
+            if any(item.get("target") != contracted_target for item in matching_evidence):
+                return "reviewer 截图证据与当前 Frame 的 target_path 不一致。"
+        if isinstance(contracted_revision, int) and not isinstance(contracted_revision, bool):
+            if any(item.get("revision") != contracted_revision for item in matching_evidence):
+                return "reviewer 截图证据与当前 Frame 的 map_revision 不一致。"
+        contracted_region = frame.map_stage_contract.get("region")
+        if isinstance(contracted_region, dict) and contracted_region:
+            if any(
+                item.get("metadata", {}).get("region") != contracted_region
+                for item in matching_evidence
+            ):
+                return "reviewer 截图证据与当前 Frame 的 region 不一致。"
     validation_missing = [
         key
-        for key in ("passed", "completion_allowed", "issues", "structured_issues")
+        for key in ("passed", "issues", "structured_issues")
         if key not in validation
     ]
     if validation_missing:
@@ -880,7 +1510,15 @@ def _map_structured_output_error(frame: Frame, text: str) -> str | None:
     return None
 
 
-def _repair_map_structured_output(frame: Frame, text: str, error: str) -> str:
+def _repair_map_structured_output(
+    frame: Frame,
+    text: str,
+    error: str,
+    *,
+    category: str,
+    attempt: int,
+    exhausted: bool,
+) -> str:
     """把不合规地图输出保守修复为不可完成的合法结果。"""
     source = _json_object_from_text(text) or {}
     stage = source.get("stage")
@@ -898,9 +1536,15 @@ def _repair_map_structured_output(frame: Frame, text: str, error: str) -> str:
     )
     structured_issues.append(
         {
-            "code": "structured_output_repaired",
+            "code": (
+                "structured_output_repair_exhausted"
+                if exhausted
+                else "structured_output_repaired"
+            ),
             "message": error,
             "agent": frame.agent.name,
+            "category": category,
+            "attempt": attempt,
         }
     )
 
@@ -942,251 +1586,42 @@ def _repair_map_structured_output(frame: Frame, text: str, error: str) -> str:
             "结构化输出曾不合规，本结果不能作为任务完成依据。",
         ],
         "next_stage": "validator" if stage == "writer" else "planner",
+        "repair": {
+            "status": "exhausted" if exhausted else "repaired",
+            "error_category": category,
+            "original_issue_categories": sorted(
+                {
+                    category,
+                    *(
+                        str(item.get("code"))
+                        for item in raw_structured_issues
+                        if isinstance(item, dict) and item.get("code")
+                    ),
+                }
+            ),
+            "safe_diagnostics": [safe_structured_diagnostic(error)],
+            "applied_actions": structured_repair_actions(category),
+            "attempt": attempt,
+            "threshold": STRUCTURED_REPAIR_MAX_ATTEMPTS,
+        },
     }
     return json.dumps(repaired, ensure_ascii=False)
 
 
 def _map_stage_for_frame(frame: Frame) -> str:
-    """根据地图 agent/frame 名称推断结构化收尾阶段。"""
-    name = frame.agent.name
-    if name == "map-planner-agent":
-        return "planner"
-    if name == "map-validator-agent":
-        return "validator"
-    if name == "map-reviewer-agent":
-        return "reviewer"
-    if "write_one_batch" in frame.agent.prompt:
-        return "writer"
-    if "repair" in frame.agent.prompt or "repair" in name:
-        return "repairer"
+    """根据地图 agent/frame 名称推断结构化收尾阶段。
+
+    本轮整改：优先级从「名称硬编码」改为「合同 → agent 元数据 → reader 兜底」，
+    删除了对 agent name / prompt 文本的字符串匹配。
+    """
+    # 1. 合同优先：子帧创建时由 _map_stage_contract 注入
+    contracted_stage = frame.map_stage_contract.get("stage")
+    if isinstance(contracted_stage, str) and contracted_stage in _MAP_WORKER_STAGES:
+        return contracted_stage
+    # 2. 静态 agent 元数据兜底
+    if frame.agent.map_stage in _MAP_WORKER_STAGES:
+        return str(frame.agent.map_stage)
     return "reader"
-
-
-def _integer(value: Any) -> int | None:
-    """把非布尔整数参数规范化为整数。"""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _platform_role(
-    index: int,
-    count: int,
-    operation: dict[str, Any],
-    previous_y: int | None,
-) -> str:
-    """根据写入顺序和几何关系确定平台的验证角色。"""
-    if index == 0:
-        return "safe_intro"
-    if index == count - 1:
-        return "finish"
-    tags_value = operation.get("tags")
-    tags = (
-        {str(tag).strip().lower() for tag in tags_value}
-        if isinstance(tags_value, list)
-        else set()
-    )
-    y = _integer(operation.get("y"))
-    if "staircase" in tags or (previous_y is not None and y is not None and y != previous_y):
-        return "stair"
-    return ("takeoff", "landing", "rest")[(index - 1) % 3]
-
-
-def _platform_validation_args(
-    session: Session,
-    edit_calls: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    """把同一地图图层的平台写入意图确定性转换为校验器入参。"""
-    if not edit_calls:
-        return None
-    first_input = edit_calls[0].get("input")
-    if not isinstance(first_input, dict):
-        return None
-
-    operation_entries: list[tuple[int, dict[str, Any]]] = []
-    sequence = 0
-    ground_resource = ""
-    fallback_ground_resource = ""
-    for call in edit_calls:
-        call_input = call.get("input")
-        if not isinstance(call_input, dict):
-            continue
-        operations = call_input.get("operations")
-        if not isinstance(operations, list):
-            continue
-        for operation in operations:
-            if not isinstance(operation, dict):
-                continue
-            semantic = str(operation.get("semantic_layer", "")).strip().lower()
-            tags_value = operation.get("tags")
-            tags = (
-                {str(tag).strip().lower() for tag in tags_value}
-                if isinstance(tags_value, list)
-                else set()
-            )
-            if semantic != "ground" and "platform" not in tags:
-                continue
-            if operation.get("action") != "fill":
-                continue
-            x = _integer(operation.get("x"))
-            y = _integer(operation.get("y"))
-            width = _integer(operation.get("width"))
-            if x is None or y is None or width is None or width < 1:
-                continue
-            operation_entries.append((sequence, operation))
-            sequence += 1
-            if not ground_resource:
-                resource = operation.get("resource", operation.get("resource_key"))
-                if isinstance(resource, str):
-                    ground_resource = resource.strip()
-            if not fallback_ground_resource:
-                fallback = operation.get("fallback_resource")
-                if isinstance(fallback, str):
-                    fallback_ground_resource = fallback.strip()
-
-    if not operation_entries:
-        return None
-    operation_entries.sort(
-        key=lambda entry: (
-            int(entry[1]["x"]),
-            int(entry[1]["y"]),
-            entry[0],
-        )
-    )
-
-    platforms: list[dict[str, Any]] = []
-    previous_y: int | None = None
-    for index, (_, operation) in enumerate(operation_entries):
-        x = int(operation["x"])
-        y = int(operation["y"])
-        width = int(operation["width"])
-        platforms.append(
-            {
-                "id": f"auto_p{index}",
-                "x": x,
-                "y": y,
-                "width": width,
-                "role": _platform_role(index, len(operation_entries), operation, previous_y),
-                "connection": index == 0,
-            }
-        )
-        previous_y = y
-
-    segments: list[dict[str, Any]] = []
-    for index in range(len(platforms) - 1):
-        current = platforms[index]
-        following = platforms[index + 1]
-        horizontal_gap = max(
-            0,
-            int(following["x"]) - (int(current["x"]) + int(current["width"]) - 1),
-        )
-        vertical_delta = int(current["y"]) - int(following["y"])
-        if vertical_delta > 0:
-            segment_type = "jump_up"
-        elif vertical_delta < 0:
-            segment_type = "drop"
-        elif horizontal_gap > 1:
-            segment_type = "gap_jump"
-        else:
-            segment_type = "walk"
-        segments.append(
-            {
-                "index": index,
-                "type": segment_type,
-                "from_platform": current["id"],
-                "to_platform": following["id"],
-                "start": {
-                    "x": int(current["x"]) + int(current["width"]) - 1,
-                    "y": int(current["y"]) - 1,
-                },
-                "end": {
-                    "x": int(following["x"]),
-                    "y": int(following["y"]) - 1,
-                },
-                "difficulty": 0 if segment_type == "walk" else 1,
-                "note": "由服务层根据待执行 edit_map 几何生成。",
-            }
-        )
-    if not segments:
-        only = platforms[0]
-        segments.append(
-            {
-                "index": 0,
-                "type": "stand",
-                "from_platform": only["id"],
-                "to_platform": only["id"],
-                "difficulty": 0,
-                "note": "单个平台写入的前置结构校验。",
-            }
-        )
-
-    min_x = min(int(platform["x"]) for platform in platforms)
-    max_x = max(
-        int(platform["x"]) + int(platform["width"]) - 1 for platform in platforms
-    )
-    min_y = min(int(platform["y"]) for platform in platforms)
-    max_y = max(int(platform["y"]) for platform in platforms)
-    region_x = min_x - 4
-    region_y = min_y - 4
-    target = str(first_input.get("target_path", "")).strip()
-    map_layer = _integer(first_input.get("map_layer"))
-    revision = session.latest_map_revisions.get(target)
-    if revision is None:
-        revision = _integer(first_input.get("expected_revision"))
-
-    args: dict[str, Any] = {
-        "target_path": target,
-        "map_layer": map_layer if map_layer is not None else 0,
-        "x": region_x,
-        "y": region_y,
-        "width": max(8, max_x - region_x + 5),
-        "height": max(8, max_y - region_y + 5),
-        "platforms": platforms,
-        "segments": segments,
-        "connect_from_existing": True,
-        "entry_sample_x": min_x - 24,
-        "entry_sample_y": region_y,
-        "entry_sample_width": 24,
-        "entry_sample_height": max(30, max_y - region_y + 5),
-        "max_horizontal_gap": 4,
-        "max_rise": 2,
-        "max_fall": 6,
-        "min_landing_width": 3,
-        "platform_thickness": 1,
-        "max_platform_thickness": 2,
-        "max_platform_width": max(8, max(int(item["width"]) for item in platforms)),
-        "min_finish_buffer_width": 6,
-        "__auto_platform_validation": True,
-    }
-    if revision is not None:
-        args["expected_revision"] = revision
-    if ground_resource:
-        args["ground_resource"] = ground_resource
-    if fallback_ground_resource:
-        args["fallback_ground_resource"] = fallback_ground_resource
-    return args
-
-
-def _replace_assistant_with_front_call(
-    frame: Frame,
-    text: str,
-    call: FrontToolCall,
-) -> None:
-    """把当前 assistant 的原始写调用替换为服务层生成的前端调用。"""
-    if not frame.messages:
-        return
-    message = frame.messages[-1]
-    if message.get("role") != "assistant":
-        return
-    message["content"] = text
-    message["tool_calls"] = [
-        {
-            "id": call.id,
-            "type": "function",
-            "function": {
-                "name": call.name,
-                "arguments": json.dumps(call.input, ensure_ascii=False),
-            },
-        }
-    ]
 
 
 def _route_unvalidated_platform_writes_to_validator(
@@ -1197,120 +1632,44 @@ def _route_unvalidated_platform_writes_to_validator(
     project_root: Path,
     event_callback: Callable[[str, dict[str, Any]], None] | None,
 ) -> tuple[bool, ToolCallsResult | None]:
-    """在平台写入缺少批准批次时由服务层直接下发平台方案校验。"""
-    parsed_calls: list[dict[str, Any]] = []
-    deferred_calls: list[dict[str, Any]] = []
-    target = ""
-    map_layer = 0
+    """拒绝未获 planner 批准的平台写入，不在服务层推断路线。
+
+    本轮整改：旧实现会在服务层自动推断平台几何并下发 validate_platform_level_plan，
+    但这绕过了 planner 的路线设计职责，且推断结果常与模型意图不一致。
+    新实现只做「守门」：检测到缺少批准批次的平台写入就一律拒绝，
+    把控制权还给 planner agent。
+    """
+    del project_root  # 新实现不再需要 project_root，保留签名兼容
+    blocked = False
     for call in calls:
         args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
         if parse_error is not None or args is None:
             continue
-        if call.name == "edit_map":
-            normalization = normalize_edit_map_resources(project_root, args)
-            if normalization.error_code is None:
-                args = normalization.args
-        deferred_calls.append({"id": call.id, "tool": call.name, "input": args})
-        if call.name != "edit_map":
-            continue
-        if not platform_write_requires_validation(session, call.name, args):
-            continue
-        call_target = str(args.get("target_path", "")).strip()
-        call_layer = _integer(args.get("map_layer"))
-        if not parsed_calls:
-            target = call_target
-            map_layer = call_layer if call_layer is not None else 0
-        if call_target != target or (call_layer if call_layer is not None else 0) != map_layer:
-            continue
-        parsed_calls.append({"id": call.id, "tool": call.name, "input": args})
-
-    if not parsed_calls:
+        blocked = blocked or platform_write_requires_validation(session, call.name, args)
+    if not blocked:
         return False, None
-
-    validation_args = _platform_validation_args(session, parsed_calls)
-    if validation_args is None:
-        for call in calls:
-            frame.messages.append(
-                _tool_message(
-                    call.id,
-                    (
-                        "服务层无法从本轮 edit_map 提取有效的平台 fill 几何，"
-                        "因此未执行写入或前置校验。"
-                    ),
-                    is_error=True,
-                )
+    rejection = UnapprovedWriteRejection(
+        error_code="approved_write_batch_required",
+        message=(
+            "平台路线写入缺少 planner 生成并由 "
+            "validate_platform_level_plan 编译的批准批次。"
+            "服务层不会从 edit_map 几何推断路线；请返回 planner。"
+        ),
+    )
+    for call in calls:
+        frame.messages.append(
+            _tool_message(
+                call.id,
+                rejection.to_dict(),
+                is_error=True,
             )
-        return True, None
-    validation_args["__deferred_tool_calls"] = deferred_calls
-
-    validation_error = map_platform_plan_call_error(
-        session,
-        "validate_platform_level_plan",
-        validation_args,
-    )
-    if validation_error is not None:
-        for call in calls:
-            frame.messages.append(_tool_message(call.id, validation_error, is_error=True))
-        return True, None
-
-    validator = REGISTRY.get("validate_platform_level_plan")
-    if validator is None or validator.side != "front":
-        for call in calls:
-            frame.messages.append(
-                _tool_message(
-                    call.id,
-                    "validate_platform_level_plan 前端工具未注册，本轮 edit_map 未执行。",
-                    is_error=True,
-                )
-            )
-        return True, None
-
-    source_ids = [str(call["id"]) for call in parsed_calls]
-    validator_call = FrontToolCall(
-        id=f"{source_ids[0]}__platform_validation",
-        name=validator.name,
-        input=validation_args,
-        needs_confirm=False,
-        frame_id=frame.id,
-        agent=frame.agent.name,
-        render_kind=validator.render_kind,
-    )
-    text = (
-        "服务层检测到平台 edit_map 尚无当前 revision 的批准批次，"
-        "已直接生成并下发 validate_platform_level_plan；本轮原始写入暂不执行。"
-    )
-    _replace_assistant_with_front_call(frame, text, validator_call)
-    session.map_task_state.stage = "plan"
-    turn_id = session.new_turn_id()
-    session.set_pending(
-        turn_id,
-        [validator_call.id],
-        {
-            validator_call.id: {
-                "name": validator_call.name,
-                "input": validator_call.input,
-                "frame_id": validator_call.frame_id,
-                "agent": validator_call.agent,
-            }
-        },
-    )
-    logger.info(
-        "Platform write auto-routed directly to validator session=%s frame=%s calls=%d",
-        session.session_id,
-        frame.id,
-        len(parsed_calls),
-    )
+        )
     _emit_orchestration_event(
         event_callback,
-        "map_platform_validation_auto_called",
-        {
-            "frame_id": frame.id,
-            "validator_call_id": validator_call.id,
-            "source_call_ids": source_ids,
-            "count": len(parsed_calls),
-        },
+        "map_platform_write_rejected",
+        {"frame_id": frame.id, "agent": frame.agent.name},
     )
-    return True, ToolCallsResult(turn_id=turn_id, text=text, calls=[validator_call])
+    return True, None
 
 
 def _frame_objective(frame: Frame) -> str:
@@ -1444,8 +1803,15 @@ def _apply_reader_structured_completion(
     state = session.map_task_state
     if complete:
         payload["map_layer"] = map_layer
-        state.stage = "plan"
-        state.unresolved_issues.clear()
+        # 本轮整改：改用 transition_stage 受控状态机，替代直接赋值 stage
+        state.transition_stage("plan")
+        replace_map_state_field(
+            state,
+            "unresolved_issues",
+            [],
+            target=target,
+            revision=revision,
+        )
         state.context_state["reader_result"] = _slim_map_delegate_value(payload)
         state.context_state.pop("reader_exhausted", None)
         logger.info(
@@ -1471,13 +1837,18 @@ def _apply_reader_structured_completion(
         invalid_fields.append("mode=partial")
     if not isinstance(missing_inputs, list):
         invalid_fields.append("missing_inputs")
-    state.stage = "read"
-    state.unresolved_issues = [
-        {
+    # 本轮整改：改用 transition_stage 受控状态机，替代直接赋值 stage
+    state.transition_stage("read")
+    replace_map_state_field(
+        state,
+        "unresolved_issues",
+        [{
             "kind": "reader_incomplete",
             "missing_inputs": missing or invalid_fields,
-        }
-    ]
+        }],
+        target=target if isinstance(target, str) else None,
+        revision=revision,
+    )
     logger.info(
         "Map reader completion kept workflow in read stage "
         "session=%s mode=%s missing=%d invalid_fields=%s",
@@ -1503,12 +1874,16 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
     revision = _payload_revision(payload)
     validation = payload.get("validation")
     validation_dict = validation if isinstance(validation, dict) else {}
-    completion_allowed = validation_dict.get("completion_allowed") is True
+    observation_passed = (
+        validation_dict.get("passed") is True
+        and validation_dict.get("blocking_completion") is not True
+    )
     issues = validation_dict.get("issues")
     issue_list = [str(issue) for issue in issues] if isinstance(issues, list) else []
 
     if stage == "validator":
-        canonical = session.latest_map_validations.get(target)
+        # 本轮整改：latest_validations 从 session 顶层迁移到 map_task_state
+        canonical = session.map_task_state.latest_validations.get(target)
         canonical_matches = (
             isinstance(canonical, dict)
             and (not target or canonical.get("target") in ("", target))
@@ -1517,18 +1892,13 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
         canonical_success = (
             canonical_matches
             and canonical is not None
-            and all(
-                canonical.get(key) is expected
-                for key, expected in (
-                    ("passed", True),
-                    ("completion_allowed", True),
-                    ("blocking_completion", False),
-                )
-            )
+            and canonical.get("passed") is True
+            and canonical.get("blocking_completion") is not True
         )
-        if completion_allowed and canonical_success:
+        if observation_passed and canonical_success:
+            # 本轮整改：completion_blockers 从 session 顶层迁移到 map_task_state
             blockers = _clear_map_blockers(
-                session.map_completion_blockers,
+                session.map_task_state.completion_blockers,
                 target,
                 revision,
                 "map_write_requires_validation",
@@ -1539,9 +1909,12 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
                 revision,
                 "validator_failed",
             )
-            session.map_completion_blockers = _append_map_blocker_once(
-                blockers,
-                {
+            replace_map_state_field(
+                session.map_task_state,
+                "completion_blockers",
+                _append_map_blocker_once(
+                    blockers,
+                    {
                     "tool": frame.agent.name,
                     "reason": "map_review_required",
                     "issues": [
@@ -1549,23 +1922,47 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
                     ],
                     "target": target,
                     "required_revision": revision,
-                },
+                    # 本轮整改：blocker 新增 region 字段，供 reviewer 截图校验比对
+                    "region": payload.get("region"),
+                    },
+                ),
+                target=target,
+                revision=revision,
             )
         else:
             existing = next(
                 (
                     blocker
-                    for blocker in session.map_completion_blockers
+                    for blocker in session.map_task_state.completion_blockers
                     if blocker.get("target") in ("", target)
                     and (revision is None or blocker.get("required_revision") in (None, revision))
                 ),
                 None,
             )
             if existing is not None:
-                existing.setdefault("next_stage", "planner")
-            else:
-                session.map_completion_blockers = [
+                blockers = [
                     {
+                        **blocker,
+                        **(
+                            {"next_stage": blocker.get("next_stage", "planner")}
+                            if blocker is existing
+                            else {}
+                        ),
+                    }
+                    for blocker in session.map_task_state.completion_blockers
+                ]
+                replace_map_state_field(
+                    session.map_task_state,
+                    "completion_blockers",
+                    blockers,
+                    target=target,
+                    revision=revision,
+                )
+            else:
+                replace_map_state_field(
+                    session.map_task_state,
+                    "completion_blockers",
+                    [{
                         "tool": frame.agent.name,
                         "reason": "validator_failed",
                         "issues": issue_list
@@ -1573,33 +1970,45 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
                         "target": target,
                         "required_revision": revision,
                         "next_stage": "planner",
-                    }
-                ]
+                    }],
+                    target=target,
+                    revision=revision,
+                )
         return
 
-    if completion_allowed:
+    if observation_passed and not issue_list:
         blockers = _clear_map_blockers(
-            session.map_completion_blockers,
+            session.map_task_state.completion_blockers,
             target,
             revision,
             "map_review_required",
         )
-        session.map_completion_blockers = _clear_map_blockers(
-            blockers,
-            target,
-            revision,
-            "reviewer_failed",
+        replace_map_state_field(
+            session.map_task_state,
+            "completion_blockers",
+            _clear_map_blockers(
+                blockers,
+                target,
+                revision,
+                "reviewer_failed",
+            ),
+            target=target,
+            revision=revision,
         )
     else:
-        session.map_completion_blockers = [
-            {
+        replace_map_state_field(
+            session.map_task_state,
+            "completion_blockers",
+            [{
                 "tool": frame.agent.name,
                 "reason": "reviewer_failed",
-                "issues": issue_list or ["reviewer reported completion_allowed=false"],
+                "issues": issue_list or ["reviewer observation did not pass"],
                 "target": target,
                 "required_revision": revision,
-            }
-        ]
+            }],
+            target=target,
+            revision=revision,
+        )
 
 
 async def _finish_frame(
@@ -1607,6 +2016,7 @@ async def _finish_frame(
     text: str,
     prompt_factory: AgentPromptFactory | None = None,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    artifact_store: DelegateArtifactStore | None = None,
 ) -> FinalResult | None:
     """处理当前帧产出最终文本（无 `tool_calls`）的情况（§13.1）。
 
@@ -1626,21 +2036,75 @@ async def _finish_frame(
     """
     frame = session.top_frame()
     if frame is not None:
-        structured_error = _map_structured_output_error(frame, text)
+        structured_error = _map_structured_output_error(session, frame, text)
         if structured_error is not None:
+            category = structured_error_category(structured_error)
+            source_payload = _json_object_from_text(text) or {}
+            target = str(
+                source_payload.get(
+                    "target_path",
+                    frame.map_stage_contract.get("target_path", ""),
+                )
+            )
+            revision_value = source_payload.get(
+                "map_revision",
+                frame.map_stage_contract.get("map_revision", 0),
+            )
+            revision = (
+                revision_value
+                if isinstance(revision_value, int)
+                and not isinstance(revision_value, bool)
+                else 0
+            )
+            retry = record_semantic_retry(
+                session.map_task_state,
+                category="structured_output",
+                error_category=category,
+                root_cause=structured_error,
+                stage=_map_stage_for_frame(frame),
+                target=target,
+                revision=revision,
+                operation={
+                    "agent": frame.agent.name,
+                    "stage": _map_stage_for_frame(frame),
+                    "objective": _frame_objective(frame),
+                    "output_schema": _map_output_schema_for_frame(frame),
+                },
+                threshold=STRUCTURED_REPAIR_MAX_ATTEMPTS,
+            )
+            # 本轮整改：日志新增 raw_chars + raw_digest，便于跨请求
+            # 追踪同一次结构化输出拒绝/修复事件
             logger.warning(
-                "Map structured output rejected session=%s frame=%s agent=%s error=%s",
+                "Map structured output rejected session=%s frame=%s agent=%s "
+                "error=%s raw_chars=%d raw_digest=%s",
                 session.session_id,
                 frame.id,
                 frame.agent.name,
                 structured_error,
+                len(text),
+                hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16],
             )
-            text = _repair_map_structured_output(frame, text, structured_error)
+            text = _repair_map_structured_output(
+                frame,
+                text,
+                structured_error,
+                category=category,
+                attempt=int(retry["attempt"]),
+                exhausted=bool(retry["exhausted"]),
+            )
             logger.warning(
-                "Map structured output repaired session=%s frame=%s agent=%s",
+                "Map structured output repaired session=%s frame=%s agent=%s "
+                "category=%s attempt=%d exhausted=%s actions=%s "
+                "repaired_chars=%d repaired_digest=%s",
                 session.session_id,
                 frame.id,
                 frame.agent.name,
+                category,
+                retry["attempt"],
+                retry["exhausted"],
+                structured_repair_actions(category),
+                len(text),
+                hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16],
             )
 
         _apply_map_structured_completion_result(session, frame, text)
@@ -1651,7 +2115,8 @@ async def _finish_frame(
             session.pending_plan = None
         return FinalResult(text=text)
     done = session.agent_stack.pop()
-    if done.agent.name == "map-reader-agent":
+    # 本轮整改：用 map_stage=="reader" 代替 name=="map-reader-agent"
+    if done.agent.map_stage == "reader":
         session.map_task_state.context_state.pop("reader_exhausted", None)
     logger.info(
         "Child frame finished session=%s frame=%s agent=%s text_length=%d",
@@ -1661,14 +2126,25 @@ async def _finish_frame(
         len(text),
     )
     if done.pending_delegate_group_id is not None:
-        await _continue_delegate_group(session, done, text, prompt_factory, event_callback)
+        await _continue_delegate_group(
+            session,
+            done,
+            text,
+            prompt_factory,
+            event_callback,
+            artifact_store,
+        )
         return None
     parent = session.top_frame()
     assert parent is not None
     if done.pending_delegate_call_id is not None:
-        _plan_step_completed(session, done, text, event_callback)
+        delegate_result = _map_delegate_result_payload(done, text, artifact_store)
+        _plan_step_completed(session, done, delegate_result, event_callback)
         parent.messages.append(
-            _tool_message(done.pending_delegate_call_id, _map_delegate_result_payload(done, text))
+            _tool_message(
+                done.pending_delegate_call_id,
+                delegate_result,
+            )
         )
     elif done.parent_id is not None:
         parent.messages.append(
@@ -1676,7 +2152,10 @@ async def _finish_frame(
                 "role": "user",
                 "content": (
                     "自动子阶段结果："
-                    + json.dumps(_map_delegate_result_payload(done, text), ensure_ascii=False)
+                    + json.dumps(
+                        _map_delegate_result_payload(done, text, artifact_store),
+                        ensure_ascii=False,
+                    )
                 ),
             }
         )
@@ -1690,6 +2169,7 @@ async def _handle_frame_turns_exhausted(
     limit: int,
     prompt_factory: AgentPromptFactory | None,
     event_callback: Callable[[str, dict[str, Any]], None] | None,
+    artifact_store: DelegateArtifactStore | None = None,
 ) -> ErrorResult | None:
     """某个轮次预算（总轮数/edit_map 轮数/常规轮数）耗尽时的统一收尾。
 
@@ -1730,8 +2210,10 @@ async def _handle_frame_turns_exhausted(
         text,
         prompt_factory,
         event_callback,
+        artifact_store,
     )
-    if frame.agent.name == "map-reader-agent":
+    # 本轮整改：用 map_stage=="reader" 代替 name=="map-reader-agent"
+    if frame.agent.map_stage == "reader":
         session.map_task_state.context_state["reader_exhausted"] = True
     return None
 
@@ -1907,10 +2389,28 @@ def _is_complex_map_delegation_task(task: str) -> bool:
     return hits >= 2
 
 
+def _agent_name_has_role(agent_name: Any, role: str) -> bool:
+    """判断内置 Agent 名是否解析为指定稳定角色。
+
+    本轮整改新增：将 agent 名称解析为 AgentDefinition 后比对 role 字段，
+    替代直接硬编码 agent name 字符串，使 capability contract 派生的
+    动态 agent 也能被正确识别。
+    """
+    if not isinstance(agent_name, str) or not agent_name:
+        return False
+    try:
+        return get_agent(agent_name, set(REGISTRY)).role == role
+    except KeyError:
+        return False
+
+
 def _map_agent_targets_from_delegate_call(tool_name: str, args: dict[str, Any]) -> list[str]:
     """Return map-agent task texts from delegate/delegate_many args."""
     if tool_name == "delegate":
-        if args.get("agent") == "map-agent" and isinstance(args.get("task"), str):
+        # 本轮整改：用 role=="map_orchestrator" 代替硬编码 "map-agent"
+        if _agent_name_has_role(args.get("agent"), "map_orchestrator") and isinstance(
+            args.get("task"), str
+        ):
             return [str(args["task"])]
         return []
     if tool_name != "delegate_many":
@@ -1922,7 +2422,9 @@ def _map_agent_targets_from_delegate_call(tool_name: str, args: dict[str, Any]) 
     for item in raw_tasks:
         if not isinstance(item, dict):
             continue
-        if item.get("agent") == "map-agent" and isinstance(item.get("task"), str):
+        if _agent_name_has_role(item.get("agent"), "map_orchestrator") and isinstance(
+            item.get("task"), str
+        ):
             tasks.append(str(item["task"]))
     return tasks
 
@@ -1934,7 +2436,8 @@ def _requires_create_plan_before_map_delegate(
     args: dict[str, Any],
 ) -> bool:
     """Require coordinator to create a visible plan before complex map delegation."""
-    if frame.agent.name != "coordinator" or session.pending_plan is not None:
+    # 本轮整改：用 role 代替 name=="coordinator"，支持 capability contract 派生
+    if frame.agent.role != "coordinator" or session.pending_plan is not None:
         return False
     return any(
         _is_complex_map_delegation_task(task)
@@ -1945,7 +2448,12 @@ def _requires_create_plan_before_map_delegate(
 def _append_map_write_protocol_errors(frame: Frame, calls: list[Any]) -> bool:
     """校验地图写工具单轮协议，失败时补工具错误并要求模型重试。"""
     write_calls = [call for call in calls if is_map_write_tool(call.name)]
-    if write_calls and frame.agent.name in {"coordinator", "map-agent"}:
+    # 本轮整改：用 role/map_stage 代替 name in {"coordinator","map-agent"}，
+    # 确保 capability contract 派生的 agent 也受此约束
+    if write_calls and (
+        frame.agent.role == "coordinator"
+        or frame.agent.map_stage == "orchestrator"
+    ):
         message = (
             "地图总控不得直接调用写工具或临时拼接地图块；请把已确认的规划批次委派给 "
             "write_one_batch worker。平台路线只能执行 validate_platform_level_plan "
@@ -2025,7 +2533,8 @@ def _append_reader_fallback_protocol_errors(
     calls: list[Any],
 ) -> bool:
     """reader 耗尽后阻止总控绕过专职 agent 重复读取同一批事实。"""
-    if frame.agent.name != "map-agent":
+    # 本轮整改：用 map_stage=="orchestrator" 代替 name=="map-agent"
+    if frame.agent.map_stage != "orchestrator":
         return False
     if session.map_task_state.context_state.get("reader_exhausted") is not True:
         return False
@@ -2055,15 +2564,14 @@ def _append_reader_fallback_protocol_errors(
     return True
 
 
-_MAP_VALIDATION_TOOL_NAMES = frozenset(
-    {"validate_map_region", "validate_layer_coverage", "validate_object_placements"}
-)
-_MAP_FOLLOWUP_AGENT_NAMES = frozenset({"map-validator-agent", "map-reviewer-agent"})
+# 本轮整改：改用 role 集合代替硬编码 agent name，使动态派生 agent 也能被识别
+_MAP_FOLLOWUP_AGENT_ROLES = frozenset({"map_validator", "map_reviewer"})
 
 
 def _has_pending_map_write_validation(session: Session) -> bool:
     """判断当前会话是否有写后必须验证的地图阻断。"""
-    for blocker in session.map_completion_blockers:
+    # 本轮整改：blockers 从 session 顶层迁移到 map_task_state 内部
+    for blocker in session.map_task_state.completion_blockers:
         reason = blocker.get("reason")
         if reason in {"map_write_requires_validation", "map_review_required"}:
             return True
@@ -2080,7 +2588,8 @@ def _map_validation_arg_error(session: Session, tool_name: str, args: dict[str, 
     progress_error = validation_call_error(session, tool_name, args)
     if progress_error is not None:
         return progress_error
-    for blocker in session.map_completion_blockers:
+    # 本轮整改：blockers 从 session 顶层迁移到 map_task_state 内部
+    for blocker in session.map_task_state.completion_blockers:
         raw_constraints = blocker.get("workflow_constraints", [])
         if not isinstance(raw_constraints, list):
             continue
@@ -2098,100 +2607,9 @@ def _map_validation_arg_error(session: Session, tool_name: str, args: dict[str, 
 
 def _uses_persistent_map_budget(frame: Frame) -> bool:
     """判断帧是否属于需要跨 HTTP 累计预算的地图工作流。"""
-    return frame.agent.name.startswith("map-") or bool(frame.agent.workflow_operations)
-
-
-_MAP_STAGE_TOOLS: dict[str, frozenset[str]] = {
-    "read": frozenset(
-        {
-            "delegate",
-            "delegate_many",
-            "describe_map_context",
-            "describe_map_region",
-            "describe_tilemap_selection",
-            "read_scene_tree",
-            "read_file",
-            "read_class_docs",
-            "read_image_metadata",
-            "capture_viewport_screenshot",
-            "query_spatial_index",
-            "convert_map_coords",
-            "load_skill",
-            "search_tools",
-        }
-    ),
-    "plan": frozenset(
-        {
-            "delegate",
-            "delegate_many",
-            "plan_map_layout",
-            "plan_map_algorithms",
-            "validate_platform_level_plan",
-            "plan_reachable_map_growth",
-            "compute_reachable_frontier",
-            "sample_poisson_points",
-            "sample_noise_grid",
-            "compose_map_blueprint_grammar",
-            "describe_map_region",
-            "query_spatial_index",
-            "find_placement_anchors",
-            "read_file",
-            "read_class_docs",
-            "capture_viewport_screenshot",
-            "load_skill",
-            "search_tools",
-        }
-    ),
-    "write": MAP_WRITE_TOOL_NAMES
-    | frozenset(
-        {
-            "describe_map_region",
-            "query_spatial_index",
-            "find_placement_anchors",
-            "read_file",
-            "load_skill",
-            "search_tools",
-        }
-    ),
-    "validate": frozenset(
-        {
-            "delegate",
-            "delegate_many",
-            "validate_map_region",
-            "validate_layer_coverage",
-            "validate_object_placements",
-            "describe_map_region",
-            "query_spatial_index",
-            "read_file",
-            "load_skill",
-            "search_tools",
-        }
-    ),
-    "diagnostic": frozenset(
-        {
-            "validate_map_region",
-            "describe_map_region",
-            "query_spatial_index",
-            "read_file",
-            "load_skill",
-        }
-    ),
-    "review": frozenset(
-        {
-            "delegate",
-            "delegate_many",
-            "capture_viewport_screenshot",
-            "describe_map_region",
-            "validate_map_region",
-            "validate_layer_coverage",
-            "validate_object_placements",
-            "read_scene_tree",
-            "read_image_metadata",
-            "save_scene",
-            "load_skill",
-        }
-    ),
-}
+    # 本轮整改：改用 pipeline_kind=="map" 声明式元数据，
+    # 替代 name.startswith("map-") 和 workflow_operations 的隐式判断
+    return frame.agent.pipeline_kind == "map"
 
 
 def _stage_effective_tools(session: Session, frame: Frame) -> list[str]:
@@ -2201,15 +2619,19 @@ def _stage_effective_tools(session: Session, frame: Frame) -> list[str]:
     if not _uses_persistent_map_budget(frame):
         return list(frame.agent.effective_tools)
     stage = session.map_task_state.stage
-    allowed = _MAP_STAGE_TOOLS.get(stage)
-    if allowed is None:
+    # 本轮整改：阶段→工具映射从内嵌 _MAP_STAGE_TOOLS 迁移到
+    # map_capabilities.map_tools_for_stage()，支持动态扩展
+    allowed = map_tools_for_stage(stage)
+    if not allowed:
         return list(frame.agent.effective_tools)
     return [name for name in frame.agent.effective_tools if name in allowed]
 
 
 def _latest_map_progress_revision(session: Session) -> int | None:
     """返回会话当前已知的最高地图 revision。"""
-    return max(session.latest_map_revisions.values(), default=None)
+    # 本轮整改：revisions 从 session.latest_map_revisions 迁移到
+    # map_task_state.latest_revisions，统一管理地图进度状态
+    return max(session.map_task_state.latest_revisions.values(), default=None)
 
 
 def _sync_map_progress_budget(session: Session, frame: Frame) -> None:
@@ -2248,8 +2670,10 @@ def _cached_map_region_summary(
         return None
     if not isinstance(layer, int) or isinstance(layer, bool):
         return None
-    current_revision = session.latest_map_revisions.get(target)
-    targets = session.map_context_state.get("targets", {})
+    # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
+    current_revision = latest_map_revision(session, target, layer)
+    # 本轮整改：context_state 从 session 顶层迁移到 map_task_state
+    targets = session.map_task_state.context_state.get("targets", {})
     target_state = targets.get(target, {}) if isinstance(targets, dict) else {}
     layers = target_state.get("layers", {}) if isinstance(target_state, dict) else {}
     layer_state = layers.get(str(layer), {}) if isinstance(layers, dict) else {}
@@ -2287,7 +2711,8 @@ def _resumed_full_map_read_error(session: Session, args: dict[str, Any]) -> str 
     layer = args.get("map_layer")
     if not isinstance(target, str) or not isinstance(layer, int):
         return None
-    targets = session.map_context_state.get("targets", {})
+    # 本轮整改：context_state 从 session 顶层迁移到 map_task_state
+    targets = session.map_task_state.context_state.get("targets", {})
     target_state = targets.get(target, {}) if isinstance(targets, dict) else {}
     layers = target_state.get("layers", {}) if isinstance(target_state, dict) else {}
     layer_state = layers.get(str(layer), {}) if isinstance(layers, dict) else {}
@@ -2327,15 +2752,16 @@ def _is_delegate_map_followup(tool_name: str, args: dict[str, Any]) -> bool:
     for item in task_items:
         worker_spec = item.get("worker_spec")
         if isinstance(worker_spec, dict):
-            if worker_spec.get("mode") != "review_only":
-                return False
-            allowed_tools = worker_spec.get("allowed_tools")
-            if isinstance(allowed_tools, list) and any(
-                tool_name in _MAP_VALIDATION_TOOL_NAMES for tool_name in allowed_tools
-            ):
+            # 本轮整改：简化 worker_spec 判断——只有 review_only 模式才属于 followup
+            if worker_spec.get("mode") == "review_only":
                 continue
             return False
-        if item.get("agent") not in _MAP_FOLLOWUP_AGENT_NAMES:
+        # 本轮整改：用 _agent_name_has_role 解析 role 代替硬编码 agent name
+        agent_name = item.get("agent")
+        if not any(
+            _agent_name_has_role(agent_name, role)
+            for role in _MAP_FOLLOWUP_AGENT_ROLES
+        ):
             return False
     return True
 
@@ -2349,7 +2775,7 @@ def _append_map_write_followup_protocol_errors(
     if not _has_pending_map_write_validation(session):
         return False
     for call in calls:
-        if call.name in _MAP_VALIDATION_TOOL_NAMES:
+        if call.name in MAP_VALIDATION_TOOL_NAMES:
             args, parse_error = _load_tool_args(call.id, call.arguments, call.name)
             if parse_error is not None:
                 frame.messages.append(parse_error)
@@ -2375,8 +2801,12 @@ def _append_map_write_followup_protocol_errors(
             frame.agent.name,
             call.name,
         )
-        allowed_tools = sorted(set(frame.agent.effective_tools) & set(_MAP_VALIDATION_TOOL_NAMES))
-        blocker = session.map_completion_blockers[0] if session.map_completion_blockers else {}
+        allowed_tools = sorted(set(frame.agent.effective_tools) & set(MAP_VALIDATION_TOOL_NAMES))
+        blocker = (
+            session.map_task_state.completion_blockers[0]
+            if session.map_task_state.completion_blockers
+            else {}
+        )
         target = str(blocker.get("target", ""))
         revision = blocker.get("required_revision")
         next_action = (
@@ -2413,18 +2843,45 @@ def _with_map_write_metadata(
     tool_name: str,
     args: dict[str, Any],
 ) -> dict[str, Any]:
-    """给地图写工具入参补充服务端掌握的批次来源字段。"""
-    if not is_map_write_tool(tool_name):
-        return args
+    """补充服务端掌握的地图写组与验证事务元数据。"""
     enriched = dict(args)
+    if tool_name in MAP_VALIDATION_TOOL_NAMES:
+        target_path = str(enriched.get("target_path", "")).strip()
+        candidates = [
+            item
+            for item in session.map_task_state.transaction_journals
+            if item.get("status") == "prepared"
+            and (
+                not target_path
+                or str(item.get("target", "")).strip() == target_path
+            )
+        ]
+        if candidates:
+            active = candidates[-1]
+            enriched.setdefault(
+                "map_transaction_id", str(active.get("transaction_id", ""))
+            )
+            enriched.setdefault(
+                "map_transaction_revision", active.get("final_revision")
+            )
+            enriched.setdefault(
+                "map_transaction_target", str(active.get("target", ""))
+            )
+        return enriched
+    if not is_map_write_tool(tool_name):
+        return enriched
     target_path = str(enriched.get("target_path", ""))
-    latest_revision = session.latest_map_revisions.get(target_path)
+    # 本轮整改：revision 查询改为图层感知，传入 map_layer 避免跨图层冲突
+    layer = enriched.get("map_layer")
+    map_layer = layer if isinstance(layer, int) and not isinstance(layer, bool) else None
+    latest_revision = latest_map_revision(session, target_path, map_layer)
     supplied_revision = enriched.get("expected_revision")
     supplied_revision_is_int = isinstance(supplied_revision, int) and not isinstance(
         supplied_revision, bool
     )
     if latest_revision is not None and (
-        not supplied_revision_is_int or latest_revision > supplied_revision
+        not supplied_revision_is_int
+        or latest_revision > int(supplied_revision)
     ):
         logger.info(
             "Overriding stale map expected_revision session=%s frame=%s tool=%s target=%s supplied=%s latest=%s",
@@ -2436,7 +2893,8 @@ def _with_map_write_metadata(
             latest_revision,
         )
         enriched["expected_revision"] = latest_revision
-    latest_layer = session.latest_map_layers.get(target_path)
+    # 本轮整改：latest_layers 从 session 顶层迁移到 map_task_state
+    latest_layer = session.map_task_state.latest_layers.get(target_path)
     if latest_layer is not None and "map_layer" not in enriched:
         logger.info(
             "Filling missing map_layer session=%s frame=%s tool=%s target=%s map_layer=%s",
@@ -2448,6 +2906,27 @@ def _with_map_write_metadata(
         )
         enriched["map_layer"] = latest_layer
     enriched.setdefault("write_batch_id", f"b-{call_id}")
+    if (
+        isinstance(enriched.get("plan_version"), int)
+        and not isinstance(enriched.get("plan_version"), bool)
+    ):
+        transaction_seed = ":".join(
+            (
+                session.session_id,
+                frame.id,
+                str(enriched["plan_version"]),
+                target_path,
+            )
+        )
+        enriched.setdefault(
+            "map_transaction_id",
+            "mtx-" + hashlib.sha256(transaction_seed.encode("utf-8")).hexdigest()[:24],
+        )
+        enriched.setdefault("map_transaction_mode", "approved_write_group")
+        enriched.setdefault("map_transaction_base_revision", enriched.get("expected_revision"))
+        enriched.setdefault("map_transaction_validator", "validate_map_region")
+    else:
+        enriched.setdefault("map_transaction_mode", "single_tool")
     enriched.setdefault("worker", frame.agent.name)
     enriched.setdefault("mode", "write_one_batch")
     enriched.setdefault("frame_id", frame.id)
@@ -2477,7 +2956,7 @@ def _normalize_plan_steps(raw_steps: Any) -> list[dict[str, Any]] | str:
     if not isinstance(raw_steps, list) or not raw_steps:
         return "create_plan.steps 不能为空"
     normalized: list[dict[str, Any]] = []
-    for raw in raw_steps:
+    for index, raw in enumerate(raw_steps):
         if not isinstance(raw, dict):
             return "create_plan.steps 的每一项必须是 object"
         title = raw.get("title")
@@ -2493,23 +2972,43 @@ def _normalize_plan_steps(raw_steps: Any) -> list[dict[str, Any]] | str:
             get_agent(agent_name, set(REGISTRY))
         except KeyError:
             return f"未知子 agent：{agent_name}"
-        depends_on = raw.get("depends_on")
-        if depends_on is not None and not (
-            isinstance(depends_on, list) and all(isinstance(value, int) for value in depends_on)
-        ):
-            return "create_plan.steps[].depends_on 必须是整数数组"
         complexity = raw.get("estimated_complexity")
         if complexity is not None and complexity not in _PLAN_COMPLEXITY_LEVELS:
             return "create_plan.steps[].estimated_complexity 取值必须是 low/medium/high"
         normalized.append(
             {
+                "id": str(raw.get("id", raw.get("step_id", f"step-{index + 1}"))).strip(),
                 "title": title.strip(),
                 "agent": agent_name.strip(),
                 "task": task.strip(),
-                "depends_on": depends_on or [],
+                "depends_on": [
+                    str(item).strip()
+                    for item in raw.get("depends_on", [])
+                    if isinstance(item, str) and item.strip()
+                ],
+                "input_bindings": [
+                    dict(item)
+                    for item in raw.get("input_bindings", [])
+                    if isinstance(item, dict)
+                ],
+                "expected_result_schema": (
+                    dict(raw["expected_result_schema"])
+                    if isinstance(raw.get("expected_result_schema"), dict)
+                    else None
+                ),
+                "worker_spec": (
+                    dict(raw["worker_spec"])
+                    if isinstance(raw.get("worker_spec"), dict)
+                    else None
+                ),
                 "estimated_complexity": complexity,
             }
         )
+    try:
+        graph = PlanGraph.from_dict({"summary": "", "steps": normalized})
+    except PlanGraphError as exc:
+        return f"create_plan.steps 依赖图不合法：{exc}"
+    normalized = [step.to_dict() for step in graph.steps]
     return normalized
 
 
@@ -2556,12 +3055,22 @@ def _handle_create_plan(
         frame.messages.append(_tool_message(call_id, steps, is_error=True))
         return
 
-    session.pending_plan = {
-        "summary": summary.strip(),
-        "steps": steps,
-        "next_step_index": 0,
-        "frame_steps": {},
-    }
+    try:
+        graph = PlanGraph.from_dict(
+            {
+                "summary": summary.strip(),
+                "steps": steps,
+            }
+        )
+    except PlanGraphError as exc:
+        frame.messages.append(
+            _tool_message(call_id, f"create_plan 依赖图不合法：{exc}", is_error=True)
+        )
+        return
+    session.pending_plan = graph.to_dict()
+    session.pending_plan["owner_frame_id"] = frame.id
+    session.pending_plan["request_lineage_id"] = frame.map_request_lineage_id or ""
+    session.pending_plan["map_task_id"] = frame.map_task_id or ""
     logger.info(
         "Plan created session=%s frame=%s steps=%d",
         session.session_id,
@@ -2579,18 +3088,19 @@ def _handle_create_plan(
             "summary": session.pending_plan["summary"],
             "steps": [
                 {
-                    "index": index + 1,
-                    "title": step["title"],
-                    "agent": step["agent"],
-                    "task": step["task"],
-                    "depends_on": step["depends_on"],
-                    "estimated_complexity": step["estimated_complexity"],
+                    "id": step.step_id,
+                    "index": step.order + 1,
+                    "title": step.title,
+                    "agent": step.agent,
+                    "task": step.task,
+                    "depends_on": list(step.depends_on),
+                    "estimated_complexity": step.estimated_complexity,
                 }
-                for index, step in enumerate(steps)
+                for step in graph.steps
             ],
         },
     )
-    tasks = [{"agent": step["agent"], "task": step["task"]} for step in steps]
+    tasks = [graph.task_payload(step.step_id) for step in graph.steps]
     frame.messages.append(
         _tool_message(
             call_id,
@@ -2642,7 +3152,8 @@ async def _start_delegate_frame(
             _tool_message(call_id, "当前 agent 不允许委派子 agent", is_error=True)
         )
         return False
-    if has_worker_spec and frame.agent.name != "map-agent":
+    # 本轮整改：用 map_stage=="orchestrator" 代替 name=="map-agent"
+    if has_worker_spec and frame.agent.map_stage != "orchestrator":
         logger.warning(
             "Delegate rejected: dynamic worker parent is not map-agent session=%s frame=%s agent=%s",
             session.session_id,
@@ -2748,8 +3259,8 @@ async def _start_delegate_group(
         )
         return False
 
-    tasks = [task for task in raw_tasks if isinstance(task, dict)]
-    if not tasks:
+    submitted_tasks = [task for task in raw_tasks if isinstance(task, dict)]
+    if not submitted_tasks:
         logger.warning(
             "Delegate_many rejected: invalid tasks session=%s frame=%s",
             session.session_id,
@@ -2759,9 +3270,98 @@ async def _start_delegate_group(
             _tool_message(call_id, "delegate_many.tasks 格式不合法", is_error=True)
         )
         return False
-    first = tasks.pop(0)
-    if any(isinstance(task.get("worker_spec"), dict) for task in [first, *tasks]):
-        if frame.agent.name != "map-agent":
+    plan_driven = (
+        session.pending_plan is not None
+        and session.pending_plan.get("owner_frame_id") == frame.id
+    )
+    plan_step_id: str | None = None
+    if plan_driven:
+        try:
+            graph = PlanGraph.from_dict(session.pending_plan or {})
+        except PlanGraphError as exc:
+            frame.messages.append(
+                _tool_message(call_id, f"当前计划无法恢复：{exc}", is_error=True)
+            )
+            return False
+        runnable = graph.runnable_steps()
+        if not runnable:
+            frame.messages.append(
+                _tool_message(
+                    call_id,
+                    "当前计划没有可运行步骤；请检查前置步骤终态",
+                    is_error=True,
+                )
+            )
+            return False
+        first_step = runnable[0]
+        plan_step_id = first_step.step_id
+        first = graph.task_payload(first_step.step_id)
+        tasks: list[dict[str, Any]] = []
+        contract_tasks = [
+            {
+                "agent": step.agent,
+                "task": step.task,
+                "worker_spec": step.worker_spec,
+            }
+            for step in graph.steps
+            if step.status == "pending"
+        ]
+    else:
+        raw_group_steps = [
+            {
+                "id": str(
+                    task.get(
+                        "plan_step_id",
+                        task.get("id", f"{call_id}-step-{index + 1}"),
+                    )
+                ),
+                "title": str(task.get("title", task.get("task", "")))[:120],
+                "agent": task.get("agent"),
+                "task": task.get("task"),
+                "depends_on": task.get("depends_on", []),
+                "input_bindings": task.get("input_bindings", []),
+                "expected_result_schema": task.get("expected_result_schema"),
+                "worker_spec": task.get("worker_spec"),
+            }
+            for index, task in enumerate(submitted_tasks)
+        ]
+        try:
+            group_graph = PlanGraph.from_dict(
+                {
+                    "summary": f"delegate_many:{call_id}",
+                    "steps": raw_group_steps,
+                }
+            )
+        except PlanGraphError as exc:
+            frame.messages.append(
+                _tool_message(
+                    call_id,
+                    f"delegate_many 依赖图不合法：{exc}",
+                    is_error=True,
+                )
+            )
+            return False
+        runnable = group_graph.runnable_steps()
+        if not runnable:
+            frame.messages.append(
+                _tool_message(call_id, "delegate_many 没有可运行根步骤", is_error=True)
+            )
+            return False
+        first_step = runnable[0]
+        plan_step_id = first_step.step_id
+        first = group_graph.task_payload(first_step.step_id)
+        tasks = []
+        contract_tasks = [
+            {
+                "agent": step.agent,
+                "task": step.task,
+                "worker_spec": step.worker_spec,
+            }
+            for step in group_graph.steps
+        ]
+    if any(isinstance(task.get("worker_spec"), dict) for task in contract_tasks):
+        # 本轮整改：用 map_stage=="orchestrator" 代替 name=="map-agent"
+        if frame.agent.map_stage != "orchestrator":
             logger.warning(
                 "Delegate_many rejected: dynamic worker parent is not map-agent session=%s frame=%s agent=%s",
                 session.session_id,
@@ -2774,7 +3374,7 @@ async def _start_delegate_group(
             return False
         write_workers = [
             task
-            for task in [first, *tasks]
+            for task in contract_tasks
             if isinstance(task.get("worker_spec"), dict)
             and is_map_worker_write_mode(task["worker_spec"].get("mode"))
         ]
@@ -2797,9 +3397,15 @@ async def _start_delegate_group(
     session.delegate_groups[group_id] = {
         "parent_frame_id": frame.id,
         "tool_call_id": call_id,
+        "request_lineage_id": frame.map_request_lineage_id or "",
+        "map_task_id": frame.map_task_id or "",
         "remaining": tasks,
         "results": [],
         "depth": frame.depth + 1,
+        "plan_driven": plan_driven,
+        "scheduler_plan": (
+            None if plan_driven else group_graph.to_dict()
+        ),
     }
     child = await _delegate_child_frame(
         session=session,
@@ -2812,6 +3418,16 @@ async def _start_delegate_group(
     )
     if isinstance(child, str):
         session.delegate_groups.pop(group_id, None)
+        if plan_driven and session.pending_plan is not None and plan_step_id is not None:
+            active_graph = PlanGraph.from_dict(session.pending_plan)
+            failed_graph = active_graph.fail_unstarted(
+                plan_step_id,
+                "child_frame_creation_failed",
+            )
+            session.pending_plan = _with_plan_runtime_metadata(
+                failed_graph.to_dict(),
+                session.pending_plan,
+            )
         logger.warning(
             "Delegate_many rejected: invalid first task session=%s frame=%s error=%s",
             session.session_id,
@@ -2822,6 +3438,16 @@ async def _start_delegate_group(
         return False
     if child is None:
         session.delegate_groups.pop(group_id, None)
+        if plan_driven and session.pending_plan is not None and plan_step_id is not None:
+            active_graph = PlanGraph.from_dict(session.pending_plan)
+            failed_graph = active_graph.fail_unstarted(
+                plan_step_id,
+                "invalid_delegate_task",
+            )
+            session.pending_plan = _with_plan_runtime_metadata(
+                failed_graph.to_dict(),
+                session.pending_plan,
+            )
         logger.warning(
             "Delegate_many rejected: invalid first task session=%s frame=%s",
             session.session_id,
@@ -2832,7 +3458,15 @@ async def _start_delegate_group(
         )
         return False
     session.agent_stack.append(child)
-    _plan_step_started(session, child, event_callback)
+    if plan_driven:
+        _plan_step_started(session, child, event_callback, plan_step_id)
+    else:
+        group = session.delegate_groups[group_id]
+        group_graph = PlanGraph.from_dict(group["scheduler_plan"])
+        group["scheduler_plan"] = group_graph.start(
+            str(plan_step_id),
+            child.id,
+        ).to_dict()
     logger.info(
         "Delegate_many group started session=%s group_id=%s parent_frame=%s child_frame=%s total_tasks=%d",
         session.session_id,
@@ -3202,6 +3836,13 @@ async def run_turn(
         或 `ErrorResult`（LLM 调用失败/达到轮数上限）。
     """
     logger.info("Agent run_turn start session=%s max_turns=%d", session.session_id, max_turns)
+    # 本轮整改：每次 run_turn 创建独立的 artifact store 实例，
+    # 地图子 worker 完整结果落盘后父帧只保留摘要 + artifact_ref，
+    # 大幅减少上下文膨胀。生命周期与 run_turn 一致，HTTP 请求结束后自动 GC。
+    delegate_artifact_store = DelegateArtifactStore(
+        tool_ctx.security.project_root,
+        session.session_id,
+    )
     frame_turns: dict[str, int] = {}  # 非地图帧仍只统计本次 run_turn 的轮数
     # frame_id -> 其中单独计入 edit_map_max_turns 预算的轮数（tool_calls 仅含 edit_map 时）
     frame_edit_map_turns: dict[str, int] = {}
@@ -3225,6 +3866,7 @@ async def run_turn(
                 forced_text,
                 agent_prompt_factory,
                 event_callback,
+                delegate_artifact_store,
             )
             if forced_result is not None:
                 return forced_result
@@ -3242,11 +3884,22 @@ async def run_turn(
                     {
                         "frame_id": frame.id,
                         "reason": session.map_task_state.pause_reason,
+                        "pause_report": session.map_task_state.pause_report,
                         "checkpoint": session.map_task_state.checkpoint or {},
                         "counters": session.map_task_state.counters.__dict__,
                     },
                 )
-                return ErrorResult(text=f"地图任务因连续无进展已暂停。恢复检查点：{checkpoint}")
+                pause_report = json.dumps(
+                    session.map_task_state.pause_report,
+                    ensure_ascii=False,
+                    default=str,
+                )
+                return ErrorResult(
+                    text=(
+                        "地图任务因连续无进展已暂停。"
+                        f"根因与恢复建议：{pause_report}；恢复检查点：{checkpoint}"
+                    )
+                )
             _sync_map_progress_budget(session, frame)
             session.map_task_state.counters.llm_turns += 1
         used = (
@@ -3257,7 +3910,13 @@ async def run_turn(
         total_budget = frame.agent.max_turns + (frame.agent.edit_map_max_turns or 0)
         if used >= total_budget:
             result = await _handle_frame_turns_exhausted(
-                session, frame, "总轮数", total_budget, agent_prompt_factory, event_callback
+                session,
+                frame,
+                "总轮数",
+                total_budget,
+                agent_prompt_factory,
+                event_callback,
+                delegate_artifact_store,
             )
             if result is not None:
                 return result
@@ -3363,7 +4022,11 @@ async def run_turn(
 
         if not turn.tool_calls:
             finish_result = await _finish_frame(
-                session, turn.content or "", agent_prompt_factory, event_callback
+                session,
+                turn.content or "",
+                agent_prompt_factory,
+                event_callback,
+                delegate_artifact_store,
             )
             if finish_result is not None:
                 logger.info(
@@ -3419,6 +4082,7 @@ async def run_turn(
                     frame.agent.edit_map_max_turns,
                     agent_prompt_factory,
                     event_callback,
+                    delegate_artifact_store,
                 )
                 if result is not None:
                     return result
@@ -3443,6 +4107,7 @@ async def run_turn(
                     frame.agent.max_turns,
                     agent_prompt_factory,
                     event_callback,
+                    delegate_artifact_store,
                 )
                 if result is not None:
                     return result
@@ -3767,7 +4432,7 @@ async def run_turn(
                         )
                     )
                     continue
-            if tool.name in _MAP_VALIDATION_TOOL_NAMES:
+            if tool.name in MAP_VALIDATION_TOOL_NAMES:
                 cached_validation = cached_validation_result(session, tool.name, args)
                 if cached_validation is not None:
                     logger.info(
@@ -3804,7 +4469,13 @@ async def run_turn(
                     )
                     continue
             if tool.name in MAP_WRITE_TOOL_NAMES:
-                stage_error = map_write_stage_error(session, tool.name, args)
+                stage_error = (
+                    None
+                    if _frame_in_active_map_edit(session, frame)
+                    else "当前用户请求未显式授权地图内容编辑，地图写工具已拒绝"
+                )
+                if stage_error is None:
+                    stage_error = map_write_stage_error(session, tool.name, args)
                 if stage_error is not None:
                     logger.warning(
                         "Map write blocked by progress stage session=%s frame=%s tool=%s error=%s",
@@ -3869,6 +4540,8 @@ async def run_turn(
             workflow_stage=(
                 session.map_task_state.stage if _uses_persistent_map_budget(frame) else None
             ),
+            agent_role=frame.agent.role,
+            worker_mode=frame.agent.worker_mode,
         )
         server_calls = [item for item in pending_items if isinstance(item, _PendingServerCall)]
         concurrent_calls = [item for item in server_calls if item.tool.is_concurrency_safe]
@@ -3988,7 +4661,8 @@ async def run_turn(
             frame.messages.append(_tool_message(item.call_id, result, is_error=is_error))
 
         if (
-            frame.agent.name == "map-reader-agent"
+            # 本轮整改：用 map_stage=="reader" 代替 name=="map-reader-agent"
+            frame.agent.map_stage == "reader"
             and frame.map_reader_detailed_region_ready
             and not frame.force_text_only
         ):
@@ -4023,11 +4697,14 @@ async def run_turn(
             ):
                 state = session.map_task_state
                 state.plan_version = max(1, state.plan_version)
-                state.pending_batches.clear()
                 for batch_index, call in enumerate(front_calls):
                     call.input.setdefault("plan_version", state.plan_version)
                     call.input.setdefault("batch_index", batch_index)
-                state.pending_batches.extend(_queued_front_call(call) for call in front_calls[1:])
+                replace_map_state_field(
+                    state,
+                    "pending_batches",
+                    [_queued_front_call(call) for call in front_calls[1:]],
+                )
                 front_calls = front_calls[:1]
                 assistant_message = frame.messages[-1] if frame.messages else {}
                 raw_tool_calls = assistant_message.get("tool_calls")
@@ -4060,6 +4737,9 @@ async def run_turn(
                         "input": c.input,
                         "frame_id": c.frame_id,
                         "agent": c.agent,
+                        # 本轮整改：持久化 needs_confirm 标志，
+                        # 前端恢复时可据此区分自动执行与需用户确认的调用
+                        "needs_confirm": c.needs_confirm,
                     }
                     for c in front_calls
                 },

@@ -9,12 +9,11 @@ from __future__ import annotations
 
 from typing import Any
 
+# 从 map_workers 引入：
+# - MAP_TARGET_REQUIRED_TOOL_NAMES：必须显式传 target_path 的地图写工具集合
+# - requires_map_revision：判断工具是否需要携带 expected_revision 版本号（防并发覆盖）
+from app.orchestrator.map_workers import MAP_TARGET_REQUIRED_TOOL_NAMES, requires_map_revision
 from app.tools.registry import ToolDef, register as _register_tool
-
-_MAP_TARGET_OPTIONAL_TOOLS = frozenset(
-    {"compact_spatial_index", "write_resource_registry", "ensure_standard_map_layers"}
-)
-
 
 def _object_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
     return {
@@ -41,7 +40,6 @@ def _worker_spec_schema() -> dict[str, Any]:
                     "repair_write_one_batch",
                 ],
             },
-            "allowed_tools": {"type": "array", "items": {"type": "string"}},
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -61,10 +59,29 @@ def _worker_spec_schema() -> dict[str, Any]:
                 ),
             },
             "output_schema": {"type": "string", "enum": ["map_worker_result_v1"]},
+            "approved_batch": {
+                "type": "object",
+                "description": (
+                    "Required for write modes; immutable planner/validator artifact identity "
+                    "for the exact target and revision."
+                ),
+                "properties": {
+                    "artifact_ref": {"type": "string"},
+                    "batch_id": {"type": "string"},
+                    "target_path": {"type": "string"},
+                    "map_revision": {"type": "integer"},
+                },
+                "required": [
+                    "artifact_ref",
+                    "batch_id",
+                    "target_path",
+                    "map_revision",
+                ],
+            },
             "stage_id": {"type": "string"},
             "max_turns": {"type": "integer", "minimum": 1, "maximum": 12},
         },
-        ["name", "objective", "mode", "allowed_tools", "operations", "output_schema"],
+        ["name", "objective", "mode", "operations", "output_schema"],
     )
 
 
@@ -74,7 +91,9 @@ def register(tool: ToolDef) -> None:
         parameters = tool.schema.get("parameters")
         if isinstance(parameters, dict):
             properties = parameters.setdefault("properties", {})
-            if isinstance(properties, dict):
+            # 仅对需要地图版本守卫的写工具注入 expected_revision / plan_version 等字段，
+            # 避免给只读或无需版本控制的工具添加多余参数
+            if isinstance(properties, dict) and requires_map_revision(tool.name):
                 properties.setdefault(
                     "expected_revision",
                     {
@@ -109,11 +128,18 @@ def register(tool: ToolDef) -> None:
                     },
                 )
             required = parameters.setdefault("required", [])
-            if isinstance(required, list) and "expected_revision" not in required:
-                required.append("expected_revision")
+            # 同上：只有需要版本守卫的工具才把 expected_revision 加入必填
             if (
                 isinstance(required, list)
-                and tool.name not in _MAP_TARGET_OPTIONAL_TOOLS
+                and requires_map_revision(tool.name)
+                and "expected_revision" not in required
+            ):
+                required.append("expected_revision")
+            # 只有明确要求 target_path 的写工具才把 target_path 加入必填，
+            # 防止地图写入时静默使用隐式选中的地图
+            if (
+                isinstance(required, list)
+                and tool.name in MAP_TARGET_REQUIRED_TOOL_NAMES
                 and isinstance(properties, dict)
                 and "target_path" in properties
                 and "target_path" not in required
@@ -153,7 +179,7 @@ def register_front_tools() -> None:
                                 "Optional dynamic map worker spec. Only map-agent may use this. "
                                 "Use agent=map-worker (or legacy agent=map-agent) with this field; "
                                 "do not combine it with a permanent specialist agent name. "
-                                "Fields include name, objective, mode, allowed_tools, operations, constraints, "
+                                "Fields include name, objective, mode, operations, constraints, "
                                 "skills, output_schema, stage_id, max_turns."
                             ),
                             **_worker_spec_schema(),
@@ -179,6 +205,8 @@ def register_front_tools() -> None:
                     "The service executes them as isolated child frames and returns one combined result. "
                     "Must be the only tool call in the assistant turn."
                 ),
+                # 子任务按数组顺序逐条执行（非并行），每条在独立 child frame 中运行；
+                # 前一条失败时后续任务仍会继续，最终合并返回。
                 "parameters": _object_schema(
                     {
                         "tasks": {
@@ -188,6 +216,29 @@ def register_front_tools() -> None:
                                 {
                                     "agent": {"type": "string"},
                                     "task": {"type": "string"},
+                                    "plan_step_id": {
+                                        "type": "string",
+                                        "description": "Stable id returned by create_plan.",
+                                    },
+                                    "scheduler_inputs": {
+                                        "type": "object",
+                                        "description": (
+                                            "Typed predecessor outputs bound by the scheduler. "
+                                            "Callers must not synthesize this field."
+                                        ),
+                                    },
+                                    "depends_on": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Predecessor task ids interpreted only by the scheduler.",
+                                    },
+                                    "input_bindings": {
+                                        "type": "array",
+                                        "items": {"type": "object"},
+                                    },
+                                    "expected_result_schema": {
+                                        "type": "object",
+                                    },
                                     "worker_spec": {
                                         "description": "Optional dynamic map worker spec, allowed only for map-agent tasks.",
                                         **_worker_spec_schema(),
@@ -229,6 +280,13 @@ def register_front_tools() -> None:
                             "description": "Ordered list of plan steps.",
                             "items": _object_schema(
                                 {
+                                    "id": {
+                                        "type": "string",
+                                        "description": (
+                                            "Optional stable step id; omitted ids are assigned "
+                                            "deterministically as step-N."
+                                        ),
+                                    },
                                     "title": {"type": "string", "description": "Short step title."},
                                     "agent": {
                                         "type": "string",
@@ -242,15 +300,36 @@ def register_front_tools() -> None:
                                             "shown directly to the user."
                                         ),
                                     },
-                                    "depends_on": {
-                                        "type": "array",
-                                        "items": {"type": "integer"},
-                                        "description": "Optional 1-based indices of steps this step depends on.",
-                                    },
                                     "estimated_complexity": {
                                         "type": "string",
                                         "enum": ["low", "medium", "high"],
                                         "description": "Optional estimated complexity for this step.",
+                                    },
+                                    "depends_on": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Stable predecessor step ids.",
+                                    },
+                                    "input_bindings": {
+                                        "type": "array",
+                                        "description": (
+                                            "Typed bindings from predecessor results into this step."
+                                        ),
+                                        "items": _object_schema(
+                                            {
+                                                "name": {"type": "string"},
+                                                "source_step_id": {"type": "string"},
+                                                "source_path": {"type": "string"},
+                                                "required": {"type": "boolean"},
+                                            },
+                                            ["name", "source_step_id"],
+                                        ),
+                                    },
+                                    "expected_result_schema": {
+                                        "type": "object",
+                                        "description": (
+                                            "JSON-schema fragment used to validate the terminal result."
+                                        ),
                                     },
                                 },
                                 ["title", "agent", "task"],
@@ -2102,6 +2181,10 @@ def register_front_tools() -> None:
                                     "type": {"type": "string"},
                                     "from_platform": {"type": "string"},
                                     "to_platform": {"type": "string"},
+                                    "direction": {
+                                        "type": "integer",
+                                        "enum": [-1, 0, 1],
+                                    },
                                     "start": {
                                         "type": "object",
                                         "properties": {
@@ -2119,7 +2202,15 @@ def register_front_tools() -> None:
                                     "difficulty": {"type": "integer", "minimum": 0},
                                     "note": {"type": "string"},
                                 },
-                                "required": ["type"],
+                                "required": [
+                                    "index",
+                                    "type",
+                                    "from_platform",
+                                    "to_platform",
+                                    "direction",
+                                    "start",
+                                    "end",
+                                ],
                             },
                         },
                         "coin_arcs": {
@@ -2179,6 +2270,29 @@ def register_front_tools() -> None:
                             "minimum": 2,
                             "description": "Minimum safe landing platform width in cells.",
                         },
+                        "actor_clearance_cells": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Actor collision height in map cells. Required so jump arcs and "
+                                "landing headroom are checked against real occupied cells."
+                            ),
+                        },
+                        "actor_width_cells": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Actor collision width in map cells, measured from the "
+                                "real CollisionShape2D."
+                            ),
+                        },
+                        "collision_facts_artifact": {
+                            "type": "object",
+                            "description": (
+                                "Optional reader artifact bound to target, layer, revision, "
+                                "region and digest. Raw collision-cell dictionaries are rejected."
+                            ),
+                        },
                         "platform_thickness": {
                             "type": "integer",
                             "minimum": 1,
@@ -2228,6 +2342,8 @@ def register_front_tools() -> None:
                             "description": "Fallback resource key for emitted platform fill drafts.",
                         },
                     },
+                    # 必填字段：包含平台约束（max_horizontal_gap/max_rise/max_fall/min_landing_width）
+                    # 和角色碰撞高度（actor_clearance_cells），确保生成的关卡在物理上可达
                     [
                         "x",
                         "y",
@@ -2235,6 +2351,12 @@ def register_front_tools() -> None:
                         "height",
                         "platforms",
                         "segments",
+                        "max_horizontal_gap",
+                        "max_rise",
+                        "max_fall",
+                        "min_landing_width",
+                        "actor_clearance_cells",
+                        "actor_width_cells",
                         "movement_model",
                         "cell_occupancy",
                         "requires_support",
@@ -2308,10 +2430,36 @@ def register_front_tools() -> None:
                                     "type": {"type": "string"},
                                     "from_platform": {"type": "string"},
                                     "to_platform": {"type": "string"},
+                                    "direction": {
+                                        "type": "integer",
+                                        "enum": [-1, 0, 1],
+                                    },
+                                    "start": {
+                                        "type": "object",
+                                        "properties": {
+                                            "x": {"type": "integer"},
+                                            "y": {"type": "integer"},
+                                        },
+                                    },
+                                    "end": {
+                                        "type": "object",
+                                        "properties": {
+                                            "x": {"type": "integer"},
+                                            "y": {"type": "integer"},
+                                        },
+                                    },
                                     "difficulty": {"type": "integer", "minimum": 0},
                                     "note": {"type": "string"},
                                 },
-                                "required": ["type"],
+                                "required": [
+                                    "index",
+                                    "type",
+                                    "from_platform",
+                                    "to_platform",
+                                    "direction",
+                                    "start",
+                                    "end",
+                                ],
                             },
                         },
                         "coin_arcs": {
@@ -2389,6 +2537,9 @@ def register_front_tools() -> None:
                         "planning_contract": {"type": "object"},
                         "max_returned_cells": {"type": "integer", "minimum": 1},
                         "min_landing_width": {"type": "integer", "minimum": 2},
+                        "actor_clearance_cells": {"type": "integer", "minimum": 1},
+                        "actor_width_cells": {"type": "integer", "minimum": 1},
+                        "collision_facts_artifact": {"type": "object"},
                         "max_platform_thickness": {"type": "integer", "minimum": 1},
                         "max_platform_width": {"type": "integer", "minimum": 5},
                         "min_finish_buffer_width": {"type": "integer", "minimum": 4},
@@ -3569,6 +3720,22 @@ def register_front_tools() -> None:
                             "minimum": 0,
                             "description": "leap: max cells the character may drop and still be considered a valid reach (falling is usually generous).",
                         },
+                        "actor_clearance_cells": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "leap: actor collision height in cells; every sampled jump arc "
+                                "and landing cell must have this much clearance."
+                            ),
+                        },
+                        "actor_width_cells": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "leap: actor collision width in cells; takeoff, every "
+                                "sampled footprint, and landing support must fit."
+                            ),
+                        },
                         "max_step": {
                             "type": "integer",
                             "minimum": 1,
@@ -4071,78 +4238,6 @@ def register_front_tools() -> None:
                         },
                     },
                     [],
-                ),
-            },
-        )
-    )
-    register(
-        ToolDef(
-            name="fill_rect",
-            domain="map",
-            side="front",
-            writes_project=True,
-            needs_preview=True,
-            render_kind="map",
-            schema={
-                "name": "fill_rect",
-                "description": "Fill a rectangle in the selected TileMapLayer after user confirmation.",
-                "parameters": _object_schema(
-                    {
-                        "x": {"type": "integer"},
-                        "y": {"type": "integer"},
-                        "width": {"type": "integer"},
-                        "height": {"type": "integer"},
-                        "source_id": {"type": "integer"},
-                        "atlas_x": {"type": "integer"},
-                        "atlas_y": {"type": "integer"},
-                    },
-                    ["x", "y", "width", "height", "source_id", "atlas_x", "atlas_y"],
-                ),
-            },
-        )
-    )
-    register(
-        ToolDef(
-            name="paint_from_image_grid",
-            domain="map",
-            side="front",
-            reads_project=True,
-            writes_project=True,
-            needs_preview=True,
-            render_kind="map",
-            read_path_args=["image_path"],
-            schema={
-                "name": "paint_from_image_grid",
-                "description": (
-                    "Convert an image or sketch into a bounded TileMap cell grid using a color palette. "
-                    "Requires a selected TileMapLayer and user confirmation."
-                ),
-                "parameters": _object_schema(
-                    {
-                        "image_path": {
-                            "type": "string",
-                            "description": "Relative or res:// image path.",
-                        },
-                        "origin_x": {"type": "integer"},
-                        "origin_y": {"type": "integer"},
-                        "max_width": {"type": "integer"},
-                        "max_height": {"type": "integer"},
-                        "palette": {
-                            "type": "array",
-                            "description": "Color-to-tile mappings with hex/source_id/atlas_x/atlas_y.",
-                            "items": _object_schema(
-                                {
-                                    "hex": {"type": "string"},
-                                    "source_id": {"type": "integer"},
-                                    "atlas_x": {"type": "integer"},
-                                    "atlas_y": {"type": "integer"},
-                                    "alternative_tile": {"type": "integer"},
-                                },
-                                ["hex", "source_id", "atlas_x", "atlas_y"],
-                            ),
-                        },
-                    },
-                    ["image_path", "palette"],
                 ),
             },
         )

@@ -1,16 +1,18 @@
 ---
 name: map-procedural-generation
+schema-version: 2
 description: 从零批量生成/装饰地图的算法栈（zone planning、Poisson/noise 采样、grammar/blueprint 模板、草图转地图）。
 when_to_use: 用户要求大范围生成、装饰、村庄/地牢/房间/道路/资源分布、"自然分布"、模板复用、或草图/参考图转地图时加载。
-allowed-tools: [plan_map_layout, plan_map_algorithms, sample_poisson_points, sample_noise_grid, compose_map_blueprint_grammar, save_map_blueprint, apply_map_blueprint, ensure_standard_map_layers, read_scene_tree, read_image_metadata, query_spatial_index, find_placement_anchors, validate_object_placements, repair_placements, paint_from_image_grid, edit_map, fill_rect, paint_terrain_connect, place_map_objects, validate_layer_coverage, validate_map_region, repair_map_region, compact_spatial_index]
+required-capabilities: [category:context_read, category:plan]
+compatible-roles: [map_planner, map_worker]
+compatible-stages: [plan]
+compatible-modes: [propose_only, repair_propose]
 paths: []
 ---
 
-加载前提：reader 已确认 `target_path`、`map_layer`、revision、资源语义表、空间索引状态和任务区域。缺少真实资源或目标时返回 `missing_inputs`。
-
 ## 核心流程
 
-复杂生成、装饰或替换先调用 `plan_map_layout`，获得结构化 `MapIntent`、zones、anchors、资源缺口、候选批次和校验计划。只有目标、图层和资源均确认后才能交给 writer。
+复杂生成、装饰或替换先调用 `plan_map_layout`，获得结构化 `MapIntent`、zones、anchors、资源缺口、候选批次和校验计划。
 
 算法按意图选择：
 
@@ -18,7 +20,7 @@ paths: []
 - 连续密度或材质变化：`sample_noise_grid`。
 - 自然间距的离散对象：`sample_poisson_points`。
 - 模块化房间、桥、塔或重复结构：`compose_map_blueprint_grammar`。
-- 草图或色块参考：`read_image_metadata` 后使用 `paint_from_image_grid`。
+- 草图或色块参考：`read_image_metadata` 后由 planner 生成有边界的 `edit_map` 批次。
 
 需要新地图骨架或缺少清晰分层时才调用 `ensure_standard_map_layers`，复用已有标准层。大型生成先规划入口、出口、主路径和可通行区域，再规划建筑、障碍和装饰；2D 保持道路/平台/河岸连通，3D 保持地板、墙体、门格和 Node3D 支撑关系。
 
@@ -42,8 +44,4 @@ PackedScene 对象先用 `find_placement_anchors`/`validate_object_placements` �
 
 ## 草图/参考图转地图
 
-读取图像尺寸和颜色后，用 `paint_from_image_grid` 生成有边界、可撤销的 TileMap 候选批次。
-
-## 输出与验收交接
-
-planner 输出有序候选批次、`expected_cells`、postconditions 和所需 validator constraints。主路径、背景、覆盖层和对象分别规划；对象不得阻断受保护路线。writer 执行后交给 validator 检查连通性、覆盖率、overlap/blocked 和实例完整性，再由 reviewer 做视觉复核。
+读取图像尺寸和颜色后，生成使用已注册资源的有边界 `edit_map` 候选批次。

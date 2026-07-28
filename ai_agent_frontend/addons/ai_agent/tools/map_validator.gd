@@ -34,6 +34,9 @@ static func movement_from_input(input: Dictionary, dimension: int) -> Dictionary
 		"max_horizontal_gap": maxi(1, int(input.get("max_horizontal_gap", 1))),
 		"max_rise": maxi(0, int(input.get("max_rise", 1))),
 		"max_fall": maxi(0, int(input.get("max_fall", 64))),
+		"actor_clearance_cells": maxi(1, int(input.get("actor_clearance_cells", 2))),
+		"actor_width_cells": maxi(1, int(input.get("actor_width_cells", 1))),
+		# actor_clearance_cells：角色头顶净空格数，用于跳跃/寻路时检查纵向碰撞。
 		# free：单步最大移动距离（曼哈顿格数）。
 		"max_step": maxi(1, int(input.get("max_step", 1))),
 	}
@@ -63,6 +66,27 @@ static func movement_input_error(input: Dictionary, dimension: int, require_expl
 			"error_code": "invalid_movement_model",
 			"message": "movement_model must be one of: grid, leap, free.",
 		}
+	if require_explicit and model == "leap":
+		var missing_leap_facts: Array = []
+		for ability_field in [
+			"max_horizontal_gap",
+			"max_rise",
+			"max_fall",
+			"actor_clearance_cells",
+			"actor_width_cells",
+		]:
+			if not input.has(ability_field):
+				missing_leap_facts.append({
+					"field": ability_field,
+					"source": "player_controller_or_collision_shape",
+					"reason": "default_value_cannot_authorize_platform_execution",
+				})
+		if not missing_leap_facts.is_empty():
+			return {
+				"error_code": "missing_leap_actor_facts",
+				"message": "Leap validation requires measured movement and actor footprint facts.",
+				"missing_inputs": missing_leap_facts,
+			}
 	for occupancy_name in ["cell_occupancy", "support_occupancy"]:
 		var default_occupancy := "empty" if occupancy_name == "cell_occupancy" else "filled"
 		var occupancy := str(input.get(occupancy_name, default_occupancy)).strip_edges().to_lower()
@@ -101,6 +125,17 @@ static func movement_input_error(input: Dictionary, dimension: int, require_expl
 				"field": sign_field,
 				"message": "%s must be -1 or 1." % sign_field,
 			}
+	## actor_clearance_cells 校验：值必须 >= 1，否则角色碰撞体积无效。
+	if input.has("actor_clearance_cells") and int(input.get("actor_clearance_cells")) < 1:
+		return {
+			"error_code": "invalid_actor_clearance",
+			"message": "actor_clearance_cells must be at least 1.",
+		}
+	if input.has("actor_width_cells") and int(input.get("actor_width_cells")) < 1:
+		return {
+			"error_code": "invalid_actor_width",
+			"message": "actor_width_cells must be at least 1.",
+		}
 	for anchor_field_name in ["start", "goal", "frontier", "entry_anchor"]:
 		var single_coordinate_error := _anchor_coordinate_error(input.get(anchor_field_name), anchor_field_name, dimension)
 		if not single_coordinate_error.is_empty():
@@ -836,11 +871,44 @@ static func _has_support(filled: Dictionary, coords: Vector3i, region: Dictionar
 
 ## 某格能否作为一个「落脚点」被站立/占据。grid/free 只要基础可走；leap 还要求脚下有支撑。
 static func is_standable(filled: Dictionary, coords: Vector3i, region: Dictionary, movement: Dictionary) -> bool:
-	if not _base_walkable(filled, coords, movement):
-		return false
+	for occupied_cell in _actor_footprint_cells(coords, movement):
+		if not in_region(occupied_cell, region):
+			return false
+		if not _base_walkable(filled, occupied_cell, movement):
+			return false
 	if bool(movement.get("requires_support", false)):
-		return _has_support(filled, coords, region, movement)
+		for support_anchor in _actor_base_cells(coords, movement):
+			if not _has_support(filled, support_anchor, region, movement):
+				return false
 	return true
+
+
+static func _actor_base_cells(coords: Vector3i, movement: Dictionary) -> Array:
+	var result: Array = []
+	var width := maxi(1, int(movement.get("actor_width_cells", 1)))
+	var support_offset: Vector3i = movement.get("support_offset", Vector3i(0, 1, 0))
+	var down_axis := _down_axis(support_offset)
+	var lateral_axis := 1 if down_axis == 0 else 0
+	var first_offset := -floori(float(width - 1) / 2.0)
+	for index in range(width):
+		var offset := first_offset + index
+		var cell := coords
+		if lateral_axis == 0:
+			cell.x += offset
+		else:
+			cell.y += offset
+		result.append(cell)
+	return result
+
+
+static func _actor_footprint_cells(coords: Vector3i, movement: Dictionary) -> Array:
+	var result: Array = []
+	var support_offset: Vector3i = movement.get("support_offset", Vector3i(0, 1, 0))
+	var height := maxi(1, int(movement.get("actor_clearance_cells", 1)))
+	for base_cell in _actor_base_cells(coords, movement):
+		for height_index in range(height):
+			result.append((base_cell as Vector3i) - support_offset * height_index)
+	return result
 
 
 ## 按移动模型生成 current 的可达邻居（已过滤 in_region + 可站立）。
@@ -881,6 +949,100 @@ static func _free_neighbors(filled: Dictionary, current: Vector3i, region: Dicti
 	return result
 
 
+## 采样抛物线跳跃轨迹，并按角色占用高度检查沿途和落点净空。
+static func _leap_trajectory_clear(
+	filled: Dictionary,
+	current: Vector3i,
+	next: Vector3i,
+	region: Dictionary,
+	movement: Dictionary
+) -> bool:
+	return bool(
+		validate_leap_transition(filled, current, next, region, movement).get(
+			"passed",
+			false
+		)
+	)
+
+
+## 规划预检与最终区域验证共享的 leap 事实判断。
+## 返回结构化轨迹样本、碰撞位置、起落点净空，调用方不得用另一套近似公式授权执行。
+static func validate_leap_transition(
+	filled: Dictionary,
+	current: Vector3i,
+	next: Vector3i,
+	region: Dictionary,
+	movement: Dictionary
+) -> Dictionary:
+	var support_offset: Vector3i = movement.get("support_offset", Vector3i(0, 1, 0))
+	var down_axis := _down_axis(support_offset)
+	var horizontal := _horizontal_magnitude(next - current, down_axis)
+	var vertical := absi(_axis_value(next - current, down_axis))
+	## 采样步数取水平/垂直距离的 2 倍（至少 2 步），确保抛物线轨迹足够精细。
+	var steps := maxi(2, maxi(horizontal, vertical) * 2)
+	var arc_height := maxi(1, int(movement.get("max_rise", 1)))
+	var obstructed_samples: Array = []
+	var sampled_footprints: Array = []
+	for step_index in range(0, steps + 1):
+		var progress := float(step_index) / float(steps)
+		var sample := Vector3i(
+			roundi(lerpf(float(current.x), float(next.x), progress)),
+			roundi(lerpf(float(current.y), float(next.y), progress)),
+			roundi(lerpf(float(current.z), float(next.z), progress))
+		)
+		## 用二次抛物线 4*h*t*(1-t) 模拟跳跃弧线，t 为进度 [0,1]，拱高为 arc_height。
+		var arc_offset := roundi(
+			4.0 * float(arc_height) * progress * (1.0 - progress)
+		)
+		sample -= support_offset * arc_offset
+		var footprint_payload: Array = []
+		for occupied_cell_value in _actor_footprint_cells(sample, movement):
+			var occupied_cell: Vector3i = occupied_cell_value
+			footprint_payload.append(coord_payload(
+				occupied_cell,
+				int(movement.get("dimension", 2))
+			))
+			if not in_region(occupied_cell, region):
+				obstructed_samples.append({
+					"step": step_index,
+					"progress": progress,
+					"cell": coord_payload(
+						occupied_cell,
+						int(movement.get("dimension", 2))
+					),
+					"reason": "outside_region",
+				})
+			elif not _base_walkable(filled, occupied_cell, movement):
+				obstructed_samples.append({
+					"step": step_index,
+					"progress": progress,
+					"cell": coord_payload(
+						occupied_cell,
+						int(movement.get("dimension", 2))
+					),
+					"reason": "actor_footprint_collision",
+				})
+		sampled_footprints.append({
+			"step": step_index,
+			"anchor": coord_payload(sample, int(movement.get("dimension", 2))),
+			"footprint": footprint_payload,
+		})
+	var takeoff_clear := is_standable(filled, current, region, movement)
+	var landing_clear := is_standable(filled, next, region, movement)
+	return {
+		"passed": obstructed_samples.is_empty() and takeoff_clear and landing_clear,
+		"trajectory_clear": obstructed_samples.is_empty(),
+		"takeoff_clearance": takeoff_clear,
+		"landing_clearance": landing_clear,
+		"actor_footprint": {
+			"width_cells": int(movement.get("actor_width_cells", 1)),
+			"height_cells": int(movement.get("actor_clearance_cells", 1)),
+		},
+		"obstructed_samples": obstructed_samples,
+		"samples": sampled_footprints,
+	}
+
+
 static func _leap_neighbors(filled: Dictionary, current: Vector3i, region: Dictionary, movement: Dictionary) -> Array:
 	var dimension := int(movement.get("dimension", 2))
 	var gap := maxi(1, int(movement.get("max_horizontal_gap", 1)))
@@ -909,7 +1071,18 @@ static func _leap_neighbors(filled: Dictionary, current: Vector3i, region: Dicti
 				if horizontal > gap:
 					continue
 				var next := current + delta
-				if in_region(next, region) and is_standable(filled, next, region, movement):
+				## leap BFS/A* 搜索邻居时，除常规的区域内 + 可站立检查外，
+				## 还需通过 _leap_trajectory_clear 校验抛物线轨迹净空，
+				## 确保跳跃过程中角色头顶不会碰到障碍。
+				if in_region(next, region) \
+						and is_standable(filled, next, region, movement) \
+						and bool(validate_leap_transition(
+							filled,
+							current,
+							next,
+							region,
+							movement
+						).get("passed", false)):
 					result.append(next)
 	return result
 

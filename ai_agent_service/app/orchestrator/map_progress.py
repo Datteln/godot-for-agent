@@ -8,12 +8,38 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from app.orchestrator.map_contracts import MAP_RUNTIME_STAGE_TRANSITIONS
+from app.orchestrator.map_workers import MAP_PLAN_TOOL_NAMES, PLATFORM_PLAN_TOOL_NAMES
+from app.orchestrator.map_workflow import (
+    assert_map_workflow_write_allowed,
+    dispatch_map_workflow_event,
+    make_map_workflow_event,
+    migrate_legacy_workflow_scopes,
+    replace_map_state_field,
+    workflow_scope_identity,
+)
+from app.orchestrator.map_recovery import (
+    SEMANTIC_RETRY_MAX_ATTEMPTS,
+    record_semantic_retry,
+    retry_pause_report,
+)
+
 if TYPE_CHECKING:
     from app.agents.types import Frame
     from app.sessions.store import Session
 
 ValidationMode = Literal["diagnostic", "completion"]
-MapTaskStatus = Literal["idle", "running", "paused", "completed"]
+MapTaskStatus = Literal["idle", "running", "paused", "completed", "cancelled"]
+# 地图任务全局合法状态转换表：
+# 每个键对应的 frozenset 列出从该状态出发允许进入的下一个状态，
+# 任何未列出的转换都会被 transition_status 拒绝，确保状态机单调推进。
+_MAP_STATUS_TRANSITIONS: dict[MapTaskStatus, frozenset[MapTaskStatus]] = {
+    "idle": frozenset({"running"}),
+    "running": frozenset({"paused", "completed", "cancelled"}),
+    "paused": frozenset({"running", "cancelled"}),
+    "completed": frozenset({"running"}),  # 完成后可再次启动新任务
+    "cancelled": frozenset({"running"}),  # 取消后可再次启动新任务
+}
 
 
 @dataclass
@@ -40,6 +66,9 @@ class MapTaskState:
     task_id: str = ""
     status: MapTaskStatus = "idle"
     stage: str = "read"
+    # 独立场景结构版本：每次场景结构发生根本性变化时递增，
+    # 用于失效所有依赖旧结构的派生状态（计划、校验缓存、批次等）
+    structure_revision: int = 0
     plan_version: int = 0
     counters: MapTaskCounters = field(default_factory=MapTaskCounters)
     failure_frontier: dict[str, Any] | None = None
@@ -67,6 +96,146 @@ class MapTaskState:
     checkpoint: dict[str, Any] | None = None
     resumed_from_checkpoint: bool = False
     pause_reason: str = ""
+    pause_report: dict[str, Any] = field(default_factory=dict)
+    workflow_schema_version: int = 1
+    workflow_events: list[dict[str, Any]] = field(default_factory=list)
+    workflow_scopes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    evidence_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
+    retry_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
+    transaction_journals: list[dict[str, Any]] = field(default_factory=list)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """在功能开关启用时检测 reducer-owned 字段的运行时直写。"""
+        if name in self.__dict__:
+            assert_map_workflow_write_allowed(name)
+        super().__setattr__(name, value)
+
+    def transition_status(self, next_status: MapTaskStatus) -> None:
+        """按唯一合法转换表推进地图任务状态。
+
+        所有状态变更必须经过此守卫，拒绝任何不在 _MAP_STATUS_TRANSITIONS 中的转换。
+        """
+        allowed = _MAP_STATUS_TRANSITIONS.get(self.status, frozenset())
+        if next_status not in allowed:
+            raise ValueError(
+                f"illegal map task status transition: {self.status} -> {next_status}"
+            )
+        self.status = next_status
+
+    def transition_stage(self, next_stage: str) -> None:
+        """按唯一合法转换表推进地图工作流阶段。
+
+        阶段转换由 MAP_RUNTIME_STAGE_TRANSITIONS 约束，确保流水线单向推进。
+        """
+        dispatch_map_workflow_event(
+            self,
+            make_map_workflow_event(
+                self,
+                "stage_transition",
+                "__workflow__",
+                self.structure_revision,
+                {"stage": next_stage},
+            ),
+        )
+
+    def record_structure_change(self) -> int:
+        """推进独立场景结构版本，并失效所有依赖旧结构的派生状态。
+
+        当场景结构发生根本性变化时（如用户重新编辑地图基础结构），调用此方法：
+        - 递增 structure_revision 标记结构版本
+        - 递增 plan_version 使所有基于旧结构的规划失效
+        - 重置 stage 为 read，强制重新读取
+        - 清空所有派生缓存：failure_frontier、unresolved_issues、completed_goals、
+          pending_batches、validation_cache/contracts/workflows、planning_attempts、
+          approved_platform_plans、region_reads/summaries、context_state 等
+        """
+        self.structure_revision += 1
+        self.plan_version += 1
+        self.transition_stage("read")
+        for field_name, empty_value in (
+            ("failure_frontier", None),
+            ("unresolved_issues", []),
+            ("completed_goals", []),
+            ("pending_batches", []),
+            ("validation_cache", {}),
+            ("validation_contracts", {}),
+            ("validation_workflows", {}),
+            ("no_progress_streaks", {}),
+            ("latest_validations", {}),
+            ("validation_failure_counts", {}),
+            ("planning_attempts", {}),
+            ("planning_fingerprints", {}),
+            ("tool_failure_fingerprints", {}),
+            ("approved_platform_plans", {}),
+            ("region_reads", {}),
+            ("region_summaries", {}),
+            ("completion_blockers", []),
+            ("pause_report", {}),
+        ):
+            replace_map_state_field(self, field_name, empty_value)
+        self.context_state.clear()
+        return self.structure_revision
+
+    def start(self, task_id: str) -> None:
+        """启动新任务并进入 read 阶段。
+
+        由 start_new_task 内部调用，不直接暴露给外部调用方。
+        """
+        self.transition_status("running")
+        self.task_id = task_id
+        self.transition_stage("read")
+        self.resumed_from_checkpoint = False
+        self.pause_reason = ""
+        replace_map_state_field(self, "pause_report", {})
+        replace_map_state_field(self, "checkpoint", None)
+
+    def start_new_task(self, task_id: str) -> None:
+        """显式替换未暂停的旧任务并启动一个独立新任务。
+
+        若当前有运行中的任务会先取消它；暂停中的任务必须先恢复或取消再替换，
+        防止状态机出现"暂停中被静默替换"的歧义。
+        """
+        if self.status == "paused":
+            raise ValueError("paused map task must be resumed or cancelled before replacement")
+        if self.status == "running":
+            self.cancel("replaced_by_new_task")
+        self.start(task_id)
+
+    def resume(self) -> None:
+        """显式恢复已暂停任务。
+
+        仅当 status == paused 时可用；恢复后标记 resumed_from_checkpoint，
+        并清空无进展计数器避免旧 streak 误触发再次暂停。
+        """
+        if self.status != "paused":
+            raise ValueError(f"cannot resume map task with status={self.status}")
+        self.transition_status("running")
+        self.resumed_from_checkpoint = True
+        self.pause_reason = ""
+        replace_map_state_field(self, "no_progress_streaks", {})
+        replace_map_state_field(self, "pause_report", {})
+
+    def complete(self) -> None:
+        """在无 blocker 时完成运行中的地图任务。"""
+        if self.status != "running":
+            raise ValueError(f"cannot complete map task with status={self.status}")
+        self.transition_status("completed")
+
+    def cancel(self, reason: str) -> None:
+        """取消运行中或暂停中的地图任务并冻结残留批次。
+
+        取消后清空 pending_batches、completion_blockers 和 checkpoint，
+        确保旧任务的残留数据不会继续被执行。
+        """
+        if self.status not in {"running", "paused"}:
+            raise ValueError(f"cannot cancel map task with status={self.status}")
+        self.transition_status("cancelled")
+        self.pause_reason = reason
+        self.resumed_from_checkpoint = False
+        replace_map_state_field(self, "pending_batches", [])
+        replace_map_state_field(self, "completion_blockers", [])
+        replace_map_state_field(self, "checkpoint", None)
+        replace_map_state_field(self, "pause_report", {})
 
     def to_dict(self) -> dict[str, Any]:
         """将任务状态转换为 JSON 可序列化字典。"""
@@ -107,6 +276,10 @@ class MapTaskState:
             "region_reads",
             "region_summaries",
             "context_state",
+            "workflow_scopes",
+            "evidence_registry",
+            "retry_registry",
+            "pause_report",
         ):
             if not isinstance(data.get(key), dict):
                 data[key] = {}
@@ -116,24 +289,50 @@ class MapTaskState:
             "pending_batches",
             "executed_batches",
             "completion_blockers",
+            "workflow_events",
+            "transaction_journals",
         ):
             if not isinstance(data.get(key), list):
                 data[key] = []
-        if data.get("status") not in {"idle", "running", "paused", "completed"}:
+        # 校验 status 和 stage 是否在合法枚举内；不合法时回退默认值，
+        # 防止旧持久化数据或损坏数据导致运行时崩溃。
+        if data.get("status") not in _MAP_STATUS_TRANSITIONS:
             data["status"] = "idle"
-        return cls(**data)
+        if data.get("stage") not in MAP_RUNTIME_STAGE_TRANSITIONS:
+            data["stage"] = "read"
+        state = cls(**data)
+        migrate_legacy_workflow_scopes(state)
+        return state
 
-    def make_checkpoint(self, reason: str) -> dict[str, Any]:
-        """生成恢复所需的最小结构化检查点并暂停任务。"""
-        self.status = "paused"
+    def make_checkpoint(
+        self,
+        reason: str,
+        pause_report: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """生成恢复所需的最小结构化检查点并暂停任务。
+
+        通过 transition_status 进入 paused 状态，将 structure_revision 等
+        关键字段连同 failure_frontier、unresolved_issues 等一并快照到 checkpoint。
+        """
+        self.transition_status("paused")
         self.pause_reason = reason
+        target, revision = workflow_scope_identity(self)
+        replace_map_state_field(
+            self,
+            "pause_report",
+            deepcopy(pause_report or {}),
+            target=target,
+            revision=revision,
+        )
         self.counters.pauses += 1
-        self.checkpoint = {
+        checkpoint = {
             "task_id": self.task_id,
             "status": self.status,
             "stage": self.stage,
+            "structure_revision": self.structure_revision,  # 独立场景结构版本
             "plan_version": self.plan_version,
             "reason": reason,
+            "pause_report": deepcopy(self.pause_report),
             "failure_frontier": deepcopy(self.failure_frontier),
             "unresolved_issues": deepcopy(self.unresolved_issues),
             "completed_goals": deepcopy(self.completed_goals),
@@ -142,7 +341,17 @@ class MapTaskState:
             "latest_revisions": dict(self.latest_revisions),
             "known_regions": list(self.region_reads),
         }
-        return self.checkpoint
+        dispatch_map_workflow_event(
+            self,
+            make_map_workflow_event(
+                self,
+                "checkpoint_replaced",
+                target,
+                revision,
+                {"checkpoint": checkpoint},
+            ),
+        )
+        return checkpoint
 
 
 @dataclass(frozen=True)
@@ -154,6 +363,44 @@ class MapPlanOutcome:
     blocked_reason: str | None
     error_code: str | None
     suggested_foothold: dict[str, Any] | None
+
+
+def map_revision_scope_key(target: str, map_layer: int | None = None) -> str:
+    """生成与 Godot 前端一致的 canonical 地图 revision 作用域键。
+
+    格式：无图层时直接返回 target；有图层时返回 "target::map_layer=N"，
+    确保不同图层的 revision 互不干扰。
+    """
+    normalized_target = target.strip()
+    if map_layer is None:
+        return normalized_target
+    return f"{normalized_target}::map_layer={map_layer}"
+
+
+def latest_map_revision(
+    session: Session,
+    target: str,
+    map_layer: int | None = None,
+) -> int | None:
+    """优先读取目标图层 revision，兼容无图层旧会话记录。
+
+    查找顺序：
+    1. 先用 map_revision_scope_key 生成带图层的作用域键，优先匹配
+    2. 若未找到且指定了图层，再检查 latest_layers 记录的图层是否匹配
+    3. 最后回退到无图层的 target 键（兼容旧会话）
+    """
+    state: MapTaskState = session.map_task_state
+    # 优先查找带图层作用域的 revision
+    scoped = state.latest_revisions.get(
+        map_revision_scope_key(target, map_layer)
+    )
+    if scoped is not None:
+        return scoped
+    # 若指定了图层但会话记录的图层不匹配，视为无有效 revision
+    if map_layer is not None and state.latest_layers.get(target) != map_layer:
+        return None
+    # 回退到无图层旧格式
+    return state.latest_revisions.get(target)
 
 
 def parse_map_plan_outcome(tool_name: str, result: dict[str, Any]) -> MapPlanOutcome:
@@ -216,15 +463,6 @@ def parse_map_plan_outcome(tool_name: str, result: dict[str, Any]) -> MapPlanOut
     )
 
 
-_MAP_PLAN_TOOL_NAMES = frozenset(
-    {
-        "plan_map_layout",
-        "plan_map_algorithms",
-        "validate_platform_level_plan",
-        "plan_reachable_map_growth",
-    }
-)
-_PLATFORM_PLAN_TOOL_NAMES = frozenset({"validate_platform_level_plan", "plan_reachable_map_growth"})
 MAP_PLATFORM_PLAN_MAX_ATTEMPTS = 2
 
 _CONTRACT_KEYS = (
@@ -336,31 +574,92 @@ def remember_validation_cache(
     if tool_name != "validate_map_region":
         return
     fingerprint = validation_request_fingerprint(session, tool_name, tool_args)
-    session.map_task_state.validation_cache[fingerprint] = dict(result)
-    while len(session.map_task_state.validation_cache) > 64:
-        session.map_task_state.validation_cache.pop(
-            next(iter(session.map_task_state.validation_cache))
-        )
+    cache = dict(session.map_task_state.validation_cache)
+    cache[fingerprint] = dict(result)
+    while len(cache) > 64:
+        cache.pop(next(iter(cache)))
+    replace_map_state_field(
+        session.map_task_state,
+        "validation_cache",
+        cache,
+        target=_target(tool_args),
+        revision=_revision(session, tool_args),
+    )
 
 
 def record_no_progress(session: Session, target: str, reason: str) -> dict[str, Any] | None:
-    """累计无进展事件，并在第三次时生成暂停检查点。"""
-    state = session.map_task_state
-    streak = state.no_progress_streaks.get(target, 0) + 1
-    state.no_progress_streaks[target] = streak
+    """累计无进展事件，并在第三次时生成暂停检查点。
+
+    map_task_state 已是唯一状态源，无需在生成检查点前额外同步。
+    """
+    state: MapTaskState = session.map_task_state
+    scoped_target, revision = workflow_scope_identity(state, target=target)
+    retry = record_semantic_retry(
+        state,
+        category="validation_failure",
+        error_category=reason,
+        root_cause=reason,
+        stage=state.stage,
+        target=scoped_target,
+        revision=revision,
+        operation={"reason": reason, "scope": target},
+        threshold=SEMANTIC_RETRY_MAX_ATTEMPTS,
+    )
+    retry_key = str(retry["retry_key"])
+    streak = int(retry["attempt"])
+    streaks = dict(state.no_progress_streaks)
+    streaks[retry_key] = streak
+    replace_map_state_field(
+        state,
+        "no_progress_streaks",
+        streaks,
+        target=scoped_target,
+        revision=revision,
+    )
     state.counters.no_progress_events += 1
-    if streak < 3:
+    if streak < SEMANTIC_RETRY_MAX_ATTEMPTS:
         return None
-    session.sync_map_task_state()
-    return state.make_checkpoint(reason)
+    report = retry_pause_report(
+        state,
+        stage=state.stage,
+        target=scoped_target,
+        revision=revision,
+        last_attempt=retry,
+    )
+    if state.status == "running":
+        return state.make_checkpoint(reason, report)
+    state.pause_reason = reason
+    replace_map_state_field(
+        state,
+        "pause_report",
+        report,
+        target=scoped_target,
+        revision=revision,
+    )
+    checkpoint = {
+        "task_id": state.task_id,
+        "status": state.status,
+        "stage": state.stage,
+        "reason": reason,
+        "pause_report": report,
+    }
+    replace_map_state_field(
+        state,
+        "checkpoint",
+        checkpoint,
+        target=scoped_target,
+        revision=revision,
+    )
+    return checkpoint
 
 
 def resume_map_task(state: MapTaskState) -> None:
-    """从检查点恢复任务，同时保留地图事实和批次进度。"""
-    state.status = "running"
-    state.resumed_from_checkpoint = True
-    state.pause_reason = ""
-    state.no_progress_streaks.clear()
+    """从检查点恢复任务，同时保留地图事实和批次进度。
+
+    委托给 state.resume() 统一执行：校验状态合法性、推进 status、
+    标记 resumed_from_checkpoint 并清空无进展计数器。
+    """
+    state.resume()
 
 
 def _target(tool_args: dict[str, Any]) -> str:
@@ -453,14 +752,21 @@ def remember_map_tool_failure(
 ) -> None:
     """记录一次地图工具失败，供后续相同调用在服务层直接阻断。"""
     fingerprint = map_tool_call_fingerprint(tool_name, tool_args)
-    session.map_task_state.tool_failure_fingerprints[fingerprint] = {
+    failures = dict(session.map_task_state.tool_failure_fingerprints)
+    failures[fingerprint] = {
         "tool": tool_name,
         "error_code": error_code,
         "message": message,
     }
-    while len(session.map_task_state.tool_failure_fingerprints) > 128:
-        first_key = next(iter(session.map_task_state.tool_failure_fingerprints))
-        del session.map_task_state.tool_failure_fingerprints[first_key]
+    while len(failures) > 128:
+        failures.pop(next(iter(failures)))
+    replace_map_state_field(
+        session.map_task_state,
+        "tool_failure_fingerprints",
+        failures,
+        target=_target(tool_args),
+        revision=_revision(session, tool_args),
+    )
 
 
 def repeated_map_tool_failure_error(
@@ -487,7 +793,7 @@ def map_platform_plan_call_error(
     tool_args: dict[str, Any],
 ) -> str | None:
     """在执行前拒绝超限或完全相同的平台规划提交。"""
-    if tool_name not in _PLATFORM_PLAN_TOOL_NAMES:
+    if tool_name not in PLATFORM_PLAN_TOOL_NAMES:
         return None
     scope = _platform_plan_scope(tool_args)
     attempts = session.map_task_state.planning_attempts.get(scope, 0)
@@ -510,7 +816,8 @@ def map_platform_plan_call_error(
 
 def map_platform_plan_attempt_count(session: Session, tool_args: dict[str, Any]) -> int:
     """返回当前目标和图层已经执行的平台规划次数。"""
-    return session.map_task_state.planning_attempts.get(_platform_plan_scope(tool_args), 0)
+    state: MapTaskState = session.map_task_state
+    return state.planning_attempts.get(_platform_plan_scope(tool_args), 0)
 
 
 def _remember_platform_plan_attempt(
@@ -519,17 +826,33 @@ def _remember_platform_plan_attempt(
     tool_args: dict[str, Any],
 ) -> None:
     """记录一次真实执行的平台规划及其显式方案指纹。"""
-    if tool_name not in _PLATFORM_PLAN_TOOL_NAMES:
+    if tool_name not in PLATFORM_PLAN_TOOL_NAMES:
         return
     scope = _platform_plan_scope(tool_args)
     state = session.map_task_state
-    state.planning_attempts[scope] = state.planning_attempts.get(scope, 0) + 1
+    attempts = dict(state.planning_attempts)
+    attempts[scope] = attempts.get(scope, 0) + 1
+    replace_map_state_field(
+        state,
+        "planning_attempts",
+        attempts,
+        target=_target(tool_args),
+        revision=_revision(session, tool_args),
+    )
     fingerprint = _platform_plan_fingerprint(tool_name, tool_args)
     if fingerprint is None:
         return
     fingerprint_key = f"{scope}::{fingerprint}"
-    state.planning_fingerprints[fingerprint_key] = (
-        state.planning_fingerprints.get(fingerprint_key, 0) + 1
+    fingerprints = dict(state.planning_fingerprints)
+    fingerprints[fingerprint_key] = (
+        fingerprints.get(fingerprint_key, 0) + 1
+    )
+    replace_map_state_field(
+        state,
+        "planning_fingerprints",
+        fingerprints,
+        target=_target(tool_args),
+        revision=_revision(session, tool_args),
     )
 
 
@@ -541,11 +864,18 @@ def _validation_scope(tool_args: dict[str, Any]) -> str:
 
 
 def _revision(session: Session, tool_args: dict[str, Any]) -> int | None:
-    """返回调用声明或会话已知的当前地图 revision。"""
+    """返回调用声明或会话已知的当前地图 revision。
+
+    优先使用工具参数中的 expected_revision；否则按 target_path + map_layer
+    从会话状态中查询（图层感知）。
+    """
     value = tool_args.get("expected_revision")
     if isinstance(value, int) and not isinstance(value, bool):
         return value
-    return session.latest_map_revisions.get(_target(tool_args))
+    # 提取 map_layer 参数，用于图层感知的 revision 查询
+    layer = tool_args.get("map_layer")
+    map_layer = layer if isinstance(layer, int) and not isinstance(layer, bool) else None
+    return latest_map_revision(session, _target(tool_args), map_layer)
 
 
 def validation_call_error(
@@ -559,7 +889,7 @@ def validation_call_error(
     scope = _validation_scope(tool_args)
     revision = _revision(session, tool_args)
     mode = validation_mode(tool_args)
-    workflow = session.map_validation_workflows.get(scope, {})
+    workflow = session.map_task_state.validation_workflows.get(scope, {})
     same_revision = workflow.get("map_revision") == revision
 
     if mode == "completion":
@@ -570,7 +900,7 @@ def validation_call_error(
                 "无路线的图层/区域检查请使用 validation_mode='diagnostic'。"
             )
         contract_hash = validation_contract_hash(tool_args)
-        frozen = session.map_validation_contracts.get(scope)
+        frozen = session.map_task_state.validation_contracts.get(scope)
         if isinstance(frozen, dict) and frozen.get("hash") not in (None, contract_hash):
             record_no_progress(session, scope, "completion_contract_drift")
             return (
@@ -603,11 +933,19 @@ def map_write_stage_error(
     tool_name: str,
     tool_args: dict[str, Any],
 ) -> str | None:
-    """只允许平台写入执行同作用域内校验通过的编译批次。"""
+    """只允许平台写入执行同作用域内校验通过的编译批次。
+
+    所有 validation_workflows 和 revision 查询均通过 map_task_state 统一访问，
+    revision 查询使用 latest_map_revision 以支持图层感知。
+    """
     target = _target(tool_args)
     scope = _validation_scope(tool_args)
-    workflow = session.map_validation_workflows.get(scope, {})
-    revision = session.latest_map_revisions.get(target)
+    # 统一通过 map_task_state 访问验证工作流状态
+    workflow = session.map_task_state.validation_workflows.get(scope, {})
+    # 图层感知的 revision 查询
+    layer = tool_args.get("map_layer")
+    map_layer = layer if isinstance(layer, int) and not isinstance(layer, bool) else None
+    revision = latest_map_revision(session, target, map_layer)
     if workflow.get("map_revision") == revision and workflow.get("next_stage") == "planner":
         record_no_progress(session, scope, "write_attempted_before_planning")
         frontier = session.map_task_state.failure_frontier or {}
@@ -641,14 +979,23 @@ def map_write_stage_error(
             )
         return None
     if approval.get("map_revision") != revision:
-        session.map_task_state.approved_platform_plans.pop(scope, None)
+        approvals = dict(session.map_task_state.approved_platform_plans)
+        approvals.pop(scope, None)
+        replace_map_state_field(
+            session.map_task_state,
+            "approved_platform_plans",
+            approvals,
+            target=target,
+            revision=revision,
+        )
         return (
             f"平台方案基于 map revision {approval.get('map_revision')}，当前 revision 为 "
             f"{revision}；旧编译批次已失效，请重新读取边界并提交 "
             "validate_platform_level_plan。"
         )
+    approval = deepcopy(approval)
     batches_value = approval.get("remaining_batches")
-    batches = batches_value if isinstance(batches_value, list) else []
+    batches = list(batches_value) if isinstance(batches_value, list) else []
     matched_index = next(
         (
             index
@@ -670,8 +1017,26 @@ def map_write_stage_error(
     tool_args["validated_platform_batch"] = True
     if isinstance(revision, int) and not isinstance(revision, bool):
         approval["map_revision"] = revision + 1
+    approval["remaining_batches"] = batches
+    approvals = dict(session.map_task_state.approved_platform_plans)
+    approvals[scope] = approval
+    replace_map_state_field(
+        session.map_task_state,
+        "approved_platform_plans",
+        approvals,
+        target=target,
+        revision=revision,
+    )
     workflow["next_stage"] = "write"
-    session.map_validation_workflows[scope] = workflow
+    workflows = dict(session.map_task_state.validation_workflows)
+    workflows[scope] = workflow
+    replace_map_state_field(
+        session.map_task_state,
+        "validation_workflows",
+        workflows,
+        target=target,
+        revision=revision,
+    )
     return None
 
 
@@ -723,6 +1088,9 @@ def platform_write_requires_validation(
 ) -> bool:
     """判断平台写入是否必须先执行或重新执行平台方案校验。
 
+    使用 latest_map_revision 进行图层感知查询，确保不同图层的 approval
+    和 revision 比较在各自作用域内进行。
+
     Args:
         session: 当前地图任务会话。
         tool_name: 待执行的地图写工具名。
@@ -740,7 +1108,9 @@ def platform_write_requires_validation(
     if not isinstance(approval, dict):
         return True
 
-    revision = session.latest_map_revisions.get(target)
+    layer = tool_args.get("map_layer")
+    map_layer = layer if isinstance(layer, int) and not isinstance(layer, bool) else None
+    revision = latest_map_revision(session, target, map_layer)
     if approval.get("map_revision") != revision:
         return True
 
@@ -770,7 +1140,7 @@ def remember_map_plan_progress(
     result: dict[str, Any],
 ) -> None:
     """有效规划完成后允许执行阶段写入，但仍要求新 revision 后再 completion。"""
-    if tool_name not in _MAP_PLAN_TOOL_NAMES:
+    if tool_name not in MAP_PLAN_TOOL_NAMES:
         return
     _remember_platform_plan_attempt(session, tool_name, tool_args)
     outcome = parse_map_plan_outcome(tool_name, result)
@@ -785,41 +1155,69 @@ def remember_map_plan_progress(
     ):
         scope_args["map_layer"] = result_layer
     scope = _validation_scope(scope_args)
-    current_revision = session.latest_map_revisions.get(target)
+    layer = scope_args.get("map_layer")
+    map_layer = layer if isinstance(layer, int) and not isinstance(layer, bool) else None
+    current_revision = latest_map_revision(session, target, map_layer)
 
     if not outcome.executable:
         # 规划工具可能以成功响应承载诊断结果；任何失败都必须留在规划阶段恢复。
         state = session.map_task_state
-        state.stage = "plan"
-        state.approved_platform_plans.pop(scope, None)
-        state.failure_frontier = {
-            "tool": tool_name,
-            "blocked_reason": outcome.blocked_reason,
-            "error_code": outcome.error_code,
-            "suggested_foothold": outcome.suggested_foothold,
-        }
-        state.unresolved_issues = [
+        state.transition_stage("plan")
+        approvals = dict(state.approved_platform_plans)
+        approvals.pop(scope, None)
+        replace_map_state_field(
+            state,
+            "approved_platform_plans",
+            approvals,
+            target=target,
+            revision=current_revision,
+        )
+        replace_map_state_field(
+            state,
+            "failure_frontier",
             {
+                "tool": tool_name,
+                "blocked_reason": outcome.blocked_reason,
+                "error_code": outcome.error_code,
+                "suggested_foothold": outcome.suggested_foothold,
+            },
+            target=target,
+            revision=current_revision,
+        )
+        replace_map_state_field(
+            state,
+            "unresolved_issues",
+            [{
                 "kind": "map_plan_not_executable",
                 "tool": tool_name,
                 "blocked_reason": outcome.blocked_reason,
                 "error_code": outcome.error_code,
-            }
-        ]
-        if tool_name in _PLATFORM_PLAN_TOOL_NAMES:
-            workflow = session.map_validation_workflows.get(scope, {})
+            }],
+            target=target,
+            revision=current_revision,
+        )
+        if tool_name in PLATFORM_PLAN_TOOL_NAMES:
+            workflow = session.map_task_state.validation_workflows.get(scope, {})
             workflow["map_revision"] = current_revision
             workflow["next_stage"] = "planner"
             workflow["plan_tool"] = tool_name
             workflow["plan_error_code"] = outcome.error_code or outcome.blocked_reason
-            session.map_validation_workflows[scope] = workflow
+            workflows = dict(session.map_task_state.validation_workflows)
+            workflows[scope] = workflow
+            replace_map_state_field(
+                session.map_task_state,
+                "validation_workflows",
+                workflows,
+                target=target,
+                revision=current_revision,
+            )
         return
 
-    if tool_name not in _PLATFORM_PLAN_TOOL_NAMES:
+    if tool_name not in PLATFORM_PLAN_TOOL_NAMES:
         locked_scope = next(
             (
                 key
-                for key, value in session.map_validation_workflows.items()
+                for key, value in session.map_task_state.validation_workflows.items()
                 if key.startswith(f"{target}::")
                 and isinstance(value, dict)
                 and value.get("map_revision") == current_revision
@@ -828,32 +1226,68 @@ def remember_map_plan_progress(
             None,
         )
         if locked_scope is not None:
-            session.map_task_state.stage = "plan"
+            session.map_task_state.transition_stage("plan")
             return
 
-    active_workflow = session.map_validation_workflows.get(scope)
+    active_workflow = session.map_task_state.validation_workflows.get(scope)
     if isinstance(active_workflow, dict) and active_workflow.get("next_stage") == "planner":
         if active_workflow.get("map_revision") != current_revision:
             return
         active_workflow["next_stage"] = "write"
         active_workflow["plan_tool"] = tool_name
-        session.map_validation_workflows[scope] = active_workflow
+        workflows = dict(session.map_task_state.validation_workflows)
+        workflows[scope] = active_workflow
+        replace_map_state_field(
+            session.map_task_state,
+            "validation_workflows",
+            workflows,
+            target=target,
+            revision=current_revision,
+        )
     state = session.map_task_state
-    state.stage = "write"
+    state.transition_stage("write")
     state.plan_version += 1
-    state.failure_frontier = None
-    state.unresolved_issues.clear()
-    state.no_progress_streaks[scope] = 0
-    if tool_name in _PLATFORM_PLAN_TOOL_NAMES:
+    replace_map_state_field(
+        state,
+        "failure_frontier",
+        None,
+        target=target,
+        revision=current_revision,
+    )
+    replace_map_state_field(
+        state,
+        "unresolved_issues",
+        [],
+        target=target,
+        revision=current_revision,
+    )
+    streaks = dict(state.no_progress_streaks)
+    streaks[scope] = 0
+    replace_map_state_field(
+        state,
+        "no_progress_streaks",
+        streaks,
+        target=target,
+        revision=current_revision,
+    )
+    if tool_name in PLATFORM_PLAN_TOOL_NAMES:
         batches = _platform_edit_batches(result)
         for index, batch in enumerate(batches):
             batch["batch_index"] = index
-        state.approved_platform_plans[scope] = {
+        approvals = dict(state.approved_platform_plans)
+        approvals[scope] = {
             "tool": tool_name,
             "map_revision": current_revision,
             "plan_version": state.plan_version,
             "remaining_batches": batches,
         }
+        replace_map_state_field(
+            state,
+            "approved_platform_plans",
+            approvals,
+            target=target,
+            revision=current_revision,
+        )
 
 
 def remember_validation_progress(
@@ -884,60 +1318,115 @@ def remember_validation_progress(
         else _revision(session, tool_args)
     )
     mode = validation_mode(tool_args)
-    workflow = session.map_validation_workflows.get(scope, {})
+    workflow = session.map_task_state.validation_workflows.get(scope, {})
     if workflow.get("map_revision") != revision:
         workflow = {"map_revision": revision}
 
     if mode == "completion":
         contract = validation_contract(scope_args)
-        session.map_validation_contracts.setdefault(
+        contracts = dict(session.map_task_state.validation_contracts)
+        contracts.setdefault(
             scope,
             {"hash": validation_contract_hash(scope_args), "contract": contract},
         )
+        replace_map_state_field(
+            session.map_task_state,
+            "validation_contracts",
+            contracts,
+            target=target,
+            revision=revision,
+        )
         workflow["completion_attempted"] = True
         workflow["next_stage"] = "reviewer" if successful else "diagnostic"
-        session.map_task_state.stage = "review" if successful else "diagnostic"
-        session.map_task_state.unresolved_issues = list(result.get("issues", []))
+        session.map_task_state.transition_stage(
+            "review" if successful else "diagnostic"
+        )
+        replace_map_state_field(
+            session.map_task_state,
+            "unresolved_issues",
+            list(result.get("issues", [])),
+            target=target,
+            revision=revision,
+        )
         if successful:
-            session.map_task_state.completed_goals.append(contract)
+            replace_map_state_field(
+                session.map_task_state,
+                "completed_goals",
+                [*session.map_task_state.completed_goals, contract],
+                target=target,
+                revision=revision,
+            )
     else:
         workflow["diagnostic_attempted"] = True
         workflow["next_stage"] = "planner"
-        session.map_task_state.stage = "plan"
-        session.map_task_state.failure_frontier = {
-            "region": result.get("region", {}),
-            "issues": result.get("issues", []),
-            "structured_issues": result.get("structured_issues", []),
-        }
+        session.map_task_state.transition_stage("plan")
+        replace_map_state_field(
+            session.map_task_state,
+            "failure_frontier",
+            {
+                "region": result.get("region", {}),
+                "issues": result.get("issues", []),
+                "structured_issues": result.get("structured_issues", []),
+            },
+            target=target,
+            revision=revision,
+        )
     workflow["issues"] = result.get("issues", [])
-    session.map_validation_workflows[scope] = workflow
+    workflows = dict(session.map_task_state.validation_workflows)
+    workflows[scope] = workflow
+    replace_map_state_field(
+        session.map_task_state,
+        "validation_workflows",
+        workflows,
+        target=target,
+        revision=revision,
+    )
     session.map_task_state.counters.validations += 1
-    session.map_task_state.no_progress_streaks[scope] = 0
+    streaks = dict(session.map_task_state.no_progress_streaks)
+    streaks[scope] = 0
+    replace_map_state_field(
+        session.map_task_state,
+        "no_progress_streaks",
+        streaks,
+        target=target,
+        revision=revision,
+    )
 
 
-def reset_map_task_progress(session: Session, frame: Frame | None = None) -> None:
-    """在新用户地图任务开始时重置合同、阶段和当前帧的进展周期。"""
+def reset_map_task_progress(
+    session: Session,
+    frame: Frame | None = None,
+    *,
+    task_id: str | None = None,
+) -> None:
+    """在新用户地图任务开始时重置合同、阶段和当前帧的进展周期。
+
+    通过 state.start_new_task() 统一处理状态转换：若当前有运行中任务会先取消，
+    暂停中任务会拒绝替换（必须先恢复或取消），然后启动独立新任务。
+    """
     state = session.map_task_state
-    state.task_id = f"map-{session.session_id}-{session.turn_counter + 1}"
-    state.status = "running"
-    state.stage = "read"
+    state.start_new_task(task_id or f"map-{session.session_id}-{session.turn_counter + 1}")
     state.plan_version = 0
     state.counters = MapTaskCounters()
-    state.failure_frontier = None
-    state.unresolved_issues.clear()
-    state.completed_goals.clear()
-    state.pending_batches.clear()
-    state.executed_batches.clear()
-    state.validation_cache.clear()
-    state.validation_contracts.clear()
-    state.validation_workflows.clear()
-    state.no_progress_streaks.clear()
-    state.planning_attempts.clear()
-    state.planning_fingerprints.clear()
-    state.tool_failure_fingerprints.clear()
-    state.approved_platform_plans.clear()
+    for field_name, empty_value in (
+        ("failure_frontier", None),
+        ("unresolved_issues", []),
+        ("completed_goals", []),
+        ("pending_batches", []),
+        ("executed_batches", []),
+        ("validation_cache", {}),
+        ("validation_contracts", {}),
+        ("validation_workflows", {}),
+        ("no_progress_streaks", {}),
+        ("planning_attempts", {}),
+        ("planning_fingerprints", {}),
+        ("tool_failure_fingerprints", {}),
+        ("approved_platform_plans", {}),
+        ("completion_blockers", []),
+    ):
+        replace_map_state_field(state, field_name, empty_value)
     state.context_state.pop("reader_exhausted", None)
-    state.checkpoint = None
+    replace_map_state_field(state, "checkpoint", None)
     state.resumed_from_checkpoint = False
     state.pause_reason = ""
     if frame is None:

@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from app.security.settings import SecuritySettings
-from app.skills.catalog import SkillCatalog
+
+if TYPE_CHECKING:
+    from app.skills.catalog import SkillCatalog
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,8 @@ class ToolContext:
         agent_effective_tools: 阶段裁剪前的 agent 工具集合，用于区分阶段限制与
             agent 自身范围限制。
         workflow_stage: 当前地图工作流阶段；非地图帧为 None。
+        agent_role: 当前 Agent 的稳定角色。
+        worker_mode: 当前动态地图 Worker mode；永久 Agent 为 None。
         rag_index_path: 本地 RAG 索引文件路径；为空时 handler 使用工程内默认路径。
     """
 
@@ -36,4 +41,6 @@ class ToolContext:
     effective_tools: frozenset[str] = frozenset()
     agent_effective_tools: frozenset[str] = frozenset()
     workflow_stage: str | None = None
+    agent_role: str | None = None
+    worker_mode: str | None = None
     rag_index_path: Path | None = None

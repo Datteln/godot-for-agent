@@ -11,6 +11,8 @@ const ChatPanelText = preload("res://addons/ai_agent/ui/chat_panel_text.gd")
 const ChatPanelTheme = preload("res://addons/ai_agent/ui/chat_panel_theme.gd")
 const ChatMessageStore = preload("res://addons/ai_agent/ui/chat_message_store.gd")
 const ChatNodeFactory = preload("res://addons/ai_agent/ui/chat_node_factory.gd")
+# 报告格式化逻辑已迁出到独立模块 chat_report_formatter.gd，本文件仅保留调用入口
+const ChatReportFormatter = preload("res://addons/ai_agent/ui/chat_report_formatter.gd")
 const ChatVirtualScroller = preload("res://addons/ai_agent/ui/chat_virtual_scroller.gd")
 const InlineToolConfirmation = preload("res://addons/ai_agent/ui/inline_tool_confirmation.gd")
 const LogEntryRenderer = preload("res://addons/ai_agent/ui/log_entry_renderer.gd")
@@ -131,8 +133,9 @@ var _state_before_compact := AgentState.IDLE
 var _state := AgentState.IDLE
 var _last_doctor_report: Dictionary = {}
 var _extensions_pending := false
-var _pending_calls: Array = []
-var _pending_silent_results: Array = []
+var _pending_calls: Array = []  # 等待用户确认的调用子集（仅 needs_confirm=true 的项）
+var _pending_silent_results: Array = []  # 暂停点之前已执行的静默调用结果，回传模型时拼在前面
+var _pending_ordered_calls: Array = []  # 从首个确认项开始的原始序列切片，保留 assistant 声明的时序
 var _inline_confirm := InlineToolConfirmation.new()
 var _interrupted_locally := false
 var _indent_current_text := false
@@ -890,12 +893,12 @@ func _on_response(response: Dictionary) -> void:
 		_last_doctor_report = response
 		if _extensions_pending:
 			_extensions_pending = false
-			_append_message("system", _format_extensions_report({
+			_append_message("system", ChatReportFormatter.extensions_report({
 				"skills": response.get("skills", []),
 				"warnings": response.get("warnings", [])
 			}))
 		else:
-			_append_message("system", _format_doctor_report(response))
+			_append_message("system", ChatReportFormatter.doctor_report(response))
 		if state_store != null:
 			state_store.set_value("doctor_warnings", response.get("warnings", []))
 		return
@@ -909,7 +912,7 @@ func _on_response(response: Dictionary) -> void:
 		return
 
 	if response.has("items") and response.has("ok"):
-		_append_message("system", _format_memory_report(response))
+		_append_message("system", ChatReportFormatter.memory_report(response))
 		return
 
 	if response.has("ok") and response.has("session_id") and response.size() == 2:
@@ -918,18 +921,18 @@ func _on_response(response: Dictionary) -> void:
 
 	if response.has("type") and response.get("type") == "data":
 		var value = response.get("value", null)
-		if value is Array and _looks_like_command_list(value):
+		if value is Array and ChatReportFormatter.looks_like_command_list(value):
 			_populate_commands_popup(value)
 			if _commands_requested:
 				_commands_requested = false
 				_commands_btn.disabled = _state != AgentState.IDLE
 				_show_commands_popup()
 		else:
-			_append_message("system", _format_plain_value("数据", value))
+			_append_message("system", ChatReportFormatter.plain_value("数据", value))
 		return
 
 	if response.has("ok") and response.has("text"):
-		var command_text := _format_command_response(response)
+		var command_text := ChatReportFormatter.command_response(response)
 		_append_message("system" if bool(response.get("ok", false)) else "error", command_text)
 		if _state == AgentState.WAITING_LLM:
 			_set_state(AgentState.IDLE)
@@ -960,99 +963,6 @@ func _on_response(response: Dictionary) -> void:
 				"type": str(response.get("type", ""))
 			})
 			_append_message("system", JSON.stringify(response, "\t"))
-
-
-func _format_doctor_report(report: Dictionary) -> String:
-	var capabilities: Dictionary = report.get("capabilities", {}) if report.get("capabilities", {}) is Dictionary else {}
-	var lsp: Dictionary = capabilities.get("lsp", {}) if capabilities.get("lsp", {}) is Dictionary else {}
-	var mcp: Dictionary = capabilities.get("mcp", {}) if capabilities.get("mcp", {}) is Dictionary else {}
-	var rag: Dictionary = capabilities.get("rag", {}) if capabilities.get("rag", {}) is Dictionary else {}
-	var lines: Array[String] = ["诊断报告", "", "基础状态"]
-	lines.append("• Python：%s" % str(report.get("python_version", "未知")))
-	lines.append("• 模型：%s" % str(report.get("llm_model", "未配置")))
-	lines.append("• LLM 地址：%s" % _doctor_status(bool(report.get("llm_base_url_configured", false))))
-	lines.append("• 鉴权：%s" % _doctor_status(bool(report.get("auth_enabled", false))))
-	lines.append("• 权限模式：%s" % str(report.get("permission_mode", "未知")))
-	lines.append("• 受信任项目：%s" % _doctor_status(bool(report.get("trusted_project", false))))
-	lines.append("• 项目目录：%s" % str(report.get("project_root", "未知")))
-	lines.append("• 会话目录：%s" % str(report.get("session_store_dir", "未知")))
-
-	lines.append_array(["", "能力"])
-	lines.append("• LSP：%s；模式：%s；服务：%s" % [
-		_doctor_status(bool(lsp.get("enabled", false))), str(lsp.get("mode", "未知")), str(lsp.get("lsp_server", "未知"))
-	])
-	lines.append("  诊断来源：%s" % _doctor_list(lsp.get("diagnostics_sources", [])))
-	lines.append("  回退工具：%s" % _doctor_list(lsp.get("fallbacks", [])))
-	lines.append("• MCP：%s；模式：%s；权限：%s" % [
-		_doctor_status(bool(mcp.get("enabled", false))), str(mcp.get("mode", "未知")), str(mcp.get("permission_mode_when_enabled", "未知"))
-	])
-	lines.append("  入口：%s" % str(mcp.get("entrypoint", "未配置")))
-	lines.append("• RAG：%s；模式：%s；策略：%s" % [
-		_doctor_status(bool(rag.get("enabled", false))), str(rag.get("mode", "未知")), str(rag.get("strategy", "未知"))
-	])
-	lines.append("  主索引：%s（%s）" % [
-		"已创建" if bool(rag.get("index_exists", false)) else "未创建", str(rag.get("index_path", "未知"))
-	])
-	var sub_indexes: Dictionary = rag.get("sub_indexes", {}) if rag.get("sub_indexes", {}) is Dictionary else {}
-	for index_name in sub_indexes.keys():
-		var index_info: Dictionary = sub_indexes[index_name] if sub_indexes[index_name] is Dictionary else {}
-		lines.append("  %s：%s（%s）" % [
-			str(index_name), "已创建" if bool(index_info.get("exists", false)) else "未创建", str(index_info.get("path", "未知"))
-		])
-
-	lines.append_array(["", "启用域", _doctor_list(report.get("enabled_domains", []))])
-	var tools: Array = report.get("registered_tools", []) if report.get("registered_tools", []) is Array else []
-	lines.append_array(["", "已注册工具（%d）" % tools.size(), _doctor_list(tools)])
-
-	lines.append_array(["", "输出风格"])
-	var styles: Array = report.get("output_styles", []) if report.get("output_styles", []) is Array else []
-	if styles.is_empty():
-		lines.append("• 无")
-	for style in styles:
-		if style is Dictionary:
-			lines.append("• %s：%s%s" % [
-				str(style.get("name", "未命名")), str(style.get("description", "")), "" if bool(style.get("enabled", true)) else "（已禁用）"
-			])
-
-	lines.append_array(["", "技能"])
-	var skills: Array = report.get("skills", []) if report.get("skills", []) is Array else []
-	if skills.is_empty():
-		lines.append("• 无")
-	for skill in skills:
-		if skill is Dictionary:
-			lines.append("• %s：%s" % [str(skill.get("name", "未命名")), str(skill.get("description", ""))])
-			lines.append("  工具：%s" % _doctor_list(skill.get("effective_tools", [])))
-
-	lines.append_array(["", "警告"])
-	var warnings: Array = report.get("warnings", []) if report.get("warnings", []) is Array else []
-	if warnings.is_empty():
-		lines.append("• 无")
-	else:
-		for warning in warnings:
-			lines.append("• %s" % str(warning))
-	return "\n".join(lines)
-
-
-func _doctor_status(enabled: bool) -> String:
-	return "已启用" if enabled else "未启用"
-
-
-func _doctor_list(values) -> String:
-	if not (values is Array) or values.is_empty():
-		return "无"
-	var items := PackedStringArray()
-	for value in values:
-		items.append(str(value))
-	return "、".join(items)
-
-
-func _looks_like_command_list(values: Array) -> bool:
-	if values.is_empty():
-		return true
-	for value in values:
-		if not (value is Dictionary) or not value.has("name") or not value.has("description"):
-			return false
-	return true
 
 
 func _on_show_commands() -> void:
@@ -1136,140 +1046,17 @@ func _run_selected_command(command_name: String, args: Dictionary) -> void:
 	_http_client.run_command(command_name, args)
 
 
-func _format_commands_report(commands: Array) -> String:
-	var lines: Array[String] = ["命令", "", "共 %d 个可用命令" % commands.size()]
-	if commands.is_empty():
-		lines.append("• 无")
-		return "\n".join(lines)
-	for command in commands:
-		if not (command is Dictionary):
-			continue
-		lines.append("")
-		lines.append("• %s" % str(command.get("name", "未命名")))
-		lines.append("  %s" % str(command.get("description", "无说明")))
-		var schema: Dictionary = command.get("args_schema", {}) if command.get("args_schema", {}) is Dictionary else {}
-		var properties: Dictionary = schema.get("properties", {}) if schema.get("properties", {}) is Dictionary else {}
-		if properties.is_empty():
-			lines.append("  参数：无")
-		else:
-			var required: Array = schema.get("required", []) if schema.get("required", []) is Array else []
-			var args: Array[String] = []
-			for arg_name in properties.keys():
-				var info: Dictionary = properties[arg_name] if properties[arg_name] is Dictionary else {}
-				var label := str(arg_name) + "：" + str(info.get("type", "任意"))
-				if required.has(arg_name):
-					label += "，必填"
-				elif info.has("default"):
-					label += "，默认 %s" % str(info.get("default"))
-				args.append(label)
-			lines.append("  参数：%s" % "；".join(PackedStringArray(args)))
-	return "\n".join(lines)
-
-
+## 兼容适配器：外部调用方/测试可能仍通过面板接口访问格式化，实际实现已迁出到 ChatReportFormatter。
 func _format_command_response(response: Dictionary) -> String:
-	var text := str(response.get("text", "")).strip_edges()
-	var result = response.get("result", null)
-	if not (result is Dictionary):
-		return text
-	if result.has("python_version"):
-		return _format_doctor_report(result)
-	if result.has("files") and result.has("chunks") and result.has("changed_files"):
-		return _format_rebuild_index_result(result)
-	if result.has("compacted_frames") and result.has("removed_messages"):
-		return _format_compact_result(result)
-	var formatted := _format_plain_value("命令结果", result)
-	return formatted if text.is_empty() else text + "\n\n" + formatted
+	return ChatReportFormatter.command_response(response)
 
 
 func _format_rebuild_index_result(result: Dictionary) -> String:
-	var lines: Array[String] = ["RAG 索引构建完成", ""]
-	lines.append("• 本次处理文件：%d" % int(result.get("files", 0)))
-	lines.append("• 索引片段：%d" % int(result.get("chunks", 0)))
-	lines.append("• 发生变化的文件：%d" % int(result.get("changed_files", 0)))
-	if result.has("vectors"):
-		lines.append("• 向量数量：%d" % int(result.get("vectors", 0)))
-	if result.has("symbols"):
-		lines.append("• 符号数量：%d" % int(result.get("symbols", 0)))
-	if result.has("assets"):
-		lines.append("• 资源数量：%d" % int(result.get("assets", 0)))
-	lines.append("• 文件数量是否超限：%s" % ("是" if bool(result.get("truncated_files", false)) else "否"))
-	return "\n".join(lines)
+	return ChatReportFormatter.rebuild_index_result(result)
 
 
 func _format_compact_result(result: Dictionary) -> String:
-	var lines: Array[String] = ["会话上下文压缩完成", ""]
-	lines.append("• 压缩帧数：%d" % int(result.get("compacted_frames", 0)))
-	lines.append("• 移除消息：%d" % int(result.get("removed_messages", 0)))
-	lines.append("• 截断超长消息：%d" % int(result.get("truncated_messages", 0)))
-	lines.append("• 待处理任务：%s" % ("已保留" if result.get("pending_turn_id", null) != null else "无"))
-	return "\n".join(lines)
-
-
-func _format_memory_report(response: Dictionary) -> String:
-	var items: Array = response.get("items", []) if response.get("items", []) is Array else []
-	var lines: Array[String] = ["记忆", "", "状态：%s" % ("成功" if bool(response.get("ok", true)) else "失败")]
-	var response_text := str(response.get("text", "")).strip_edges()
-	if response_text != "":
-		lines.append("消息：%s" % response_text)
-	lines.append("条目：%d" % items.size())
-	if items.is_empty():
-		lines.append("• 无")
-		return "\n".join(lines)
-	for index in range(items.size()):
-		var item = items[index]
-		if not (item is Dictionary):
-			continue
-		lines.append("")
-		lines.append("%d. %s" % [index + 1, str(item.get("text", ""))])
-		lines.append("   ID：%s" % str(item.get("id", "未知")))
-		lines.append("   范围：%s；标签：%s" % [str(item.get("scope", "未知")), _doctor_list(item.get("tags", []))])
-		var updated_at := int(float(item.get("updated_at", 0.0)))
-		if updated_at > 0:
-			lines.append("   更新时间：%s" % Time.get_datetime_string_from_unix_time(updated_at, true))
-	return "\n".join(lines)
-
-
-func _format_extensions_report(payload: Dictionary) -> String:
-	var skills: Array = payload.get("skills", []) if payload.get("skills", []) is Array else []
-	var lines: Array[String] = ["扩展", "", "技能：%d" % skills.size()]
-	if skills.is_empty():
-		lines.append("• 无")
-	for skill in skills:
-		if not (skill is Dictionary):
-			continue
-		lines.append("")
-		lines.append("• %s%s" % [
-			str(skill.get("name", "未命名")), "" if bool(skill.get("enabled", true)) else "（已禁用）"
-		])
-		lines.append("  %s" % str(skill.get("description", "无说明")))
-		var qualified_name := str(skill.get("qualified_name", "")).strip_edges()
-		if qualified_name != "":
-			lines.append("  标识：%s；来源：%s" % [qualified_name, str(skill.get("source", "未知"))])
-		lines.append("  工具：%s" % _doctor_list(skill.get("effective_tools", [])))
-		var when_to_use := str(skill.get("when_to_use", "")).strip_edges()
-		if when_to_use != "":
-			lines.append("  使用时机：%s" % when_to_use)
-	var warnings: Array = payload.get("warnings", []) if payload.get("warnings", []) is Array else []
-	lines.append_array(["", "警告"])
-	if warnings.is_empty():
-		lines.append("• 无")
-	else:
-		for warning in warnings:
-			lines.append("• %s" % str(warning))
-	return "\n".join(lines)
-
-
-func _format_plain_value(title: String, value) -> String:
-	if value == null:
-		return title + "\n\n无"
-	if value is Array:
-		return title + "\n\n" + _doctor_list(value)
-	if value is Dictionary:
-		var lines: Array[String] = [title, ""]
-		for key in value.keys():
-			lines.append("• %s：%s" % [str(key), str(value[key])])
-		return "\n".join(lines)
-	return title + "\n\n" + str(value)
+	return ChatReportFormatter.compact_result(result)
 
 
 func _handle_tool_calls(response: Dictionary) -> void:
@@ -1295,19 +1082,21 @@ func _handle_tool_calls(response: Dictionary) -> void:
 	# `agent_tool_calls` 事件会在同一批 SSE 尾包处理完后结束当前 Thought。
 	# 不在 HTTP 回调中标记 reasoning key 为 closed，否则正文之后才到的 reasoning
 	# 尾包会被丢弃，而不是作为下一条独立 Thought 保留。
-	var silent: Array = []
+	# 不再用 silent 数组做分组——分组会打乱 assistant 声明的调用顺序。
+	# 改为仅计数 silent_count（用于日志），保留原始 calls 顺序供后续按序执行。
 	var confirm: Array = []
+	var silent_count := 0
 	for call in calls:
 		if call is Dictionary and bool(call.get("needs_confirm", false)):
 			confirm.append(call)
-		else:
-			silent.append(call)
+		elif call is Dictionary:
+			silent_count += 1
 	var call_names: Array = []
 	for call in calls:
 		if call is Dictionary:
 			call_names.append(str(call.get("name", "")))
 	FrontendLogger.info(editor_interface, "ChatPanel", "Handling tool calls.", {
-		"count": calls.size(), "silent": silent.size(), "confirm": confirm.size(), "names": call_names
+		"count": calls.size(), "silent": silent_count, "confirm": confirm.size(), "names": call_names
 	})
 
 	# workflow 工具（Edit/Write）的"宣告"消息直接跳过：确认框本身（confirm 分支）
@@ -1322,33 +1111,68 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		state_store.set_value("pending_calls", confirm)
 
 	var results: Array = []
-	for call in silent:
-		if call is Dictionary:
+	if confirm.is_empty():
+		# 全部调用均无需确认——按原始顺序依次执行，结果直接回传模型
+		for call in calls:
+			if call is Dictionary:
+				if _interrupted_locally:
+					return
+				var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
+				var preview: Control = null
+				var stats := {}
+				if is_workflow:
+					preview = ToolPreviewRenderer.render_call(call, _theme_colors)
+					stats = ToolPreviewRenderer.diff_stats(call)
+				else:
+					_append_message("system", EventFormatter.format_tool_call_header(call))
+				_set_state(AgentState.EXECUTING)
+				var result: Dictionary = await _tool_executor.execute(call)
+				if _interrupted_locally:
+					return
+				result = _ensure_tool_result_for_call(call, result)
+				results.append(result)
+				_append_tool_result(call, result, preview, stats)
+
+	_move_stream_to_end()
+	if not confirm.is_empty():
+		# 原序列中第一项需要确认的调用是暂停点；它之前的静默调用已经满足
+		# 顺序前置条件，可以立即执行。暂停点及其后的所有调用等用户决定后，
+		# 再从原位置继续，避免权限分组改变 assistant 声明的时序。
+		_pending_silent_results.clear()
+		_pending_ordered_calls.clear()
+		var reached_confirmation := false
+		for call in calls:
+			if not (call is Dictionary):
+				continue
+			# 遇到首个 needs_confirm 调用后切换为"暂存"模式：该项及其后所有调用
+			# （无论是否还需要确认）都按原序压入 _pending_ordered_calls，
+			# 等用户在确认面板操作时再逐个执行或拒绝。
+			if bool(call.get("needs_confirm", false)):
+				reached_confirmation = true
+			if reached_confirmation:
+				_pending_ordered_calls.append(call)
+				continue
 			if _interrupted_locally:
 				return
 			var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
 			var preview: Control = null
 			var stats := {}
 			if is_workflow:
-				# 必须在执行前渲染：之后文件已经被改写成 after_text，就读不到
-				# 真正的 before 内容了。
 				preview = ToolPreviewRenderer.render_call(call, _theme_colors)
 				stats = ToolPreviewRenderer.diff_stats(call)
 			else:
 				_append_message("system", EventFormatter.format_tool_call_header(call))
 			_set_state(AgentState.EXECUTING)
-			var result: Dictionary = await _tool_executor.execute(call)
+			var leading_result: Dictionary = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
-			result = _ensure_tool_result_for_call(call, result)
-			results.append(result)
-			_append_tool_result(call, result, preview, stats)
-
-	_move_stream_to_end()
-	if not confirm.is_empty():
+			leading_result = _ensure_tool_result_for_call(call, leading_result)
+			_pending_silent_results.append(leading_result)
+			_append_tool_result(call, leading_result, preview, stats)
+		# 暂停点之前的静默调用已立即执行完毕，结果存入 _pending_silent_results，
+		# 后续回传模型时拼在确认调用结果的前面，保证时序正确。
 		FrontendLogger.info(editor_interface, "ChatPanel", "Waiting for inline tool confirmation.", {"count": confirm.size()})
 		_pending_calls = confirm.duplicate(true)
-		_pending_silent_results = results.duplicate(true)
 		_show_inline_confirmation(confirm.duplicate(true))
 		_set_state(AgentState.WAITING_CONFIRM)
 	else:
@@ -2109,7 +1933,7 @@ func _on_extensions() -> void:
 			"skills": _last_doctor_report.get("skills", []),
 			"warnings": _last_doctor_report.get("warnings", [])
 		}
-		_append_message("system", _format_extensions_report(payload))
+		_append_message("system", ChatReportFormatter.extensions_report(payload))
 
 
 func _on_effort_selected(index: int) -> void:
@@ -2219,22 +2043,35 @@ func _show_inline_confirmation(calls: Array) -> void:
 	_post_final_scroll_frames = max(_post_final_scroll_frames, 5)
 
 
+## 用户点击"应用"：按 _pending_ordered_calls 的原始顺序逐项处理。
+## 每个调用先通过 _pending_confirmation_index 判断它是否真的需要确认：
+## - 需要确认的项：读取确认面板中对应条目的 should_apply 状态，决定执行或拒绝；
+##   grant_session_allow 仅附着在这类真正经过用户确认的调用上。
+## - 不需要确认的项（暂停点之后夹带的静默调用）：直接执行，should_apply 恒为 true。
 func _on_inline_apply() -> void:
 	if _inline_confirm.is_busy():
 		return
 	_inline_confirm.set_busy(true)
-	var results := _pending_silent_results.duplicate(true)
-	for index in range(_pending_calls.size()):
-		var call = _pending_calls[index]
+	var results: Array = _pending_silent_results.duplicate(true)
+	for call in _pending_ordered_calls:
 		if not (call is Dictionary):
 			continue
-		var should_apply := _inline_confirm.should_apply(index)
-		# 只对 workflow 工具（Edit/Write）合并成带 diff 的单条目；其它工具（如
-		# set_node_property/add_node）走旧的"宣告 + 结果"两条文本消息——它们的
-		# 宣告消息在上面没有被跳过，混进新面板只会再造一次重复条目。
+		var confirmation_index := _pending_confirmation_index(str(call.get("id", "")))
+		var needs_confirmation := confirmation_index >= 0
+		var should_apply := (
+			_inline_confirm.should_apply(confirmation_index) if needs_confirmation else true
+		)
 		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-		var preview := _inline_confirm.preview_for(index, is_workflow)
-		var stats := _inline_confirm.diff_stats_for(index, is_workflow)
+		var preview: Control = null
+		var stats := {}
+		if needs_confirmation:
+			preview = _inline_confirm.preview_for(confirmation_index, is_workflow)
+			stats = _inline_confirm.diff_stats_for(confirmation_index, is_workflow)
+		elif is_workflow:
+			preview = ToolPreviewRenderer.render_call(call, _theme_colors)
+			stats = ToolPreviewRenderer.diff_stats(call)
+		else:
+			_append_message("system", EventFormatter.format_tool_call_header(call))
 		if should_apply:
 			if _interrupted_locally:
 				return
@@ -2243,7 +2080,10 @@ func _on_inline_apply() -> void:
 			if _interrupted_locally:
 				return
 			result = _ensure_tool_result_for_call(call, result)
-			result["grant_session_allow"] = _inline_confirm.grant_session_allow()
+			if needs_confirmation:
+				# grant_session_allow 只附着在真正经过用户确认的调用上，
+				# 避免夹带的静默调用意外获得会话级权限豁免。
+				result["grant_session_allow"] = _inline_confirm.grant_session_allow()
 			results.append(result)
 			_append_tool_result(call, result, preview, stats)
 		else:
@@ -2254,27 +2094,56 @@ func _on_inline_apply() -> void:
 	_on_decision(results)
 
 
+## 用户点击"拒绝"：按原始顺序遍历 _pending_ordered_calls。
+## - 需要确认的项：生成 rejected 结果回传模型，让模型知道用户拒绝了该编辑，
+##   可以继续给出建设性回复（如手动修改步骤或降级方案），而非前端单方面中断。
+## - 不需要确认的项（夹带的静默调用）：正常执行，不因其后的确认项被拒绝而跳过。
 func _on_inline_reject() -> void:
 	if _inline_confirm.is_busy():
 		return
 	_inline_confirm.set_busy(true)
-	var calls := _pending_calls.duplicate(true)
-	# 拒绝不等于挂断：把 rejected 结果回传给模型，让它读到"用户拒绝了这个
-	# 编辑"之后继续给出建设性回复（如手动修改步骤、改成只读分析或降级
-	# 方案），而不是前端单方面结束本轮、晾着用户。
-	var results := _pending_silent_results.duplicate(true)
-	for index in range(calls.size()):
-		var call = calls[index]
+	var results: Array = _pending_silent_results.duplicate(true)
+	for call in _pending_ordered_calls:
 		if not (call is Dictionary):
 			continue
-		var rejected := AgentDTO.rejected_result(call)
-		results.append(rejected)
+		var confirmation_index := _pending_confirmation_index(str(call.get("id", "")))
+		var needs_confirmation := confirmation_index >= 0
 		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-		var preview := _inline_confirm.preview_for(index, is_workflow)
-		var stats := _inline_confirm.diff_stats_for(index, is_workflow)
-		_append_tool_result(call, rejected, preview, stats)
+		var preview: Control = null
+		var stats := {}
+		if needs_confirmation:
+			preview = _inline_confirm.preview_for(confirmation_index, is_workflow)
+			stats = _inline_confirm.diff_stats_for(confirmation_index, is_workflow)
+			var rejected := AgentDTO.rejected_result(call)
+			results.append(rejected)
+			_append_tool_result(call, rejected, preview, stats)
+			continue
+		if is_workflow:
+			preview = ToolPreviewRenderer.render_call(call, _theme_colors)
+			stats = ToolPreviewRenderer.diff_stats(call)
+		else:
+			_append_message("system", EventFormatter.format_tool_call_header(call))
+		if _interrupted_locally:
+			return
+		_set_state(AgentState.EXECUTING)
+		var result: Dictionary = await _tool_executor.execute(call)
+		if _interrupted_locally:
+			return
+		result = _ensure_tool_result_for_call(call, result)
+		results.append(result)
+		_append_tool_result(call, result, preview, stats)
 	_inline_confirm.set_busy(false)
 	_on_decision(results)
+
+
+## 在 _pending_calls（仅含 needs_confirm 的调用）中查找指定 tool_use_id 的索引。
+## 返回 -1 表示该调用不需要确认（是暂停点之后夹带的静默调用）。
+func _pending_confirmation_index(tool_use_id: String) -> int:
+	for index in range(_pending_calls.size()):
+		var call = _pending_calls[index]
+		if call is Dictionary and str(call.get("id", "")) == tool_use_id:
+			return index
+	return -1
 
 
 ## 仅拆除确认框的 UI（旧的 checkbox/diff 预览/按钮），不触碰 `_pending_calls` /
@@ -2290,6 +2159,7 @@ func _clear_inline_confirmation() -> void:
 	_clear_inline_confirmation_ui()
 	_pending_calls.clear()
 	_pending_silent_results.clear()
+	_pending_ordered_calls.clear()  # 同步清理原始序列切片，防止下一轮残留
 
 
 func _request_model():

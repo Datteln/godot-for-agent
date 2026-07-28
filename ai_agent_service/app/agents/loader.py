@@ -127,13 +127,18 @@ def load_agent_file(path: Path) -> AgentDefinition:
         ),
         can_delegate=bool(meta.get("can_delegate") or meta.get("can-delegate") or False),
         hooks=hooks if isinstance(hooks, dict) and hooks else None,
+        # 从 frontmatter 读取稳定的编排元数据；缺省值与 AgentDefinition 默认值对齐
+        pipeline_kind=str(meta.get("pipeline_kind") or "general"),
+        role=str(meta.get("role") or "specialist"),
+        map_stage=(str(meta["map_stage"]) if meta.get("map_stage") else None),
     )
     logger.info(
         "Agent definition loaded name=%s source=%s tools=%d skills=%d max_turns=%d "
         "can_delegate=%s prompt_chars=%d",
         definition.name,
         definition.source,
-        len(definition.tools),
+        # tools 可能为 None（"使用当前上下文可见工具"），日志中安全降级为 0
+        len(definition.tools or []),
         len(definition.skills),
         definition.max_turns,
         definition.can_delegate,

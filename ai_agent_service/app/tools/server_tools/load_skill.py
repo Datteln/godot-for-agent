@@ -31,17 +31,34 @@ async def load_skill_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str
     if ctx.skill_catalog is None:
         raise ValueError("SkillCatalog 未初始化")
 
-    skill = ctx.skill_catalog.get(name)
+    binding = ctx.skill_catalog.resolve_binding(
+        name,
+        set(ctx.agent_effective_tools or ctx.effective_tools),
+        workflow_stage=ctx.workflow_stage,
+        worker_mode=ctx.worker_mode,
+        agent_role=ctx.agent_role,
+        permitted_tools=set(ctx.effective_tools),
+    )
+    if binding.status != "resolved" or binding.qualified_name is None:
+        raise ValueError(
+            "Skill 绑定失败："
+            f"status={binding.status}; reasons={','.join(binding.reason_codes)}"
+        )
+    skill = ctx.skill_catalog.get(binding.qualified_name)
     if skill is None:
-        raise ValueError(f"未找到 Skill：{name}")
-    if not skill.enabled:
-        raise ValueError(f"Skill 未启用：{skill.qualified_name}")
-
+        raise ValueError(f"Skill 绑定后无法读取：{binding.qualified_name}")
+    visible_tools = list(binding.effective_tools)
+    unavailable_tools = sorted(
+        set(skill.effective_tools) - set(binding.effective_tools)
+    )
     logger.info(
-        "load_skill success session=%s qualified_name=%s source=%s warnings=%d",
+        "load_skill success session=%s qualified_name=%s source=%s "
+        "tools=%d unavailable=%d warnings=%d",
         ctx.session_id,
         skill.qualified_name,
         skill.source,
+        len(visible_tools),
+        len(unavailable_tools),
         len(skill.warnings),
     )
     return {
@@ -51,7 +68,10 @@ async def load_skill_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str
         "description": skill.description,
         "when_to_use": skill.when_to_use,
         "content": skill.body,
-        "effective_tools": skill.effective_tools,
+        "effective_tools": visible_tools,       # 仅返回当前 Agent 可见的工具子集
+        "unavailable_tools": unavailable_tools,  # Skill 需要但当前 Agent 不可用的工具
+        "workflow_stage": ctx.workflow_stage,    # 当前工作流阶段，供 Skill 正文感知上下文
+        "binding": binding.to_dict(),
         "warnings": skill.warnings,
     }
 

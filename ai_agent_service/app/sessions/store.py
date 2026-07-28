@@ -19,8 +19,14 @@ from typing import Any, Literal
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, CompactSnapshot, Frame
 from app.orchestrator.map_progress import MapTaskState
+from app.orchestrator.map_request_scope import MapRequestScope
 from app.orchestrator.map_workers import restore_project_agent
 from app.permissions.engine import SessionAllowGrant
+from app.sessions.schema import (
+    SESSION_SCHEMA_VERSION,
+    migrate_session_payload,
+    session_payload_version,
+)
 from app.storage.atomic import atomic_write_json
 
 logger = logging.getLogger(__name__)
@@ -43,7 +49,9 @@ class Session:
         pending_tool_call_ids: `pending_turn_id` 对应的待回应 `tool_use_id` 集合。
         turn_counter: `turn_id` 生成计数器。
         frame_counter: `frame_id` 生成计数器。
-        request_id_cache: `request_id` → 上次响应体，用于用户消息级幂等（§14.1）。
+        request_id_cache: `request_id` → 上次响应体，用于请求级幂等（§14.1）。
+        completed_tool_turn_cache: 已处理工具结果的 turn id → 结果指纹与响应体；
+            客户端更换 request_id 重试同一批结果时仍返回第一次响应。
         pending_tool_calls: pending tool_call_id → tool metadata，用于工具结果回填、
             enrich 与会话级 allow 授权。
         session_allow: 本会话内"总是允许"的授权集合，不跨会话持久化到项目配置。
@@ -54,28 +62,11 @@ class Session:
             不存在活跃计划时为 None。
         verify_retry_count: 文件路径 → 该文件已触发的"校验失败-修复"重试次数，
             用于防止 Verify 与 LLM 修复之间死循环。
-        map_completion_blockers: 地图编辑任务的阻断完成原因；前端地图工具回传
-            `blocking_completion` 或尚未通过路线校验时写入，最终回复前清空或拦截。
-        map_auto_iterations: 当前地图任务已自动续跑的次数；超过上限后必须交还用户，
-            不再继续调用地图工具。
-        latest_map_validations: 最近一次真实地图校验的完整状态；用于跨轮次、压缩和
-            worker 回填时防止旧上下文把失败误报为通过。
-        map_validation_failure_counts: 校验失败指纹 → 无新地图 revision 时的重复次数；
-            达到上限后停止自动续跑。
-        map_validation_contracts: 目标地图与图层作用域 → 当前用户任务冻结的 completion 验收合同；
-            模型不能靠修改 start/goal/移动参数绕过失败结果。
-        map_validation_workflows: 目标地图与图层作用域 → 当前 revision 的验证阶段状态；用于强制
-            completion → diagnostic → planner → write → 新 revision 的转换。
-        map_no_progress_streaks: 目标地图 → 当前 revision 连续无进展次数；真实写入
-            推进 revision 或新用户任务开始时清零。
-        latest_map_revisions: 最近一次地图读/写/验证工具返回的 target_path → map_revision；
-            服务层下发地图写工具前用它覆盖过期的 `expected_revision`。
-        latest_map_layers: 最近一次地图工具确认的 target_path → map_layer；服务层在
-            地图写工具漏传 `map_layer` 时补齐，不覆盖显式入参。
-        latest_map_region_reads: 最近已读取过的地图区域签名 → map_revision；
-            用于要求地图计算/编辑工具先读取真实区域，且旧 revision 会重新读取。
-        latest_map_region_summaries: 最近已读取过的地图区域签名 → 精简 describe_map_region 摘要；
-            用于阻止平台规划在空采样/错图层上继续执行。
+        map_task_state: 地图任务的唯一运行时状态，包括 revision、校验合同、缓存和完成门。
+        map_request_scope: 当前用户请求的结构化 intent、lineage 与 completion candidate；
+            普通对话默认不绑定地图任务。
+        map_task_lineage: 当前地图任务独立于普通 request scope 持久化的 origin、
+            lineage 与 completion-candidate 状态，供显式恢复继承。
         pending_map_write_after_read: 因缺少 map state 而挂起的一次地图写调用；
             自动读到 `map_layer`/`map_revision` 后恢复下发。
         pending_map_validation_after_read: 因缺少 `map_layer` 而挂起的一次地图校验调用；
@@ -86,7 +77,6 @@ class Session:
             自动压缩用它和本地估算取大，避免低估。
         force_compact_next_turn: 最近一次 provider 用量超过阈值后置位；下一轮 LLM 前
             强制 compact 一次。
-        map_context_state: 每 session 的地图小索引，只存摘要和 artifact_ref，不存 raw cells。
         rag_context: 当前用户提问检索到的 RAG 上下文（分层 prompt 的 L3 段），
             在新用户消息到达时刷新、在工具结果回填等同一轮的后续请求里复用，
             使该段在整轮 agent 循环内保持稳定、可被缓存（§16.1 RAG 段缓存）。
@@ -99,6 +89,9 @@ class Session:
     turn_counter: int = 0
     frame_counter: int = 0
     request_id_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 已处理工具结果的 turn id → 结果指纹与响应体；
+    # 客户端更换 request_id 重试同一批工具结果时，直接返回首次响应而不重复执行
+    completed_tool_turn_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_tool_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
     session_allow: set[SessionAllowGrant] = field(default_factory=set)
     effort: str = "standard"
@@ -107,84 +100,17 @@ class Session:
     pending_plan: dict[str, Any] | None = None
     verify_retry_count: dict[str, int] = field(default_factory=dict)
     pending_verify_candidates: list[dict[str, Any]] = field(default_factory=list)
-    map_completion_blockers: list[dict[str, Any]] = field(default_factory=list)
-    map_auto_iterations: int = 0
-    latest_map_validations: dict[str, dict[str, Any]] = field(default_factory=dict)
-    map_validation_failure_counts: dict[str, int] = field(default_factory=dict)
-    map_validation_contracts: dict[str, dict[str, Any]] = field(default_factory=dict)
-    map_validation_workflows: dict[str, dict[str, Any]] = field(default_factory=dict)
-    map_no_progress_streaks: dict[str, int] = field(default_factory=dict)
-    latest_map_revisions: dict[str, int] = field(default_factory=dict)
-    latest_map_layers: dict[str, int] = field(default_factory=dict)
-    latest_map_region_reads: dict[str, int] = field(default_factory=dict)
-    latest_map_region_summaries: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_map_write_after_read: dict[str, Any] | None = None
     pending_map_validation_after_read: dict[str, Any] | None = None
     pending_map_tool_after_read: dict[str, Any] | None = None
     latest_context_used_tokens: int = 0
     force_compact_next_turn: bool = False
-    map_context_state: dict[str, Any] = field(default_factory=dict)
     map_task_state: MapTaskState = field(default_factory=MapTaskState)
+    map_request_scope: MapRequestScope = field(default_factory=MapRequestScope)
+    map_task_lineage: dict[str, Any] = field(default_factory=dict)
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
-
-    def __post_init__(self) -> None:
-        """把旧字段绑定到统一地图任务状态，兼容已有调用方。"""
-        state = self.map_task_state
-        legacy_pairs = (
-            ("validation_contracts", self.map_validation_contracts),
-            ("validation_workflows", self.map_validation_workflows),
-            ("no_progress_streaks", self.map_no_progress_streaks),
-            ("latest_validations", self.latest_map_validations),
-            ("validation_failure_counts", self.map_validation_failure_counts),
-            ("latest_revisions", self.latest_map_revisions),
-            ("latest_layers", self.latest_map_layers),
-            ("region_reads", self.latest_map_region_reads),
-            ("region_summaries", self.latest_map_region_summaries),
-            ("context_state", self.map_context_state),
-        )
-        for state_name, legacy_value in legacy_pairs:
-            state_value = getattr(state, state_name)
-            canonical = state_value if state_value else legacy_value
-            setattr(state, state_name, canonical)
-            setattr(self, self._legacy_map_field_name(state_name), canonical)
-        if not state.completion_blockers:
-            state.completion_blockers = self.map_completion_blockers
-        else:
-            self.map_completion_blockers = state.completion_blockers
-        state.auto_iterations = max(state.auto_iterations, self.map_auto_iterations)
-
-    @staticmethod
-    def _legacy_map_field_name(state_name: str) -> str:
-        """返回统一状态字段对应的旧 Session 属性名。"""
-        return {
-            "validation_contracts": "map_validation_contracts",
-            "validation_workflows": "map_validation_workflows",
-            "no_progress_streaks": "map_no_progress_streaks",
-            "latest_validations": "latest_map_validations",
-            "validation_failure_counts": "map_validation_failure_counts",
-            "latest_revisions": "latest_map_revisions",
-            "latest_layers": "latest_map_layers",
-            "region_reads": "latest_map_region_reads",
-            "region_summaries": "latest_map_region_summaries",
-            "context_state": "map_context_state",
-        }[state_name]
-
-    def sync_map_task_state(self) -> None:
-        """在持久化前同步仍由旧标量属性承载的地图状态。"""
-        self.map_task_state.completion_blockers = self.map_completion_blockers
-        self.map_task_state.auto_iterations = self.map_auto_iterations
-
-    def replace_map_completion_blockers(self, blockers: list[dict[str, Any]]) -> None:
-        """原子替换完成门阻断项及其兼容别名。"""
-        self.map_completion_blockers = blockers
-        self.map_task_state.completion_blockers = blockers
-
-    def set_map_auto_iterations(self, value: int) -> None:
-        """同步更新地图自动迭代次数。"""
-        self.map_auto_iterations = value
-        self.map_task_state.auto_iterations = value
 
     def top_frame(self) -> Frame | None:
         """返回当前活跃帧（栈顶），栈为空时返回 None。
@@ -247,9 +173,27 @@ class Session:
             turn_id: 本轮分配的 `turn_id`。
             tool_call_ids: 本轮所有 front 工具调用的 `tool_use_id` 列表。
         """
+        enriched_metadata: dict[str, dict[str, Any]] = {}
+        frames = {frame.id: frame for frame in self.agent_stack}
+        for tool_call_id in tool_call_ids:
+            item = dict((metadata or {}).get(tool_call_id, {}))
+            frame = frames.get(str(item.get("frame_id", "")))
+            lineage_id = (
+                frame.map_request_lineage_id
+                if frame is not None
+                else self.map_request_scope.lineage_id
+            )
+            map_task_id = (
+                frame.map_task_id
+                if frame is not None
+                else self.map_request_scope.map_task_id
+            )
+            item["request_lineage_id"] = lineage_id or ""
+            item["map_task_id"] = map_task_id or ""
+            enriched_metadata[tool_call_id] = item
         self.pending_turn_id = turn_id
         self.pending_tool_call_ids = set(tool_call_ids)
-        self.pending_tool_calls = metadata or {}
+        self.pending_tool_calls = enriched_metadata
 
     def clear_pending(self) -> None:
         """清空待回应记录（前端结果已全部校验通过并 append 后调用）。"""
@@ -355,6 +299,11 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
                 "skills": frame.agent.skills,
                 "workflow_operations": frame.agent.workflow_operations,
                 "workflow_constraints": frame.agent.workflow_constraints,
+                # 持久化稳定的编排元数据：权限/预算只从这些字段推断
+                "pipeline_kind": frame.agent.pipeline_kind,
+                "role": frame.agent.role,
+                "map_stage": frame.agent.map_stage,
+                "worker_mode": frame.agent.worker_mode,
                 "model": frame.agent.model,
                 "effort": frame.agent.effort,
                 "max_turns": frame.agent.max_turns,
@@ -379,6 +328,15 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
         "forced_completion_text": frame.forced_completion_text,
         "force_text_only": frame.force_text_only,
         "map_reader_detailed_region_ready": frame.map_reader_detailed_region_ready,
+        # 地图子 Frame 的可信阶段合同与运行时证据，用于跨轮次恢复时保持流水线状态一致
+        "map_stage_contract": frame.map_stage_contract,
+        "map_request_lineage_id": frame.map_request_lineage_id,
+        "map_task_id": frame.map_task_id,
+        "contract_id": frame.contract_id,
+        "worker_instance_id": frame.worker_instance_id,
+        "result_schema": frame.result_schema,
+        "allowed_next_stages": list(frame.allowed_next_stages),
+        "map_evidence": frame.map_evidence,
         "compact_snapshot": (
             {
                 "revision": frame.compact_snapshot.revision,
@@ -462,6 +420,36 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
         ),
         force_text_only=data.get("force_text_only") is True,
         map_reader_detailed_region_ready=data.get("map_reader_detailed_region_ready") is True,
+        map_stage_contract=_as_dict(data.get("map_stage_contract")),
+        map_request_lineage_id=(
+            str(data["map_request_lineage_id"])
+            if data.get("map_request_lineage_id") is not None
+            else None
+        ),
+        map_task_id=(
+            str(data["map_task_id"]) if data.get("map_task_id") is not None else None
+        ),
+        contract_id=(
+            str(data["contract_id"]) if data.get("contract_id") is not None else None
+        ),
+        worker_instance_id=(
+            str(data["worker_instance_id"])
+            if data.get("worker_instance_id") is not None
+            else None
+        ),
+        result_schema=(
+            str(data["result_schema"]) if data.get("result_schema") is not None else None
+        ),
+        allowed_next_stages=tuple(
+            str(item)
+            for item in _as_list(data.get("allowed_next_stages"))
+            if isinstance(item, str)
+        ),
+        map_evidence=[
+            dict(item)
+            for item in data.get("map_evidence", [])
+            if isinstance(item, dict)
+        ],
         compact_snapshot=compact_snapshot,
     )
 
@@ -475,8 +463,9 @@ def session_to_dict(session: Session) -> dict[str, Any]:
     Returns:
         仅含 JSON 原生类型的字典。
     """
-    session.sync_map_task_state()
     return {
+        # 持久化 schema 版本：供 migrate_session_payload 判断是否需要升级
+        "schema_version": SESSION_SCHEMA_VERSION,
         "session_id": session.session_id,
         "agent_stack": [_frame_to_dict(f) for f in session.agent_stack],
         "pending_turn_id": session.pending_turn_id,
@@ -484,6 +473,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "turn_counter": session.turn_counter,
         "frame_counter": session.frame_counter,
         "request_id_cache": session.request_id_cache,
+        "completed_tool_turn_cache": session.completed_tool_turn_cache,
         "pending_tool_calls": session.pending_tool_calls,
         "session_allow": [list(grant) for grant in sorted(session.session_allow)],
         "effort": session.effort,
@@ -492,24 +482,14 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "pending_plan": session.pending_plan,
         "verify_retry_count": session.verify_retry_count,
         "pending_verify_candidates": session.pending_verify_candidates,
-        "map_completion_blockers": session.map_completion_blockers,
-        "map_auto_iterations": session.map_auto_iterations,
-        "latest_map_validations": session.latest_map_validations,
-        "map_validation_failure_counts": session.map_validation_failure_counts,
-        "map_validation_contracts": session.map_validation_contracts,
-        "map_validation_workflows": session.map_validation_workflows,
-        "map_no_progress_streaks": session.map_no_progress_streaks,
-        "latest_map_revisions": session.latest_map_revisions,
-        "latest_map_layers": session.latest_map_layers,
-        "latest_map_region_reads": session.latest_map_region_reads,
-        "latest_map_region_summaries": session.latest_map_region_summaries,
         "pending_map_write_after_read": session.pending_map_write_after_read,
         "pending_map_validation_after_read": session.pending_map_validation_after_read,
         "pending_map_tool_after_read": session.pending_map_tool_after_read,
         "latest_context_used_tokens": session.latest_context_used_tokens,
         "force_compact_next_turn": session.force_compact_next_turn,
-        "map_context_state": session.map_context_state,
         "map_task_state": session.map_task_state.to_dict(),
+        "map_request_scope": session.map_request_scope.to_dict(),
+        "map_task_lineage": session.map_task_lineage,
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
         "rag_context": session.rag_context,
@@ -557,6 +537,9 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
     """
     if not isinstance(data, dict):
         raise ValueError("session payload must be an object")
+    # 反序列化前先执行 schema 迁移：把旧版字段映射到当前结构，
+    # 迁移后 data 已经是最新 schema，后续代码无需再处理兼容
+    data, _ = migrate_session_payload(data)
     if not isinstance(data.get("session_id"), str) or not data["session_id"]:
         raise ValueError("session payload missing string session_id")
     raw_history_events = data.get("history_events", [])
@@ -590,6 +573,7 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         turn_counter=_as_int(data.get("turn_counter")),
         frame_counter=_as_int(data.get("frame_counter")),
         request_id_cache=_as_dict(data.get("request_id_cache")),
+        completed_tool_turn_cache=_as_dict(data.get("completed_tool_turn_cache")),
         pending_tool_calls=_as_dict(data.get("pending_tool_calls")),
         session_allow={
             (str(item[0]), str(item[1]), str(item[2]), str(item[3]) if len(item) >= 4 else "")
@@ -606,55 +590,6 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
             for item in _as_list(data.get("pending_verify_candidates"))
             if isinstance(item, dict)
         ],
-        map_completion_blockers=[
-            item for item in _as_list(data.get("map_completion_blockers")) if isinstance(item, dict)
-        ],
-        map_auto_iterations=_as_int(data.get("map_auto_iterations")),
-        latest_map_validations={
-            str(key): value
-            for key, value in _as_dict(data.get("latest_map_validations")).items()
-            if isinstance(value, dict)
-        },
-        map_validation_failure_counts={
-            str(key): value
-            for key, value in _as_dict(data.get("map_validation_failure_counts")).items()
-            if isinstance(value, int) and not isinstance(value, bool)
-        },
-        map_validation_contracts={
-            str(key): value
-            for key, value in _as_dict(data.get("map_validation_contracts")).items()
-            if isinstance(value, dict)
-        },
-        map_validation_workflows={
-            str(key): value
-            for key, value in _as_dict(data.get("map_validation_workflows")).items()
-            if isinstance(value, dict)
-        },
-        map_no_progress_streaks={
-            str(key): value
-            for key, value in _as_dict(data.get("map_no_progress_streaks")).items()
-            if isinstance(value, int) and not isinstance(value, bool)
-        },
-        latest_map_revisions={
-            str(key): value
-            for key, value in _as_dict(data.get("latest_map_revisions")).items()
-            if isinstance(value, int) and not isinstance(value, bool)
-        },
-        latest_map_layers={
-            str(key): value
-            for key, value in _as_dict(data.get("latest_map_layers")).items()
-            if isinstance(value, int) and not isinstance(value, bool)
-        },
-        latest_map_region_reads={
-            str(key): value
-            for key, value in _as_dict(data.get("latest_map_region_reads")).items()
-            if isinstance(value, int) and not isinstance(value, bool)
-        },
-        latest_map_region_summaries={
-            str(key): value
-            for key, value in _as_dict(data.get("latest_map_region_summaries")).items()
-            if isinstance(value, dict)
-        },
         pending_map_write_after_read=(
             data.get("pending_map_write_after_read")
             if isinstance(data.get("pending_map_write_after_read"), dict)
@@ -672,8 +607,9 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         ),
         latest_context_used_tokens=_as_int(data.get("latest_context_used_tokens")),
         force_compact_next_turn=bool(data.get("force_compact_next_turn", False)),
-        map_context_state=_as_dict(data.get("map_context_state")),
         map_task_state=map_task_state,
+        map_request_scope=MapRequestScope.from_dict(data.get("map_request_scope")),
+        map_task_lineage=_as_dict(data.get("map_task_lineage")),
         history_event_counter=history_event_counter,
         history_events=history_events,
         rag_context=str(data.get("rag_context", "")),
@@ -775,9 +711,9 @@ class SessionStore:
         Args:
             session: 待保存的会话。
         """
-        self._sessions[session.session_id] = session
         path = self._path_for(session.session_id)
         atomic_write_json(path, session_to_dict(session))
+        self._sessions[session.session_id] = session
         logger.debug(
             "Session saved session=%s frames=%d pending=%s cache_entries=%d path=%s",
             session.session_id,
@@ -843,7 +779,13 @@ class SessionStore:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            session = session_from_dict(data, available_tools)
+            # 加载时先检测持久化文件的 schema 版本，执行迁移后再反序列化，
+            # 使旧文件能透明升级到当前 SESSION_SCHEMA_VERSION
+            if not isinstance(data, dict):
+                raise ValueError("session payload must be an object")
+            source_version = session_payload_version(data)
+            migrated_data, migrated = migrate_session_payload(data)
+            session = session_from_dict(migrated_data, available_tools)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning("Session load failed session=%s path=%s error=%s", session_id, path, exc)
             return None
@@ -857,5 +799,16 @@ class SessionStore:
                 path,
             )
             return None
+        # 若发生了 schema 迁移，立即将升级后的会话回写磁盘，
+        # 避免每次加载都重复执行迁移逻辑
+        if migrated:
+            atomic_write_json(path, session_to_dict(session))
+            logger.info(
+                "Session payload migrated session=%s from_version=%d to_version=%d path=%s",
+                session_id,
+                source_version,
+                SESSION_SCHEMA_VERSION,
+                path,
+            )
         logger.debug("Session loaded from disk session=%s path=%s", session_id, path)
         return session

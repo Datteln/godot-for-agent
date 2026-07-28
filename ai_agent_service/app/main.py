@@ -26,6 +26,7 @@ from app.logging_config import configure_logging
 from app.mcp.server import run_mcp_stdio
 from app.memory.store import MemoryStore
 from app.output_styles.catalog import OutputStyleCatalog
+from app.orchestrator.map_capabilities import validate_map_capability_contract
 from app.query.engine import QueryEngine
 from app.rag.build_manager import RagIndexBuildManager
 from app.recovery.pointer import RecoveryPointerStore
@@ -87,7 +88,13 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
 
     register_server_tools()
     register_front_tools()
-
+    # 启动时校验地图工具能力合同的完整性：
+    # 确保 MAP_TOOL_CAPABILITIES 中声明的每个工具都已在 REGISTRY 注册，
+    # 且 category/requires_revision/requires_target 等字段合法；
+    # 合同不合法时直接拒绝启动，避免运行时出现难以诊断的权限缺口
+    capability_issues = validate_map_capability_contract(REGISTRY)
+    if capability_issues:
+        raise RuntimeError("地图工具能力合同无效：" + "；".join(capability_issues))
     security = security_settings_from_app(resolved_settings)
     llm = OpenAICompatibleProvider(
         base_url=resolved_settings.llm_base_url,

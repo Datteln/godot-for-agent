@@ -75,6 +75,20 @@ COMMANDS: list[CommandInfo] = [
             },
         },
     ),
+    # 显式恢复已暂停的地图任务：前端在用户主动恢复时调用，
+    # 底层通过 QueryEngine.resume_paused_map_task 从检查点继续
+    CommandInfo(
+        name="resume_map_task",
+        description="显式恢复指定 session 中已暂停的地图任务。",
+        args_schema={"type": "object", "properties": {}},
+    ),
+    # 显式取消运行中或暂停中的地图任务：清空旧检查点和待执行批次，
+    # 防止已失效的任务继续执行
+    CommandInfo(
+        name="cancel_map_task",
+        description="显式取消指定 session 中运行或暂停的地图任务。",
+        args_schema={"type": "object", "properties": {}},
+    ),
     CommandInfo(
         name="set_effort",
         description="设置当前 session 的 effort 档位。",
@@ -310,6 +324,34 @@ def create_router(
                 request.session_id, keep_recent=keep_recent, use_llm=use_llm
             )
             return CommandResponse(ok=True, text="compact 已完成", result=result)
+        # resume_map_task：显式恢复已暂停的地图任务
+        # 需要 session_id；调用 QueryEngine.resume_paused_map_task 从检查点继续
+        if name == "resume_map_task":
+            if request.session_id is None:
+                logger.warning("Command resume_map_task rejected: missing session_id")
+                return _err("resume_map_task 需要 session_id")
+            result = await query_engine.resume_paused_map_task(request.session_id)
+            if result.get("resumed") is not True:
+                return _err(f"地图任务未恢复：{result.get('reason', 'unknown')}")
+            return CommandResponse(
+                ok=True,
+                text="地图任务已显式恢复；下一条消息将从检查点继续。",
+                result=result,
+            )
+        # cancel_map_task：显式取消运行中或暂停中的地图任务
+        # 清空旧检查点和待执行批次，防止已失效任务继续执行
+        if name == "cancel_map_task":
+            if request.session_id is None:
+                logger.warning("Command cancel_map_task rejected: missing session_id")
+                return _err("cancel_map_task 需要 session_id")
+            result = await query_engine.cancel_map_task(request.session_id)
+            if result.get("cancelled") is not True:
+                return _err(f"地图任务未取消：{result.get('reason', 'unknown')}")
+            return CommandResponse(
+                ok=True,
+                text="地图任务已取消，旧检查点和待执行批次不会继续。",
+                result=result,
+            )
         if name == "set_effort":
             if request.session_id is None:
                 logger.warning("Command set_effort rejected: missing session_id")

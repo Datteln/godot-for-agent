@@ -80,6 +80,16 @@ class EventStore:
         logger.debug("Event appended session=%s seq=%d type=%s", session_id, seq, event_type)
         return event
 
+    def ensure_sequence(self, session_id: str, persisted_seq: int) -> None:
+        """让进程内序号从持久化 cursor 之后继续，避免重启后回退到 1。
+
+        当会话从磁盘加载时，其 history_event_counter 可能远大于进程内的 _seq 计数。
+        此方法把进程内序号推进到持久化值，确保新追加的事件序号严格递增、不与
+        历史事件序号冲突。
+        """
+        if persisted_seq > self._seq.get(session_id, 0):
+            self._seq[session_id] = persisted_seq
+
     def list_after(self, session_id: str, after: int = 0) -> list[Event]:
         """返回指定 seq 之后的事件。"""
         events = [event for event in self._events.get(session_id, []) if event.seq > after]

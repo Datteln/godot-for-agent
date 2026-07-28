@@ -5,6 +5,7 @@ const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 const MapValidator = preload("res://addons/ai_agent/tools/map_validator.gd")
 const MapBlueprints = preload("res://addons/ai_agent/tools/map_blueprints.gd")
 const MapLayerScaffold = preload("res://addons/ai_agent/tools/map_layer_scaffold.gd")
+const MapNoiseSampler = preload("res://addons/ai_agent/tools/map_noise_sampler.gd")
 const MapIntentParser = preload("res://addons/ai_agent/tools/map_intent_parser.gd")
 const MapLayoutPlanner = preload("res://addons/ai_agent/tools/map_layout_planner.gd")
 const MapAlgorithms = preload("res://addons/ai_agent/tools/map_algorithms.gd")
@@ -1421,6 +1422,17 @@ static func _resolve_map_target(
 		"layers": layers,
 		"suggested_map_layer": int(suggested.get("index", -1)),
 	}
+
+
+## 公开的 API：解析并返回地图写入使用的 canonical 节点身份（路径、节点引用、类型）。
+## ToolExecutor 在 revision 守卫前调用此函数，以获得精确的 revision key。
+static func resolve_map_target_identity(
+	input: Dictionary,
+	editor_interface: EditorInterface,
+	require_explicit_map_layer: bool = false
+) -> Dictionary:
+	## 解析并返回地图写入使用的 canonical 节点身份。
+	return _resolve_map_target(input, editor_interface, require_explicit_map_layer)
 
 
 static func _resolve_map_target_unchecked(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
@@ -4022,6 +4034,86 @@ static func _dictionary_sha256(value: Dictionary) -> String:
 	return context.finish().hex_encode()
 
 
+static func _platform_collision_facts(
+	input: Dictionary,
+	target: Node,
+	target_path: String,
+	region: Dictionary,
+	map_layer: int
+) -> Dictionary:
+	if input.has("_collision_cells"):
+		return {
+			"ok": false,
+			"error_code": "unverified_collision_cells_rejected",
+			"message": "Raw _collision_cells are private and cannot authorize platform validation.",
+		}
+	var revision := int(input.get("_canonical_map_revision", -1))
+	if revision < 0:
+		return {
+			"ok": false,
+			"error_code": "collision_facts_revision_unavailable",
+			"message": "Canonical map revision is unavailable; re-run through ToolExecutor.",
+		}
+	var artifact_value = input.get("collision_facts_artifact")
+	if artifact_value is Dictionary:
+		var artifact: Dictionary = (artifact_value as Dictionary).duplicate(true)
+		var supplied_digest := str(artifact.get("digest", ""))
+		artifact.erase("digest")
+		if supplied_digest == "" or supplied_digest != _dictionary_sha256(artifact):
+			return {
+				"ok": false,
+				"error_code": "collision_facts_digest_mismatch",
+				"message": "Collision fact artifact digest is missing or invalid.",
+			}
+		if str(artifact.get("artifact_ref", "")).strip_edges() == "":
+			return {
+				"ok": false,
+				"error_code": "collision_facts_artifact_unverifiable",
+				"message": "Collision fact artifact must have an artifact_ref.",
+			}
+		if str(artifact.get("target_path", "")) != target_path:
+			return {
+				"ok": false,
+				"error_code": "collision_facts_target_mismatch",
+				"message": "Collision facts belong to a different map target.",
+				"expected_target": target_path,
+				"actual_target": artifact.get("target_path"),
+			}
+		if int(artifact.get("map_layer", map_layer)) != map_layer:
+			return {
+				"ok": false,
+				"error_code": "collision_facts_layer_mismatch",
+				"message": "Collision facts belong to a different map layer.",
+			}
+		if revision < 0 or int(artifact.get("map_revision", -2)) != revision:
+			return {
+				"ok": false,
+				"error_code": "collision_facts_revision_stale",
+				"message": "Collision facts are stale; read the target again.",
+				"expected_revision": revision,
+				"actual_revision": artifact.get("map_revision"),
+			}
+		if artifact.get("region") != region or not (artifact.get("cells") is Dictionary):
+			return {
+				"ok": false,
+				"error_code": "collision_facts_malformed",
+				"message": "Collision facts have an invalid region or cell lookup.",
+			}
+		artifact["digest"] = supplied_digest
+		artifact["source"] = "reader_artifact"
+		return {"ok": true, "facts": artifact}
+	var facts := {
+		"source": "canonical_editor_target",
+		"target_path": target_path,
+		"map_layer": map_layer,
+		"map_revision": revision,
+		"region": region,
+		"cells": _collect_filled_cells(target, region, 2, map_layer),
+	}
+	facts["digest"] = _dictionary_sha256(facts)
+	return {"ok": true, "facts": facts}
+
+
 static func _planning_contract_error(input: Dictionary, current: Dictionary) -> Dictionary:
 	if not input.has("planning_contract"):
 		return {}
@@ -4132,11 +4224,25 @@ static func validate_platform_level_plan(input: Dictionary, editor_interface: Ed
 			"entry_sample": platform_input.get("entry_sample", {}),
 		}
 	var map_layer := int(platform_input.get("map_layer", 0))
+	var collision_result := _platform_collision_facts(
+		platform_input,
+		target,
+		str(target_result.get("path", "")),
+		region,
+		map_layer
+	)
+	if not bool(collision_result.get("ok", false)):
+		return collision_result
+	var collision_facts: Dictionary = collision_result.get("facts", {})
 	var contract := _planning_contract(target_result, target, region, 2, map_layer, movement, anchor_value)
 	var contract_error := _planning_contract_error(platform_input, contract)
 	if not contract_error.is_empty():
 		return contract_error
-	var result := MapPlatformPlanValidator.validate_platform_level_plan(platform_input, context)
+	var result := MapPlatformPlanValidator.validate_platform_level_plan(
+		platform_input,
+		context,
+		collision_facts
+	)
 	result["planning_contract"] = contract
 	return result
 
@@ -4249,7 +4355,23 @@ static func plan_reachable_map_growth(input: Dictionary, editor_interface: Edito
 	var contract_error := _planning_contract_error(growth_input, contract)
 	if not contract_error.is_empty():
 		return contract_error
-	var result := MapReachableGrowth.plan_growth(growth_input, context)
+	var growth_collision_facts := {}
+	if platform_profile:
+		var collision_result := _platform_collision_facts(
+			growth_input,
+			target,
+			str(target_result.get("path", "")),
+			region,
+			map_layer
+		)
+		if not bool(collision_result.get("ok", false)):
+			return collision_result
+		growth_collision_facts = collision_result.get("facts", {})
+	var result := MapReachableGrowth.plan_growth(
+		growth_input,
+		context,
+		growth_collision_facts
+	)
 	result["planning_contract"] = contract
 	return result
 
@@ -4799,6 +4921,18 @@ static func validate_map_region(input: Dictionary, editor_interface: EditorInter
 		"blocking_completion": bool(result["blocking_completion"]),
 		"issues": completion_issues,
 	}
+	if str(movement.get("model", "grid")) == "leap":
+		result["traversal_validation"] = {
+			"schema_version": 2,
+			"movement_model": "leap",
+			"passed": bool(result.get("passed", false)),
+			"issues": completion_issues,
+			"transitions": result.get("segments", []),
+			"actor_footprint": {
+				"width_cells": movement.get("actor_width_cells"),
+				"height_cells": movement.get("actor_clearance_cells"),
+			},
+		}
 	return result
 
 
@@ -4917,58 +5051,9 @@ static func repair_map_region(input: Dictionary, editor_interface: EditorInterfa
 
 ## 用 FastNoiseLite 在一块区域上采样归一化噪声值（0..1），供 agent 做"密度/自然分布"决策
 ## （树木、岩石、草地变化等）。纯计算，不读写场景，不需确认。固定 seed 可复现。
+## 实现已迁移到 MapNoiseSampler，此处仅做委托调用。
 static func sample_noise_grid(input: Dictionary, _editor_interface: EditorInterface) -> Dictionary:
-	var dimension := 3 if str(input.get("dimension", "2d")) == "3d" else 2
-	var width := max(1, int(input.get("width", 1)))
-	var height := max(1, int(input.get("height", 1)))
-	var depth := max(1, int(input.get("depth", 1))) if dimension == 3 else 1
-	if width * height * depth > MAX_NOISE_CELLS:
-		return {
-			"ok": false,
-			"message": "noise grid exceeds the %d-sample limit; request a smaller grid" % MAX_NOISE_CELLS,
-			"error_code": "noise_grid_too_large",
-		}
-	var x := int(input.get("x", 0))
-	var y := int(input.get("y", 0))
-	var z := int(input.get("z", 0))
-
-	var noise := FastNoiseLite.new()
-	noise.seed = int(input.get("seed", 0))
-	noise.frequency = float(input.get("frequency", 0.05))
-	noise.noise_type = _noise_type_from_name(str(input.get("noise_type", "simplex")))
-	var octaves := int(input.get("octaves", 0))
-	if octaves > 0:
-		noise.fractal_octaves = octaves
-
-	var rows: Array = []
-	if dimension == 3:
-		for dz in range(depth):
-			var plane: Array = []
-			for dy in range(height):
-				var row: Array = []
-				for dx in range(width):
-					row.append(_normalize_noise(noise.get_noise_3d(x + dx, y + dy, z + dz)))
-				plane.append(row)
-			rows.append(plane)
-	else:
-		for dy in range(height):
-			var row: Array = []
-			for dx in range(width):
-				row.append(_normalize_noise(noise.get_noise_2d(x + dx, y + dy)))
-			rows.append(row)
-	return {
-		"ok": true,
-		"dimension": dimension,
-		"origin": {"x": x, "y": y, "z": z},
-		"width": width,
-		"height": height,
-		"depth": depth,
-		"seed": noise.seed,
-		"frequency": noise.frequency,
-		"noise_type": str(input.get("noise_type", "simplex")),
-		"values": rows,
-		"note": "values are normalized to 0..1; pick a threshold to convert to placement density",
-	}
+	return MapNoiseSampler.sample(input, MAX_NOISE_CELLS)
 
 
 ## 把一块现有区域里非空的瓦片/网格存成可复用模板
@@ -5363,183 +5448,3 @@ static func _coverage_repair_columns(gap: Dictionary, union_extent: Dictionary, 
 	var out := columns.keys()
 	out.sort()
 	return out
-
-
-static func _normalize_noise(value: float) -> float:
-	return clampf((value + 1.0) * 0.5, 0.0, 1.0)
-
-
-static func _noise_type_from_name(noise_name: String) -> int:
-	match noise_name.to_lower():
-		"perlin":
-			return FastNoiseLite.TYPE_PERLIN
-		"value":
-			return FastNoiseLite.TYPE_VALUE
-		"value_cubic":
-			return FastNoiseLite.TYPE_VALUE_CUBIC
-		"cellular":
-			return FastNoiseLite.TYPE_CELLULAR
-		"simplex_smooth":
-			return FastNoiseLite.TYPE_SIMPLEX_SMOOTH
-		_:
-			return FastNoiseLite.TYPE_SIMPLEX
-
-static func fill_rect(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
-	var selected := describe_selection(editor_interface)
-	if not bool(selected.get("ok", false)):
-		return selected
-	var layer := _selected_tilemap_layer(editor_interface)
-	if layer == null or not layer.has_method("set_cell"):
-		return {"ok": false, "message": "Selected TileMapLayer cannot set cells"}
-
-	var x := int(input.get("x", 0))
-	var y := int(input.get("y", 0))
-	var width := max(0, int(input.get("width", 0)))
-	var height := max(0, int(input.get("height", 0)))
-	var source_id := int(input.get("source_id", -1))
-	var atlas := Vector2i(int(input.get("atlas_x", -1)), int(input.get("atlas_y", -1)))
-	var alt := int(input.get("alternative_tile", 0))
-
-	var before: Array = []
-	var after: Array = []
-	for yy in range(y, y + height):
-		for xx in range(x, x + width):
-			var coords := Vector2i(xx, yy)
-			before.append(_read_cell(layer, coords))
-			after.append({
-				"coords": coords,
-				"source_id": source_id,
-				"atlas_coords": atlas,
-				"alternative_tile": alt
-			})
-
-	if undo_manager != null:
-		undo_manager.record_tile_cells(layer, before, after)
-	else:
-		for cell in after:
-			layer.call("set_cell", cell["coords"], cell["source_id"], cell["atlas_coords"], cell["alternative_tile"])
-	return {"ok": true, "target": selected, "cells": after.size()}
-
-
-static func paint_from_image_grid(input: Dictionary, editor_interface: EditorInterface, undo_manager: Node) -> Dictionary:
-	var selected := describe_selection(editor_interface)
-	if not bool(selected.get("ok", false)):
-		return selected
-	var layer := _selected_tilemap_layer(editor_interface)
-	if layer == null or not layer.has_method("set_cell"):
-		return {"ok": false, "message": "Selected TileMapLayer cannot set cells"}
-
-	var image_path := PathUtils.to_res_path(str(input.get("image_path", "")))
-	if image_path == "":
-		return {"ok": false, "message": "image_path is required"}
-	var image := Image.new()
-	var err := image.load(image_path)
-	if err != OK:
-		return {"ok": false, "message": "failed to load image", "path": image_path, "error": err}
-	var palette: Array = input.get("palette", [])
-	if palette.is_empty():
-		return {"ok": false, "message": "palette is required"}
-
-	var origin := Vector2i(int(input.get("origin_x", 0)), int(input.get("origin_y", 0)))
-	var width = min(image.get_width(), max(1, int(input.get("max_width", image.get_width()))))
-	var height = min(image.get_height(), max(1, int(input.get("max_height", image.get_height()))))
-	var before: Array = []
-	var after: Array = []
-	for y in range(height):
-		for x in range(width):
-			var tile := _nearest_palette_tile(image.get_pixel(x, y), palette)
-			if tile.is_empty():
-				continue
-			var coords := origin + Vector2i(x, y)
-			before.append(_read_cell(layer, coords))
-			after.append({
-				"coords": coords,
-				"source_id": int(tile.get("source_id", -1)),
-				"atlas_coords": Vector2i(int(tile.get("atlas_x", -1)), int(tile.get("atlas_y", -1))),
-				"alternative_tile": int(tile.get("alternative_tile", 0))
-			})
-
-	if undo_manager != null:
-		undo_manager.record_tile_cells(layer, before, after)
-	else:
-		for cell in after:
-			layer.call("set_cell", cell["coords"], cell["source_id"], cell["atlas_coords"], cell["alternative_tile"])
-	return {
-		"ok": true,
-		"target": selected,
-		"image_path": image_path,
-		"width": width,
-		"height": height,
-		"cells": after.size()
-	}
-
-
-static func _selected_tilemap_layer(editor_interface: EditorInterface) -> Node:
-	for node in editor_interface.get_selection().get_selected_nodes():
-		if node != null and node.get_class() == "TileMapLayer":
-			return node
-	var root := editor_interface.get_edited_scene_root()
-	if root == null:
-		return null
-	var found: Array = []
-	_collect_tilemap_layers(root, found)
-	if found.size() == 1:
-		return found[0]
-	return null
-
-
-static func _read_cell(layer: Node, coords: Vector2i) -> Dictionary:
-	var source_id := -1
-	var atlas := Vector2i(-1, -1)
-	var alt := 0
-	if layer.has_method("get_cell_source_id"):
-		source_id = int(layer.call("get_cell_source_id", coords))
-	if layer.has_method("get_cell_atlas_coords"):
-		atlas = layer.call("get_cell_atlas_coords", coords)
-	if layer.has_method("get_cell_alternative_tile"):
-		alt = int(layer.call("get_cell_alternative_tile", coords))
-	return {
-		"coords": coords,
-		"source_id": source_id,
-		"atlas_coords": atlas,
-		"alternative_tile": alt
-	}
-
-
-static func _nearest_palette_tile(color: Color, palette: Array) -> Dictionary:
-	var best: Dictionary = {}
-	var best_score := INF
-	for item in palette:
-		if not (item is Dictionary):
-			continue
-		var candidate: Dictionary = item
-		var parsed := _parse_hex_color(str(candidate.get("hex", "#000000")))
-		var score := pow(color.r - parsed.r, 2.0) + pow(color.g - parsed.g, 2.0) + pow(color.b - parsed.b, 2.0)
-		if score < best_score:
-			best_score = score
-			best = candidate
-	return best
-
-
-static func _parse_hex_color(raw: String) -> Color:
-	var hex := raw.strip_edges().trim_prefix("#")
-	if hex.length() < 6:
-		return Color.BLACK
-	var r := _hex_byte(hex.substr(0, 2)) / 255.0
-	var g := _hex_byte(hex.substr(2, 2)) / 255.0
-	var b := _hex_byte(hex.substr(4, 2)) / 255.0
-	return Color(r, g, b, 1.0)
-
-
-static func _hex_byte(pair: String) -> float:
-	var value := 0
-	for i in range(min(2, pair.length())):
-		var c := pair.unicode_at(i)
-		value *= 16
-		if c >= 48 and c <= 57:
-			value += c - 48
-		elif c >= 65 and c <= 70:
-			value += c - 55
-		elif c >= 97 and c <= 102:
-			value += c - 87
-	return float(value)

@@ -411,3 +411,4 @@ ai_map_agent/
 .godot/
 *.md
 !ai_agent_service/**/*.md
+!openspec/**/*.md

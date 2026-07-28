@@ -30,6 +30,7 @@ func _enter_tree() -> void:
 	_undo_manager = UnifiedUndoManager.new()
 	_undo_manager.name = "UnifiedUndoManager"
 	_undo_manager.undo_redo = get_undo_redo()
+	_undo_manager.configure(get_editor_interface())
 	add_child(_undo_manager)
 
 	_chat_panel = ChatPanel.new()

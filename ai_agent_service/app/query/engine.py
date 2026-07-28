@@ -17,8 +17,8 @@ import json
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import replace
-from datetime import datetime, timezone
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -48,9 +48,14 @@ from app.orchestrator.agent import (
     ToolCallsResult,
     run_turn,
 )
-from app.orchestrator.map_workers import MAP_REVISION_GUARDED_TOOL_NAMES
+from app.orchestrator.map_workers import (
+    MAP_REVISION_GUARDED_TOOL_NAMES,
+    MAP_VALIDATION_TOOL_NAMES,
+    PLATFORM_PLAN_TOOL_NAMES,
+)
 from app.orchestrator.map_progress import (
     MAP_PLATFORM_PLAN_MAX_ATTEMPTS,
+    latest_map_revision,
     map_platform_plan_attempt_count,
     parse_map_plan_outcome,
     remember_map_tool_failure,
@@ -69,6 +74,33 @@ from app.prompt.project_context import build_project_context
 from app.prompt.rag_context import build_rag_context
 from app.query.compactor import SessionCompactor
 from app.query.helpers import *
+from app.query.tool_result_submission import (
+    ToolResultBatchValidationError,
+    ValidatedToolResultBatch,
+    validate_tool_result_batch,
+)
+from app.orchestrator.map_artifacts import (
+    CURRENT_MAP_ARTIFACT_TURN,
+    MapArtifactLocator,
+    MapArtifactStore,
+    StagedMapArtifactTurn,
+)
+from app.orchestrator.map_workflow import replace_map_state_field
+from app.orchestrator.evidence import (
+    EvidenceValidationError,
+    register_screenshot_evidence,
+)
+from app.orchestrator.completion_gate import (
+    completion_gate_text,
+    evaluate_map_completion,
+    has_canonical_map_target_revision,
+)
+from app.orchestrator.map_request_scope import (
+    MapRequestScope,
+    bind_map_task,
+    mark_completion_candidate,
+    new_request_scope,
+)
 from app.rag.asset_llm_client import AssetLLMClient, AssetLLMConfig
 from app.rag.factory import create_codebase_index
 from app.recovery.pointer import RecoveryPointerStore
@@ -77,17 +109,156 @@ from app.sessions.store import Session, SessionStore
 from app.skills.catalog import SkillCatalog
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
-from app.storage.atomic import atomic_write_json
 from app.verify.runner import VerifyRunner
 
 logger = logging.getLogger(__name__)
 
 _MAP_AUTO_COMPACT_CONTEXT_TOKENS = 64_000
 _MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
-_MAP_ARTIFACT_MAX_FILES_PER_SESSION = 128
-_MAP_ARTIFACT_MAX_BYTES_PER_SESSION = 100 * 1024 * 1024
 _MAP_MAX_AUTO_ITERATIONS = 3
-_PLATFORM_PLAN_TOOL_NAMES = frozenset({"validate_platform_level_plan", "plan_reachable_map_growth"})
+_COMPLETED_TOOL_TURN_CACHE_SIZE = 64
+
+
+def _map_completion_candidate_is_current(session: Session) -> bool:
+    """Return whether the current final is owned by an active map-edit lineage."""
+    scope = session.map_request_scope
+    frame = session.top_frame()
+    return (
+        scope.activates_map_gate
+        and scope.completion_candidate
+        and scope.map_task_id == session.map_task_state.task_id
+        and frame is not None
+        and frame.map_request_lineage_id == scope.lineage_id
+        and frame.map_task_id == scope.map_task_id
+        and has_canonical_map_target_revision(session.map_task_state)
+    )
+
+
+def _bind_request_scope_to_frames(
+    session: Session,
+    scope: MapRequestScope,
+    *,
+    all_frames: bool,
+) -> None:
+    """Attach the active request lineage to the root/current workflow Frames."""
+    frames = session.agent_stack if all_frames else session.agent_stack[:1]
+    for frame in frames:
+        frame.map_request_lineage_id = scope.lineage_id
+        frame.map_task_id = scope.map_task_id or None
+
+
+def _retire_non_root_frames(session: Session, reason: str) -> None:
+    """Close an abandoned child stack so an unrelated request can use the root."""
+    if len(session.agent_stack) <= 1:
+        return
+    root = session.agent_stack[0]
+    direct_child = next(
+        (frame for frame in session.agent_stack[1:] if frame.parent_id == root.id),
+        None,
+    )
+    call_id: str | None = None
+    if direct_child is not None:
+        call_id = direct_child.pending_delegate_call_id
+        if call_id is None and direct_child.pending_delegate_group_id is not None:
+            group = session.delegate_groups.get(direct_child.pending_delegate_group_id, {})
+            value = group.get("tool_call_id")
+            call_id = str(value) if value else None
+    if call_id:
+        root.messages.append(
+            _tool_message(
+                call_id,
+                {
+                    "error": True,
+                    "reason": reason,
+                    "summary": "Previous delegated map runtime was made dormant by a new request.",
+                },
+                is_error=True,
+            )
+        )
+    session.agent_stack = [root]
+    session.pending_plan = None
+    session.delegate_groups.clear()
+
+
+def _activate_user_request_scope(
+    session: Session,
+    request: ChatRequest,
+) -> tuple[MapRequestScope, bool]:
+    """Classify a user request and explicitly start or resume a map task."""
+    dedicated_resume_authorized = (
+        session.map_task_state.resumed_from_checkpoint
+        and session.map_task_state.status == "running"
+        and bool(session.map_task_state.task_id)
+    )
+    scope = new_request_scope(
+        request_id=request.request_id,
+        user_message=request.user_message or "",
+        dedicated_resume_authorized=dedicated_resume_authorized,
+    )
+    state = session.map_task_state
+    resumed_existing_task = False
+    if scope.intent == "map_edit":
+        can_continue = (
+            scope.explicit_continuation
+            and bool(state.task_id)
+            and state.status in {"running", "paused"}
+        )
+        if can_continue:
+            if state.status == "paused":
+                resume_map_task(state)
+            scope = bind_map_task(scope, state.task_id)
+            task_lineage = session.map_task_lineage
+            if (
+                str(task_lineage.get("task_id", "")) == state.task_id
+                and str(task_lineage.get("lineage_id", ""))
+            ):
+                scope = replace(
+                    scope,
+                    lineage_id=str(task_lineage["lineage_id"]),
+                    completion_candidate=(
+                        task_lineage.get("completion_candidate") is True
+                    ),
+                )
+            resumed_existing_task = True
+            _bind_request_scope_to_frames(session, scope, all_frames=True)
+        else:
+            if state.status == "paused":
+                state.cancel("replaced_by_explicit_map_edit")
+            _retire_non_root_frames(session, "replaced_by_explicit_map_edit")
+            task_digest = hashlib.sha256(scope.lineage_id.encode("utf-8")).hexdigest()[:20]
+            task_id = f"map-request-{task_digest}"
+            root = session.agent_stack[0] if session.agent_stack else None
+            reset_map_task_progress(session, root, task_id=task_id)
+            scope = bind_map_task(scope, task_id)
+            session.map_task_lineage = {
+                "task_id": task_id,
+                "lineage_id": scope.lineage_id,
+                "origin_request_id": scope.request_id,
+                "completion_candidate": False,
+            }
+            _bind_request_scope_to_frames(session, scope, all_frames=False)
+    else:
+        _retire_non_root_frames(session, "unrelated_request")
+        _bind_request_scope_to_frames(session, scope, all_frames=False)
+    session.map_request_scope = scope
+    return scope, resumed_existing_task
+
+
+@dataclass
+class _SubmissionPublicationBuffer:
+    """暂存工具结果事务产生的外部 artifact 与事件。"""
+
+    session: Session
+    request_id: str | None
+    turn_id: str
+    map_artifact_turn: StagedMapArtifactTurn
+    events: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
+
+
+_PUBLICATION_BUFFER: ContextVar[_SubmissionPublicationBuffer | None] = ContextVar(
+    "tool_result_publication_buffer",
+    default=None,
+)
 
 
 def _normalize_model_override(model: str | None) -> str | None:
@@ -113,6 +284,56 @@ def _response_from_dict(data: dict[str, Any]) -> ChatResponse:
     if response_type == "final":
         return ChatFinalResponse.model_validate(data)
     return ChatErrorResponse.model_validate(data)
+
+
+def _tool_result_batch_identity(results: list[ToolResult] | None) -> tuple[str, str] | None:
+    """生成与 request_id 无关的工具结果批次身份。
+
+    返回 ``(turn_id, sha256_fingerprint)`` 二元组，用于跨 request_id 的幂等缓存：
+    即使前端因网络超时换了 request_id 重发，只要 turn_id 与工具结果内容不变，
+    就能命中已消费的响应。指纹基于规范化 JSON（按 tool_use_id 排序、键排序、
+    紧凑分隔），确保同一批次不同序列化顺序仍产生相同哈希。
+    """
+    if not results:
+        return None
+    # 批次内所有结果必须属于同一个 turn_id，否则无法与 pending_turn_id 对齐
+    turn_ids = {result.turn_id for result in results}
+    if len(turn_ids) != 1:
+        return None
+    # 按 tool_use_id 排序后序列化，消除前端可能传入的不同顺序
+    canonical_results = sorted(
+        (result.model_dump(mode="json") for result in results),
+        key=lambda item: str(item.get("tool_use_id", "")),
+    )
+    encoded = json.dumps(
+        canonical_results,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return next(iter(turn_ids)), hashlib.sha256(encoded).hexdigest()
+
+
+def _remember_completed_tool_turn(
+    session: Session,
+    identity: tuple[str, str],
+    response: ChatResponse,
+) -> None:
+    """保存已消费批次的第一次响应，并限制持久化缓存大小。
+
+    以 turn_id 为键、响应快照为值写入 ``completed_tool_turn_cache``，
+    供后续同一批次的重试请求做幂等命中。当缓存条目超过上限时，
+    按插入顺序淘汰最早的条目（简易 LRU）。
+    """
+    turn_id, fingerprint = identity
+    session.completed_tool_turn_cache[turn_id] = {
+        "fingerprint": fingerprint,
+        "response": response.model_dump(),
+    }
+    # 简易 LRU：dict 保持插入顺序，超限时淘汰最旧条目
+    while len(session.completed_tool_turn_cache) > _COMPLETED_TOOL_TURN_CACHE_SIZE:
+        oldest_turn_id = next(iter(session.completed_tool_turn_cache))
+        del session.completed_tool_turn_cache[oldest_turn_id]
 
 
 def _step_to_response(step: StepResult) -> ChatResponse:
@@ -297,6 +518,9 @@ def _map_batch_postcondition_error(
     batch_id = str(tool_args.get("write_batch_id", ""))
     if batch_id and result.get("write_batch_id") != batch_id:
         return "write_batch_id mismatch"
+    transaction_id = str(tool_args.get("map_transaction_id", ""))
+    if transaction_id and result.get("map_transaction_id") != transaction_id:
+        return "map_transaction_id mismatch"
     expected_revision = tool_args.get("expected_revision")
     actual_revision = result.get("map_revision")
     if (
@@ -341,19 +565,136 @@ def _remember_map_batch_result(
         "result": result if isinstance(result, dict) else {},
         "postconditions_passed": error is None,
         "error": error,
+        "map_transaction_id": tool_args.get("map_transaction_id"),
     }
-    state.executed_batches.append(entry)
+    replace_map_state_field(
+        state,
+        "executed_batches",
+        [*state.executed_batches, entry],
+        target=str(tool_args.get("target_path", "")) or None,
+        revision=(
+            result.get("map_revision")
+            if isinstance(result, dict)
+            and isinstance(result.get("map_revision"), int)
+            else None
+        ),
+    )
     state.counters.executed_batches += 1
+    transaction_id = str(tool_args.get("map_transaction_id", "")).strip()
+    if transaction_id:
+        journals = list(state.transaction_journals)
+        matched = next(
+            (
+                item
+                for item in journals
+                if item.get("transaction_id") == transaction_id
+            ),
+            None,
+        )
+        transaction_entry = dict(matched) if isinstance(matched, dict) else {
+            "transaction_id": transaction_id,
+            "target": str(tool_args.get("target_path", "")),
+            "base_revision": tool_args.get("map_transaction_base_revision"),
+            "operation_ids": [],
+        }
+        operation_ids = list(transaction_entry.get("operation_ids", []))
+        batch_id = str(tool_args.get("write_batch_id", ""))
+        if batch_id and batch_id not in operation_ids:
+            operation_ids.append(batch_id)
+        transaction_entry.update(
+            {
+                "operation_ids": operation_ids,
+                "final_revision": (
+                    result.get("map_revision") if isinstance(result, dict) else None
+                ),
+                "status": "prepared" if error is None else "rolled_back",
+                "error": error,
+            }
+        )
+        journals = [
+            item
+            for item in journals
+            if item.get("transaction_id") != transaction_id
+        ]
+        journals.append(transaction_entry)
+        replace_map_state_field(
+            state,
+            "transaction_journals",
+            journals,
+            target=str(tool_args.get("target_path", "")) or None,
+            revision=(
+                result.get("map_revision")
+                if isinstance(result, dict)
+                and isinstance(result.get("map_revision"), int)
+                else None
+            ),
+        )
     if error is None:
         state.counters.writes += 1
-        state.stage = "validate" if not state.pending_batches else "write"
+        # 通过 transition_stage 推进阶段，内部会触发派生状态（如缓存）的失效
+        state.transition_stage("validate" if not state.pending_batches else "write")
         if not state.pending_batches and session.latest_context_used_tokens >= 32_000:
             session.force_compact_next_turn = True
         return
     state.counters.failed_batches += 1
-    state.pending_batches.clear()
-    state.stage = "plan"
-    state.unresolved_issues = [error]
+    replace_map_state_field(state, "pending_batches", [])
+    # 批次失败时回退到 plan 阶段，重新规划
+    state.transition_stage("plan")
+    replace_map_state_field(state, "unresolved_issues", [error])
+
+
+def _remember_map_transaction_validation(
+    session: Session,
+    tool_args: dict[str, Any],
+    result: dict[str, Any],
+    successful: bool,
+) -> None:
+    """把 Godot 端验证后的 write-group 终态镜像到 Session。"""
+    transaction_id = str(tool_args.get("map_transaction_id", "")).strip()
+    if not transaction_id:
+        return
+    journals = list(session.map_task_state.transaction_journals)
+    matched = next(
+        (
+            item
+            for item in journals
+            if item.get("transaction_id") == transaction_id
+        ),
+        None,
+    )
+    if not isinstance(matched, dict):
+        return
+    updated = dict(matched)
+    frontend_status = str(result.get("map_transaction_status", "")).strip()
+    updated["status"] = (
+        frontend_status
+        if frontend_status in {"committed", "rolled_back", "failed"}
+        else ("committed" if successful else "rolled_back")
+    )
+    updated["final_revision"] = result.get(
+        "map_revision", updated.get("final_revision")
+    )
+    updated["validation_tool"] = result.get("validation_tool")
+    updated["error"] = None if successful else str(
+        result.get("message", "map validation failed")
+    )
+    journals = [
+        item
+        for item in journals
+        if item.get("transaction_id") != transaction_id
+    ]
+    journals.append(updated)
+    replace_map_state_field(
+        session.map_task_state,
+        "transaction_journals",
+        journals,
+        target=str(updated.get("target", "")) or None,
+        revision=(
+            updated.get("final_revision")
+            if isinstance(updated.get("final_revision"), int)
+            else None
+        ),
+    )
 
 
 def _resume_map_batch_queue(session: Session) -> ChatToolCallsResponse | None:
@@ -361,13 +702,21 @@ def _resume_map_batch_queue(session: Session) -> ChatToolCallsResponse | None:
     state = session.map_task_state
     if not state.pending_batches or state.unresolved_issues:
         return None
-    raw = state.pending_batches.pop(0)
+    raw = state.pending_batches[0]
+    replace_map_state_field(
+        state,
+        "pending_batches",
+        state.pending_batches[1:],
+    )
     input_args = raw.get("input", {})
     if not isinstance(input_args, dict):
-        state.pending_batches.clear()
+        replace_map_state_field(state, "pending_batches", [])
         return None
     target = str(input_args.get("target_path", ""))
-    latest_revision = session.latest_map_revisions.get(target)
+    # 根据 map_layer 查询最新修订号，确保批次下发时携带正确的 expected_revision
+    layer = input_args.get("map_layer")
+    map_layer = layer if isinstance(layer, int) and not isinstance(layer, bool) else None
+    latest_revision = latest_map_revision(session, target, map_layer)
     if latest_revision is not None:
         input_args["expected_revision"] = latest_revision
     call = FrontToolCallDTO(
@@ -381,7 +730,7 @@ def _resume_map_batch_queue(session: Session) -> ChatToolCallsResponse | None:
     )
     frame = next((item for item in session.agent_stack if item.id == call.frame_id), None)
     if frame is None:
-        state.pending_batches.clear()
+        replace_map_state_field(state, "pending_batches", [])
         return None
     frame.messages.append(
         {
@@ -409,6 +758,7 @@ def _resume_map_batch_queue(session: Session) -> ChatToolCallsResponse | None:
                 "input": call.input,
                 "frame_id": call.frame_id,
                 "agent": call.agent,
+                "needs_confirm": call.needs_confirm,
             }
         },
     )
@@ -416,8 +766,8 @@ def _resume_map_batch_queue(session: Session) -> ChatToolCallsResponse | None:
 
 
 from app.query.helpers import (
-    _MAP_VALIDATION_TOOL_NAMES,
     _PERSISTED_HISTORY_EVENT_TYPES,
+    _abort_pending_map_region_read_on_size_error,
     _append_platform_planning_failure_hint,
     _build_user_content,
     _bind_map_validation_to_pending_write,
@@ -432,6 +782,7 @@ from app.query.helpers import (
     _json_char_size,
     _map_completion_blocker,
     _map_completion_gate_text,
+    _map_region_from_write_args,
     _MAP_VALIDATION_REPEAT_LIMIT,
     _map_validation_is_successful,
     _remember_map_validation,
@@ -516,7 +867,7 @@ class QueryEngine:
         # 一个，但用户可能在前一个请求仍卡在 per-session 锁等待时就发出下一条
         # 消息/中断，short-lived 地出现多个；用 set 而不是单个槎位，避免新任务
         # 覆盖掉真正持有锁、仍在运行的旧任务引用，导致 interrupt() 取消错对象。
-        self._active_tasks: dict[str, set[asyncio.Task]] = {}
+        self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._history_blocks_cache: dict[str, tuple[tuple[int, int, int], list[Any]]] = {}
 
     @property
@@ -524,40 +875,16 @@ class QueryEngine:
         """当前工具注册表里的可见工具名集合。"""
         return set(REGISTRY)
 
-    def _map_artifact_path(self, session_id: str, tool_name: str, result: dict[str, Any]) -> Path:
-        """构造地图 raw artifact 的项目内路径。"""
-        target = str(result.get("target_path", result.get("target", "map")))
-        revision = result.get("map_revision", result.get("actual_revision", "unknown"))
-        digest = hashlib.sha256(
-            json.dumps(
-                {
-                    "tool": tool_name,
-                    "target": target,
-                    "revision": revision,
-                    "region": _region_summary_from_value(result),
-                    "size": _json_char_size(result),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()[:16]
-        return (
-            self._settings.project_root
-            / ".ai_agent_service"
-            / "artifacts"
-            / _safe_artifact_name(session_id)
-            / f"{_safe_artifact_name(tool_name)}-{digest}.json"
-        )
-
     def _store_map_artifact(
         self,
         session_id: str,
+        turn_id: str,
+        tool_use_id: str,
         tool_name: str,
         tool_args: dict[str, Any],
         result: Any,
-    ) -> str | None:
-        """把大型地图工具 raw result 写入本地 artifact，返回相对路径引用。"""
+    ) -> MapArtifactLocator | None:
+        """把大型地图工具结果加入当前事务的会话级聚合 turn。"""
         if tool_name not in {
             "describe_map_region",
             "query_spatial_index",
@@ -574,60 +901,41 @@ class QueryEngine:
             return None
         if tool_name == "query_spatial_index" and not isinstance(result.get("matches"), list):
             return None
-        if tool_name in _MAP_VALIDATION_TOOL_NAMES and _json_char_size(result) < 8_000:
+        if tool_name in MAP_VALIDATION_TOOL_NAMES and _json_char_size(result) < 8_000:
             return None
-        path = self._map_artifact_path(session_id, tool_name, result)
-        try:
-            atomic_write_json(
-                path,
-                {
-                    "tool": tool_name,
-                    "input": tool_args,
-                    "result": result,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                },
+        store = MapArtifactStore(self._settings.project_root, session_id)
+        publication_buffer = _PUBLICATION_BUFFER.get()
+        if publication_buffer is not None:
+            publication_buffer.map_artifact_turn.add_entry(
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                result=result,
             )
-            self._cleanup_map_artifacts(path.parent)
-        except OSError as exc:
+            return store.locator(publication_buffer.turn_id, tool_use_id)
+        staged = StagedMapArtifactTurn(
+            session_id=session_id,
+            turn_id=turn_id,
+            request_id=None,
+        )
+        staged.add_entry(
+            tool_use_id=tool_use_id,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            result=result,
+        )
+        try:
+            store.merge_turn(staged)
+        except (OSError, TypeError, ValueError) as exc:
             logger.warning(
-                "Failed to write map artifact session=%s tool=%s path=%s error=%s",
+                "Failed to write map artifact session=%s tool=%s turn=%s error=%s",
                 session_id,
                 tool_name,
-                path,
+                turn_id,
                 exc,
             )
             return None
-        try:
-            return str(path.relative_to(self._settings.project_root)).replace("\\", "/")
-        except ValueError:
-            return str(path)
-
-    def _cleanup_map_artifacts(self, session_dir: Path) -> None:
-        """按 LRU 清理单个 session 的地图 artifact 文件。"""
-        try:
-            files = [path for path in session_dir.iterdir() if path.is_file()]
-        except OSError:
-            return
-        stats: list[tuple[Path, float, int]] = []
-        for path in files:
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            stats.append((path, stat.st_mtime, stat.st_size))
-        stats.sort(key=lambda item: item[1], reverse=True)
-        total = 0
-        for index, (path, _mtime, size) in enumerate(stats):
-            total += size
-            if (
-                index < _MAP_ARTIFACT_MAX_FILES_PER_SESSION
-                and total <= _MAP_ARTIFACT_MAX_BYTES_PER_SESSION
-            ):
-                continue
-            try:
-                path.unlink()
-            except OSError:
-                logger.debug("Failed to prune map artifact path=%s", path)
+        return store.locator(turn_id, tool_use_id)
 
     def session_history(
         self, session_id: str, limit: int = 200, before: int = 0
@@ -714,6 +1022,13 @@ class QueryEngine:
         try:
             async with self._store.lock_for(request.session_id):
                 session = self._store.get_or_create(request.session_id, self.available_tools)
+                # 确保事件存储的序列号与会话历史计数器对齐，
+                # 防止因崩溃恢复或跨进程导致的序列偏移
+                if self._events is not None:
+                    self._events.ensure_sequence(
+                        session.session_id,
+                        session.history_event_counter,
+                    )
                 logger.info(
                     "Chat request accepted session=%s request_id=%s has_user=%s tool_results=%d",
                     request.session_id,
@@ -733,13 +1048,80 @@ class QueryEngine:
                     )
                     return _response_from_dict(session.request_id_cache[request.request_id])
 
+                # ---- 工具结果批次幂等缓存 ----
+                # 前端可能因超时/断连重发同一批 tool_results（request_id 可能不同），
+                # 此处基于 turn_id + 内容指纹做二次幂等保护：
+                # 1) 指纹匹配 → 直接返回缓存的响应，避免重复执行
+                # 2) 指纹不匹配 → 同一 turn_id 内容不同属于协议违规，拒绝请求
+                tool_batch_identity = _tool_result_batch_identity(request.tool_results)
+                if tool_batch_identity is not None:
+                    completed_turn = session.completed_tool_turn_cache.get(
+                        tool_batch_identity[0]
+                    )
+                    if isinstance(completed_turn, dict):
+                        if completed_turn.get("fingerprint") != tool_batch_identity[1]:
+                            return ChatErrorResponse(
+                                text="同一 turn_id 已处理，但重试的 tool_results 内容不同"
+                            )
+                        cached_response = completed_turn.get("response")
+                        if isinstance(cached_response, dict):
+                            logger.info(
+                                "Tool result batch idempotency hit session=%s turn_id=%s",
+                                request.session_id,
+                                tool_batch_identity[0],
+                            )
+                            return _response_from_dict(cached_response)
+
+                validated_tool_batch: ValidatedToolResultBatch | None = None
+                if request.tool_results is not None:
+                    try:
+                        validated_tool_batch = validate_tool_result_batch(
+                            session,
+                            request.tool_results,
+                            REGISTRY,
+                        )
+                    except ToolResultBatchValidationError as exc:
+                        logger.warning(
+                            "Tool result preflight rejected session=%s code=%s reason=%s",
+                            request.session_id,
+                            exc.code,
+                            exc.message,
+                        )
+                        return ChatErrorResponse(text=exc.message)
+
                 # 取消保护快照：本轮可能在追加 assistant 的 tool_calls 后、写入对应
                 # tool result 之前被 interrupt 取消。若让这半截历史留在内存里，下一次
                 # 请求发给 OpenAI 兼容端点会因 tool_call 缺少 tool result 而 400。取消
                 # 时回滚到本轮开始前的内存快照（本轮尚未 save()，磁盘仍是旧版本）。
                 snapshot = copy.deepcopy(session)
+                working_session = (
+                    copy.deepcopy(session)
+                    if validated_tool_batch is not None
+                    else session
+                )
+                publication_buffer: _SubmissionPublicationBuffer | None = None
+                publication_token: Token[_SubmissionPublicationBuffer | None] | None = None
+                map_artifact_token: Token[StagedMapArtifactTurn | None] | None = None
+                if validated_tool_batch is not None:
+                    staged_map_turn = StagedMapArtifactTurn(
+                        session_id=working_session.session_id,
+                        turn_id=validated_tool_batch.turn_id,
+                        request_id=request.request_id,
+                    )
+                    publication_buffer = _SubmissionPublicationBuffer(
+                        session=working_session,
+                        request_id=request.request_id,
+                        turn_id=validated_tool_batch.turn_id,
+                        map_artifact_turn=staged_map_turn,
+                    )
+                    publication_token = _PUBLICATION_BUFFER.set(publication_buffer)
+                    map_artifact_token = CURRENT_MAP_ARTIFACT_TURN.set(staged_map_turn)
                 try:
-                    response = await self._submit_locked(session, request)
+                    response = await self._submit_locked(
+                        working_session,
+                        request,
+                        validated_tool_batch,
+                    )
                 except asyncio.CancelledError:
                     self._store.replace_in_memory(request.session_id, snapshot)
                     raise
@@ -756,10 +1138,48 @@ class QueryEngine:
                             "待回传工具仍可使用同一 request_id 安全重试"
                         )
                     )
+                finally:
+                    if map_artifact_token is not None:
+                        CURRENT_MAP_ARTIFACT_TURN.reset(map_artifact_token)
+                    if publication_token is not None:
+                        _PUBLICATION_BUFFER.reset(publication_token)
 
                 if request.request_id is not None:
-                    session.request_id_cache[request.request_id] = response.model_dump()
-                self._store.save(session)
+                    working_session.request_id_cache[request.request_id] = response.model_dump()
+                # 若本轮已完整消费且 pending_turn_id 已推进（说明不是同一轮的重试），
+                # 将响应写入幂等缓存，供后续相同批次的重放请求使用
+                if (
+                    tool_batch_identity is not None
+                    and working_session.pending_turn_id != tool_batch_identity[0]
+                ):
+                    _remember_completed_tool_turn(
+                        working_session,
+                        tool_batch_identity,
+                        response,
+                    )
+                try:
+                    if (
+                        publication_buffer is not None
+                        and publication_buffer.map_artifact_turn.entries
+                    ):
+                        MapArtifactStore(
+                            self._settings.project_root,
+                            working_session.session_id,
+                        ).assert_mergeable(publication_buffer.map_artifact_turn)
+                    self._store.save(working_session)
+                except (OSError, TypeError, ValueError):
+                    self._store.replace_in_memory(request.session_id, snapshot)
+                    logger.exception(
+                        "Session commit failed; original session retained session=%s request_id=%s",
+                        request.session_id,
+                        request.request_id,
+                    )
+                    return ChatErrorResponse(
+                        text="会话持久化失败；工具结果未提交，可安全重试同一批次"
+                    )
+                session = working_session
+                if publication_buffer is not None:
+                    self._flush_submission_publications(publication_buffer)
                 self._record_recovery(session, response)
                 logger.info(
                     "Chat request completed session=%s response_type=%s pending=%s",
@@ -782,7 +1202,12 @@ class QueryEngine:
                     if not tasks:
                         del self._active_tasks[request.session_id]
 
-    async def _submit_locked(self, session: Session, request: ChatRequest) -> ChatResponse:
+    async def _submit_locked(
+        self,
+        session: Session,
+        request: ChatRequest,
+        validated_tool_batch: ValidatedToolResultBatch | None = None,
+    ) -> ChatResponse:
         """在持有会话锁时执行一次请求。"""
         has_user = request.user_message is not None
         has_results = request.tool_results is not None
@@ -854,6 +1279,63 @@ class QueryEngine:
                 layered_prompt.to_content_blocks() if len(layers) >= 2 else layered_prompt.to_text()
             )
 
+        async def build_child_agent_prompt(agent: AgentDefinition, task: str) -> str:
+            """为委派或自动恢复子 Agent 构造按任务检索的分层 system prompt。
+
+            在构造 prompt 前先校验 Skill 绑定完整性：若 Agent 声明了所需 skill
+            但目录未配置（missing）或版本不兼容（incompatible），立即抛出异常，
+            避免子 Agent 在缺少关键能力的情况下被静默启动。
+            """
+            # Skill 绑定校验：确保子 Agent 所需的 skill 均已正确绑定
+            if self._skill_catalog is None:
+                if agent.skills:
+                    raise ValueError("Skill 绑定失败：当前 QueryEngine 未配置 SkillCatalog")
+            else:
+                binding = self._skill_catalog.binding_status(
+                    agent.skills,
+                    set(agent.effective_tools),
+                    workflow_stage=(
+                        session.map_task_state.stage
+                        if agent.pipeline_kind == "map"
+                        else None
+                    ),
+                    worker_mode=agent.worker_mode,
+                    agent_role=agent.role,
+                    permitted_tools=set(agent.effective_tools),
+                )
+                if binding["missing"] or binding["incompatible"]:
+                    raise ValueError(
+                        "Skill 绑定失败："
+                        + json.dumps(
+                            {
+                                "missing": binding["missing"],
+                                "incompatible": binding["incompatible"],
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+            # 按任务文本检索 RAG 上下文，与主 Agent 共享同一套检索管线
+            task_rag_context = await self._retrieve_rag_context(security, task)
+            child_context = ContextBuilder().build(
+                stable_prefix=build_system_prompt(
+                    agent,
+                    self._skill_catalog,
+                    self._output_styles,
+                    session.output_style,
+                ),
+                structure_context=project_context,
+                dynamic_context=task_rag_context,
+                query=task,
+            )
+            return cast(
+                str,
+                LayeredPrompt(
+                    core=child_context.stable_prefix,
+                    structure_context=child_context.structure_context,
+                    rag_context=child_context.dynamic_context,
+                ).to_text(),
+            )
+
         if has_results:
             self._emit(
                 session.session_id,
@@ -867,7 +1349,11 @@ class QueryEngine:
                 session.pending_turn_id,
             )
             result_error, verify_candidates = await self._append_tool_results(
-                session, request.tool_results or [], security
+                session,
+                request.tool_results or [],
+                security,
+                build_child_agent_prompt,
+                validated_tool_batch,
             )
             if result_error is not None:
                 logger.warning(
@@ -889,6 +1375,10 @@ class QueryEngine:
                     session.pending_turn_id,
                 )
                 return ChatErrorResponse(text="当前会话仍有待回传的工具结果，不能开始新的用户消息")
+            request_scope, resumed_existing_map_task = _activate_user_request_scope(
+                session,
+                request,
+            )
             frame = session.top_frame()
             if frame is None:
                 logger.error(
@@ -898,31 +1388,43 @@ class QueryEngine:
                 return ChatErrorResponse(text="会话没有活跃的 agent 帧")
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
             session.pending_verify_candidates.clear()
-            session.map_completion_blockers.clear()
-            session.set_map_auto_iterations(0)
-            if session.map_task_state.status == "paused":
-                resume_map_task(session.map_task_state)
+            if (
+                # 显式自然语言续接或 resume_map_task 命令后的首次用户消息：
+                # 仅属于该 map-edit lineage 的请求才恢复检查点与批次。
+                resumed_existing_map_task
+                and session.map_task_state.resumed_from_checkpoint
+                and session.map_task_state.checkpoint is not None
+            ):
                 frame.messages.append(
                     {
                         "role": "system",
                         "content": (
-                            "Resume the existing map task from map_task_state.checkpoint. "
-                            "Reuse cached facts and executed_batches; do not reread the whole map."
+                            "Resume the explicitly reactivated map task from its checkpoint. "
+                            "Reuse cached facts and executed batches."
                         ),
                     }
                 )
+                session.map_task_state.resumed_from_checkpoint = False
                 resumed_batch = _resume_map_batch_queue(session)
                 if resumed_batch is not None:
                     self._emit_tool_call_response(
                         session,
                         resumed_batch,
-                        "Resumed map batch from checkpoint session=%s turn_id=%s count=%d",
+                        "Resumed map batch from explicit command session=%s turn_id=%s count=%d",
                     )
                     return resumed_batch
-            else:
-                reset_map_task_progress(session, frame)
+            elif session.map_task_state.resumed_from_checkpoint:
+                # dedicated resume 授权只消费一次；后续普通消息不得继续沿用。
+                session.map_task_state.resumed_from_checkpoint = False
             self._emit(
-                session.session_id, "user_submitted", {"has_context": request.context is not None}
+                session.session_id,
+                "user_submitted",
+                {
+                    "has_context": request.context is not None,
+                    "request_intent": request_scope.intent,
+                    "request_lineage_id": request_scope.lineage_id,
+                    "map_task_id": request_scope.map_task_id,
+                },
             )
             logger.info(
                 "User turn appended session=%s has_context=%s language_hint=%s",
@@ -958,29 +1460,6 @@ class QueryEngine:
             }:
                 return
             self._emit(session.session_id, event_type, payload)
-
-        async def build_child_agent_prompt(agent: AgentDefinition, task: str) -> str:
-            """为委派子 agent 构造按任务检索的分层 system prompt。"""
-            task_rag_context = await self._retrieve_rag_context(security, task)
-            child_context = ContextBuilder().build(
-                stable_prefix=build_system_prompt(
-                    agent,
-                    self._skill_catalog,
-                    self._output_styles,
-                    session.output_style,
-                ),
-                structure_context=project_context,
-                dynamic_context=task_rag_context,
-                query=task,
-            )
-            return cast(
-                str,
-                LayeredPrompt(
-                    core=child_context.stable_prefix,
-                    structure_context=child_context.structure_context,
-                    rag_context=child_context.dynamic_context,
-                ).to_text(),
-            )
 
         def emit_verify_turn_event(event_type: str, payload: dict[str, Any]) -> None:
             self._emit(session.session_id, event_type, payload)
@@ -1020,14 +1499,22 @@ class QueryEngine:
                 response = _step_to_response(step)
                 response = self._defer_map_tool_calls_if_needed(session, response)
         map_gate_continuations = 0
+        # ---- 地图完成门控循环 ----
+        # 当 agent 产出 final 响应但仍有 completion_blockers 时，
+        # 自动调度 reviewer 或 repair continuation，最多迭代 _MAP_MAX_AUTO_ITERATIONS 次
         while (
             isinstance(response, ChatFinalResponse)
-            and session.map_completion_blockers
+            and _map_completion_candidate_is_current(session)
+            and session.map_task_state.completion_blockers
             and session.map_task_state.auto_iterations < _MAP_MAX_AUTO_ITERATIONS
         ):
             scheduled = False
-            if _has_only_map_review_required(session.map_completion_blockers):
-                scheduled = _schedule_map_reviewer_if_required(session)
+            # 优先尝试调度 reviewer 子 Agent（需要 build_child_agent_prompt 构造独立 prompt）
+            if _has_only_map_review_required(session.map_task_state.completion_blockers):
+                scheduled = await _schedule_map_reviewer_if_required(
+                    session,
+                    build_child_agent_prompt,
+                )
                 if scheduled:
                     logger.info(
                         "Map completion gate scheduled reviewer continuation session=%s",
@@ -1039,12 +1526,12 @@ class QueryEngine:
                     logger.info(
                         "Map completion gate scheduled repair continuation session=%s blockers=%d",
                         session.session_id,
-                        len(session.map_completion_blockers),
+                        len(session.map_task_state.completion_blockers),
                     )
             if not scheduled:
                 break
             map_gate_continuations += 1
-            session.set_map_auto_iterations(session.map_task_state.auto_iterations + 1)
+            session.map_task_state.auto_iterations += 1
             step = await self._run_agent_turn(
                 session,
                 security,
@@ -1061,12 +1548,14 @@ class QueryEngine:
                 "Chat produced front tool calls session=%s turn_id=%s count=%d",
             )
         elif isinstance(response, ChatFinalResponse):
-            if session.map_completion_blockers:
-                gated_text = _map_completion_gate_text(session.map_completion_blockers)
-                _replace_last_assistant_final(session, gated_text)
-                response = ChatFinalResponse(text=gated_text)
-            elif session.map_task_state.status == "running" and session.map_task_state.task_id:
-                session.map_task_state.status = "completed"
+            if _map_completion_candidate_is_current(session):
+                gate = evaluate_map_completion(session.map_task_state)
+                if not gate.allowed:
+                    gated_text = completion_gate_text(gate)
+                    _replace_last_assistant_final(session, gated_text)
+                    response = ChatFinalResponse(text=gated_text)
+                elif session.map_task_state.status == "running":
+                    session.map_task_state.complete()
             self._emit(session.session_id, "final", {"text_length": len(response.text)})
             logger.info(
                 "Chat produced final response session=%s text_length=%d",
@@ -1289,7 +1778,12 @@ class QueryEngine:
         return None
 
     async def _append_tool_results(
-        self, session: Session, results: list[ToolResult], security: SecuritySettings
+        self,
+        session: Session,
+        results: list[ToolResult],
+        security: SecuritySettings,
+        prompt_factory: AgentPromptFactory | None = None,
+        validated_batch: ValidatedToolResultBatch | None = None,
     ) -> tuple[ChatErrorResponse | None, list[dict[str, Any]]]:
         """校验并把前端工具结果追加到对应 agent 帧。
 
@@ -1299,48 +1793,27 @@ class QueryEngine:
             本次落地、且命中 `verify_trigger_tools` 的编辑类工具调用，供调用方
             驱动 Verify 两阶段校验（§3.3）。
         """
-        if session.pending_turn_id is None:
-            logger.warning("Tool results rejected: no pending turn session=%s", session.session_id)
-            return ChatErrorResponse(text="当前会话没有等待回传的工具调用"), []
-        if not results:
-            logger.warning("Tool results rejected: empty results session=%s", session.session_id)
-            return ChatErrorResponse(text="tool_results 不能为空"), []
-
-        ids = {result.tool_use_id for result in results}
-        if ids != session.pending_tool_call_ids:
-            expected = ", ".join(sorted(session.pending_tool_call_ids))
-            actual = ", ".join(sorted(ids))
+        try:
+            batch = validated_batch or validate_tool_result_batch(
+                session,
+                results,
+                REGISTRY,
+            )
+        except ToolResultBatchValidationError as exc:
             logger.warning(
-                "Tool results rejected: id mismatch session=%s expected=%s actual=%s",
+                "Tool result preflight rejected session=%s code=%s reason=%s",
                 session.session_id,
-                expected,
-                actual,
+                exc.code,
+                exc.message,
             )
-            return (
-                ChatErrorResponse(
-                    text=f"tool_results 与 pending 工具调用不匹配：expected={expected}; actual={actual}"
-                ),
-                [],
-            )
-        if any(result.turn_id != session.pending_turn_id for result in results):
-            logger.warning(
-                "Tool results rejected: turn mismatch session=%s pending_turn=%s",
-                session.session_id,
-                session.pending_turn_id,
-            )
-            return ChatErrorResponse(text="tool_results.turn_id 与当前 pending_turn_id 不匹配"), []
+            return ChatErrorResponse(text=exc.message), []
 
+        results = [item.result for item in batch.items]
         frames = {frame.id: frame for frame in session.agent_stack}
+
         verify_candidates: list[dict[str, Any]] = []
         for result in results:
-            frame = frames.get(result.frame_id)
-            if frame is None:
-                logger.warning(
-                    "Tool results rejected: unknown frame session=%s frame=%s",
-                    session.session_id,
-                    result.frame_id,
-                )
-                return ChatErrorResponse(text=f"未知 frame_id：{result.frame_id}"), []
+            frame = frames[result.frame_id]
             is_error = result.status in {"rejected", "error"}
             metadata = session.pending_tool_calls.get(result.tool_use_id, {})
             tool_name = str(metadata.get("name", ""))
@@ -1349,7 +1822,7 @@ class QueryEngine:
                 tool_args = {}
             tool = REGISTRY.get(tool_name)
             payload: Any
-            map_artifact_ref: str | None = None
+            map_artifact_locator: MapArtifactLocator | None = None
             if result.status == "applied":
                 applied_result = result.result
                 if (
@@ -1362,8 +1835,10 @@ class QueryEngine:
                     applied_result = await self._enrich_front_image_result(
                         tool_name, applied_result, security
                     )
-                    map_artifact_ref = self._store_map_artifact(
+                    map_artifact_locator = self._store_map_artifact(
                         session.session_id,
+                        batch.turn_id,
+                        result.tool_use_id,
                         tool_name,
                         tool_args,
                         applied_result,
@@ -1373,7 +1848,16 @@ class QueryEngine:
                         tool_name,
                         tool_args,
                         applied_result,
-                        map_artifact_ref,
+                        (
+                            map_artifact_locator.artifact_ref
+                            if map_artifact_locator is not None
+                            else None
+                        ),
+                        (
+                            map_artifact_locator.as_dict()
+                            if map_artifact_locator is not None
+                            else None
+                        ),
                     )
                 if result.grant_session_allow and tool is not None:
                     session.session_allow.add(make_session_allow_grant(tool, tool_args))
@@ -1384,8 +1868,8 @@ class QueryEngine:
                         frame.id,
                     )
                 artifact_refs = list(result.artifact_refs)
-                if map_artifact_ref is not None:
-                    artifact_refs.append(map_artifact_ref)
+                if map_artifact_locator is not None:
+                    artifact_refs.append(map_artifact_locator.artifact_ref)
                 payload = {
                     "status": result.status,
                     "result": applied_result,
@@ -1414,6 +1898,83 @@ class QueryEngine:
                     "result": result.result,
                 }
             result_for_gate = payload.get("result") if isinstance(payload, dict) else None
+            # ---- structure_revision 推进 ----
+            # ensure_standard_map_layers 实际创建了/删除了图层时推进结构版本号，
+            # 使下游依赖结构信息的派生状态（缓存、校验结果等）自动失效；
+            # 未发生变更时仍写入当前版本号，保持下游可追溯。
+            if (
+                tool_name == "ensure_standard_map_layers"
+                and result.status == "applied"
+                and isinstance(result_for_gate, dict)
+            ):
+                if result_for_gate.get("changed") is True:
+                    result_for_gate["structure_revision"] = (
+                        session.map_task_state.record_structure_change()
+                    )
+                else:
+                    result_for_gate["structure_revision"] = (
+                        session.map_task_state.structure_revision
+                    )
+            # ---- 截图证据记录 ----
+            # capture_viewport_screenshot 成功后将截图元信息追加到 frame.map_evidence，
+            # 供后续的地图完整性校验使用（关联 target_path、revision、focus_region 等）
+            if (
+                tool_name == "capture_viewport_screenshot"
+                and result.status == "applied"
+                and isinstance(result_for_gate, dict)
+            ):
+                screenshot_target = str(
+                    result_for_gate.get("target_path", tool_args.get("target_path", ""))
+                )
+                screenshot_revision = result_for_gate.get(
+                    "map_revision",
+                    latest_map_revision(
+                        session,
+                        screenshot_target,
+                        session.map_task_state.latest_layers.get(screenshot_target),
+                    ),
+                )
+                evidence_result = {
+                    **result_for_gate,
+                    "target_path": screenshot_target,
+                    "map_revision": screenshot_revision,
+                    "region": (
+                        dict(tool_args["focus_region"])
+                        if isinstance(tool_args.get("focus_region"), dict)
+                        else {}
+                    ),
+                }
+                try:
+                    evidence = register_screenshot_evidence(
+                        session.map_task_state,
+                        frame,
+                        tool_use_id=result.tool_use_id,
+                        result=evidence_result,
+                        artifact_refs=list(payload.get("artifact_refs", [])),
+                        project_root=self._settings.project_root,
+                    )
+                except EvidenceValidationError as exc:
+                    logger.warning(
+                        "Screenshot evidence rejected session=%s frame=%s "
+                        "tool_use_id=%s error=%s",
+                        session.session_id,
+                        frame.id,
+                        result.tool_use_id,
+                        exc,
+                    )
+                else:
+                    frame.map_evidence.append(
+                        {
+                            "tool_use_id": result.tool_use_id,
+                            "kind": "viewport_screenshot",
+                            "target_path": screenshot_target,
+                            "map_revision": screenshot_revision,
+                            "region": evidence.metadata.get("region", {}),
+                            "artifact_refs": [evidence.artifact_ref],
+                            "evidence_id": evidence.evidence_id,
+                            "contract_id": evidence.contract_id,
+                        }
+                    )
             if (
                 result.status == "error"
                 and tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
@@ -1456,6 +2017,12 @@ class QueryEngine:
                         "plan_version": tool_args.get("plan_version"),
                         "batch_index": tool_args.get("batch_index"),
                         "write_batch_id": tool_args.get("write_batch_id"),
+                        "map_transaction_id": tool_args.get("map_transaction_id"),
+                        "map_transaction_status": (
+                            result_for_gate.get("map_transaction_status")
+                            if isinstance(result_for_gate, dict)
+                            else None
+                        ),
                         "postconditions_passed": batch_entry.get("postconditions_passed", False),
                         "remaining_batches": len(session.map_task_state.pending_batches),
                     },
@@ -1477,6 +2044,26 @@ class QueryEngine:
             )
             if result.status == "applied" or trusted_error_revision:
                 _remember_latest_map_revision(session, tool_name, tool_args, result_for_gate)
+            if (
+                result.status == "applied"
+                and tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
+            ):
+                session.map_request_scope = mark_completion_candidate(
+                    session.map_request_scope,
+                    lineage_id=str(metadata.get("request_lineage_id", "")),
+                    map_task_id=str(metadata.get("map_task_id", "")),
+                )
+                if session.map_request_scope.completion_candidate:
+                    session.map_task_lineage = {
+                        **session.map_task_lineage,
+                        "task_id": session.map_request_scope.map_task_id,
+                        "lineage_id": session.map_request_scope.lineage_id,
+                        "origin_request_id": (
+                            session.map_task_lineage.get("origin_request_id")
+                            or session.map_request_scope.request_id
+                        ),
+                        "completion_candidate": True,
+                    }
             if isinstance(result_for_gate, dict):
                 remember_map_plan_progress(
                     session,
@@ -1485,8 +2072,8 @@ class QueryEngine:
                     result_for_gate,
                 )
                 if (
-                    frame.agent.name == "map-planner-agent"
-                    and tool_name in _PLATFORM_PLAN_TOOL_NAMES
+                    frame.agent.map_stage == "planner"
+                    and tool_name in PLATFORM_PLAN_TOOL_NAMES
                 ):
                     plan_outcome = parse_map_plan_outcome(tool_name, result_for_gate)
                     attempt_count = map_platform_plan_attempt_count(session, tool_args)
@@ -1508,7 +2095,7 @@ class QueryEngine:
                         )
                 elif (
                     _is_dynamic_map_writer(frame)
-                    and tool_name in _PLATFORM_PLAN_TOOL_NAMES
+                    and tool_name in PLATFORM_PLAN_TOOL_NAMES
                     and not parse_map_plan_outcome(tool_name, result_for_gate).executable
                 ):
                     frame.forced_completion_text = _writer_platform_validation_failure_text(
@@ -1533,14 +2120,21 @@ class QueryEngine:
                 if tool_name == "describe_map_region" and result.status == "applied":
                     session.map_task_state.counters.reads += 1
                     target = str(result_for_gate.get("target", tool_args.get("target_path", "")))
-                    session.map_task_state.no_progress_streaks[target] = 0
+                    streaks = dict(session.map_task_state.no_progress_streaks)
+                    streaks[target] = 0
+                    replace_map_state_field(
+                        session.map_task_state,
+                        "no_progress_streaks",
+                        streaks,
+                        target=target,
+                    )
                 if (
                     tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
                     and result.status == "applied"
                     and "plan_version" not in tool_args
                 ):
                     session.map_task_state.counters.writes += 1
-                    session.map_task_state.stage = "validate"
+                    session.map_task_state.transition_stage("validate")
                 if session.latest_context_used_tokens >= 32_000 and tool_name in {
                     "plan_map_layout",
                     "plan_map_algorithms",
@@ -1559,7 +2153,7 @@ class QueryEngine:
                     result_for_gate,
                 )
                 if (
-                    frame.agent.name == "map-reader-agent"
+                    frame.agent.map_stage == "reader"
                     and result.status == "applied"
                     and isinstance(result_for_gate, dict)
                     and _map_reader_has_detailed_region(result_for_gate)
@@ -1578,7 +2172,7 @@ class QueryEngine:
                 map_layer = tool_args.get("map_layer")
                 if isinstance(map_layer, int) and not isinstance(map_layer, bool):
                     blocker["map_layer"] = map_layer
-            if tool_name in _MAP_VALIDATION_TOOL_NAMES and isinstance(result_for_gate, dict):
+            if tool_name in MAP_VALIDATION_TOOL_NAMES and isinstance(result_for_gate, dict):
                 validation_state = _remember_map_validation(
                     session, tool_name, result_for_gate, tool_args
                 )
@@ -1591,9 +2185,17 @@ class QueryEngine:
                     result_for_gate,
                     validation_success,
                 )
+                _remember_map_transaction_validation(
+                    session,
+                    tool_args,
+                    result_for_gate,
+                    validation_success,
+                )
                 if tool_name == "validate_map_region" and mode == "diagnostic":
-                    session.map_completion_blockers = [
-                        {
+                    replace_map_state_field(
+                        session.map_task_state,
+                        "completion_blockers",
+                        [{
                             "tool": tool_name,
                             "reason": "map_diagnostic_complete",
                             "issues": result_for_gate.get("issues", [])
@@ -1601,8 +2203,10 @@ class QueryEngine:
                             "target": validation_state["target"],
                             "required_revision": validation_state["map_revision"],
                             "next_stage": "planner",
-                        }
-                    ]
+                        }],
+                        target=str(validation_state["target"]),
+                        revision=validation_state["map_revision"],
+                    )
                 elif validation_success:
                     target = str(result_for_gate.get("target", tool_args.get("target_path", "")))
                     revision = result_for_gate.get("map_revision")
@@ -1611,21 +2215,33 @@ class QueryEngine:
                         if isinstance(revision, int) and not isinstance(revision, bool)
                         else None
                     )
-                    session.map_completion_blockers = _clear_validation_blockers(
-                        session.map_completion_blockers,
+                    blockers = _clear_validation_blockers(
+                        session.map_task_state.completion_blockers,
                         target,
                         revision_value,
                         tool_name,
                         tool_args,
                     )
                     if not _has_review_blocker(
-                        session.map_completion_blockers,
+                        blockers,
                         target,
                         revision_value,
                     ):
-                        session.map_completion_blockers.append(
-                            _review_required_blocker(tool_name, target, revision_value)
+                        blockers.append(
+                            _review_required_blocker(
+                                tool_name,
+                                target,
+                                revision_value,
+                                _map_region_from_write_args(tool_args, result_for_gate),
+                            )
                         )
+                    replace_map_state_field(
+                        session.map_task_state,
+                        "completion_blockers",
+                        blockers,
+                        target=target,
+                        revision=revision_value,
+                    )
                 else:
                     validation_blocker = blocker or {
                         "tool": tool_name,
@@ -1644,11 +2260,37 @@ class QueryEngine:
                             *validation_blocker.get("issues", []),
                             "same validation failure repeated without a new map revision; automatic retry stopped",
                         ]
-                    session.map_completion_blockers = [validation_blocker]
+                    replace_map_state_field(
+                        session.map_task_state,
+                        "completion_blockers",
+                        [validation_blocker],
+                        target=str(validation_state["target"]),
+                        revision=validation_state["map_revision"],
+                    )
             elif blocker is not None:
-                session.map_completion_blockers = [blocker]
+                replace_map_state_field(
+                    session.map_task_state,
+                    "completion_blockers",
+                    [blocker],
+                    target=str(blocker.get("target", "")) or None,
+                    revision=blocker.get("required_revision"),
+                )
             history_payload = (
-                _history_payload_for_front_tool(tool_name, payload, map_artifact_ref)
+                _history_payload_for_front_tool(
+                    tool_name,
+                    payload,
+                    (
+                        map_artifact_locator.artifact_ref
+                        if map_artifact_locator is not None
+                        else None
+                    ),
+                    (
+                        map_artifact_locator.as_dict()
+                        if map_artifact_locator is not None
+                        else None
+                    ),
+                    frozenset(frame.agent.effective_tools),
+                )
                 if isinstance(payload, dict)
                 else payload
             )
@@ -1656,10 +2298,10 @@ class QueryEngine:
                 _tool_message(result.tool_use_id, history_payload, is_error=is_error)
             )
             if (
-                frame.agent.name == "map-reader-agent"
+                frame.agent.map_stage == "reader"
                 and tool_name == "describe_map_region"
                 and frame.map_reader_detailed_region_ready
-                and map_artifact_ref is None
+                and map_artifact_locator is None
             ):
                 _arm_map_reader_text_completion(frame)
             if isinstance(result_for_gate, dict):
@@ -1669,12 +2311,13 @@ class QueryEngine:
                 and str(result.error_code) == "map_revision_conflict"
                 and trusted_error_revision
             ):
-                _schedule_revision_conflict_reader(
+                await _schedule_revision_conflict_reader(
                     session,
                     frame,
                     tool_name,
                     tool_args,
                     result_for_gate,
+                    prompt_factory,
                 )
             # cell_count_mismatch 时自动注入恢复指引，避免 LLM 盲目重试
             if str(result.error_code) == "cell_count_mismatch":
@@ -1868,6 +2511,91 @@ class QueryEngine:
         self._emit(session_id, "config_changed", {"effort": effort})
         logger.info("Session effort changed session=%s effort=%s", session_id, effort)
 
+    async def resume_paused_map_task(self, session_id: str) -> dict[str, Any]:
+        """显式恢复暂停的地图任务，但不在命令请求内静默执行写批次。
+
+        仅在任务处于 ``paused`` 状态且无 pending 前端工具调用时允许恢复。
+        恢复操作本身只修改状态并持久化，实际的批次执行由下一轮 chat 请求
+        驱动（通过 ``resumed_from_checkpoint`` 路径），避免在此处隐式触发
+        长时间运行的写操作。
+
+        Args:
+            session_id: 需要恢复的会话标识。
+
+        Returns:
+            恢复后的地图任务状态和检查点摘要。
+        """
+        async with self._store.lock_for(session_id):
+            session = self._store.get_or_create(session_id, self.available_tools)
+            state = session.map_task_state
+            # 前置条件：任务必须处于暂停状态且有可用检查点
+            if state.status != "paused" or state.checkpoint is None:
+                return {
+                    "resumed": False,
+                    "status": state.status,
+                    "reason": "map_task_not_paused",
+                }
+            # 前置条件：不能有尚未回传的前端工具调用
+            if session.pending_turn_id is not None:
+                return {
+                    "resumed": False,
+                    "status": state.status,
+                    "reason": "front_tools_still_pending",
+                }
+            resume_map_task(state)
+            self._store.save(session)
+            result = {
+                "resumed": True,
+                "status": state.status,
+                "task_id": state.task_id,
+                "checkpoint": state.checkpoint,
+            }
+        self._emit(session_id, "map_task_resumed", {"task_id": result["task_id"]})
+        logger.info("Paused map task explicitly resumed session=%s", session_id)
+        return result
+
+    async def cancel_map_task(self, session_id: str) -> dict[str, Any]:
+        """显式取消地图任务并清除尚未执行的地图批次。
+
+        适用于用户主动中止正在运行或暂停的地图任务。仅当任务处于
+        ``running`` 或 ``paused`` 状态时才允许取消，且要求当前无 pending
+        前端工具调用，防止取消操作与正在处理的工具结果产生竞态。
+
+        Args:
+            session_id: 需要取消地图任务的会话标识。
+
+        Returns:
+            是否取消成功及取消后的任务状态。
+        """
+        async with self._store.lock_for(session_id):
+            session = self._store.get_or_create(session_id, self.available_tools)
+            state = session.map_task_state
+            # 前置条件：只有运行中或暂停中的任务才能被取消
+            if state.status not in {"running", "paused"}:
+                return {
+                    "cancelled": False,
+                    "status": state.status,
+                    "reason": "map_task_not_active",
+                }
+            # 前置条件：不能有尚未回传的前端工具调用
+            if session.pending_turn_id is not None:
+                return {
+                    "cancelled": False,
+                    "status": state.status,
+                    "reason": "front_tools_still_pending",
+                }
+            task_id = state.task_id
+            state.cancel("cancelled_by_user")
+            self._store.save(session)
+            result = {
+                "cancelled": True,
+                "status": state.status,
+                "task_id": task_id,
+            }
+        self._emit(session_id, "map_task_cancelled", {"task_id": task_id})
+        logger.info("Map task explicitly cancelled session=%s task_id=%s", session_id, task_id)
+        return result
+
     async def set_output_style(self, session_id: str, output_style: str) -> None:
         """Set session output style without starting a model turn."""
         async with self._store.lock_for(session_id):
@@ -1951,6 +2679,27 @@ class QueryEngine:
 
     def _emit(self, session_id: str, event_type: str, payload: dict[str, Any]) -> int:
         """记录内部事件；未配置事件存储时返回 0。"""
+        publication_buffer = _PUBLICATION_BUFFER.get()
+        if publication_buffer is not None:
+            staged_payload = dict(payload)
+            staged_payload.setdefault(
+                "_submission_request_id",
+                publication_buffer.request_id,
+            )
+            staged_payload.setdefault(
+                "_submission_turn_id",
+                publication_buffer.turn_id,
+            )
+            if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
+                self._record_persisted_history_event(
+                    publication_buffer.session,
+                    event_type,
+                    staged_payload,
+                )
+            publication_buffer.events.append(
+                (session_id, event_type, staged_payload)
+            )
+            return 0
         log_payload = _event_payload_for_log(payload)
         logger.debug(
             "Event emitted session=%s type=%s payload=%s",
@@ -1960,33 +2709,83 @@ class QueryEngine:
         )
         if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
             session = self._store.get_or_create(session_id, self.available_tools)
-            if event_type == "context_usage":
-                try:
-                    used_tokens = int(payload.get("used_tokens", 0))
-                except (TypeError, ValueError):
-                    used_tokens = 0
-                if used_tokens > 0:
-                    session.latest_context_used_tokens = used_tokens
-                    frame = session.top_frame()
-                    is_map_frame = frame is not None and (
-                        frame.agent.name.startswith("map-") or bool(frame.agent.workflow_operations)
-                    )
-                    threshold = (
-                        min(
-                            self._settings.auto_compact_token_threshold,
-                            _MAP_AUTO_COMPACT_CONTEXT_TOKENS,
-                        )
-                        if is_map_frame
-                        else self._settings.auto_compact_token_threshold
-                    )
-                    if used_tokens >= threshold:
-                        session.force_compact_next_turn = True
-            session.record_history_event(event_type, payload)
+            self._record_persisted_history_event(session, event_type, payload)
         if self._events is None:
             return 0
         event = self._events.append(session_id, event_type, payload)
         logger.debug("Event persisted session=%s seq=%d type=%s", session_id, event.seq, event_type)
         return event.seq
+
+    def _record_persisted_history_event(
+        self,
+        session: Session,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """把需恢复的事件写入指定 Session，不触碰外部 EventStore。"""
+        if event_type == "context_usage":
+            try:
+                used_tokens = int(payload.get("used_tokens", 0))
+            except (TypeError, ValueError):
+                used_tokens = 0
+            if used_tokens > 0:
+                session.latest_context_used_tokens = used_tokens
+                frame = session.top_frame()
+                is_map_frame = frame is not None and (
+                    frame.agent.pipeline_kind == "map"
+                    or bool(frame.agent.workflow_operations)
+                )
+                threshold = (
+                    min(
+                        self._settings.auto_compact_token_threshold,
+                        _MAP_AUTO_COMPACT_CONTEXT_TOKENS,
+                    )
+                    if is_map_frame
+                    else self._settings.auto_compact_token_threshold
+                )
+                if used_tokens >= threshold:
+                    session.force_compact_next_turn = True
+        session.record_history_event(event_type, payload)
+
+    def _flush_submission_publications(
+        self,
+        publication_buffer: _SubmissionPublicationBuffer,
+    ) -> None:
+        """在 Session 成功提交后按 artifact、事件顺序发布暂存副作用。"""
+        if publication_buffer.map_artifact_turn.entries:
+            try:
+                MapArtifactStore(
+                    self._settings.project_root,
+                    publication_buffer.session.session_id,
+                ).merge_turn(publication_buffer.map_artifact_turn)
+            except (OSError, TypeError, ValueError) as exc:
+                logger.error(
+                    "Committed session map artifact publication failed session=%s "
+                    "turn=%s error=%s",
+                    publication_buffer.session.session_id,
+                    publication_buffer.turn_id,
+                    exc,
+                )
+        if self._events is None:
+            return
+        for session_id, event_type, payload in publication_buffer.events:
+            try:
+                event = self._events.append(session_id, event_type, payload)
+            except OSError as exc:
+                logger.error(
+                    "Committed session event publication failed session=%s "
+                    "type=%s error=%s",
+                    session_id,
+                    event_type,
+                    exc,
+                )
+                continue
+            logger.debug(
+                "Deferred event persisted session=%s seq=%d type=%s",
+                session_id,
+                event.seq,
+                event_type,
+            )
 
     def _record_recovery(self, session: Session, response: ChatResponse) -> None:
         """根据最新响应写入或清理最小恢复指针。"""

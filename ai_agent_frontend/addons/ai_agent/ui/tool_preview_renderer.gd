@@ -37,7 +37,8 @@ static func infer_render_kind(call: Dictionary) -> String:
 	match str(call.get("name", "")):
 		"propose_script_edit", "propose_tests", "apply_text_edit", "create_shader_material":
 			return "diff"
-		"edit_map", "fill_rect", "paint_from_image_grid":
+		## fill_rect / paint_from_image_grid 已移除，不再需要 map 渲染类型。
+		"edit_map":
 			return "map"
 		"run_tests", "run_headless_self_test", "run_system_command", "execute_gd_script", "git_status", "git_diff", "export_project":
 			return "run"
