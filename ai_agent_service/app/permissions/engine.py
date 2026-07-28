@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from app.permissions.rules import PermRule, match_rules
-from app.security.paths import all_paths_ok
+from app.security.paths import all_capture_paths_ok, all_paths_ok
 from app.security.settings import SecuritySettings
 from app.tools.registry import ToolDef
 
@@ -65,13 +65,15 @@ def _effect_of(tool: ToolDef) -> str:
         tool: 工具定义。
 
     Returns:
-        `execute_project` / `write_project` / `network` / `read_project`
+        `execute_project` / `write_project` / `write_internal_cache` / `network` / `read_project`
         中的一个，按风险从高到低优先判定。
     """
     if tool.executes_process:
         return "execute_project"
     if tool.writes_project:
         return "write_project"
+    if tool.writes_internal_cache:
+        return "write_internal_cache"
     if tool.uses_network:
         return "network"
     return "read_project"
@@ -90,7 +92,9 @@ def _session_allow_match(ctx: PermissionContext, tool: ToolDef, args: dict[str, 
     return make_session_allow_grant(tool, args) in ctx.session_allow
 
 
-def make_session_allow_grant(tool: ToolDef, args: dict[str, Any] | None = None) -> SessionAllowGrant:
+def make_session_allow_grant(
+    tool: ToolDef, args: dict[str, Any] | None = None
+) -> SessionAllowGrant:
     """构造该工具对应的会话级"总是允许"授权键。
 
     Args:
@@ -111,7 +115,9 @@ def make_session_allow_grant(tool: ToolDef, args: dict[str, Any] | None = None) 
             }
         else:
             fingerprint_input = safe_args
-        encoded = json.dumps(fingerprint_input, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        encoded = json.dumps(
+            fingerprint_input, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         signature = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return (tool.name, tool.domain, _effect_of(tool), signature)
 
@@ -164,18 +170,49 @@ def check(tool: ToolDef, args: dict[str, Any], ctx: PermissionContext) -> Decisi
         三态决策之一；`deny` 表示不执行，`ask` 表示 front 改动型工具需前端
         预览确认，`allow` 表示可直接执行/静默返回前端执行。
     """
+    if not tool.internal_cache_scope_is_valid:
+        logger.debug("Permission deny tool=%s reason=invalid_internal_cache_scope", tool.name)
+        return "deny"
     legacy_read_path_args = [] if tool.writes_project else tool.path_args
     legacy_write_path_args = tool.path_args if tool.writes_project else []
-    read_path_args = [*legacy_read_path_args, *tool.read_path_args]
-    write_path_args = [*legacy_write_path_args, *tool.write_path_args]
+    capture_read_names = set(tool.capture_read_path_args)
+    capture_write_names = set(tool.capture_write_path_args)
+    read_path_args = [
+        name
+        for name in (*legacy_read_path_args, *tool.read_path_args)
+        if name not in capture_read_names
+    ]
+    write_path_args = [
+        name
+        for name in (*legacy_write_path_args, *tool.write_path_args)
+        if name not in capture_write_names
+    ]
     if not all_paths_ok(args, read_path_args, ctx.security, write=False):
         logger.debug("Permission deny tool=%s reason=read_path_boundary", tool.name)
         return "deny"
     if not all_paths_ok(args, write_path_args, ctx.security, write=True):
         logger.debug("Permission deny tool=%s reason=path_boundary", tool.name)
         return "deny"
+    if not all_capture_paths_ok(
+        args,
+        tool.capture_read_path_args,
+        ctx.security,
+        write=False,
+    ):
+        logger.debug("Permission deny tool=%s reason=capture_read_path_boundary", tool.name)
+        return "deny"
+    if not all_capture_paths_ok(
+        args,
+        tool.capture_write_path_args,
+        ctx.security,
+        write=True,
+    ):
+        logger.debug("Permission deny tool=%s reason=capture_write_path_boundary", tool.name)
+        return "deny"
     if tool.domain not in ctx.security.enabled_domains:
-        logger.debug("Permission deny tool=%s reason=disabled_domain domain=%s", tool.name, tool.domain)
+        logger.debug(
+            "Permission deny tool=%s reason=disabled_domain domain=%s", tool.name, tool.domain
+        )
         return "deny"
     if tool.name not in ctx.effective_tools:
         logger.debug("Permission deny tool=%s reason=not_effective_tool", tool.name)

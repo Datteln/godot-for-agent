@@ -1,7 +1,7 @@
 """工具注册表（§7 工具系统与注册表）。
 
 每个工具携带 `side`（前端/服务端执行）与 effect 元数据
-（`reads_project`/`writes_project`/`executes_process`/`uses_network`），
+（`reads_project`/`writes_project`/`writes_internal_cache`/`executes_process`/`uses_network`），
 权限闸（`app/permissions/engine.py`）据此决策 `allow`/`ask`/`deny`。
 新增能力域/工具只需注册一个 `ToolDef` 并归入某 agent 的 `tools` 列表，
 编排层、权限闸与入口零改动（NFR-10）。
@@ -24,6 +24,13 @@ ToolHandler = Callable[[dict[str, Any], ToolContext], Awaitable[dict[str, Any]]]
 # front 工具的服务端增强：把前端返回的结构化结果与本次调用入参合并增强。
 ToolEnricher = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 
+MAP_SUPPORT_INTERNAL_CACHE_PATHS: frozenset[str] = frozenset(
+    {
+        "res://.ai_agent_service/map_agent/resource_registry.json",
+        "res://.ai_agent_service/map_agent/spatial_index.json",
+    }
+)
+
 
 @dataclass
 class ToolDef:
@@ -37,6 +44,8 @@ class ToolDef:
         side: `front` 表示由 Godot 前端执行；`server` 表示由本服务执行。
         reads_project: 是否读取工程文件/编辑器状态。
         writes_project: 是否写工程（默认触发预览确认 + 可撤销）。
+        writes_internal_cache: 是否可写固定内部缓存；不代表一般工程写权限。
+        internal_cache_paths: 编译期声明的内部缓存固定路径，不接受调用参数扩展。
         executes_process: 是否运行游戏/测试（触发超时/取消/日志/沙箱）。
         uses_network: 是否产生外联（如 embedding 索引）。
         needs_preview: 是否需要前端预览确认；通常由 `mutating` 派生，
@@ -51,6 +60,8 @@ class ToolDef:
             为兼容旧定义，该字段会按 `writes_project` 推断为读或写路径。
         read_path_args: 需要按读权限校验的路径参数名。
         write_path_args: 需要按写权限校验的路径参数名。
+        capture_read_path_args: 图片回看路径参数；额外允许受限的 `user://` 临时空间。
+        capture_write_path_args: 截图写入路径参数；额外允许受限的 `user://` 临时空间。
         schema: OpenAI function calling 的 `function` schema。
         handler: `side="server"` 时的实现；`side="front"` 时为 None。
         enrich: `side="front"` 时对前端结果的服务端增强（如合并文档 prose）。
@@ -63,6 +74,8 @@ class ToolDef:
     side: Literal["front", "server"]
     reads_project: bool = False
     writes_project: bool = False
+    writes_internal_cache: bool = False
+    internal_cache_paths: tuple[str, ...] = ()
     executes_process: bool = False
     uses_network: bool = False
     needs_preview: bool = False
@@ -75,6 +88,8 @@ class ToolDef:
     path_args: list[str] = field(default_factory=list)
     read_path_args: list[str] = field(default_factory=list)
     write_path_args: list[str] = field(default_factory=list)
+    capture_read_path_args: list[str] = field(default_factory=list)
+    capture_write_path_args: list[str] = field(default_factory=list)
     schema: dict[str, Any] = field(default_factory=dict)
     handler: ToolHandler | None = None
     enrich: ToolEnricher | None = None
@@ -90,10 +105,24 @@ class ToolDef:
         return self.writes_project or self.executes_process
 
     @property
+    def internal_cache_scope_is_valid(self) -> bool:
+        """判断内部缓存 effect 是否仅覆盖编译期允许的固定路径。"""
+        declared = frozenset(self.internal_cache_paths)
+        if not self.writes_internal_cache:
+            return not declared
+        return bool(declared) and declared.issubset(MAP_SUPPORT_INTERNAL_CACHE_PATHS)
+
+    @property
     def all_path_args(self) -> list[str]:
         """All declared path-like argument names, preserving declaration order."""
         result: list[str] = []
-        for name in (*self.path_args, *self.read_path_args, *self.write_path_args):
+        for name in (
+            *self.path_args,
+            *self.read_path_args,
+            *self.write_path_args,
+            *self.capture_read_path_args,
+            *self.capture_write_path_args,
+        ):
             if name not in result:
                 result.append(name)
         return result
@@ -108,6 +137,8 @@ def register(tool: ToolDef) -> None:
     Args:
         tool: 待注册的工具定义；`tool.name` 作为注册表键，重复注册会覆盖。
     """
+    if not tool.internal_cache_scope_is_valid:
+        raise ValueError(f"tool {tool.name!r} declares an invalid writes_internal_cache scope")
     REGISTRY[tool.name] = tool
     logger.debug(
         "Tool registered name=%s side=%s domain=%s mutating=%s deferred=%s",

@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 PermissionMode = Literal["default", "plan", "auto_approve", "read_only", "full_access"]
 Effort = Literal["quick", "standard", "deep", "verify", "advisor"]
+InterruptCause = Literal["user_interrupted", "client_timeout"]
 
 
 class Context(BaseModel):
@@ -162,6 +163,13 @@ class ResetRequest(BaseModel):
     session_id: str
 
 
+class InterruptRequest(BaseModel):
+    """`POST /chat/interrupt` 请求体，区分用户停止与客户端等待超时。"""
+
+    session_id: str
+    cause: InterruptCause = "user_interrupted"
+
+
 class InterruptResponse(BaseModel):
     """`POST /chat/interrupt` 响应：是否真正取消了正在执行的请求，以及
     该会话此刻的最新事件序号，供前端跳过中断前后产生的过期事件。
@@ -231,10 +239,22 @@ class ChatEventDTO(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class ChatProgressDTO(BaseModel):
+    """活跃 `/chat` 请求的事务外、非持久化存活快照。"""
+
+    type: Literal["turn_progress"] = "turn_progress"
+    session_id: str
+    request_id: str | None = None
+    turn_id: str | None = None
+    phase: str
+    heartbeat_seq: int
+
+
 class ChatEventsResponse(BaseModel):
     """`GET /chat/events` 响应。"""
 
     events: list[ChatEventDTO]
+    progress: ChatProgressDTO | None = None
 
 
 class SessionHistoryItemDTO(BaseModel):

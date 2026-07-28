@@ -47,6 +47,25 @@ static func to_res_path(path: String) -> String:
 	return res_path
 
 
+## 截图与图片回看可使用项目路径或 Godot 的 user:// 临时空间；仍禁止绝对路径和目录穿越。
+static func to_capture_path(path: String) -> String:
+	var cleaned := path.strip_edges().replace("\\", "/")
+	if cleaned == "":
+		return ""
+	if cleaned.begins_with("user://"):
+		var relative := cleaned.trim_prefix("user://").trim_prefix("/")
+		if relative == "":
+			return ""
+		for part in relative.split("/", false):
+			if part == ".." or ":" in part:
+				return ""
+		var user_path := ("user://" + relative).simplify_path()
+		return user_path if user_path.begins_with("user://") else ""
+	if "://" in cleaned and not cleaned.begins_with("res://"):
+		return ""
+	return to_res_path(cleaned)
+
+
 ## 判断给定 res:// 路径是否允许写入（不在 DENY_WRITE_PREFIXES 之内）。
 static func is_write_allowed(res_path: String) -> bool:
 	if res_path == "":

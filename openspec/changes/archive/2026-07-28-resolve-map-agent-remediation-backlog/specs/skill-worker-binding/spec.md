@@ -22,6 +22,14 @@ The system MUST derive effective tools from the intersection of Agent Interface,
 - **WHEN** a Skill is loaded in a worker whose stage cannot use some globally registered tools
 - **THEN** those tools are excluded from the binding and from the worker's callable tool set
 
+#### Scenario: Dynamic reader is created by a narrow map orchestrator
+- **WHEN** the parent map orchestrator intentionally lacks context-read tools and creates a `read_only` dynamic Worker
+- **THEN** the Worker Agent Interface is derived from its own mode Capability Contract and registered tools before Skill, stage, and permission filtering, rather than intersecting with the parent's tool list
+
+#### Scenario: Dynamic Worker mode excludes writes
+- **WHEN** a non-writing Worker derives its interface from registered tools
+- **THEN** only tools declared for that Worker mode are retained and `delegate`, `delegate_many`, and `create_plan` remain unavailable
+
 ### Requirement: Callers cannot supply a duplicate tool whitelist
 Dynamic worker requests MUST NOT accept an `allowed_tools` field as an authority for tool reachability.
 
@@ -67,3 +75,18 @@ The map artifact reader MUST resolve Session `map_artifacts.json` entries by tur
 #### Scenario: Delegate reader receives a raw map artifact locator
 - **WHEN** `read_delegate_artifact` is called with a locator for a raw map-tool entry
 - **THEN** it returns a structured incompatible-artifact-kind error without attempting to treat the map document as a delegate artifact
+
+#### Scenario: Artifact reader receives an image reference
+- **WHEN** `read_map_artifact` or `read_delegate_artifact` receives a `res://` or `user://` screenshot/image reference
+- **THEN** it returns structured `incompatible_artifact_kind` with `actual_kind=image`, the expected artifact kind, and `recommended_tool=read_image_metadata` without attempting filesystem path concatenation
+
+### Requirement: Visual review questions use the image-understanding side channel
+`read_image_metadata` SHALL accept an optional bounded `question` and pass it separately from the media type to the configured asset-understanding model.
+
+#### Scenario: Reader asks a visual confirmation question
+- **WHEN** a compatible reader calls `read_image_metadata` with a screenshot and a question about appearance, visibility, composition, or obstruction
+- **THEN** the runtime invokes image understanding with media type `image`, uses the question as the visual prompt, and returns the question with its semantic answer
+
+#### Scenario: Reader asks for exact tile facts from a screenshot
+- **WHEN** a question asks for an exact cell coordinate, column number, source id, atlas coordinate, or revision
+- **THEN** tool guidance states that the visual answer is non-authoritative and directs exact-fact collection to `describe_map_context` or `describe_map_region`

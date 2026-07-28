@@ -1,4 +1,10 @@
-## ADDED Requirements
+# map-progress-recovery Specification
+
+## Purpose
+
+Define measurable map-task progress, bounded recovery, typed pauses, model fallback, and resumable checkpoints.
+
+## Requirements
 
 ### Requirement: Structured-output repair is observable
 The runtime MUST preserve structured validation issues, repair actions, repair attempt number, and a stable error category whenever it repairs worker output.
@@ -10,6 +16,10 @@ The runtime MUST preserve structured validation issues, repair actions, repair a
 #### Scenario: Same repair failure repeats
 - **WHEN** the same structured issue category repeats beyond its configured threshold
 - **THEN** the runtime stops retrying and returns a typed repair-exhausted result
+
+#### Scenario: Structured issues are null or malformed
+- **WHEN** worker output contains `validation.structured_issues=null`, a non-array value, or omits the field
+- **THEN** repair normalizes it to an empty issue list and all later category aggregation consumes only that normalized list without raising an iteration error
 
 ### Requirement: Retry identity is semantic and scoped
 The system SHALL aggregate retries by stage, target, revision, normalized operation signature, and error category.
@@ -39,6 +49,40 @@ When progress thresholds are exceeded, the pause result MUST include the first r
 #### Scenario: Multiple failures lead to pause
 - **WHEN** retries across one scoped operation reach the no-progress threshold
 - **THEN** the task pauses with the earliest causal failure rather than only the final symptom
+
+### Requirement: Pause causes are typed and truthfully rendered
+Every paused map task MUST record a typed pause kind and produce a non-empty recovery report whose user-facing message matches the actual cause.
+
+#### Scenario: The client watchdog interrupts an otherwise progressing request
+- **WHEN** `/chat/interrupt` is received with `cause=client_timeout`
+- **THEN** the checkpoint records `pause_kind=client_timeout`, preserves the resumable task state, and reports a client-wait timeout rather than continuous no-progress
+
+#### Scenario: The user explicitly stops a task
+- **WHEN** the user invokes stop and interrupt carries `cause=user_interrupted`
+- **THEN** the task reports that it was paused by the user and does not describe the pause as model failure or no-progress exhaustion
+
+#### Scenario: A pause has no specialized report payload
+- **WHEN** a paused checkpoint lacks a category-specific report
+- **THEN** the runtime synthesizes a minimal structured report from pause kind, stage, checkpoint, and unresolved issues and never renders an empty `{}` as recovery guidance
+
+#### Scenario: No-progress actually reaches its threshold
+- **WHEN** semantic no-progress counters reach the configured threshold
+- **THEN** the task records `pause_kind=no_progress_exhausted` and only this pause kind may use continuous-no-progress wording
+
+### Requirement: Model timeout fallback is owned by the backend attempt
+The backend LLM provider SHALL retry a failed or timed-out primary model attempt with the configured fallback model at most once before reporting provider exhaustion.
+
+#### Scenario: Primary model attempt times out before producing a durable result
+- **WHEN** a fallback model is configured and differs from the primary model
+- **THEN** the provider discards provisional output from the failed attempt, emits `agent_model_fallback`, and retries the same messages and tools with the fallback model
+
+#### Scenario: The outer chat watchdog expires
+- **WHEN** the frontend stops receiving both committed events and backend liveness heartbeats
+- **THEN** it may interrupt with `cause=client_timeout` but MUST NOT replay `/chat`, resubmit tool results, or choose the fallback model itself
+
+#### Scenario: Fallback is unavailable or also fails
+- **WHEN** no distinct fallback is configured or the fallback attempt fails
+- **THEN** the runtime returns a typed provider-exhausted result and preserves a resumable checkpoint when a map task is active
 
 ### Requirement: Worker prompts contain mode-specific task guidance only
 Dynamic worker prompts SHALL be selected by worker mode and SHALL NOT duplicate stage transitions, tool whitelists, result schema, resource rules, or recovery state machines owned by runtime contracts.

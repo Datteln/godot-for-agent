@@ -912,7 +912,8 @@ def _map_result_summary(
             artifact_locator is not None
             and "read_map_artifact" in effective_tools
             and (
-            result.get("cells_omitted") or result.get("cells_returned") != result.get("cells_total")
+                result.get("cells_omitted")
+                or result.get("cells_returned") != result.get("cells_total")
             )
         ):
             summary["exact_cells_hint"] = (
@@ -942,6 +943,10 @@ def _map_result_summary(
             summary["artifact_ref"] = artifact_ref
         if artifact_locator is not None:
             summary.update(artifact_locator)
+            if "read_map_artifact" in effective_tools:
+                summary["artifact_read_hint"] = (
+                    "使用 read_map_artifact 和该 map_tool_result 定位信息读取完整 matches。"
+                )
         return summary
 
     if tool_name in _MAP_OBJECT_PLACEMENT_TOOL_NAMES:
@@ -998,6 +1003,12 @@ def _map_result_summary(
             )
         if artifact_ref is not None:
             summary["artifact_ref"] = artifact_ref
+        if artifact_locator is not None:
+            summary.update(artifact_locator)
+            if "read_map_artifact" in effective_tools:
+                summary["artifact_read_hint"] = (
+                    "使用 read_map_artifact 和该 map_tool_result 定位信息读取完整字段。"
+                )
         return summary
 
     if tool_name in MAP_VALIDATION_TOOL_NAMES:
@@ -1018,6 +1029,12 @@ def _map_result_summary(
         summary = {key: result[key] for key in keep_keys if key in result}
         if artifact_ref is not None:
             summary["artifact_ref"] = artifact_ref
+        if artifact_locator is not None:
+            summary.update(artifact_locator)
+            if "read_map_artifact" in effective_tools:
+                summary["artifact_read_hint"] = (
+                    "使用 read_map_artifact 和该 map_tool_result 定位信息读取完整校验结果。"
+                )
         return summary
 
     return result

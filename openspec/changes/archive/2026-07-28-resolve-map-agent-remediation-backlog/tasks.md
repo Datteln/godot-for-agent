@@ -13,10 +13,10 @@
 - [x] 2.4 Defer artifact/event publication until Session commit and attach request/turn idempotency keys
 - [ ] 2.5 Add regression tests proving an invalid later result leaves earlier messages, grants, pending metadata, map state, cache, and disk unchanged
 - [ ] 2.6 Add regression tests for frame/pending metadata mismatch, reducer failure rollback, persistence failure rollback, and idempotent retry
-- [ ] 2.7 Introduce the versioned Session-level `map_artifacts.json` schema with `turns[turn_id].entries[tool_use_id]`, canonical fingerprints, and typed artifact locators
-- [ ] 2.8 Replace per-call `_StagedArtifact` files with one transaction-local staged turn block that aggregates all large map-tool results in the submitted batch
-- [ ] 2.9 Implement a map artifact reader that resolves committed and current-transaction staged entries by turn/tool-use id while keeping delegate-schema reads isolated
-- [ ] 2.10 Atomically merge staged turns only after Session persistence, discard them on interrupt/rollback, reject conflicting turn fingerprints, and retain read-only compatibility for existing legacy per-call artifacts
+- [x] 2.7 Introduce the versioned Session-level `map_artifacts.json` schema with `turns[turn_id].entries[tool_use_id]`, canonical fingerprints, and typed artifact locators
+- [x] 2.8 Replace per-call `_StagedArtifact` files with one transaction-local staged turn block that aggregates all large map-tool results in the submitted batch
+- [x] 2.9 Implement a map artifact reader that resolves committed and current-transaction staged entries by turn/tool-use id while keeping delegate-schema reads isolated
+- [x] 2.10 Atomically merge staged turns only after Session persistence, discard them on interrupt/rollback, reject conflicting turn fingerprints, and retain read-only compatibility for existing legacy per-call artifacts
 - [ ] 2.11 Add regression coverage for multiple map results producing one persistent file, staged read-your-writes, successful commit, interrupt rollback, missing legacy files, and idempotent/conflicting retry
 
 ## 3. Dependency-Aware Plan Scheduler
@@ -40,8 +40,8 @@
 - [x] 4.5 Migrate bundled map Skills from duplicated `allowed-tools` names to versioned semantic `required_capabilities`
 - [x] 4.6 Remove dynamic Worker request `allowed_tools` and derive the callable set exclusively from the resolved binding
 - [ ] 4.7 Add tests for global-extra-tool exclusion, disabled Skill, unknown Skill, mode mismatch, stage mismatch, permission restriction, and legacy metadata migration
-- [ ] 4.8 Generate artifact-reading hints from artifact kind plus the current effective tool set and remove the hard-coded `read_file` hint from map result summaries
-- [ ] 4.9 Route complete map-context, scene-tree, and exact-fact requests from map orchestrator to a compatible reader, and keep `search_tools` unable to activate scope-excluded tools
+- [x] 4.8 Generate artifact-reading hints from artifact kind plus the current effective tool set and remove the hard-coded `read_file` hint from map result summaries
+- [x] 4.9 Route complete map-context, scene-tree, and exact-fact requests from map orchestrator to a compatible reader, and keep `search_tools` unable to activate scope-excluded tools
 - [ ] 4.10 Add contract tests for map/delegate reader separation, scope-aware hints, reader routing, excluded-tool search, and mixed server/front tool batches without classifying server tools as missing
 
 ## 5. Event-Owned Map Workflow State
@@ -97,7 +97,7 @@
 - [x] 9.6 Aggregate no-progress counts by scoped error category and retain the earliest root cause
 - [x] 9.7 Include first root cause, category counts, stage, target, revision, last attempt, and recovery guidance in pause results and history
 - [ ] 9.8 Add tests for semantically equivalent retries, changed error categories, repair circuit breaking, reader recovery success/failure, and root-cause pause reporting
-- [ ] 9.9 Preserve map NodePath semantics so omitted `target_path` performs documented compatible-map inference while `"."` remains the scene root and yields structured target recovery when it is not a map
+- [x] 9.9 Preserve map NodePath semantics so omitted `target_path` performs documented compatible-map inference while `"."` remains the scene root and yields structured target recovery when it is not a map
 - [ ] 9.10 Add recovery tests for omitted-target inference, invalid dot target candidates/hints, and suppression of identical no-progress target retries
 
 ## 10. Prompt and Duplicate-Contract Cleanup
@@ -112,12 +112,12 @@
 ## 11. Migration, Integration, and Acceptance
 
 - [x] 11.1 Run Session and Skill metadata migrations against representative legacy fixtures and verify one-time canonical rewrite
-- [x] 11.2 Run Python compileall, focused mypy, OpenSpec validation, and the complete pytest suite with no new unexplained failures
+- [ ] 11.2 Run Python compileall, focused mypy, OpenSpec validation, and the complete pytest suite with no new unexplained failures
 - [x] 11.3 Run Godot headless script parsing and editor-plugin initialization after each GDScript transaction/platform slice
 - [ ] 11.4 Run an end-to-end map flow covering reader→planner→writer→validator→reviewer with artifact inputs, evidence gate, and successful grouped commit
 - [ ] 11.5 Run an end-to-end failure flow covering invalid later tool result, failed predecessor, stale worker result, failed validation rollback, retry exhaustion, and paused root-cause output
 - [x] 11.6 Remove migration-only legacy fields and feature-flag observation paths after parity tests pass
-- [x] 11.7 Update `未修复问题清单.md` and `整改审查报告.md` with implemented task ids, verification evidence, and any intentionally deferred limits
+- [ ] 11.7 Update `未修复问题清单.md` and `整改审查报告.md` with implemented task ids, verification evidence, and any intentionally deferred limits
 - [ ] 11.8 Run an end-to-end mixed server/front map-read flow proving one Session artifact file, staged same-turn reads, committed historical reads, reader delegation, and interrupt cleanup
 
 ## 12. Request-Scoped Map-Edit Gate
@@ -127,5 +127,30 @@
 - [x] 12.3 Propagate stable map-edit lineage through the root turn, plan steps, child Frames, pending front-tool metadata, tool-result continuations, and the final map completion candidate
 - [x] 12.4 Replace the historical `task_id` Completion Gate condition with current-request `map_edit` lineage plus a completion-candidate marker; return ordinary, plan-only, read-only, validation-only, and `missing_inputs` responses unchanged
 - [x] 12.5 Keep historical running/paused/completed map tasks dormant during unrelated requests, and allow lineage inheritance only for an explicit map-edit continuation or the dedicated `resume_map_task` command
-- [ ] 12.6 Add regression coverage for greeting after stale task state, map read/analysis, plan-only requests, missing target/revision, unrelated new requests, bare "continue", explicit map-edit continuation, tool-result lineage, and a valid gated completion
+- [ ] 12.6 Add regression coverage for greeting after stale task state, map read/analysis, plan-only requests, missing target/revision, unrelated new requests, contextual "continue" with one focused task, ambiguous/stale continuation candidates, explicit map-edit continuation, tool-result lineage, and a valid gated completion
 - [x] 12.7 Reproduce the reported swallowed-chat case and rerun Python compileall, focused mypy, full pytest baseline, OpenSpec strict validation, and Godot headless plugin initialization
+
+## 13. Screenshot Review and Dynamic Worker Reachability
+
+- [x] 13.1 Add a scheme-aware capture path contract for `capture_viewport_screenshot` and `read_image_metadata` that accepts validated `res://`, `user://`, and project-relative paths, keeps ordinary `to_res_path` behavior unchanged, distinguishes scratch paths in the service permission layer, and verifies traversal/unknown-scheme/project-deny cases
+- [x] 13.2 Extend `read_image_metadata` with a bounded optional `question`, pass it to asset understanding separately from the fixed `image` type hint using original tool args, document the visual-versus-exact-fact boundary, and return structured `incompatible_artifact_kind` recovery from map/delegate artifact readers for image refs
+- [x] 13.3 Derive read-only, propose-only, repair-propose, and review-only dynamic Worker tools from `mode_tools & set(REGISTRY)` before Skill/stage/permission filtering, retain orchestration-tool stripping, verify no code relies on the parent-tool-subset invariant, and cover reader/planner/reviewer reachability without write escalation
+- [ ] 13.4 Make `_repair_map_structured_output` consume only normalized `structured_issues`, and add regression coverage proving null, malformed, and missing values produce a conservative repaired result instead of rolling back the Session
+
+## 14. Direct Map Support-Data Self-Healing
+
+- [x] 14.1 Add a deterministic map support-data builder that scans canonical TileMapLayer/TileMap/GridMap cells, TileSet sources/atlas tiles, and MeshLibrary items into stable registry and spatial-index documents without LLM semantic invention
+- [x] 14.2 Invoke the builder inside `describe_map_context` only for missing support files, rebuild only the missing file, reread it in the same call, skip creation when no compatible map exists, and never create planner/writer/child-Frame work
+- [x] 14.3 Add a fixed-path `writes_internal_cache` effect for the two `.ai_agent_service/map_agent/` files, keep it outside Completion Gate, map transactions, Undo, and general reader write authority, and serialize first-use rebuild with a lock plus in-lock recheck
+- [x] 14.4 Write rebuilt documents through validated atomic replacement and return rebuilt reason, entry counts, `semantic_aliases_recovered`, index completeness, skipped counts, coverage, and structured corruption diagnostics without overwriting malformed existing data
+- [ ] 14.5 Add Godot and service contract coverage for both-missing, one-missing, empty map with resources, no compatible map, malformed existing data, deterministic repeated rebuild, concurrent first read, atomic write failure, and spatial-index capacity overflow
+
+## 15. Chat Liveness, Model Fallback, and Contextual Resume
+
+- [x] 15.1 Add an out-of-band, non-persistent `turn_progress` heartbeat for active LLM/tool-result phases that remains visible while `_SubmissionPublicationBuffer` holds business events, and prove it cannot mutate or replay Session/history/artifact state
+- [x] 15.2 Make the frontend refresh `/chat` idle timeout on heartbeat or committed progress, retain the independent hard cap, and prohibit timeout handling from replaying `/chat`, resubmitting tool results, or selecting a model
+- [x] 15.3 Align provider attempt timeout, client idle timeout, and hard-cap configuration so a progressing request cannot be cancelled before backend fallback has a chance to run
+- [x] 15.4 Extend interrupt requests and map checkpoints with typed causes including `client_timeout`, `user_interrupted`, `no_progress_exhausted`, `provider_exhausted`, and `budget_exhausted`
+- [x] 15.5 Render pause responses by typed cause, synthesize a non-empty minimal recovery report when specialized details are absent, and reserve “continuous no progress” wording for `no_progress_exhausted`
+- [x] 15.6 Split continuation-intent detection from contextual task-reference resolution; directly resume the unique current focused task with its original lineage/checkpoint/authorization scope, disambiguate multiple or stale candidates, and keep unrelated paused tasks dormant
+- [ ] 15.7 Add end-to-end regressions for buffered-but-progressing `/chat`, primary timeout fallback, fallback exhaustion, client timeout interruption, explicit user stop, `继续任务` with one focused paused task, ambiguous/stale tasks, ordinary chat with paused state, and prevention of duplicate tool side effects

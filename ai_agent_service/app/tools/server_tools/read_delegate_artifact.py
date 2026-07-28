@@ -7,12 +7,17 @@ from typing import Any
 from app.orchestrator.delegate_artifacts import DelegateArtifactStore
 from app.tools.context import ToolContext
 from app.tools.registry import ToolDef, register
+from app.tools.server_tools.artifact_errors import (
+    artifact_read_error,
+    image_artifact_mismatch,
+)
 
 READ_DELEGATE_ARTIFACT_SCHEMA: dict[str, Any] = {
     "name": "read_delegate_artifact",
     "description": (
         "读取当前会话地图子 Agent 的完整 artifact。省略 field 时只返回可用字段；"
         "读取 proposed_batches/write_results 等数组时使用 offset/limit 分页。"
+        "截图不是委派 artifact；查看截图必须使用 read_image_metadata。"
     ),
     "parameters": {
         "type": "object",
@@ -34,23 +39,45 @@ async def read_delegate_artifact_handler(
     """读取当前 session 的委派 artifact，拒绝跨目录和跨会话引用。"""
     artifact_ref = args.get("artifact_ref")
     if not isinstance(artifact_ref, str) or not artifact_ref:
-        raise ValueError("artifact_ref 不能为空")
+        return artifact_read_error(
+            str(artifact_ref or ""),
+            "map_delegate_result",
+            ValueError("artifact_ref 不能为空"),
+        )
+    mismatch = image_artifact_mismatch(artifact_ref, "map_delegate_result")
+    if mismatch is not None:
+        return mismatch
     field = args.get("field", "")
     if not isinstance(field, str):
-        raise ValueError("field 必须是字符串")
+        return artifact_read_error(
+            artifact_ref,
+            "map_delegate_result",
+            ValueError("field 必须是字符串"),
+        )
     offset = args.get("offset", 0)
     limit = args.get("limit", 20)
     if isinstance(offset, bool) or not isinstance(offset, int):
-        raise ValueError("offset 必须是整数")
+        return artifact_read_error(
+            artifact_ref,
+            "map_delegate_result",
+            ValueError("offset 必须是整数"),
+        )
     if isinstance(limit, bool) or not isinstance(limit, int):
-        raise ValueError("limit 必须是整数")
+        return artifact_read_error(
+            artifact_ref,
+            "map_delegate_result",
+            ValueError("limit 必须是整数"),
+        )
     store = DelegateArtifactStore(ctx.security.project_root, ctx.session_id)
-    return store.read_page(
-        artifact_ref,
-        field=field,
-        offset=offset,
-        limit=limit,
-    )
+    try:
+        return store.read_page(
+            artifact_ref,
+            field=field,
+            offset=offset,
+            limit=limit,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        return artifact_read_error(artifact_ref, "map_delegate_result", error)
 
 
 def register_read_delegate_artifact_tool() -> None:

@@ -184,17 +184,11 @@ def build_dynamic_map_worker(
     if stage_id is not None and (not isinstance(stage_id, str) or not stage_id.strip()):
         return "worker_spec.stage_id 必须是非空字符串"
 
-    # 工具裁剪：写入 mode 直接用 mode 白名单 ∩ 注册表（不受父 agent 工具限制），
-    # 非写入 mode 则进一步受限于父 agent 的有效工具集，防止越权。
-    # 不再由 spec.allowed_tools 手动指定，全部由 map_tools_for_worker_mode 按 mode 合同派发。
-    parent_tools = set(parent.effective_tools) & set(REGISTRY)
+    # mode 合同本身就是 worker 的能力边界；所有动态 worker 都从该合同与注册表
+    # 派生初始工具集，避免父 agent 为编排而精简的工具集误删 reader/reviewer
+    # 需要的数据读取工具。编排类工具仍在下方统一剥除。
     mode_tools = set(map_tools_for_worker_mode(str(mode)))
-    if mode in MAP_WORKER_WRITE_MODES:
-        # 写入 worker 只执行合同批次，工具集完全由 mode 白名单决定
-        effective = mode_tools & set(REGISTRY)
-    else:
-        # 非写入 worker 的工具还需是父 agent 已拥有的子集
-        effective = mode_tools & parent_tools
+    effective = mode_tools & set(REGISTRY)
     # 编排类工具一律剔除，worker 不可再委派或创建计划
     effective -= {"delegate", "delegate_many", "create_plan"}
     if not effective:

@@ -15,6 +15,7 @@ from typing import Any
 from app.orchestrator.map_workers import MAP_TARGET_REQUIRED_TOOL_NAMES, requires_map_revision
 from app.tools.registry import ToolDef, register as _register_tool
 
+
 def _object_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
     return {
         "type": "object",
@@ -1400,6 +1401,7 @@ def register_front_tools() -> None:
             uses_network=True,
             is_read_only=True,
             write_path_args=["output_path"],
+            capture_write_path_args=["output_path"],
             render_kind="json",
             schema={
                 "name": "capture_viewport_screenshot",
@@ -1433,7 +1435,10 @@ def register_front_tools() -> None:
                         },
                         "output_path": {
                             "type": "string",
-                            "description": "Optional project-relative output path; defaults to a temp user:// location.",
+                            "description": (
+                                "Optional project-relative, res://, or user:// output path without '..'; "
+                                "defaults to a temporary user:// location."
+                            ),
                         },
                         "focus_node_path": {
                             "type": "string",
@@ -1760,15 +1765,23 @@ def register_front_tools() -> None:
             domain="map",
             side="front",
             reads_project=True,
+            writes_internal_cache=True,
+            internal_cache_paths=(
+                "res://.ai_agent_service/map_agent/resource_registry.json",
+                "res://.ai_agent_service/map_agent/spatial_index.json",
+            ),
             is_read_only=True,
-            is_concurrency_safe=True,
+            is_concurrency_safe=False,
             render_kind="json",
             schema={
                 "name": "describe_map_context",
                 "description": (
                     "Read the current scene's editable map context before planning a 2D/3D map task: "
                     "TileMapLayer/legacy TileMap/GridMap nodes, TileSet/MeshLibrary references, "
-                    "resource_registry.json status, performance summary, and spatial_index.json summary. Use this as the "
+                    "resource_registry.json status, performance summary, and spatial_index.json summary. "
+                    "When either fixed internal support file is missing and a compatible map exists, this same "
+                    "read deterministically rebuilds only the missing file from canonical editor facts; it never "
+                    "creates planner/writer work or grants general project writes. Use this as the "
                     "project-recognition step before resolving natural-language resources or choosing "
                     "a target map node."
                 ),
@@ -2052,7 +2065,10 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
-                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["actor_cell", "support_cell"],
+                                    },
                                 },
                             },
                         },
@@ -2064,7 +2080,10 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
-                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["actor_cell", "support_cell"],
+                                    },
                                 },
                             },
                         },
@@ -2076,7 +2095,10 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
-                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["actor_cell", "support_cell"],
+                                    },
                                 },
                             },
                         },
@@ -3264,7 +3286,12 @@ def register_front_tools() -> None:
                 "gravity_axis": {"type": "string", "enum": ["x", "y", "z"]},
                 "gravity_sign": {"type": "integer", "enum": [-1, 1]},
             },
-            "required": ["movement_model", "cell_occupancy", "requires_support", "support_occupancy"],
+            "required": [
+                "movement_model",
+                "cell_occupancy",
+                "requires_support",
+                "support_occupancy",
+            ],
         },
         "protected_cells": {"type": "array", "items": {"type": "object"}},
         "path_cells": {"type": "array", "items": {"type": "object"}},
@@ -3660,7 +3687,10 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
-                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["actor_cell", "support_cell"],
+                                    },
                                 },
                             },
                         },
@@ -3673,7 +3703,10 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
-                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["actor_cell", "support_cell"],
+                                    },
                                 },
                             },
                         },
@@ -3686,7 +3719,10 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
-                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["actor_cell", "support_cell"],
+                                    },
                                 },
                             },
                         },
@@ -3877,7 +3913,10 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
-                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["actor_cell", "support_cell"],
+                                    },
                                 },
                             },
                         },
@@ -3889,7 +3928,10 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
-                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["actor_cell", "support_cell"],
+                                    },
                                 },
                             },
                         },
@@ -3901,7 +3943,10 @@ def register_front_tools() -> None:
                                     "x": {"type": "integer"},
                                     "y": {"type": "integer"},
                                     "z": {"type": "integer"},
-                                    "role": {"type": "string", "enum": ["actor_cell", "support_cell"]},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["actor_cell", "support_cell"],
+                                    },
                                 },
                             },
                         },
@@ -4281,17 +4326,31 @@ def register_front_tools() -> None:
             is_concurrency_safe=True,
             render_kind="json",
             path_args=["path"],
+            capture_read_path_args=["path"],
             schema={
                 "name": "read_image_metadata",
                 "description": (
-                    "Read image size, format and sampled dominant colors from a project asset. When asset "
-                    "understanding is configured, the service also sends the image through the multimodal "
-                    "asset-understanding model after applying the shared image compression/format conversion."
+                    "Read image size, format and sampled dominant colors, optionally asking the multimodal "
+                    "asset-understanding model a focused visual question. Use this only for visual confirmation "
+                    "(for example whether a result looks correct or reachable). It is not authoritative for exact "
+                    "tile coordinates, source_id, atlas coordinates, or revision; use describe_map_context or "
+                    "describe_map_region for those facts."
                 ),
                 "parameters": _object_schema(
                     {
-                        "path": {"type": "string", "description": "Relative or res:// image path."},
+                        "path": {
+                            "type": "string",
+                            "description": "Project-relative, res://, or user:// image path without '..'.",
+                        },
                         "sample_step": {"type": "integer"},
+                        "question": {
+                            "type": "string",
+                            "maxLength": 2000,
+                            "description": (
+                                "Optional focused visual question. Answers are approximate visual evidence, "
+                                "not exact map-data facts."
+                            ),
+                        },
                     },
                     ["path"],
                 ),

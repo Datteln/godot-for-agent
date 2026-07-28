@@ -28,9 +28,9 @@ static func create_resource(input: Dictionary, undo_manager: Node) -> Dictionary
 
 
 static func read_image_metadata(input: Dictionary) -> Dictionary:
-	var path := PathUtils.to_res_path(str(input.get("path", "")))
+	var path := PathUtils.to_capture_path(str(input.get("path", "")))
 	if path == "":
-		return {"ok": false, "message": "path must be relative or res://"}
+		return {"ok": false, "message": "path must be project-relative, res://, or user:// without '..'"}
 	if not PathUtils.is_read_allowed(path):
 		return {"ok": false, "message": "reading this path is not allowed: " + path, "error_code": "read_denied"}
 	var image := Image.new()

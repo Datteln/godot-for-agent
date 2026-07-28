@@ -9,6 +9,7 @@ from fastapi import APIRouter, Response, status
 from app.api.schemas import (
     ChatEventDTO,
     ChatEventsResponse,
+    ChatProgressDTO,
     ChatRequest,
     ChatResponse,
     CommandInfo,
@@ -16,6 +17,7 @@ from app.api.schemas import (
     CommandResponse,
     DoctorResponse,
     HealthResponse,
+    InterruptRequest,
     InterruptResponse,
     MemoryItemDTO,
     MemoryRequest,
@@ -166,9 +168,13 @@ def create_router(
         return await query_engine.discard_pending(request.session_id)
 
     @router.post("/chat/interrupt", response_model=InterruptResponse)
-    async def interrupt(request: ResetRequest) -> InterruptResponse:
-        logger.info("HTTP /chat/interrupt session=%s", request.session_id)
-        return await query_engine.interrupt(request.session_id)
+    async def interrupt(request: InterruptRequest) -> InterruptResponse:
+        logger.info(
+            "HTTP /chat/interrupt session=%s cause=%s",
+            request.session_id,
+            request.cause,
+        )
+        return await query_engine.interrupt(request.session_id, cause=request.cause)
 
     @router.get("/doctor", response_model=DoctorResponse)
     async def doctor() -> DoctorResponse:
@@ -201,6 +207,7 @@ def create_router(
     @router.get("/chat/events", response_model=ChatEventsResponse)
     async def chat_events(session_id: str, after: int = 0) -> ChatEventsResponse:
         events = event_store.list_after(session_id, after)
+        raw_progress = query_engine.turn_progress(session_id)
         logger.debug("HTTP /chat/events session=%s after=%d count=%d", session_id, after, len(events))
         return ChatEventsResponse(
             events=[
@@ -211,7 +218,12 @@ def create_router(
                     payload=event.payload,
                 )
                 for event in events
-            ]
+            ],
+            progress=(
+                ChatProgressDTO(**raw_progress)
+                if raw_progress is not None
+                else None
+            ),
         )
 
     @router.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)

@@ -68,6 +68,7 @@ from app.orchestrator.map_progress import (
     # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
     latest_map_revision,
     cached_validation_result,
+    map_pause_message,
     map_platform_plan_call_error,
     map_write_stage_error,
     platform_write_requires_validation,
@@ -747,8 +748,10 @@ def _plan_step_completed(
             session.map_task_state.make_checkpoint(
                 "map_retry_exhausted",
                 report,
+                pause_kind="no_progress_exhausted",
             )
         else:
+            session.map_task_state.pause_kind = "no_progress_exhausted"
             session.map_task_state.pause_reason = "map_retry_exhausted"
             replace_map_state_field(
                 session.map_task_state,
@@ -1594,7 +1597,7 @@ def _repair_map_structured_output(
                     category,
                     *(
                         str(item.get("code"))
-                        for item in raw_structured_issues
+                        for item in structured_issues
                         if isinstance(item, dict) and item.get("code")
                     ),
                 }
@@ -3874,32 +3877,28 @@ async def run_turn(
 
         persistent_map_budget = _uses_persistent_map_budget(frame)
         if persistent_map_budget:
-            if session.map_task_state.status == "paused":
-                checkpoint = json.dumps(
-                    session.map_task_state.checkpoint or {}, ensure_ascii=False, default=str
-                )
+            current_scope_owns_task = (
+                session.map_request_scope.activates_map_gate
+                and session.map_request_scope.map_task_id
+                == session.map_task_state.task_id
+            )
+            if (
+                session.map_task_state.status == "paused"
+                and current_scope_owns_task
+            ):
                 _emit_orchestration_event(
                     event_callback,
                     "map_task_paused",
                     {
                         "frame_id": frame.id,
+                        "pause_kind": session.map_task_state.pause_kind,
                         "reason": session.map_task_state.pause_reason,
                         "pause_report": session.map_task_state.pause_report,
                         "checkpoint": session.map_task_state.checkpoint or {},
                         "counters": session.map_task_state.counters.__dict__,
                     },
                 )
-                pause_report = json.dumps(
-                    session.map_task_state.pause_report,
-                    ensure_ascii=False,
-                    default=str,
-                )
-                return ErrorResult(
-                    text=(
-                        "地图任务因连续无进展已暂停。"
-                        f"根因与恢复建议：{pause_report}；恢复检查点：{checkpoint}"
-                    )
-                )
+                return ErrorResult(text=map_pause_message(session.map_task_state))
             _sync_map_progress_budget(session, frame)
             session.map_task_state.counters.llm_turns += 1
         used = (
@@ -4013,6 +4012,17 @@ async def run_turn(
                 frame.id,
                 exc,
             )
+            if (
+                session.map_request_scope.activates_map_gate
+                and session.map_request_scope.map_task_id
+                == session.map_task_state.task_id
+                and session.map_task_state.status == "running"
+            ):
+                session.map_task_state.make_checkpoint(
+                    "provider_exhausted",
+                    pause_kind="provider_exhausted",
+                )
+                return ErrorResult(text=map_pause_message(session.map_task_state))
             return ErrorResult(text=str(exc))
 
         frame.messages.append(turn.raw_message)
@@ -4756,4 +4766,14 @@ async def run_turn(
     logger.warning(
         "Agent run_turn reached max turns session=%s max_turns=%d", session.session_id, max_turns
     )
+    if (
+        session.map_request_scope.activates_map_gate
+        and session.map_request_scope.map_task_id == session.map_task_state.task_id
+        and session.map_task_state.status == "running"
+    ):
+        session.map_task_state.make_checkpoint(
+            "budget_exhausted",
+            pause_kind="budget_exhausted",
+        )
+        return ErrorResult(text=map_pause_message(session.map_task_state))
     return ErrorResult(text="已达到本轮最大循环次数，请精简任务或拆分请求后重试")

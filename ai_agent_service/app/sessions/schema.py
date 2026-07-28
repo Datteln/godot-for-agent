@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Final
 
-SESSION_SCHEMA_VERSION: Final = 4
+SESSION_SCHEMA_VERSION: Final = 5
 
 _LEGACY_MAP_FIELDS: Final[dict[str, str]] = {
     "map_completion_blockers": "completion_blockers",
@@ -82,6 +82,26 @@ def migrate_session_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
                     continue
                 raw_frame.setdefault("map_request_lineage_id", None)
                 raw_frame.setdefault("map_task_id", None)
+
+    if source_version < 5:
+        legacy_pause_reason = str(map_state.get("pause_reason", ""))
+        pause_kind = {
+            "user_interrupted": "user_interrupted",
+            "client_timeout": "client_timeout",
+            "provider_exhausted": "provider_exhausted",
+            "budget_exhausted": "budget_exhausted",
+        }.get(legacy_pause_reason)
+        if pause_kind is None:
+            pause_kind = (
+                "no_progress_exhausted"
+                if map_state.get("status") == "paused"
+                and bool(map_state.get("pause_report"))
+                else ""
+            )
+        map_state.setdefault("pause_kind", pause_kind)
+        checkpoint = map_state.get("checkpoint")
+        if isinstance(checkpoint, dict) and pause_kind:
+            checkpoint.setdefault("pause_kind", pause_kind)
 
     migrated["map_task_state"] = map_state
     migrated["schema_version"] = SESSION_SCHEMA_VERSION

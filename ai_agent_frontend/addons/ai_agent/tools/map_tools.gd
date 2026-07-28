@@ -31,6 +31,7 @@ const MAP_DATA_DIR := "res://.ai_agent_service/map_agent"
 const RESOURCE_REGISTRY_PATH := "res://.ai_agent_service/map_agent/resource_registry.json"
 const SPATIAL_INDEX_PATH := "res://.ai_agent_service/map_agent/spatial_index.json"
 const BLUEPRINTS_DIR := "res://.ai_agent_service/map_agent/blueprints"
+static var _map_support_rebuild_mutex := Mutex.new()
 
 
 static func _map_completion_blocker(reason: String, issues: Array = []) -> Dictionary:
@@ -139,10 +140,16 @@ static func describe_map_context(input: Dictionary, editor_interface: EditorInte
 	for node in found:
 		maps.append(_describe_map_node(root, node))
 
+	var support_rebuild := _ensure_map_support_data(root, found)
 	var registry := _read_json_resource(RESOURCE_REGISTRY_PATH)
 	var spatial_index := _read_json_resource(SPATIAL_INDEX_PATH)
 	var entries_2d := _count_index_entries(spatial_index.get("data", {}).get("2d", {}))
 	var entries_3d := _count_index_entries(spatial_index.get("data", {}).get("3d", {}))
+	var spatial_metadata: Dictionary = (
+		spatial_index.get("data", {}).get("_meta", {})
+		if spatial_index.get("data", {}) is Dictionary
+		else {}
+	)
 	return {
 		"ok": true,
 		"scene": root.scene_file_path,
@@ -153,6 +160,7 @@ static func describe_map_context(input: Dictionary, editor_interface: EditorInte
 			"spatial_index_entries": entries_2d + entries_3d,
 		},
 		"resource_registry": registry,
+		"support_data_rebuild": support_rebuild,
 		"spatial_index": {
 			"path": SPATIAL_INDEX_PATH,
 			"exists": bool(spatial_index.get("exists", false)),
@@ -161,6 +169,10 @@ static func describe_map_context(input: Dictionary, editor_interface: EditorInte
 			"entries_total": entries_2d + entries_3d,
 			"max_entries": MAX_SPATIAL_INDEX_ENTRIES,
 			"usage_ratio": float(entries_2d + entries_3d) / float(MAX_SPATIAL_INDEX_ENTRIES),
+			"complete": spatial_metadata.get("complete", null),
+			"included": spatial_metadata.get("included", entries_2d + entries_3d),
+			"skipped": spatial_metadata.get("skipped", 0),
+			"coverage": spatial_metadata.get("coverage", {}),
 		},
 		"notes": [
 			"Use describe_map_region for exact cells before editing a target area.",
@@ -1464,10 +1476,22 @@ static func _resolve_map_target_unchecked(input: Dictionary, editor_interface: E
 				"hint": hint,
 			}
 		if not _is_map_node(requested):
+			var compatible_candidates := _map_node_paths(root)
 			return {
 				"ok": false,
 				"message": "Target must be a TileMapLayer, TileMap, or GridMap",
-				"error_code": "unsupported_map_type"
+				"error_code": "unsupported_map_type",
+				"requested_target_path": requested_path,
+				"actual_type": requested.get_class(),
+				"candidates": compatible_candidates,
+				"hint": (
+					"target_path='.' intentionally means the edited scene root; it is not a map node. " +
+					"Retry once with a path from candidates, or omit target_path to use selected/unique-map inference."
+					if requested_path == "."
+					else
+					"Use a path from candidates, or omit target_path to use selected/unique-map inference. " +
+					"Do not retry the same unsupported target_path."
+				),
 			}
 		return {"ok": true, "node": requested, "path": requested_path}
 	for selected in editor_interface.get_selection().get_selected_nodes():
@@ -1484,7 +1508,13 @@ static func _resolve_map_target_unchecked(input: Dictionary, editor_interface: E
 		"ok": false,
 		"message": "Select a map node or provide target_path" if found.is_empty() else "Multiple map nodes found; provide target_path",
 		"error_code": "map_target_required",
-		"candidates": candidates
+		"candidates": candidates,
+		"hint": (
+			"No compatible map node is available in the edited scene."
+			if found.is_empty()
+			else
+			"Choose one exact NodePath from candidates; omitting target_path cannot infer when multiple maps exist."
+		),
 	}
 
 
@@ -1896,6 +1926,591 @@ static func _read_json_resource(path: String) -> Dictionary:
 	if not (parsed is Dictionary):
 		return {"exists": true, "path": path, "data": {}, "warning": "JSON root is not an object"}
 	return {"exists": true, "path": path, "data": parsed}
+
+
+## 保证缺失的地图支持数据在当前上下文读取内由 canonical 场景事实直接重建。
+static func _ensure_map_support_data(root: Node, map_nodes: Array) -> Dictionary:
+	var before_registry := _inspect_map_support_file(RESOURCE_REGISTRY_PATH, "resource_registry")
+	var before_index := _inspect_map_support_file(SPATIAL_INDEX_PATH, "spatial_index")
+	var corruption := _support_corruption_diagnostics(before_registry, before_index)
+	if map_nodes.is_empty():
+		return {
+			"rebuilt": false,
+			"rebuild_skipped": "no_compatible_map",
+			"files": [],
+			"corruption": corruption,
+		}
+	if bool(before_registry.get("exists", false)) and bool(before_index.get("exists", false)):
+		return {
+			"rebuilt": false,
+			"reason": "support_data_corrupt" if not corruption.is_empty() else "support_data_present",
+			"files": [],
+			"corruption": corruption,
+		}
+
+	# Front tool 调度会把本工具标记为非并发安全；该锁仍作为进程内最后一道首次初始化保护。
+	_map_support_rebuild_mutex.lock()
+	var result := _ensure_map_support_data_locked(root, map_nodes)
+	_map_support_rebuild_mutex.unlock()
+	return result
+
+
+## 在重建锁内复查缺失条件，只写仍不存在的固定支持文件。
+static func _ensure_map_support_data_locked(root: Node, map_nodes: Array) -> Dictionary:
+	var registry_state := _inspect_map_support_file(RESOURCE_REGISTRY_PATH, "resource_registry")
+	var index_state := _inspect_map_support_file(SPATIAL_INDEX_PATH, "spatial_index")
+	var need_registry := not bool(registry_state.get("exists", false))
+	var need_index := not bool(index_state.get("exists", false))
+	var corruption := _support_corruption_diagnostics(registry_state, index_state)
+	if not need_registry and not need_index:
+		return {
+			"rebuilt": false,
+			"reason": "support_data_created_by_concurrent_read",
+			"files": [],
+			"corruption": corruption,
+		}
+
+	var built := _build_map_support_data(root, map_nodes)
+	var files: Array = []
+	var failures: Array = []
+	if need_registry:
+		var registry_write := _write_missing_support_json_atomically(
+			RESOURCE_REGISTRY_PATH,
+			built.get("resource_registry", {}),
+			"resource_registry"
+		)
+		files.append(registry_write)
+		if not bool(registry_write.get("ok", false)):
+			failures.append(registry_write)
+	if need_index:
+		var index_write := _write_missing_support_json_atomically(
+			SPATIAL_INDEX_PATH,
+			built.get("spatial_index", {}),
+			"spatial_index"
+		)
+		files.append(index_write)
+		if not bool(index_write.get("ok", false)):
+			failures.append(index_write)
+
+	var final_registry := _inspect_map_support_file(RESOURCE_REGISTRY_PATH, "resource_registry")
+	var final_index := _inspect_map_support_file(SPATIAL_INDEX_PATH, "spatial_index")
+	return {
+		"rebuilt": failures.is_empty() and files.any(func(item): return bool(item.get("written", false))),
+		"reason": "missing_support_data",
+		"files": files,
+		"entry_counts": {
+			"resource_registry": int(built.get("registry_entries", 0)),
+			"spatial_index": int(built.get("index_included", 0)),
+		},
+		"semantic_aliases_recovered": false,
+		"index_complete": bool(built.get("index_complete", true)),
+		"index_included": int(built.get("index_included", 0)),
+		"index_skipped": int(built.get("index_skipped", 0)),
+		"coverage": built.get("coverage", {}),
+		"corruption": _support_corruption_diagnostics(final_registry, final_index),
+		"failures": failures,
+	}
+
+
+## 从地图节点绑定的真实资源和已使用 cell 构造确定性 registry/index 文档。
+static func _build_map_support_data(root: Node, map_nodes: Array) -> Dictionary:
+	var path_to_node := {}
+	for node_value in map_nodes:
+		if node_value is Node:
+			var node: Node = node_value
+			path_to_node[str(root.get_path_to(node))] = node
+	var target_paths: Array = path_to_node.keys()
+	target_paths.sort()
+
+	var registry := {}
+	for target_path_value in target_paths:
+		var resource_node: Node = path_to_node[target_path_value]
+		_collect_node_resource_registry(resource_node, registry)
+		_collect_used_cell_resource_registry(resource_node, registry)
+	registry = _dictionary_with_sorted_keys(registry)
+
+	var index := {"2d": {}, "3d": {}}
+	var coverage := {}
+	var included := 0
+	var skipped := 0
+	for target_path_value in target_paths:
+		var target_path := str(target_path_value)
+		var node: Node = path_to_node[target_path_value]
+		var dimension := 3 if node.get_class() == "GridMap" else 2
+		var branch_key := "3d" if dimension == 3 else "2d"
+		var target_entries := {}
+		var scanned_for_target := 0
+		var included_for_target := 0
+		var cell_records := _canonical_used_cell_records(node, dimension)
+		for record_value in cell_records:
+			var record: Dictionary = record_value
+			var map_layer := int(record.get("map_layer", 0))
+			var coords: Vector3i = record.get("coords", Vector3i.ZERO)
+			var cell := _read_map_cell(node, coords, dimension, map_layer)
+			if _is_empty_cell(node, cell):
+				continue
+			scanned_for_target += 1
+			if included >= MAX_SPATIAL_INDEX_ENTRIES:
+				skipped += 1
+				continue
+			var safe_cell := _describe_safe_cell(cell, dimension)
+			var resource_key := _resource_key_for_cell(node, cell, dimension)
+			if resource_key != "":
+				safe_cell["resource"] = resource_key
+				safe_cell["resource_key"] = resource_key
+			target_entries[_spatial_tile_index_key(cell, dimension)] = safe_cell
+			included += 1
+			included_for_target += 1
+		index[branch_key][target_path] = _dictionary_with_sorted_keys(target_entries)
+		coverage[target_path] = {
+			"dimension": dimension,
+			"scanned": scanned_for_target,
+			"included": included_for_target,
+			"skipped": scanned_for_target - included_for_target,
+		}
+	index["2d"] = _dictionary_with_sorted_keys(index["2d"])
+	index["3d"] = _dictionary_with_sorted_keys(index["3d"])
+	index["_meta"] = {
+		"schema": "map_spatial_index_v1",
+		"complete": skipped == 0,
+		"included": included,
+		"skipped": skipped,
+		"capacity": MAX_SPATIAL_INDEX_ENTRIES,
+		"coverage": _dictionary_with_sorted_keys(coverage),
+	}
+	return {
+		"resource_registry": registry,
+		"spatial_index": index,
+		"registry_entries": registry.size(),
+		"index_complete": skipped == 0,
+		"index_included": included,
+		"index_skipped": skipped,
+		"coverage": index["_meta"]["coverage"],
+	}
+
+
+## 枚举一个地图节点绑定的 TileSet/MeshLibrary，登记所有可验证资源项。
+static func _collect_node_resource_registry(node: Node, registry: Dictionary) -> void:
+	if node.get_class() == "GridMap":
+		if not ("mesh_library" in node) or node.get("mesh_library") == null:
+			return
+		var mesh_library = node.get("mesh_library")
+		var item_ids: Array = mesh_library.call("get_item_list")
+		item_ids.sort()
+		for item_value in item_ids:
+			var item := int(item_value)
+			var display_name := _verified_mesh_item_name(mesh_library, item)
+			var key := _stable_mesh_registry_key(display_name, item)
+			registry[key] = {
+				"kind": "mesh_library_item",
+				"mode": "3d",
+				"item": item,
+				"mesh_library_item": item,
+				"footprint": {"width": 1, "height": 1, "depth": 1},
+				"required_cells": 1,
+			}
+		return
+	if not ("tile_set" in node) or node.get("tile_set") == null:
+		return
+	var tile_set = node.get("tile_set")
+	for source_index in range(int(tile_set.call("get_source_count"))):
+		var source_id := int(tile_set.call("get_source_id", source_index))
+		var source = tile_set.call("get_source", source_id)
+		if source == null:
+			continue
+		var source_name := _verified_tile_source_name(source)
+		if source.has_method("get_tiles_count") and source.has_method("get_tile_id"):
+			for tile_index in range(int(source.call("get_tiles_count"))):
+				var atlas_coords: Vector2i = source.call("get_tile_id", tile_index)
+				var alternatives: Array = [0]
+				if source.has_method("get_alternative_tiles_count") and source.has_method("get_alternative_tile_id"):
+					for alternative_index in range(int(source.call("get_alternative_tiles_count", atlas_coords))):
+						var alternative_id := int(source.call("get_alternative_tile_id", atlas_coords, alternative_index))
+						if not alternatives.has(alternative_id):
+							alternatives.append(alternative_id)
+				alternatives.sort()
+				for alternative_value in alternatives:
+					_put_verified_2d_registry_entry(
+						registry,
+						source_name,
+						source_id,
+						atlas_coords,
+						int(alternative_value)
+					)
+		elif source.has_method("get_scene_tiles_count") and source.has_method("get_scene_tile_id"):
+			for scene_index in range(int(source.call("get_scene_tiles_count"))):
+				var scene_id := int(source.call("get_scene_tile_id", scene_index))
+				_put_verified_2d_registry_entry(
+					registry,
+					source_name,
+					source_id,
+					Vector2i(scene_id, 0),
+					0
+				)
+
+
+## 补登记已使用 cell 的真实 signature，覆盖非 atlas TileSet source 等合法引用。
+static func _collect_used_cell_resource_registry(node: Node, registry: Dictionary) -> void:
+	var dimension := 3 if node.get_class() == "GridMap" else 2
+	if dimension == 3:
+		return
+	for record_value in _canonical_used_cell_records(node, dimension):
+		var record: Dictionary = record_value
+		var cell := _read_map_cell(
+			node,
+			record.get("coords", Vector3i.ZERO),
+			dimension,
+			int(record.get("map_layer", 0))
+		)
+		var source_id := int(cell.get("source_id", -1))
+		if source_id < 0:
+			continue
+		var source_name := ""
+		if "tile_set" in node and node.get("tile_set") != null:
+			var tile_set = node.get("tile_set")
+			if bool(tile_set.call("has_source", source_id)):
+				source_name = _verified_tile_source_name(tile_set.call("get_source", source_id))
+		_put_verified_2d_registry_entry(
+			registry,
+			source_name,
+			source_id,
+			cell.get("atlas_coords", Vector2i(-1, -1)),
+			int(cell.get("alternative_tile", 0))
+		)
+
+
+## 收集稳定排序后的已使用 cell 坐标及 legacy TileMap layer。
+static func _canonical_used_cell_records(node: Node, dimension: int) -> Array:
+	var by_key := {}
+	if dimension == 3:
+		for coords_value in node.call("get_used_cells"):
+			var coords: Vector3i = coords_value
+			by_key[_index_coord_key(coords, 3)] = {"coords": coords, "map_layer": 0}
+	elif node.get_class() == "TileMap":
+		for map_layer in range(int(node.call("get_layers_count"))):
+			for coords_value in node.call("get_used_cells", map_layer):
+				var coords_2d: Vector2i = coords_value
+				var coords := Vector3i(coords_2d.x, coords_2d.y, 0)
+				by_key[_index_layer_coord_key(coords, 2, map_layer)] = {
+					"coords": coords,
+					"map_layer": map_layer,
+				}
+	else:
+		for coords_value in node.call("get_used_cells"):
+			var coords_2d: Vector2i = coords_value
+			var coords := Vector3i(coords_2d.x, coords_2d.y, 0)
+			by_key[_index_layer_coord_key(coords, 2, 0)] = {"coords": coords, "map_layer": 0}
+	var keys: Array = by_key.keys()
+	keys.sort()
+	var records: Array = []
+	for key in keys:
+		records.append(by_key[key])
+	return records
+
+
+## 返回 cell 对应的稳定技术资源 key，并补登记非 atlas source 的已使用 tile。
+static func _resource_key_for_cell(node: Node, cell: Dictionary, dimension: int) -> String:
+	if dimension == 3:
+		var item := int(cell.get("item", -1))
+		if item < 0:
+			return ""
+		if not ("mesh_library" in node) or node.get("mesh_library") == null:
+			return ""
+		var display_name := _verified_mesh_item_name(node.get("mesh_library"), item)
+		return _stable_mesh_registry_key(display_name, item)
+	var source_id := int(cell.get("source_id", -1))
+	var atlas_coords: Vector2i = cell.get("atlas_coords", Vector2i(-1, -1))
+	var alternative_tile := int(cell.get("alternative_tile", 0))
+	if source_id < 0:
+		return ""
+	var source_name := ""
+	if "tile_set" in node and node.get("tile_set") != null:
+		var tile_set = node.get("tile_set")
+		if bool(tile_set.call("has_source", source_id)):
+			source_name = _verified_tile_source_name(tile_set.call("get_source", source_id))
+	return _stable_2d_registry_key(source_name, source_id, atlas_coords, alternative_tile)
+
+
+## 为一个真实 2D tile signature 写入满足现有 registry 合同的条目。
+static func _put_verified_2d_registry_entry(
+	registry: Dictionary,
+	display_name: String,
+	source_id: int,
+	atlas_coords: Vector2i,
+	alternative_tile: int
+) -> void:
+	var key := _stable_2d_registry_key(display_name, source_id, atlas_coords, alternative_tile)
+	registry[key] = {
+		"kind": "tile",
+		"mode": "2d",
+		"source_id": source_id,
+		"atlas_coords": {"x": atlas_coords.x, "y": atlas_coords.y},
+		"alternative_tile": alternative_tile,
+		"footprint": {"width": 1, "height": 1},
+		"required_cells": 1,
+	}
+
+
+## 从 Resource 名称或纹理文件名提取可验证显示名；没有则留空走技术 key。
+static func _verified_tile_source_name(source) -> String:
+	if source == null:
+		return ""
+	var resource_name := str(source.get("resource_name")).strip_edges()
+	if resource_name != "":
+		return resource_name
+	var source_path := str(source.get("resource_path")).strip_edges()
+	if source_path != "":
+		return source_path.get_file().get_basename()
+	if source.has_method("get_texture"):
+		var texture = source.call("get_texture")
+		if texture != null:
+			var texture_name := str(texture.get("resource_name")).strip_edges()
+			if texture_name != "":
+				return texture_name
+			var resource_path := str(texture.get("resource_path")).strip_edges()
+			if resource_path != "":
+				return resource_path.get_file().get_basename()
+	return ""
+
+
+## 优先使用 MeshLibrary item 名称，其次使用真实 Mesh 资源名或文件名。
+static func _verified_mesh_item_name(mesh_library, item: int) -> String:
+	var item_name := str(mesh_library.call("get_item_name", item)).strip_edges()
+	if item_name != "":
+		return item_name
+	if mesh_library.has_method("get_item_mesh"):
+		var mesh = mesh_library.call("get_item_mesh", item)
+		if mesh != null:
+			var mesh_name := str(mesh.get("resource_name")).strip_edges()
+			if mesh_name != "":
+				return mesh_name
+			var mesh_path := str(mesh.get("resource_path")).strip_edges()
+			if mesh_path != "":
+				return mesh_path.get_file().get_basename()
+	return ""
+
+
+static func _stable_2d_registry_key(
+	display_name: String,
+	source_id: int,
+	atlas_coords: Vector2i,
+	alternative_tile: int
+) -> String:
+	var prefix := _technical_key_component(display_name)
+	if prefix == "":
+		prefix = "tile"
+	return "%s__s%d_a%d_%d_alt%d" % [
+		prefix, source_id, atlas_coords.x, atlas_coords.y, alternative_tile
+	]
+
+
+static func _stable_mesh_registry_key(display_name: String, item: int) -> String:
+	var prefix := _technical_key_component(display_name)
+	if prefix == "":
+		prefix = "mesh"
+	return "%s__item_%d" % [prefix, item]
+
+
+## 仅保留 ASCII 字母数字作为稳定 key 前缀；不可验证名称不会被猜成自然语言别名。
+static func _technical_key_component(value: String) -> String:
+	var lowered := value.strip_edges().to_lower()
+	var result := ""
+	var previous_underscore := false
+	for index in range(lowered.length()):
+		var code := lowered.unicode_at(index)
+		var is_ascii_alnum := (code >= 48 and code <= 57) or (code >= 97 and code <= 122)
+		if is_ascii_alnum:
+			result += lowered.substr(index, 1)
+			previous_underscore = false
+		elif not previous_underscore and result != "":
+			result += "_"
+			previous_underscore = true
+	return result.trim_suffix("_")
+
+
+static func _dictionary_with_sorted_keys(source: Dictionary) -> Dictionary:
+	var keys: Array = source.keys()
+	keys.sort()
+	var result := {}
+	for key in keys:
+		result[key] = source[key]
+	return result
+
+
+## 检查现有支持文件是否缺失、合法或损坏；损坏文件永不由读取路径覆盖。
+static func _inspect_map_support_file(path: String, kind: String) -> Dictionary:
+	var parsed := _read_json_resource(path)
+	if not bool(parsed.get("exists", false)):
+		return {"exists": false, "valid": false, "path": path, "kind": kind}
+	if parsed.has("warning"):
+		return {
+			"exists": true,
+			"valid": false,
+			"path": path,
+			"kind": kind,
+			"error_code": "map_support_data_corrupt",
+			"message": str(parsed.get("warning", "invalid JSON")),
+		}
+	var contract := _validate_map_support_document(kind, parsed.get("data", {}))
+	var result := {
+		"exists": true,
+		"valid": bool(contract.get("ok", false)),
+		"path": path,
+		"kind": kind,
+		"error_code": contract.get("error_code", ""),
+		"message": contract.get("message", ""),
+	}
+	if contract.has("invalid_keys"):
+		result["invalid_keys"] = contract["invalid_keys"]
+	return result
+
+
+static func _validate_map_support_document(kind: String, data_value) -> Dictionary:
+	if not (data_value is Dictionary):
+		return {
+			"ok": false,
+			"error_code": "map_support_data_corrupt",
+			"message": "%s JSON root must be an object" % kind,
+		}
+	var data: Dictionary = data_value
+	if kind == "resource_registry":
+		var invalid_keys := _invalid_resource_registry_keys(data)
+		if not invalid_keys.is_empty():
+			return {
+				"ok": false,
+				"error_code": "map_support_data_corrupt",
+				"message": "resource registry contains entries that fail the resource contract",
+				"invalid_keys": invalid_keys,
+			}
+		return {"ok": true}
+	if data.has("_meta") and not (data["_meta"] is Dictionary):
+		return {
+			"ok": false,
+			"error_code": "map_support_data_corrupt",
+			"message": "spatial index _meta must be an object",
+		}
+	for branch_key in ["2d", "3d"]:
+		# 兼容旧索引：历史写入只创建实际使用到的维度分支。
+		if data.has(branch_key) and not (data[branch_key] is Dictionary):
+			return {
+				"ok": false,
+				"error_code": "map_support_data_corrupt",
+				"message": "spatial index branch '%s' must be an object" % branch_key,
+			}
+		var branch: Dictionary = data.get(branch_key, {})
+		for target_path in branch.keys():
+			if not (branch[target_path] is Dictionary):
+				return {
+					"ok": false,
+					"error_code": "map_support_data_corrupt",
+					"message": "spatial index target '%s' must contain an object" % str(target_path),
+				}
+			for entry_key in (branch[target_path] as Dictionary).keys():
+				var entry = (branch[target_path] as Dictionary)[entry_key]
+				if not (entry is Dictionary) or not ((entry as Dictionary).get("coords", null) is Dictionary):
+					return {
+						"ok": false,
+						"error_code": "map_support_data_corrupt",
+						"message": "spatial index entry '%s/%s' fails the cell contract" % [
+							str(target_path), str(entry_key)
+						],
+					}
+	return {"ok": true}
+
+
+static func _support_corruption_diagnostics(registry_state: Dictionary, index_state: Dictionary) -> Array:
+	var diagnostics: Array = []
+	for state in [registry_state, index_state]:
+		if bool(state.get("exists", false)) and not bool(state.get("valid", false)):
+			var diagnostic := {
+				"path": state.get("path", ""),
+				"kind": state.get("kind", ""),
+				"error_code": "map_support_data_corrupt",
+				"message": state.get("message", "support data failed validation"),
+			}
+			if state.has("invalid_keys"):
+				diagnostic["invalid_keys"] = state["invalid_keys"]
+			diagnostics.append(diagnostic)
+	return diagnostics
+
+
+## 通过同目录临时文件、复读校验和缺失目标 rename 发布一个完整 JSON 文档。
+static func _write_missing_support_json_atomically(
+	path: String,
+	data: Dictionary,
+	kind: String
+) -> Dictionary:
+	if path not in [RESOURCE_REGISTRY_PATH, SPATIAL_INDEX_PATH]:
+		return {
+			"ok": false,
+			"written": false,
+			"path": path,
+			"error_code": "invalid_internal_cache_path",
+		}
+	var absolute := ProjectSettings.globalize_path(path)
+	if FileAccess.file_exists(absolute):
+		return {"ok": true, "written": false, "path": path, "reason": "already_exists"}
+	var contract := _validate_map_support_document(kind, data)
+	if not bool(contract.get("ok", false)):
+		return {
+			"ok": false,
+			"written": false,
+			"path": path,
+			"error_code": "map_support_data_validation_failed",
+			"message": contract.get("message", "support data failed validation"),
+		}
+	var dir_error := DirAccess.make_dir_recursive_absolute(
+		ProjectSettings.globalize_path(path.get_base_dir())
+	)
+	if dir_error != OK and dir_error != ERR_ALREADY_EXISTS:
+		return {
+			"ok": false,
+			"written": false,
+			"path": path,
+			"error_code": "map_support_data_write_failed",
+			"error": dir_error,
+		}
+	var temp_path := path + ".tmp-%d-%d" % [Time.get_ticks_usec(), OS.get_process_id()]
+	var temp_absolute := ProjectSettings.globalize_path(temp_path)
+	var file := FileAccess.open(temp_absolute, FileAccess.WRITE)
+	if file == null:
+		return {
+			"ok": false,
+			"written": false,
+			"path": path,
+			"error_code": "map_support_data_write_failed",
+			"error": FileAccess.get_open_error(),
+		}
+	file.store_string(JSON.stringify(data, "\t"))
+	file.flush()
+	file = null
+	var verify_text := FileAccess.get_file_as_string(temp_absolute)
+	var verify_data = JSON.parse_string(verify_text)
+	var verify_contract := _validate_map_support_document(kind, verify_data)
+	if not bool(verify_contract.get("ok", false)):
+		DirAccess.remove_absolute(temp_absolute)
+		return {
+			"ok": false,
+			"written": false,
+			"path": path,
+			"error_code": "map_support_data_atomic_validation_failed",
+			"message": verify_contract.get("message", "temporary support data failed validation"),
+		}
+	# 锁内第二次文件级复查，绝不覆盖并发创建或人工恢复的目标。
+	if FileAccess.file_exists(absolute):
+		DirAccess.remove_absolute(temp_absolute)
+		return {"ok": true, "written": false, "path": path, "reason": "already_exists"}
+	var rename_error := DirAccess.rename_absolute(temp_absolute, absolute)
+	if rename_error != OK:
+		DirAccess.remove_absolute(temp_absolute)
+		return {
+			"ok": false,
+			"written": false,
+			"path": path,
+			"error_code": "map_support_data_atomic_replace_failed",
+			"error": rename_error,
+		}
+	return {"ok": true, "written": true, "path": path, "reason": "missing"}
 
 
 static func _used_bounds_2d(cells: Array) -> Dictionary:
@@ -3792,6 +4407,7 @@ static func query_spatial_index(input: Dictionary, editor_interface: EditorInter
 			"note": "spatial index has no data yet; run edit_map with update_spatial_index=true first",
 		}
 	var data: Dictionary = parsed.get("data", {})
+	var index_metadata: Dictionary = data.get("_meta", {}) if data.get("_meta", {}) is Dictionary else {}
 	var branch = data.get(branch_key, {})
 	if not (branch is Dictionary):
 		return {"ok": true, "dimension": dimension, "matches": [], "total": 0}
@@ -3851,12 +4467,22 @@ static func query_spatial_index(input: Dictionary, editor_interface: EditorInter
 		"truncated": matches.size() >= limit,
 		"index_entries": _count_index_entries(data.get("2d", {})) + _count_index_entries(data.get("3d", {})),
 		"max_entries": MAX_SPATIAL_INDEX_ENTRIES,
+		"index_complete": index_metadata.get("complete", null),
+		"index_included": index_metadata.get("included", null),
+		"index_skipped": index_metadata.get("skipped", null),
+		"coverage": index_metadata.get("coverage", {}),
 	}
 	if checked_entries > 0:
 		result["checked_entries"] = checked_entries
 		result["stale_entries"] = stale_entries
 	if stale_entries > 0:
 		result["stale_warning"] = "%d spatial index entries no longer match real source_id/atlas_coords; call describe_map_region and trust the real cells before editing." % stale_entries
+	if index_metadata.get("complete", null) == false:
+		result["incomplete_index_warning"] = (
+			"This spatial index is capacity-limited and omitted %d canonical cells. "
+			+ "A zero-match result is not proof that the canonical map contains no matching cell; "
+			+ "use describe_map_context/describe_map_region for authoritative facts."
+		) % int(index_metadata.get("skipped", 0))
 	return result
 
 

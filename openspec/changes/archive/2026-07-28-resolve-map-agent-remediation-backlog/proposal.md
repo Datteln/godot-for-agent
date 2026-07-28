@@ -1,6 +1,6 @@
 ## Why
 
-map-agent 的核心安全整改已建立 revision、阶段合同和能力清单，但剩余 17 项仍在事务原子性、计划依赖、Skill 绑定、结果来源、完成证据、Undo 语义和无进展恢复之间留下可绕过的边界。现在需要把这些分散问题收敛为可验证的运行时合同，避免继续通过 prompt、影子规划器和重复白名单维持流程正确性。
+map-agent 的核心安全整改已建立 revision、阶段合同和能力清单，但尚未完成的事务原子性、计划依赖、Skill 绑定、动态 Worker 工具可达性、截图视觉回看、结果来源、完成证据、Undo 语义和无进展恢复仍留下可绕过或可崩溃的边界。现在需要把这些分散问题收敛为可验证的运行时合同，避免继续通过 prompt、影子规划器、父 Agent 工具交集和重复白名单维持流程正确性。
 
 ## What Changes
 
@@ -11,10 +11,18 @@ map-agent 的核心安全整改已建立 revision、阶段合同和能力清单�
 - 让 orchestrator 执行不可变 plan step DAG：仅在依赖成功后启动后继，并把前驱 typed result 显式绑定为后继输入。
 - 新增 Skill Binding Module，按当前 Agent、stage、worker mode 解析 `resolved/missing/incompatible`，停止信任全局 `effective_tools`。
 - 将地图上下文、节点树和精确地图事实读取稳定路由到具备对应能力的 reader；工具搜索不得突破 Agent Interface 或 Capability Contract，地图总控不得用搜索重试替代职责委派。
+- 修正动态地图 Worker 的工具派生：Worker 的 Agent Interface 由自身 mode Capability Contract、注册表、Skill binding、stage 和权限共同形成，不再与父 map-agent 的窄工具集求交；否则 read-only/planner/reviewer 会丢失 `describe_map_context`、`describe_map_region`、`read_scene_tree` 和 `read_image_metadata`。
+- 建立截图的双方案路径合同：保留通用 `to_res_path` 的项目边界，同时让截图写入和图片回看通过专用 scheme-aware 路径解析安全支持 `res://`、`user://` 与项目相对路径，并继续拒绝绝对路径、未知 scheme 和 `..`。
+- 扩展 `read_image_metadata` 为可带 `question` 的视觉回看工具，问题作为独立、限长的 VL prompt 传入 asset-understanding，而不是替换图片 `type_hint`；视觉回答不得作为 tile 坐标、source id 或 atlas 坐标的权威来源。
+- 对图片引用误传给 map/delegate artifact reader 的情况返回结构化 `incompatible_artifact_kind` 和正确恢复工具，不再抛裸 `ValueError`/`OSError`；同时修复结构化输出恢复路径对 nullable `structured_issues` 的二次迭代崩溃。
+- 让 `describe_map_context` 对缺失的 `resource_registry.json` 和 `spatial_index.json` 执行同调用、确定性的内部支持数据重建：直接扫描真实 TileMap/TileMapLayer/GridMap 并原子落盘，不创建 plan step、不切换 planner/writer、不授予 reader 通用写权限。
 - 收紧地图目标参数合同：`target_path="."` 不得被解释为自动选择地图节点；调用方应省略参数触发唯一目标推断，或根据结构化候选补充真实节点路径。
 - 强制校验 map worker result 的 stage、target、revision、next_stage 和 Frame contract，防止来源伪造及动态 Worker 名称冲突。
 - 建立唯一 Completion Gate，运行时校验 reviewer/validator 的成功截图证据，prompt 不再自行决定 `completion_allowed`。
 - 将 Completion Gate 收紧为当前请求作用域：只有用户本轮明确要求创建、修改或修复地图内容时才建立 `map_edit` 意图；普通聊天、地图读取/分析/检查、只规划不执行以及历史地图 `task_id` 均不得触发 Gate。
+- 将续作意图与地图编辑授权分离：`继续任务` 等指代表达在当前会话存在唯一、仍聚焦且已授权的可恢复任务时绑定原 `task_id`、checkpoint 和权限范围；无候选、多候选或任务已失焦时不得从任意历史地图状态推断授权。
+- 区分模型 attempt 超时与前端 `/chat` 空闲超时：模型连接/请求失败由后端 provider 在同一 LLM attempt 边界切换已配置的 fallback；长事务通过不改变 Session 的进度心跳保持可观测，前端不得通过重放 `/chat` 实现模型切换。
+- 将客户端等待超时、用户主动停止、模型耗尽、预算耗尽和真正 no-progress 建模为不同暂停类型；检查点和用户提示必须与实际原因一致，不得把 `client_timeout`/`user_interrupted` 显示为“连续无进展”或输出空 `{}` 报告。
 - 统一地图状态变更为按 target/revision 作用域的事件与 reducer，禁止 Agent/QueryEngine 直接写流程状态。
 - 明确地图 Undo 事务边界并支持批次失败整体回滚、Ctrl+Z/Redo 和重启恢复。
 - 加强平台规划验证：轨迹采样、碰撞与头顶净空、segment 几何一致性和可信 collision facts。
@@ -40,9 +48,9 @@ map-agent 的核心安全整改已建立 revision、阶段合同和能力清单�
 
 ## Impact
 
-- Python：`query/engine.py`、`query/helpers.py`、`orchestrator/agent.py`、plan/delegate、Skill catalog/load、map worker contracts、Session map state，以及 request-scoped map-edit intent/response lineage。
+- Python：`query/engine.py`、`query/helpers.py`、`orchestrator/agent.py`、`orchestrator/map_workers.py`、`orchestrator/map_request_scope.py`、`llm/provider.py`、`rag/asset_llm_client.py`、artifact readers、plan/delegate、Skill catalog/load、map worker contracts、Session map state、内部缓存 effect，以及 request-scoped map-edit intent/response lineage、续作指代和类型化暂停。
 - Artifact 持久化：Session 级 `map_artifacts.json` schema、按 turn/tool entry 定位、事务内暂存读取、原子合并、取消回滚、幂等重试和兼容迁移。
-- Godot：ToolExecutor、UnifiedUndoManager、地图写入/验证工具及 revision tracker。
+- Godot：PathUtils 的截图专用路径解析、截图输出、图片元数据回看、ToolExecutor、UnifiedUndoManager、地图支持数据确定性重建、地图写入/验证工具、revision tracker，以及 `/chat` 心跳/空闲超时与带 cause 的 interrupt。
 - Agent/Skill 定义：map-agent、planner、reader、writer/validator/reviewer 动态模板、地图读取职责路由、scope-aware 工具提示和两个地图 Skill。
 - API/持久化：工具结果提交语义、plan step/result schema、Skill binding result、map workflow event/checkpoint。
-- 测试：新增原子提交、DAG 依赖、contract spoof、截图证据、Undo/Redo/重启、平台轨迹和 no-progress 分类回归测试。
+- 测试：新增原子提交、事务外心跳、provider fallback、类型化暂停、上下文续作解析、DAG 依赖、contract spoof、截图证据、Undo/Redo/重启、平台轨迹和 no-progress 分类回归测试。

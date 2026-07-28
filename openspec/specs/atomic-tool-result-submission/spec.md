@@ -1,4 +1,10 @@
-## ADDED Requirements
+# atomic-tool-result-submission Specification
+
+## Purpose
+
+Define atomic validation, persistence, publication, idempotency, and artifact handling for mixed server/front tool-result submissions.
+
+## Requirements
 
 ### Requirement: Entire tool-result batch is validated before mutation
 The system MUST validate every result's tool id, turn id, frame ownership, status, pending metadata, and authorization before applying any result in the batch.
@@ -65,6 +71,21 @@ The orchestrator SHALL execute server tools on the service and return only pendi
 #### Scenario: Model requests one server tool and two front tools
 - **WHEN** one model response requests `search_tools` and two `describe_map_region` calls
 - **THEN** the server tool may complete before the response is returned and the client receives only the two front calls without the server tool being classified as missing
+
+### Requirement: Atomic publication remains externally live
+The system MUST expose non-mutating request-liveness progress while Session events and artifacts remain buffered for atomic commit.
+
+#### Scenario: A valid tool-result submission runs longer than the client idle timeout
+- **WHEN** the backend is still processing the submission but no committed event can yet be published
+- **THEN** it emits an out-of-band `turn_progress` heartbeat containing request/turn identity and phase but no assistant content, tool result, grant, artifact locator, or recoverable Session mutation
+
+#### Scenario: A buffered submission rolls back
+- **WHEN** the Session working copy is rejected, interrupted, or fails persistence after heartbeats were emitted
+- **THEN** no buffered business event or artifact becomes visible and the earlier heartbeats cannot be replayed as committed state
+
+#### Scenario: The client receives progress
+- **WHEN** either a progress heartbeat or a committed event arrives for the active request
+- **THEN** the client refreshes its idle watchdog without resubmitting the chat request or selecting a model
 
 ### Requirement: Legacy per-call artifacts are read-only migration inputs
 The system MAY read an existing referenced `describe_map_region-*.json` during migration but MUST write all new map-tool artifacts to the Session `map_artifacts.json`.

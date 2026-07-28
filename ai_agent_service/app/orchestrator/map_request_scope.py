@@ -94,6 +94,27 @@ _EXPLICIT_CONTINUATION_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+_GENERIC_CONTINUATION_PATTERNS = (
+    re.compile(
+        r"^(?:请)?(?:继续|接着|恢复)(?:一下)?"
+        r"(?:(?:刚才|之前|上次|当前|这个|该)(?:的)?)?"
+        r"(?:任务|工作|操作|流程)?[。！!，, ]*$"
+    ),
+    re.compile(
+        r"^(?:please\s+)?(?:continue|resume)"
+        r"(?:\s+(?:the\s+)?(?:current|previous|last|this))?"
+        r"(?:\s+(?:task|work|operation|workflow))?[.! ,]*$",
+        re.IGNORECASE,
+    ),
+)
+_CONTINUATION_NEGATIONS = (
+    "不要继续",
+    "别继续",
+    "停止继续",
+    "do not continue",
+    "don't continue",
+    "stop continuing",
+)
 _ENGLISH_MAP_CONTENT_RE = re.compile(
     r"\b(?:map|tilemap|tile\s+map|terrain|level|platform|route|path|obstacle|"
     r"collision|coin|enemy|goal|spawn|teleporter|decoration)\b",
@@ -170,6 +191,24 @@ class MapRequestScope:
         )
 
 
+def is_continuation_intent(user_message: str) -> bool:
+    """判断文本是否明确表达续作，但不据此授予任何地图编辑权限。
+
+    Args:
+        user_message: 当前用户消息原文。
+
+    Returns:
+        文本是否属于明确续作表达。
+    """
+    normalized = " ".join(user_message.strip().lower().split())
+    if not normalized or any(phrase in normalized for phrase in _CONTINUATION_NEGATIONS):
+        return False
+    return any(
+        pattern.search(normalized) is not None
+        for pattern in (*_EXPLICIT_CONTINUATION_PATTERNS, *_GENERIC_CONTINUATION_PATTERNS)
+    )
+
+
 def classify_map_request(
     user_message: str,
     *,
@@ -182,10 +221,7 @@ def classify_map_request(
     ``continue`` cannot authorize map mutation or completion gating.
     """
     normalized = " ".join(user_message.strip().lower().split())
-    explicit_continuation = dedicated_resume_authorized or any(
-        pattern.search(normalized) is not None
-        for pattern in _EXPLICIT_CONTINUATION_PATTERNS
-    )
+    explicit_continuation = dedicated_resume_authorized or is_continuation_intent(normalized)
     if dedicated_resume_authorized:
         return "map_edit", True
 

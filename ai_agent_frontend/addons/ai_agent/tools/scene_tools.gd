@@ -1083,9 +1083,9 @@ static func capture_viewport_screenshot(input: Dictionary, editor_interface: Edi
 		output_path = "user://ai_agent_screenshots/%d.png" % Time.get_ticks_usec()
 		absolute = ProjectSettings.globalize_path(output_path)
 	else:
-		output_path = PathUtils.to_res_path(output_arg)
+		output_path = PathUtils.to_capture_path(output_arg)
 		if output_path == "":
-			return {"ok": false, "message": "output_path must be a project-relative path", "error_code": "invalid_path"}
+			return {"ok": false, "message": "output_path must be project-relative, res://, or user:// without '..'", "error_code": "invalid_path"}
 		if not PathUtils.is_write_allowed(output_path):
 			return {"ok": false, "message": "output_path is not writable: " + output_path, "error_code": "path_denied"}
 		absolute = ProjectSettings.globalize_path(output_path)

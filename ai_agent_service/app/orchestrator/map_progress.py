@@ -30,6 +30,26 @@ if TYPE_CHECKING:
 
 ValidationMode = Literal["diagnostic", "completion"]
 MapTaskStatus = Literal["idle", "running", "paused", "completed", "cancelled"]
+MapTaskPauseKind = Literal[
+    "",
+    "no_progress_exhausted",
+    "client_timeout",
+    "user_interrupted",
+    "provider_exhausted",
+    "budget_exhausted",
+    "workflow_blocked",
+]
+_MAP_PAUSE_KINDS: frozenset[str] = frozenset(
+    {
+        "",
+        "no_progress_exhausted",
+        "client_timeout",
+        "user_interrupted",
+        "provider_exhausted",
+        "budget_exhausted",
+        "workflow_blocked",
+    }
+)
 # 地图任务全局合法状态转换表：
 # 每个键对应的 frozenset 列出从该状态出发允许进入的下一个状态，
 # 任何未列出的转换都会被 transition_status 拒绝，确保状态机单调推进。
@@ -95,6 +115,7 @@ class MapTaskState:
     auto_iterations: int = 0
     checkpoint: dict[str, Any] | None = None
     resumed_from_checkpoint: bool = False
+    pause_kind: MapTaskPauseKind = ""
     pause_reason: str = ""
     pause_report: dict[str, Any] = field(default_factory=dict)
     workflow_schema_version: int = 1
@@ -185,6 +206,7 @@ class MapTaskState:
         self.task_id = task_id
         self.transition_stage("read")
         self.resumed_from_checkpoint = False
+        self.pause_kind = ""
         self.pause_reason = ""
         replace_map_state_field(self, "pause_report", {})
         replace_map_state_field(self, "checkpoint", None)
@@ -211,6 +233,7 @@ class MapTaskState:
             raise ValueError(f"cannot resume map task with status={self.status}")
         self.transition_status("running")
         self.resumed_from_checkpoint = True
+        self.pause_kind = ""
         self.pause_reason = ""
         replace_map_state_field(self, "no_progress_streaks", {})
         replace_map_state_field(self, "pause_report", {})
@@ -230,6 +253,7 @@ class MapTaskState:
         if self.status not in {"running", "paused"}:
             raise ValueError(f"cannot cancel map task with status={self.status}")
         self.transition_status("cancelled")
+        self.pause_kind = ""
         self.pause_reason = reason
         self.resumed_from_checkpoint = False
         replace_map_state_field(self, "pending_batches", [])
@@ -300,6 +324,8 @@ class MapTaskState:
             data["status"] = "idle"
         if data.get("stage") not in MAP_RUNTIME_STAGE_TRANSITIONS:
             data["stage"] = "read"
+        if data.get("pause_kind") not in _MAP_PAUSE_KINDS:
+            data["pause_kind"] = ""
         state = cls(**data)
         migrate_legacy_workflow_scopes(state)
         return state
@@ -308,6 +334,8 @@ class MapTaskState:
         self,
         reason: str,
         pause_report: dict[str, Any] | None = None,
+        *,
+        pause_kind: MapTaskPauseKind = "workflow_blocked",
     ) -> dict[str, Any]:
         """生成恢复所需的最小结构化检查点并暂停任务。
 
@@ -315,12 +343,24 @@ class MapTaskState:
         关键字段连同 failure_frontier、unresolved_issues 等一并快照到 checkpoint。
         """
         self.transition_status("paused")
+        self.pause_kind = pause_kind
         self.pause_reason = reason
         target, revision = workflow_scope_identity(self)
+        normalized_report = (
+            deepcopy(pause_report)
+            if isinstance(pause_report, dict) and pause_report
+            else _minimal_pause_report(
+                self,
+                pause_kind=pause_kind,
+                reason=reason,
+                target=target,
+                revision=revision,
+            )
+        )
         replace_map_state_field(
             self,
             "pause_report",
-            deepcopy(pause_report or {}),
+            normalized_report,
             target=target,
             revision=revision,
         )
@@ -332,6 +372,7 @@ class MapTaskState:
             "structure_revision": self.structure_revision,  # 独立场景结构版本
             "plan_version": self.plan_version,
             "reason": reason,
+            "pause_kind": pause_kind,
             "pause_report": deepcopy(self.pause_report),
             "failure_frontier": deepcopy(self.failure_frontier),
             "unresolved_issues": deepcopy(self.unresolved_issues),
@@ -352,6 +393,90 @@ class MapTaskState:
             ),
         )
         return checkpoint
+
+
+def _minimal_pause_report(
+    state: MapTaskState,
+    *,
+    pause_kind: MapTaskPauseKind,
+    reason: str,
+    target: str,
+    revision: int,
+) -> dict[str, Any]:
+    """从任务状态合成始终非空的最小暂停恢复报告。
+
+    Args:
+        state: 当前地图任务状态。
+        pause_kind: 类型化暂停原因。
+        reason: 具体暂停原因或错误分类。
+        target: 当前工作流目标。
+        revision: 当前目标 revision。
+
+    Returns:
+        可持久化且可直接展示的结构化恢复报告。
+    """
+    recovery_by_kind = {
+        "client_timeout": "确认服务仍可用后发送“继续任务”，从当前检查点恢复。",
+        "user_interrupted": "需要继续时发送“继续任务”，或使用专用恢复命令。",
+        "provider_exhausted": "检查主模型与备用模型配置和连通性后恢复任务。",
+        "budget_exhausted": "缩小任务范围或提高允许预算后从检查点恢复。",
+        "no_progress_exhausted": "根据未解决问题补齐输入或调整方案后恢复。",
+        "workflow_blocked": "处理未解决问题后从检查点恢复。",
+        "": "检查暂停原因后从检查点恢复。",
+    }
+    return {
+        "pause_kind": pause_kind,
+        "reason": reason,
+        "stage": state.stage,
+        "target": target,
+        "revision": revision,
+        "unresolved_issues": deepcopy(state.unresolved_issues),
+        "recovery": recovery_by_kind[pause_kind],
+    }
+
+
+def map_pause_message(state: MapTaskState) -> str:
+    """按类型化暂停原因生成真实且可恢复的用户提示。
+
+    Args:
+        state: 已暂停的地图任务状态。
+
+    Returns:
+        包含原因、非空报告和检查点的中文提示。
+    """
+    target, revision = workflow_scope_identity(state)
+    pause_kind = state.pause_kind or "workflow_blocked"
+    report = (
+        deepcopy(state.pause_report)
+        if state.pause_report
+        else _minimal_pause_report(
+            state,
+            pause_kind=pause_kind,
+            reason=state.pause_reason or pause_kind,
+            target=target,
+            revision=revision,
+        )
+    )
+    prefix_by_kind = {
+        "client_timeout": "地图任务因客户端等待超时已暂停。",
+        "user_interrupted": "地图任务已按用户请求暂停。",
+        "provider_exhausted": "地图任务因主模型与备用模型均不可用而暂停。",
+        "budget_exhausted": "地图任务因执行预算耗尽已暂停。",
+        "no_progress_exhausted": "地图任务因连续无进展已暂停。",
+        "workflow_blocked": "地图任务因工作流阻塞已暂停。",
+    }
+    prefix = prefix_by_kind.get(pause_kind, prefix_by_kind["workflow_blocked"])
+    checkpoint = state.checkpoint or {
+        "task_id": state.task_id,
+        "status": state.status,
+        "stage": state.stage,
+        "pause_kind": pause_kind,
+    }
+    return (
+        f"{prefix}根因与恢复建议："
+        f"{json.dumps(report, ensure_ascii=False, default=str)}；恢复检查点："
+        f"{json.dumps(checkpoint, ensure_ascii=False, default=str)}"
+    )
 
 
 @dataclass(frozen=True)
@@ -627,7 +752,12 @@ def record_no_progress(session: Session, target: str, reason: str) -> dict[str, 
         last_attempt=retry,
     )
     if state.status == "running":
-        return state.make_checkpoint(reason, report)
+        return state.make_checkpoint(
+            reason,
+            report,
+            pause_kind="no_progress_exhausted",
+        )
+    state.pause_kind = "no_progress_exhausted"
     state.pause_reason = reason
     replace_map_state_field(
         state,
@@ -641,6 +771,7 @@ def record_no_progress(session: Session, target: str, reason: str) -> dict[str, 
         "status": state.status,
         "stage": state.stage,
         "reason": reason,
+        "pause_kind": state.pause_kind,
         "pause_report": report,
     }
     replace_map_state_field(

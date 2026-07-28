@@ -139,8 +139,8 @@ class AssetLLMClient:
     def available(self) -> bool:
         return self.config.enabled and bool(self.config.model and self.config.endpoint)
 
-    def describe(self, path: Path, type_hint: str) -> str:
-        """调用多模态模型生成图片或音频资源的简短语义描述。"""
+    def describe(self, path: Path, type_hint: str, question: str | None = None) -> str:
+        """调用多模态模型描述资源，图片可附带一个受限的视觉问题。"""
         if not self.available or type_hint not in {"image", "audio"}:
             logger.debug(
                 "Asset semantic description skipped asset=%s type=%s available=%s",
@@ -157,8 +157,20 @@ class AssetLLMClient:
             if type_hint == "image":
                 image_bytes, mime = _prepare_image(path)
                 data = base64.b64encode(image_bytes).decode()
-                content = [{"type": "text", "text": "请简洁描述这个游戏资源的视觉内容，不要输出分类标签。"},
-                           {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}]
+                normalized_question = (question or "").strip()[:2000]
+                prompt = (
+                    normalized_question
+                    if normalized_question
+                    else "请简洁描述这个游戏资源的视觉内容，不要输出分类标签。"
+                )
+                prompt += (
+                    "\n只依据图像回答视觉现象；不要臆测精确 tile 坐标、source_id、"
+                    "atlas 坐标或 revision，这些应由地图数据工具读取。"
+                )
+                content = [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}},
+                ]
             else:
                 content = f"请根据文件名和音频资源元数据描述用途，不要输出分类标签：{path.name}, {path.stat().st_size} bytes"
             response = client.chat.completions.create(

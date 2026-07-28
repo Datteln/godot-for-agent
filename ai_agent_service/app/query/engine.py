@@ -31,6 +31,7 @@ from app.api.schemas import (
     ChatResponse,
     ChatToolCallsResponse,
     FrontToolCallDTO,
+    InterruptCause,
     InterruptResponse,
     SessionHistoryResponse,
     ToolResult,
@@ -98,6 +99,7 @@ from app.orchestrator.completion_gate import (
 from app.orchestrator.map_request_scope import (
     MapRequestScope,
     bind_map_task,
+    is_continuation_intent,
     mark_completion_candidate,
     new_request_scope,
 )
@@ -180,6 +182,39 @@ def _retire_non_root_frames(session: Session, reason: str) -> None:
     session.delegate_groups.clear()
 
 
+def _can_contextually_resume_map_task(session: Session, user_message: str) -> bool:
+    """判断续作指代是否唯一指向当前仍聚焦的已授权地图任务。
+
+    该判断只解析“任务”所指对象，不创建新权限。只有上一请求、任务 lineage、
+    暂停检查点三者一致时，泛化续作文本才可继承原地图编辑范围。
+
+    Args:
+        session: 当前会话。
+        user_message: 当前用户消息原文。
+
+    Returns:
+        是否可以无歧义恢复当前地图任务。
+    """
+    if not is_continuation_intent(user_message):
+        return False
+    state = session.map_task_state
+    if (
+        state.status != "paused"
+        or not state.task_id
+        or not isinstance(state.checkpoint, dict)
+    ):
+        return False
+    previous_scope = session.map_request_scope
+    task_lineage = session.map_task_lineage
+    return (
+        previous_scope.intent == "map_edit"
+        and previous_scope.map_task_id == state.task_id
+        and previous_scope.lineage_id
+        == str(task_lineage.get("lineage_id", ""))
+        and state.task_id == str(task_lineage.get("task_id", ""))
+    )
+
+
 def _activate_user_request_scope(
     session: Session,
     request: ChatRequest,
@@ -190,10 +225,16 @@ def _activate_user_request_scope(
         and session.map_task_state.status == "running"
         and bool(session.map_task_state.task_id)
     )
+    contextual_resume_authorized = _can_contextually_resume_map_task(
+        session,
+        request.user_message or "",
+    )
     scope = new_request_scope(
         request_id=request.request_id,
         user_message=request.user_message or "",
-        dedicated_resume_authorized=dedicated_resume_authorized,
+        dedicated_resume_authorized=(
+            dedicated_resume_authorized or contextual_resume_authorized
+        ),
     )
     state = session.map_task_state
     resumed_existing_task = False
@@ -253,6 +294,17 @@ class _SubmissionPublicationBuffer:
     turn_id: str
     map_artifact_turn: StagedMapArtifactTurn
     events: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
+
+
+@dataclass
+class _TurnProgress:
+    """保存一个活跃 `/chat` 请求的非持久化存活状态。"""
+
+    owner_id: int
+    request_id: str | None
+    turn_id: str | None
+    phase: str
+    heartbeat_seq: int = 0
 
 
 _PUBLICATION_BUFFER: ContextVar[_SubmissionPublicationBuffer | None] = ContextVar(
@@ -868,12 +920,67 @@ class QueryEngine:
         # 消息/中断，short-lived 地出现多个；用 set 而不是单个槎位，避免新任务
         # 覆盖掉真正持有锁、仍在运行的旧任务引用，导致 interrupt() 取消错对象。
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
+        self._turn_progress: dict[str, _TurnProgress] = {}
         self._history_blocks_cache: dict[str, tuple[tuple[int, int, int], list[Any]]] = {}
 
     @property
     def available_tools(self) -> set[str]:
         """当前工具注册表里的可见工具名集合。"""
         return set(REGISTRY)
+
+    def turn_progress(self, session_id: str) -> dict[str, Any] | None:
+        """返回活跃请求的事务外存活快照，并推进临时心跳序号。
+
+        该状态只存在于进程内，不写 Session、历史、artifact 或恢复指针。
+
+        Args:
+            session_id: 查询的会话标识。
+
+        Returns:
+            活跃请求的存活信息；无活跃请求时返回 None。
+        """
+        progress = self._turn_progress.get(session_id)
+        if progress is None:
+            return None
+        progress.heartbeat_seq += 1
+        return {
+            "type": "turn_progress",
+            "session_id": session_id,
+            "request_id": progress.request_id,
+            "turn_id": progress.turn_id,
+            "phase": progress.phase,
+            "heartbeat_seq": progress.heartbeat_seq,
+        }
+
+    def _set_turn_progress(
+        self,
+        session_id: str,
+        *,
+        owner_id: int,
+        request_id: str | None,
+        turn_id: str | None,
+        phase: str,
+    ) -> None:
+        """更新活跃请求的临时阶段，不触碰可恢复业务状态。"""
+        current = self._turn_progress.get(session_id)
+        heartbeat_seq = (
+            current.heartbeat_seq
+            if current is not None and current.owner_id == owner_id
+            else 0
+        )
+        self._turn_progress[session_id] = _TurnProgress(
+            owner_id=owner_id,
+            request_id=request_id,
+            turn_id=turn_id,
+            phase=phase,
+            heartbeat_seq=heartbeat_seq,
+        )
+
+    def _clear_turn_progress(self, session_id: str, owner_id: int) -> None:
+        """仅清除属于指定请求的临时存活状态。"""
+        current = self._turn_progress.get(session_id)
+        if current is not None and current.owner_id == owner_id:
+            del self._turn_progress[session_id]
 
     def _store_map_artifact(
         self,
@@ -1017,10 +1124,25 @@ class QueryEngine:
         （而不是仅让前端断开 HTTP 连接、后端继续跑完整个 turn）。
         """
         task = asyncio.current_task()
+        progress_owner = id(task) if task is not None else id(request)
         if task is not None:
             self._active_tasks.setdefault(request.session_id, set()).add(task)
+        self._set_turn_progress(
+            request.session_id,
+            owner_id=progress_owner,
+            request_id=request.request_id,
+            turn_id=None,
+            phase="queued",
+        )
         try:
             async with self._store.lock_for(request.session_id):
+                self._set_turn_progress(
+                    request.session_id,
+                    owner_id=progress_owner,
+                    request_id=request.request_id,
+                    turn_id=None,
+                    phase="accepted",
+                )
                 session = self._store.get_or_create(request.session_id, self.available_tools)
                 # 确保事件存储的序列号与会话历史计数器对齐，
                 # 防止因崩溃恢复或跨进程导致的序列偏移
@@ -1088,6 +1210,22 @@ class QueryEngine:
                             exc.message,
                         )
                         return ChatErrorResponse(text=exc.message)
+                progress_turn_id = (
+                    validated_tool_batch.turn_id
+                    if validated_tool_batch is not None
+                    else None
+                )
+                self._set_turn_progress(
+                    request.session_id,
+                    owner_id=progress_owner,
+                    request_id=request.request_id,
+                    turn_id=progress_turn_id,
+                    phase=(
+                        "tool_result_transaction"
+                        if validated_tool_batch is not None
+                        else "agent_turn"
+                    ),
+                )
 
                 # 取消保护快照：本轮可能在追加 assistant 的 tool_calls 后、写入对应
                 # tool result 之前被 interrupt 取消。若让这半截历史留在内存里，下一次
@@ -1166,6 +1304,13 @@ class QueryEngine:
                             self._settings.project_root,
                             working_session.session_id,
                         ).assert_mergeable(publication_buffer.map_artifact_turn)
+                    self._set_turn_progress(
+                        request.session_id,
+                        owner_id=progress_owner,
+                        request_id=request.request_id,
+                        turn_id=progress_turn_id,
+                        phase="committing",
+                    )
                     self._store.save(working_session)
                 except (OSError, TypeError, ValueError):
                     self._store.replace_in_memory(request.session_id, snapshot)
@@ -1195,6 +1340,7 @@ class QueryEngine:
                 )
                 return response
         finally:
+            self._clear_turn_progress(request.session_id, progress_owner)
             if task is not None:
                 tasks = self._active_tasks.get(request.session_id)
                 if tasks is not None:
@@ -1703,7 +1849,11 @@ class QueryEngine:
         }.get(effort)
 
     async def _enrich_front_image_result(
-        self, tool_name: str, result: dict[str, Any], security: SecuritySettings
+        self,
+        tool_name: str,
+        result: dict[str, Any],
+        security: SecuritySettings,
+        tool_args: dict[str, Any],
     ) -> dict[str, Any]:
         """为前端读图类工具结果补充多模态语义描述。"""
         if tool_name not in {"read_image_metadata", "capture_viewport_screenshot"}:
@@ -1723,7 +1873,13 @@ class QueryEngine:
         semantic: dict[str, Any] = {
             "enabled": client.available,
             "model": self._settings.asset_understanding_model,
+            "authority": "visual_only",
+            "exact_fact_tools": ["describe_map_context", "describe_map_region"],
         }
+        raw_question = tool_args.get("question") if tool_name == "read_image_metadata" else None
+        question = raw_question.strip()[:2000] if isinstance(raw_question, str) else ""
+        if question:
+            semantic["question"] = question
         if not client.available:
             semantic["skipped"] = "asset_understanding_not_configured"
             enriched["semantic"] = semantic
@@ -1733,9 +1889,15 @@ class QueryEngine:
             semantic["skipped"] = "image_path_not_readable_by_service"
             enriched["semantic"] = semantic
             return enriched
-        description = await asyncio.to_thread(client.describe, image_path, "image")
+        description = await asyncio.to_thread(
+            client.describe,
+            image_path,
+            "image",
+            question or None,
+        )
         semantic["source_path"] = str(image_path)
         semantic["description"] = description
+        semantic["answer"] = description
         enriched["semantic"] = semantic
         if description:
             enriched["semantic_description"] = description
@@ -1833,7 +1995,10 @@ class QueryEngine:
                     applied_result = tool.enrich(tool_args, applied_result)
                 if isinstance(applied_result, dict):
                     applied_result = await self._enrich_front_image_result(
-                        tool_name, applied_result, security
+                        tool_name,
+                        applied_result,
+                        security,
+                        tool_args,
                     )
                     map_artifact_locator = self._store_map_artifact(
                         session.session_id,
@@ -2163,7 +2328,7 @@ class QueryEngine:
                         "Map reader detailed region ready session=%s frame=%s artifact=%s",
                         session.session_id,
                         frame.id,
-                        map_artifact_ref is not None,
+                        map_artifact_locator is not None,
                     )
             blocker = _map_completion_blocker(
                 tool_name, result.status, result_for_gate, result.error_code
@@ -2395,7 +2560,12 @@ class QueryEngine:
             self._emit(session_id, "reset", {})
         logger.info("Session reset through QueryEngine session=%s", session_id)
 
-    async def interrupt(self, session_id: str) -> InterruptResponse:
+    async def interrupt(
+        self,
+        session_id: str,
+        *,
+        cause: InterruptCause = "user_interrupted",
+    ) -> InterruptResponse:
         """真正中断该会话仍在运行的 `/chat` 请求，并丢弃其后续输出。
 
         前端"停止"按钮此前只是断开自己的 HTTP 连接：后端的 `run_turn`
@@ -2413,6 +2583,12 @@ class QueryEngine:
         真正持锁运行的旧任务永远不会被取消，导致锁一直被占用，包括这次
         interrupt 自己后面要拿的锁也会卡死。所以这里要把所有未完成的都
         取消掉。
+        Args:
+            session_id: 需要中断的会话标识。
+            cause: 用户主动停止或客户端等待超时。
+
+        Returns:
+            取消结果与最新事件游标。
         """
         cancelled = await self._cancel_active_tasks(session_id)
 
@@ -2421,7 +2597,10 @@ class QueryEngine:
         async with self._store.lock_for(session_id):
             session = self._store.get_or_create(session_id, self.available_tools)
             if session.map_task_state.status == "running":
-                session.map_task_state.make_checkpoint("user_interrupted")
+                session.map_task_state.make_checkpoint(
+                    cause,
+                    pause_kind=cause,
+                )
                 map_checkpoint_created = True
             had_pending_plan = session.pending_plan is not None
             session.pending_plan = None
@@ -2434,7 +2613,13 @@ class QueryEngine:
                         continue
                     frame.messages.append(
                         _tool_message(
-                            tool_use_id, "用户中断了当前请求，该工具调用结果未回传。", is_error=True
+                            tool_use_id,
+                            (
+                                "客户端等待超时并中断了当前请求，该工具调用结果未回传。"
+                                if cause == "client_timeout"
+                                else "用户中断了当前请求，该工具调用结果未回传。"
+                            ),
+                            is_error=True,
                         )
                     )
                     discarded += 1
@@ -2446,7 +2631,13 @@ class QueryEngine:
                 self._store.save(session)
 
         self._emit(
-            session_id, "turn_interrupted", {"cancelled": cancelled, "pending_discarded": discarded}
+            session_id,
+            "turn_interrupted",
+            {
+                "cancelled": cancelled,
+                "pending_discarded": discarded,
+                "cause": cause,
+            },
         )
         last_seq = self._events.last_seq(session_id) if self._events is not None else 0
         if self._recovery is not None and map_checkpoint_created:
@@ -2457,8 +2648,9 @@ class QueryEngine:
                 session.map_task_state.checkpoint,
             )
         logger.info(
-            "Turn interrupted session=%s cancelled=%s pending_discarded=%d last_seq=%d",
+            "Turn interrupted session=%s cause=%s cancelled=%s pending_discarded=%d last_seq=%d",
             session_id,
+            cause,
             cancelled,
             discarded,
             last_seq,

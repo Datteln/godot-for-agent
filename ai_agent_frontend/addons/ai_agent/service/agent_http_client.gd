@@ -19,6 +19,7 @@ const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd
 ## 的短超时，所以 `/chat` 用单独的、更宽松的超时设置。
 const DEFAULT_REQUEST_TIMEOUT_S := 30.0
 const DEFAULT_CHAT_REQUEST_TIMEOUT_S := 300.0
+const LLM_FALLBACK_GRACE_S := 15.0
 ## 上面那个超时现在按"空闲"语义续期（见 `_on_events_completed`）：只要
 ## `/chat/events` 轮询还能拿到新事件（流式文本、delegate、工具调用……），
 ## 就说明后端没卡死，超时计时器会被重置而不是任由它在固定总时长后到期。
@@ -203,7 +204,8 @@ func reset_session() -> void:
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing session reset.", {"session_id": _session_id()})
 	if abandoned_path == "/chat":
 		_enqueue("POST", "/chat/interrupt", {
-			"session_id": abandoned_session_id if abandoned_session_id != "" else _session_id()
+			"session_id": abandoned_session_id if abandoned_session_id != "" else _session_id(),
+			"cause": "user_interrupted"
 		})
 	_enqueue("POST", "/reset", {"session_id": _session_id()})
 
@@ -223,7 +225,10 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 	_last_event_seq = 0
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != new_session_id:
-		_enqueue("POST", "/chat/interrupt", {"session_id": previous_session_id})
+		_enqueue("POST", "/chat/interrupt", {
+			"session_id": previous_session_id,
+			"cause": "user_interrupted"
+		})
 	_enqueue("POST", "/reset", {"session_id": new_session_id})
 	_configure_event_timer()
 
@@ -246,7 +251,10 @@ func interrupt_current() -> void:
 	# 仅断开本地连接还不够：后端的 agent 循环（自动执行的静默工具）会继续跑完
 	# 整轮并持续写入新事件，等下一条用户消息发出后这些旧事件会被一起拉取、
 	# 误渲染成新对话内容。这里显式通知后端取消该会话仍在运行的请求。
-	_enqueue("POST", "/chat/interrupt", {"session_id": _session_id()})
+	_enqueue("POST", "/chat/interrupt", {
+		"session_id": _session_id(),
+		"cause": "user_interrupted"
+	})
 
 
 func switch_to_session(previous_session_id: String) -> void:
@@ -265,7 +273,10 @@ func switch_to_session(previous_session_id: String) -> void:
 	_last_event_seq = 0
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != _session_id():
-		_enqueue("POST", "/chat/interrupt", {"session_id": previous_session_id})
+		_enqueue("POST", "/chat/interrupt", {
+			"session_id": previous_session_id,
+			"cause": "user_interrupted"
+		})
 	_configure_event_timer()
 
 
@@ -400,7 +411,7 @@ func _pump() -> void:
 	else:
 		_timeout_generation = _inflight_generation
 		_inflight_started_at_msec = Time.get_ticks_msec()
-		_request_timeout_timer.start(_timeout_for_path(_inflight_path))
+		_restart_inflight_timeout()
 
 
 func _timeout_for_path(path: String) -> float:
@@ -410,7 +421,19 @@ func _timeout_for_path(path: String) -> float:
 	# 索引在后端还在跑的时候就被前端误判成"卡住"。
 	if path == "/chat" or path == "/commands/rebuild_index":
 		var chat_value := float(_setting("ai_agent/chat_request_timeout_sec"))
-		return chat_value if chat_value > 0.0 else DEFAULT_CHAT_REQUEST_TIMEOUT_S
+		var configured_timeout := (
+			chat_value if chat_value > 0.0 else DEFAULT_CHAT_REQUEST_TIMEOUT_S
+		)
+		if path == "/chat":
+			# 主模型 attempt 必须先有机会在后端超时并切换 fallback；前端空闲
+			# watchdog 不能比 provider timeout 更早取消仍可恢复的请求。
+			var llm_timeout := float(_setting("ai_agent/llm_request_timeout_s"))
+			if llm_timeout > 0.0:
+				configured_timeout = max(
+					configured_timeout,
+					llm_timeout + LLM_FALLBACK_GRACE_S
+				)
+		return configured_timeout
 	var value := float(_setting("ai_agent/request_timeout_sec"))
 	return value if value > 0.0 else DEFAULT_REQUEST_TIMEOUT_S
 
@@ -420,6 +443,18 @@ func _hard_cap_for_path(path: String) -> float:
 		return 0.0
 	var cap := float(_setting("ai_agent/chat_request_hard_cap_sec"))
 	return cap if cap > 0.0 else DEFAULT_CHAT_REQUEST_HARD_CAP_S
+
+
+func _restart_inflight_timeout() -> void:
+	## 按空闲超时与剩余硬上限中的较小值重启当前 watchdog。
+	var timeout_s := _timeout_for_path(_inflight_path)
+	var hard_cap := _hard_cap_for_path(_inflight_path)
+	if hard_cap > 0.0 and _inflight_started_at_msec > 0:
+		var elapsed_s := float(
+			Time.get_ticks_msec() - _inflight_started_at_msec
+		) / 1000.0
+		timeout_s = min(timeout_s, max(hard_cap - elapsed_s, 0.001))
+	_request_timeout_timer.start(timeout_s)
 
 
 ## 收到新事件说明这条仍在跑的 `/chat`（或 `rebuild_index`）请求后端没有
@@ -442,7 +477,7 @@ func _maybe_extend_request_timeout() -> void:
 		"elapsed_s": elapsed_s,
 		"hard_cap_s": hard_cap
 	})
-	_request_timeout_timer.start(_timeout_for_path(_inflight_path))
+	_restart_inflight_timeout()
 
 
 func _on_request_timeout() -> void:
@@ -470,7 +505,8 @@ func _on_request_timeout() -> void:
 		current_turn_id = ""
 		_suppress_events = true
 		_enqueue("POST", "/chat/interrupt", {
-			"session_id": timed_out_session_id if timed_out_session_id != "" else _session_id()
+			"session_id": timed_out_session_id if timed_out_session_id != "" else _session_id(),
+			"cause": "client_timeout"
 		})
 		interrupt_enqueued = true
 	error_occurred.emit("HTTP request timed out: " + timed_out_path)
@@ -630,7 +666,9 @@ func _on_events_completed(result: int, code: int, _headers: PackedStringArray, b
 			FrontendLogger.warn(editor_interface, "HTTP", "Ignored malformed events response.", {})
 			return
 		var events: Array = raw_events
-		if not events.is_empty():
+		var raw_progress: Variant = parsed.get("progress")
+		var has_live_progress := raw_progress is Dictionary
+		if not events.is_empty() or has_live_progress:
 			FrontendLogger.debug(editor_interface, "HTTP", "Received events.", {"count": events.size()})
 			_maybe_extend_request_timeout()
 		for event in events:

@@ -111,3 +111,41 @@ def all_paths_ok(
         `path_args` 为空（工具不涉及路径参数）时同样返回 True。
     """
     return all(path_ok(args[name], security, write) for name in path_args if name in args)
+
+
+def capture_path_ok(target: str, security: SecuritySettings, write: bool = False) -> bool:
+    """校验截图/图片路径，同时支持工程路径与受限的 Godot `user://` 空间。
+
+    `user://` 仅作为 Godot 管理的临时截图空间，不映射到项目根规则；该分支仍
+    严格拒绝空路径、目录穿越、反斜杠穿越与其他 URI scheme。`res://` 会先
+    转成项目相对路径，再复用项目路径的完整 allow/deny 边界。
+    """
+    cleaned = target.strip().replace("\\", "/")
+    if not cleaned:
+        return False
+    if cleaned.startswith("user://"):
+        relative = cleaned.removeprefix("user://").lstrip("/")
+        parts = [part for part in relative.split("/") if part]
+        accepted = bool(parts) and ".." not in parts and all(":" not in part for part in parts)
+        if not accepted:
+            logger.debug("Capture path rejected reason=user_boundary target=%s write=%s", target, write)
+        return accepted
+    if "://" in cleaned and not cleaned.startswith("res://"):
+        logger.debug("Capture path rejected reason=unknown_scheme target=%s write=%s", target, write)
+        return False
+    project_target = cleaned.removeprefix("res://").lstrip("/")
+    return path_ok(project_target, security, write)
+
+
+def all_capture_paths_ok(
+    args: dict[str, Any],
+    path_args: list[str],
+    security: SecuritySettings,
+    write: bool = False,
+) -> bool:
+    """批量校验截图/图片专用路径参数，非字符串参数按非法处理。"""
+    return all(
+        isinstance(args[name], str) and capture_path_ok(args[name], security, write)
+        for name in path_args
+        if name in args
+    )

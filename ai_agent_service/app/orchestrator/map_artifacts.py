@@ -183,8 +183,8 @@ class MapArtifactStore:
         self,
         artifact_ref: str,
         *,
-        turn_id: str,
-        entry_id: str,
+        turn_id: str = "",
+        entry_id: str = "",
         field: str = "",
         offset: int = 0,
         limit: int = 50,
@@ -193,6 +193,10 @@ class MapArtifactStore:
         """优先读取当前事务暂存条目，再读取已提交或旧版单文件条目。"""
         path = self._resolve_ref(artifact_ref)
         if path == self.path.resolve():
+            if not turn_id or not entry_id:
+                raise ValueError(
+                    "aggregated map artifact requires artifact_turn_id and artifact_entry_id"
+                )
             entry, source = self._resolve_aggregated_entry(
                 turn_id=turn_id,
                 entry_id=entry_id,
