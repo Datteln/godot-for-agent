@@ -19,6 +19,15 @@ class Event:
     payload: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class EventPage:
+    """A bounded, sequence-ordered event page."""
+
+    events: list[Event]
+    cursor: int
+    has_more: bool
+
+
 _MAX_EVENTS_PER_SESSION = 500
 
 # 旧版流式事件每条都携带"截至当前的完整累积文本"；这种 snapshot 可原地覆盖。
@@ -96,6 +105,30 @@ class EventStore:
         if events:
             logger.debug("Events listed session=%s after=%d count=%d", session_id, after, len(events))
         return events
+
+    def page_after(self, session_id: str, after: int = 0, *, limit: int = 50) -> EventPage:
+        """返回有界事件页；cursor 只覆盖本页实际返回的事件。"""
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
+        candidates = [
+            event for event in self._events.get(session_id, []) if event.seq > after
+        ]
+        page_events = candidates[:limit]
+        cursor = page_events[-1].seq if page_events else after
+        has_more = len(candidates) > len(page_events)
+        if page_events or has_more:
+            logger.debug(
+                "Event page listed session=%s after=%d limit=%d count=%d "
+                "cursor=%d has_more=%s backlog=%d",
+                session_id,
+                after,
+                limit,
+                len(page_events),
+                cursor,
+                has_more,
+                max(len(candidates) - len(page_events), 0),
+            )
+        return EventPage(events=page_events, cursor=cursor, has_more=has_more)
 
     def last_seq(self, session_id: str) -> int:
         """返回某会话最后事件序号。"""

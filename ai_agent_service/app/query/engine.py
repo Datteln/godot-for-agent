@@ -119,6 +119,16 @@ _MAP_AUTO_COMPACT_CONTEXT_TOKENS = 64_000
 _MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
 _MAP_MAX_AUTO_ITERATIONS = 3
 _COMPLETED_TOOL_TURN_CACHE_SIZE = 64
+_PREVIEW_EVENT_TYPES = frozenset({"agent_text_delta", "agent_reasoning_delta"})
+
+
+def _submission_event_delivery(event_type: str) -> str:
+    """Classify how an event may leave an active atomic submission."""
+    if event_type in _PREVIEW_EVENT_TYPES:
+        return "provisional_preview"
+    if event_type == "turn_progress":
+        return "out_of_band_liveness"
+    return "transactional"
 
 
 def _map_completion_candidate_is_current(session: Session) -> bool:
@@ -294,6 +304,10 @@ class _SubmissionPublicationBuffer:
     turn_id: str
     map_artifact_turn: StagedMapArtifactTurn
     events: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
+    previews: dict[str, dict[str, Any]] = field(default_factory=dict)
+    preview_resolved: bool = False
+    preview_event_count: int = 0
+    first_preview_seq: int = 0
 
 
 @dataclass
@@ -1261,9 +1275,21 @@ class QueryEngine:
                         validated_tool_batch,
                     )
                 except asyncio.CancelledError:
+                    if publication_buffer is not None:
+                        self._resolve_submission_previews(
+                            publication_buffer,
+                            committed=False,
+                            reason="cancelled",
+                        )
                     self._store.replace_in_memory(request.session_id, snapshot)
                     raise
                 except Exception:
+                    if publication_buffer is not None:
+                        self._resolve_submission_previews(
+                            publication_buffer,
+                            committed=False,
+                            reason="submission_failed",
+                        )
                     self._store.replace_in_memory(request.session_id, snapshot)
                     logger.exception(
                         "Chat request failed; restored session snapshot session=%s request_id=%s",
@@ -1313,6 +1339,12 @@ class QueryEngine:
                     )
                     self._store.save(working_session)
                 except (OSError, TypeError, ValueError):
+                    if publication_buffer is not None:
+                        self._resolve_submission_previews(
+                            publication_buffer,
+                            committed=False,
+                            reason="session_persistence_failed",
+                        )
                     self._store.replace_in_memory(request.session_id, snapshot)
                     logger.exception(
                         "Session commit failed; original session retained session=%s request_id=%s",
@@ -1325,6 +1357,10 @@ class QueryEngine:
                 session = working_session
                 if publication_buffer is not None:
                     self._flush_submission_publications(publication_buffer)
+                    self._resolve_submission_previews(
+                        publication_buffer,
+                        committed=True,
+                    )
                 self._record_recovery(session, response)
                 logger.info(
                     "Chat request completed session=%s response_type=%s pending=%s",
@@ -2882,12 +2918,76 @@ class QueryEngine:
                 "_submission_turn_id",
                 publication_buffer.turn_id,
             )
+            staged_payload.setdefault("request_id", publication_buffer.request_id)
+            staged_payload.setdefault("turn_id", publication_buffer.turn_id)
+            delivery = _submission_event_delivery(event_type)
+            if delivery == "transactional":
+                staged_payload.setdefault("delivery", delivery)
             if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
                 self._record_persisted_history_event(
                     publication_buffer.session,
                     event_type,
                     staged_payload,
                 )
+            if _submission_event_delivery(event_type) == "provisional_preview":
+                frame_id = str(staged_payload.get("frame_id") or "")
+                message_index = str(staged_payload.get("message_index") or "")
+                message_id = str(
+                    staged_payload.get("message_id")
+                    or f"{frame_id}:{message_index}"
+                )
+                preview_id = str(
+                    staged_payload.get("preview_id")
+                    or (
+                        f"{publication_buffer.request_id or publication_buffer.turn_id}:"
+                        f"{publication_buffer.turn_id}:{event_type}:{message_id}"
+                    )
+                )
+                staged_payload.update(
+                    {
+                        "delivery": "provisional_preview",
+                        "provisional": True,
+                        "preview_id": preview_id,
+                        "message_id": message_id,
+                    }
+                )
+                publication_buffer.previews.setdefault(
+                    preview_id,
+                    {
+                        "preview_id": preview_id,
+                        "event_type": event_type,
+                        "frame_id": frame_id,
+                        "message_id": message_id,
+                    },
+                )
+                if self._events is None:
+                    return 0
+                event = self._events.append(session_id, event_type, staged_payload)
+                publication_buffer.preview_event_count += 1
+                if publication_buffer.first_preview_seq == 0:
+                    publication_buffer.first_preview_seq = event.seq
+                    logger.info(
+                        "First submission preview published session=%s request_id=%s "
+                        "turn_id=%s preview_id=%s seq=%d provider_first_chunk=%s",
+                        session_id,
+                        publication_buffer.request_id,
+                        publication_buffer.turn_id,
+                        preview_id,
+                        event.seq,
+                        bool(staged_payload.get("provider_first_chunk", False)),
+                    )
+                else:
+                    logger.debug(
+                        "Submission preview fragment published session=%s request_id=%s "
+                        "turn_id=%s preview_id=%s seq=%d fragment=%d",
+                        session_id,
+                        publication_buffer.request_id,
+                        publication_buffer.turn_id,
+                        preview_id,
+                        event.seq,
+                        publication_buffer.preview_event_count,
+                    )
+                return event.seq
             publication_buffer.events.append(
                 (session_id, event_type, staged_payload)
             )
@@ -2907,6 +3007,56 @@ class QueryEngine:
         event = self._events.append(session_id, event_type, payload)
         logger.debug("Event persisted session=%s seq=%d type=%s", session_id, event.seq, event_type)
         return event.seq
+
+    def _resolve_submission_previews(
+        self,
+        publication_buffer: _SubmissionPublicationBuffer,
+        *,
+        committed: bool,
+        reason: str | None = None,
+    ) -> None:
+        """Resolve already-visible previews exactly once without publishing staged facts."""
+        if publication_buffer.preview_resolved or not publication_buffer.previews:
+            return
+        publication_buffer.preview_resolved = True
+        event_type = (
+            "submission_preview_committed"
+            if committed
+            else "submission_preview_discarded"
+        )
+        payload: dict[str, Any] = {
+            "delivery": "provisional_preview",
+            "provisional": False,
+            "request_id": publication_buffer.request_id,
+            "turn_id": publication_buffer.turn_id,
+            "preview_ids": list(publication_buffer.previews),
+            "previews": list(publication_buffer.previews.values()),
+        }
+        if reason is not None:
+            payload["reason"] = reason
+        if self._events is not None:
+            event = self._events.append(
+                publication_buffer.session.session_id,
+                event_type,
+                payload,
+            )
+            seq = event.seq
+        else:
+            seq = 0
+        logger.info(
+            "Submission previews resolved session=%s request_id=%s turn_id=%s "
+            "resolution=%s preview_streams=%d preview_events=%d "
+            "first_preview_seq=%d boundary_seq=%d reason=%s",
+            publication_buffer.session.session_id,
+            publication_buffer.request_id,
+            publication_buffer.turn_id,
+            "committed" if committed else "discarded",
+            len(publication_buffer.previews),
+            publication_buffer.preview_event_count,
+            publication_buffer.first_preview_seq,
+            seq,
+            reason,
+        )
 
     def _record_persisted_history_event(
         self,

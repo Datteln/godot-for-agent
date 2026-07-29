@@ -237,6 +237,17 @@ class ChatEventDTO(BaseModel):
     session_id: str
     type: str
     payload: dict[str, Any] = Field(default_factory=dict)
+    delivery: Literal[
+        "provisional_preview",
+        "transactional",
+        "out_of_band_liveness",
+    ] | None = None
+    provisional: bool = False
+    preview_id: str | None = None
+    request_id: str | None = None
+    turn_id: str | None = None
+    frame_id: str | None = None
+    message_id: str | None = None
 
 
 class ChatProgressDTO(BaseModel):
@@ -255,6 +266,8 @@ class ChatEventsResponse(BaseModel):
 
     events: list[ChatEventDTO]
     progress: ChatProgressDTO | None = None
+    cursor: int = 0
+    has_more: bool = False
 
 
 class SessionHistoryItemDTO(BaseModel):

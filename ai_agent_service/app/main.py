@@ -188,6 +188,8 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         )
     )
     app.state.rag_build_manager = rag_build_manager
+    app.state.event_store = event_store
+    app.state.query_engine = query_engine
     logger.info(
         "AI agent service app ready tools=%d session_store=%s",
         len(REGISTRY),

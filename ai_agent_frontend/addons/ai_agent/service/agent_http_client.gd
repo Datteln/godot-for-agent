@@ -27,6 +27,7 @@ const LLM_FALLBACK_GRACE_S := 15.0
 ## 单条 `/chat` 请求也不会无限续期下去。
 const DEFAULT_CHAT_REQUEST_HARD_CAP_S := 1800.0
 const MAX_TOOL_RESULT_RETRIES := 3
+const EVENT_PAGE_LIMIT := 50
 
 var editor_interface: EditorInterface
 var service: Node
@@ -357,7 +358,11 @@ func resume_from_pointer(pointer: Dictionary) -> void:
 func poll_events() -> void:
 	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
 		return
-	var path := "/chat/events?session_id=%s&after=%d" % [_session_id().uri_encode(), _last_event_seq]
+	var path := "/chat/events?session_id=%s&after=%d&limit=%d" % [
+		_session_id().uri_encode(),
+		_last_event_seq,
+		EVENT_PAGE_LIMIT,
+	]
 	var err := _event_http.request(_url(path), _headers(), HTTPClient.METHOD_GET)
 	if err != OK:
 		FrontendLogger.warn(editor_interface, "HTTP", "Failed to start event poll.", {"error": err})
@@ -660,27 +665,64 @@ func _on_events_completed(result: int, code: int, _headers: PackedStringArray, b
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
 		return
 	var parsed := JSON.parse_string(body.get_string_from_utf8())
-	if parsed is Dictionary:
-		var raw_events: Variant = parsed.get("events", [])
-		if not (raw_events is Array):
-			FrontendLogger.warn(editor_interface, "HTTP", "Ignored malformed events response.", {})
-			return
-		var events: Array = raw_events
-		var raw_progress: Variant = parsed.get("progress")
-		var has_live_progress := raw_progress is Dictionary
+	var page := _parse_event_page(parsed, _last_event_seq)
+	if bool(page.get("valid", false)):
+		var events: Array = page.get("events", [])
+		var raw_progress: Variant = page.get("progress")
+		var has_live_progress: bool = raw_progress is Dictionary
 		if not events.is_empty() or has_live_progress:
-			FrontendLogger.debug(editor_interface, "HTTP", "Received events.", {"count": events.size()})
+			FrontendLogger.debug(editor_interface, "HTTP", "Received events.", {
+				"count": events.size(),
+				"has_more": bool(page.get("has_more", false)),
+				"response_cursor": int(page.get("cursor", _last_event_seq)),
+			})
 			_maybe_extend_request_timeout()
 		for event in events:
-			if event is Dictionary:
-				_last_event_seq = max(_last_event_seq, int(event.get("seq", _last_event_seq)))
-				_try_recover_tool_calls_response(event)
+			_try_recover_tool_calls_response(event)
+		_last_event_seq = int(page.get("cursor", _last_event_seq))
 		if _suppress_events:
 			if not events.is_empty():
 				FrontendLogger.debug(editor_interface, "HTTP", "Suppressed events after interrupt.", {"count": events.size()})
 			return
 		if not events.is_empty():
 			events_received.emit(events)
+		if bool(page.get("has_more", false)):
+			# request_completed runs after this HTTPRequest becomes reusable. Defer one
+			# turn and retain poll_events' disconnected guard to prevent overlap.
+			call_deferred("_poll_event_backlog")
+
+
+func _parse_event_page(parsed: Variant, current_cursor: int) -> Dictionary:
+	# Keep compatibility with older backends: cursor/has_more and preview fields
+	# are optional, while accepted event sequence remains the source of truth.
+	if not (parsed is Dictionary):
+		return {"valid": false, "events": [], "cursor": current_cursor, "has_more": false}
+	var raw_events: Variant = parsed.get("events", [])
+	if not (raw_events is Array):
+		return {"valid": false, "events": [], "cursor": current_cursor, "has_more": false}
+	var accepted: Array = []
+	var accepted_cursor := current_cursor
+	for raw_event in raw_events:
+		if not (raw_event is Dictionary):
+			continue
+		var seq := int(raw_event.get("seq", 0))
+		if seq <= accepted_cursor:
+			continue
+		accepted.append(raw_event)
+		accepted_cursor = seq
+	return {
+		"valid": true,
+		"events": accepted,
+		"cursor": accepted_cursor,
+		"has_more": bool(parsed.get("has_more", false)),
+		"progress": parsed.get("progress"),
+	}
+
+
+func _poll_event_backlog() -> void:
+	if _suppress_events:
+		return
+	poll_events()
 
 
 func _try_recover_tool_calls_response(event: Dictionary) -> void:

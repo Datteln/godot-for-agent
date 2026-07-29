@@ -11,6 +11,7 @@ func _init() -> void:
 		push_error("first text packet of a new stream segment was discarded")
 		quit(1)
 		return
+	panel._history_replaying = false
 	panel._history_refresh_needed = true
 	if panel._history_request_before(0.0) != 0 or panel._history_request_before(999.0) != 0:
 		push_error("stale history was not refreshed for both scroll directions")

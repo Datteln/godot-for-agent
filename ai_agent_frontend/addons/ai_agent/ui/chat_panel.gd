@@ -141,6 +141,7 @@ var _interrupted_locally := false
 var _indent_current_text := false
 var _event_queue: Array = []
 var _draining_events := false
+var _preview_registry: Dictionary = {}
 var _force_scroll_once := false
 var _pending_final_response := {}
 var _pending_final_event := {}
@@ -176,6 +177,7 @@ var _post_final_scroll_frames := 0   # final 响应后持续滚动到底部的�
 var _post_delta_scroll_frames := 0   # 文本流刷新后持续滚动到底部的剩余帧数（避免每帧都强制滚动）
 var _post_history_layout_frames := 0  # 历史节点完成布局后重新测量虚拟列表的剩余帧数
 var _user_is_dragging_scrollbar := false   # 用户正在拖拽滚动条
+var _user_scroll_intent := false
 var _user_scrolled_up_ms: int = 0   # 用户主动上滚的时间戳，用于冷却期
 var _empty_final_ignored_ms: int = -1   # 空 final 被忽略的时间戳，超时后强制结束 turn
 
@@ -192,6 +194,8 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
+	if _draining_events:
+		_drain_event_queue()
 	if _virtual_scroller != null:
 		var resync_request := _virtual_scroller.consume_resync_request()
 		if bool(resync_request.get("requested", false)):
@@ -543,6 +547,8 @@ func _connect_signals() -> void:
 	_recovery_prompt.accepted_recovery.connect(_on_recovery_accepted)
 	_recovery_prompt.rejected_recovery.connect(_on_recovery_rejected)
 	_scroll.get_v_scroll_bar().value_changed.connect(_on_scroll_value_changed)
+	_scroll.gui_input.connect(_on_scroll_gui_input)
+	_scroll.get_v_scroll_bar().gui_input.connect(_on_scroll_gui_input)
 	_scroll.scroll_started.connect(_on_scrollbar_button_down)
 	_scroll.scroll_ended.connect(_on_scrollbar_button_up)
 	if service != null:
@@ -1797,8 +1803,6 @@ func _drain_event_queue() -> void:
 			break
 	if _event_queue.is_empty():
 		_draining_events = false
-	else:
-		call_deferred("_drain_event_queue")
 
 
 func _handle_event(event: Dictionary) -> void:
@@ -1843,8 +1847,14 @@ func _handle_event(event: Dictionary) -> void:
 		return
 	if event_type == "agent_reasoning_delta":
 		_on_reasoning_delta(event)
+		_register_provisional_preview(payload, "reasoning")
 	elif event_type == "agent_text_delta":
 		_on_text_delta(event)
+		_register_provisional_preview(payload, "text")
+	elif event_type == "submission_preview_committed":
+		_resolve_provisional_previews(payload, true)
+	elif event_type == "submission_preview_discarded":
+		_resolve_provisional_previews(payload, false)
 	elif event_type == "final":
 		if payload.has("text"):
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (via event stream)", {})
@@ -1899,6 +1909,54 @@ func _handle_event(event: Dictionary) -> void:
 				_post_final_scroll_frames = max(_post_final_scroll_frames, 5)
 		if event_type == "compact_boundary" and _state == AgentState.COMPACTING:
 			_set_state(_state_before_compact)
+
+
+func _register_provisional_preview(payload: Dictionary, kind: String) -> void:
+	if not bool(payload.get("provisional", false)):
+		return
+	var preview_id := str(payload.get("preview_id", "")).strip_edges()
+	if preview_id == "":
+		return
+	_preview_registry[preview_id] = {
+		"request_id": str(payload.get("request_id", "")),
+		"turn_id": str(payload.get("turn_id", "")),
+		"kind": kind,
+		"stream_key": _stream_event_key(payload),
+	}
+
+
+func _resolve_provisional_previews(payload: Dictionary, committed: bool) -> void:
+	var raw_ids: Variant = payload.get("preview_ids", [])
+	if not (raw_ids is Array):
+		return
+	var invalidated := false
+	for raw_id in raw_ids:
+		var preview_id := str(raw_id)
+		if not _preview_registry.has(preview_id):
+			continue
+		var preview: Dictionary = _preview_registry[preview_id]
+		_preview_registry.erase(preview_id)
+		if committed:
+			continue
+		var stream_key := str(preview.get("stream_key", ""))
+		match str(preview.get("kind", "")):
+			"text":
+				if stream_key != "" and stream_key == _stream_key:
+					_discard_stream_message()
+				else:
+					invalidated = true
+			"reasoning":
+				if stream_key != "" and stream_key == _reasoning_key:
+					var reasoning_index := _reasoning_message_index
+					_finish_reasoning_stream()
+					if reasoning_index >= 0:
+						_remove_queued_message(reasoning_index)
+				else:
+					invalidated = true
+	if invalidated:
+		# Selected rollback UX: preserve already-finalized layout but clearly mark
+		# that the matching provisional attempt did not commit.
+		_append_message("error", "未提交的模型预览已丢弃；本次工具结果事务未生效。")
 
 
 func _remember_server_file_read(event: Dictionary) -> void:
@@ -2717,6 +2775,7 @@ func _clear_messages(reset_history := true) -> void:
 		_history_replay_cursor = 0
 		_history_replay_context.clear()
 		_history_replay_started_ms = -1
+	_preview_registry.clear()
 	if _virtual_scroller != null:
 		_virtual_scroller.clear()
 	if _message_store != null:
@@ -2806,14 +2865,12 @@ func _on_scroll_value_changed(value: float) -> void:
 		return
 
 	if is_at_bottom:
-		# 用户滚回底部附近，恢复自动滚动；但如果用户刚刚主动上滚过（冷却期内），
-		# 不急着恢复——避免内容增长导致 scroll_max 变化时误触发 is_at_bottom。
-		if _user_scrolled_up_ms > 0 and Time.get_ticks_msec() - _user_scrolled_up_ms < 500:
-			return
-		_auto_scroll = true
-		_user_scrolled_up_ms = 0
-	else:
-		# 用户主动向上滚动——无论是否正在流式输出，都尊重用户意图。
+		# Only an identified user navigation can change follow intent. Layout
+		# growth and virtual-scroller corrections also emit value_changed.
+		if _user_scroll_intent or _user_is_dragging_scrollbar:
+			_auto_scroll = true
+			_user_scrolled_up_ms = 0
+	elif _user_scroll_intent or _user_is_dragging_scrollbar:
 		_auto_scroll = false
 		_user_scrolled_up_ms = Time.get_ticks_msec()
 	var history_before := _history_request_before(value)
@@ -2843,10 +2900,41 @@ func _history_request_before(value: float) -> int:
 
 func _on_scrollbar_button_down() -> void:
 	_user_is_dragging_scrollbar = true
+	_user_scroll_intent = true
 
 
 func _on_scrollbar_button_up() -> void:
 	_user_is_dragging_scrollbar = false
+	_user_scroll_intent = false
+
+
+func _on_scroll_gui_input(event: InputEvent) -> void:
+	var navigation := false
+	if event is InputEventMouseButton:
+		navigation = (
+			event.button_index == MOUSE_BUTTON_WHEEL_UP
+			or event.button_index == MOUSE_BUTTON_WHEEL_DOWN
+		)
+	elif event is InputEventPanGesture:
+		navigation = true
+	elif event is InputEventKey and event.pressed:
+		navigation = event.keycode in [
+			KEY_UP,
+			KEY_DOWN,
+			KEY_PAGEUP,
+			KEY_PAGEDOWN,
+			KEY_HOME,
+			KEY_END,
+		]
+	if not navigation:
+		return
+	_user_scroll_intent = true
+	call_deferred("_clear_scroll_intent")
+
+
+func _clear_scroll_intent() -> void:
+	if not _user_is_dragging_scrollbar:
+		_user_scroll_intent = false
 
 
 func _scroll_to_bottom_deferred() -> void:

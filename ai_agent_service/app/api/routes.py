@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Query, Response, status
 
 from app.api.schemas import (
     ChatEventDTO,
@@ -43,6 +43,9 @@ from app.security.settings import SecuritySettings
 from app.skills.catalog import SkillCatalog
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_EVENT_PAGE_LIMIT = 50
+_MAX_EVENT_PAGE_LIMIT = 200
 
 COMMANDS: list[CommandInfo] = [
     CommandInfo(
@@ -205,10 +208,27 @@ def create_router(
         )
 
     @router.get("/chat/events", response_model=ChatEventsResponse)
-    async def chat_events(session_id: str, after: int = 0) -> ChatEventsResponse:
-        events = event_store.list_after(session_id, after)
+    async def chat_events(
+        session_id: str,
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(
+            default=_DEFAULT_EVENT_PAGE_LIMIT,
+            ge=1,
+            le=_MAX_EVENT_PAGE_LIMIT,
+        ),
+    ) -> ChatEventsResponse:
+        page = event_store.page_after(session_id, after, limit=limit)
         raw_progress = query_engine.turn_progress(session_id)
-        logger.debug("HTTP /chat/events session=%s after=%d count=%d", session_id, after, len(events))
+        logger.debug(
+            "HTTP /chat/events session=%s after=%d limit=%d count=%d "
+            "cursor=%d has_more=%s",
+            session_id,
+            after,
+            limit,
+            len(page.events),
+            page.cursor,
+            page.has_more,
+        )
         return ChatEventsResponse(
             events=[
                 ChatEventDTO(
@@ -216,14 +236,23 @@ def create_router(
                     session_id=event.session_id,
                     type=event.type,
                     payload=event.payload,
+                    delivery=event.payload.get("delivery"),
+                    provisional=bool(event.payload.get("provisional", False)),
+                    preview_id=event.payload.get("preview_id"),
+                    request_id=event.payload.get("request_id"),
+                    turn_id=event.payload.get("turn_id"),
+                    frame_id=event.payload.get("frame_id"),
+                    message_id=event.payload.get("message_id"),
                 )
-                for event in events
+                for event in page.events
             ],
             progress=(
                 ChatProgressDTO(**raw_progress)
                 if raw_progress is not None
                 else None
             ),
+            cursor=page.cursor,
+            has_more=page.has_more,
         )
 
     @router.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)
