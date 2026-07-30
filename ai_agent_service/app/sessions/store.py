@@ -14,7 +14,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, CompactSnapshot, Frame
@@ -111,6 +111,11 @@ class Session:
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
+    _turn_counter_reserver: Callable[[str, int], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def top_frame(self) -> Frame | None:
         """返回当前活跃帧（栈顶），栈为空时返回 None。
@@ -136,6 +141,8 @@ class Session:
             会话内唯一递增的 turn id 字符串。
         """
         self.turn_counter += 1
+        if self._turn_counter_reserver is not None:
+            self._turn_counter_reserver(self.session_id, self.turn_counter)
         return f"t{self.turn_counter}"
 
     def ensure_root_frame(self, agent: AgentDefinition) -> Frame:
@@ -648,13 +655,21 @@ class SessionStore:
     `pending_*` 与 `request_id_cache`；不包含鉴权 token 或 API key。
     """
 
-    def __init__(self, storage_dir: Path) -> None:
+    def __init__(
+        self,
+        storage_dir: Path,
+        *,
+        project_root: Path | None = None,
+    ) -> None:
         """初始化会话存储。
 
         Args:
             storage_dir: 会话 JSON 文件的存放目录，按需创建。
+            project_root: 工程根目录；提供后会用已占用 artifact turn 修正
+                重启时的单调计数器。
         """
         self._storage_dir = storage_dir
+        self._project_root = project_root
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -693,6 +708,7 @@ class SessionStore:
             return existing
         restored = self._load(session_id, available_tools)
         session = restored if restored is not None else Session(session_id=session_id)
+        session._turn_counter_reserver = self._reserve_turn_counter
         self._sessions[session_id] = session
         if restored is None:
             logger.info("Session created session=%s", session_id)
@@ -712,6 +728,16 @@ class SessionStore:
             session: 待保存的会话。
         """
         path = self._path_for(session.session_id)
+        persisted = self._read_persisted_payload(path)
+        session.turn_counter = max(
+            session.turn_counter,
+            _as_int(persisted.get("turn_counter")),
+        )
+        session.history_event_counter = max(
+            session.history_event_counter,
+            _as_int(persisted.get("history_event_counter")),
+        )
+        session._turn_counter_reserver = self._reserve_turn_counter
         atomic_write_json(path, session_to_dict(session))
         self._sessions[session.session_id] = session
         logger.debug(
@@ -736,7 +762,38 @@ class SessionStore:
             session_id: 会话 id。
             session: 回滚目标快照。
         """
+        current = self._sessions.get(session_id)
+        if current is not None:
+            session.turn_counter = max(
+                session.turn_counter,
+                current.turn_counter,
+            )
+        session._turn_counter_reserver = self._reserve_turn_counter
         self._sessions[session_id] = session
+
+    def _read_persisted_payload(self, path: Path) -> dict[str, Any]:
+        """Read the persisted object used to merge monotonic counters."""
+        if not path.exists():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _reserve_turn_counter(self, session_id: str, value: int) -> None:
+        """Durably reserve a turn number before exposing it to a caller."""
+        path = self._path_for(session_id)
+        payload = self._read_persisted_payload(path)
+        if value <= _as_int(payload.get("turn_counter")):
+            return
+        if not payload:
+            payload = {
+                "schema_version": SESSION_SCHEMA_VERSION,
+                "session_id": session_id,
+            }
+        payload["turn_counter"] = value
+        atomic_write_json(path, payload)
 
     def reset(self, session_id: str) -> None:
         """清空指定会话（内存与本地持久化文件）。
@@ -786,6 +843,16 @@ class SessionStore:
             source_version = session_payload_version(data)
             migrated_data, migrated = migrate_session_payload(data)
             session = session_from_dict(migrated_data, available_tools)
+            if self._project_root is not None:
+                from app.orchestrator.map_artifacts import MapArtifactStore
+
+                session.turn_counter = max(
+                    session.turn_counter,
+                    MapArtifactStore(
+                        self._project_root,
+                        session_id,
+                    ).max_reserved_turn_counter(),
+                )
         except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning("Session load failed session=%s path=%s error=%s", session_id, path, exc)
             return None

@@ -39,6 +39,21 @@ Worker contract construction and workflow stage transitions MUST execute inside 
 - **WHEN** a runnable step cannot produce a payload conforming to its worker contract
 - **THEN** the scheduler records the typed failure without creating a worker Frame or partially advancing workflow state
 
+### Requirement: Delegate groups have one authoritative pending-step source
+The scheduler graph MUST be the sole source of pending delegate-group work. The runtime MUST NOT maintain or execute a parallel legacy `remaining` task queue.
+
+#### Scenario: A delegate group starts
+- **WHEN** orchestration creates a dependency-aware delegate group
+- **THEN** the first and every subsequent runnable child are selected from scheduler graph state without storing a second pending-task list
+
+#### Scenario: A child completes
+- **WHEN** a delegate child reaches a terminal result
+- **THEN** the next child is derived only from dependency status and runnable steps in the updated scheduler graph
+
+#### Scenario: A legacy persisted group is loaded
+- **WHEN** compatibility loading encounters a delegate group containing the old `remaining` field
+- **THEN** it migrates the group to one scheduler graph or returns a typed blocked outcome before execution and never runs both representations
+
 ### Requirement: Repeated plan creation is bounded
 The runtime MUST identify plan attempts by a semantic key containing task, stage, target, revision, operation, and root error and MUST stop unchanged attempts after a configured bound.
 
@@ -48,4 +63,23 @@ The runtime MUST identify plan attempts by a semantic key containing task, stage
 
 #### Scenario: Authoritative input changes
 - **WHEN** a new revision, required input, or successful predecessor changes the semantic plan state
-- **THEN** the runtime permits a new plan attempt while retaining prior terminal outcomes for diagnosis
+- **THEN** the runtime permits a new exact plan attempt while retaining prior terminal outcomes for diagnosis and without implicitly resetting task-level convergence accounting
+
+### Requirement: Plan convergence is bounded across revisions
+The runtime MUST maintain a reducer-owned convergence count scoped to the stable task lineage, target, operation, and root-error family, independent of the exact attempt revision, and MUST stop plan cycles that repeatedly fail to reach an explicit convergence checkpoint or terminal outcome.
+
+#### Scenario: Partial success advances revision without convergence
+- **WHEN** repeated plan cycles each produce a successful predecessor or map write and advance revision from `N` to `N+1` and onward, but the same task lineage returns to `create_plan` without reaching an explicit convergence checkpoint or terminal outcome
+- **THEN** each cycle increments the same task-level convergence count and the runtime returns a typed circuit-breaker result at the configured bound
+
+#### Scenario: Multi-revision work makes authoritative task progress
+- **WHEN** a plan cycle advances revision and satisfies a declared convergence checkpoint or reaches the task's terminal outcome
+- **THEN** the runtime records that progress and does not classify the productive cycle as cross-revision thrash
+
+#### Scenario: The same task resumes
+- **WHEN** a paused or restarted task resumes the same stable lineage
+- **THEN** its convergence count and prior exact attempt outcomes are restored rather than reset by the current revision
+
+#### Scenario: A distinct task epoch begins
+- **WHEN** the runtime starts a distinct task lineage through `task_epoch_started`
+- **THEN** the new task receives a fresh convergence budget without removing the prior task's diagnostic history

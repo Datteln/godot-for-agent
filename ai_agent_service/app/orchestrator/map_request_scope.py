@@ -308,3 +308,8 @@ def mark_completion_candidate(
     ):
         return replace(scope, completion_candidate=True)
     return scope
+
+
+def invalidate_completion_candidate(scope: MapRequestScope) -> MapRequestScope:
+    """清除旧任务 lineage 留下的完成候选标记。"""
+    return replace(scope, completion_candidate=False)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Final
 
-SESSION_SCHEMA_VERSION: Final = 5
+SESSION_SCHEMA_VERSION: Final = 7
 
 _LEGACY_MAP_FIELDS: Final[dict[str, str]] = {
     "map_completion_blockers": "completion_blockers",
@@ -102,6 +102,42 @@ def migrate_session_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         checkpoint = map_state.get("checkpoint")
         if isinstance(checkpoint, dict) and pause_kind:
             checkpoint.setdefault("pause_kind", pause_kind)
+
+    if source_version < 6:
+        legacy_resume = map_state.pop("resumed_from_checkpoint", False)
+        task_id = str(map_state.get("task_id", ""))
+        raw_lineage = migrated.get("map_task_lineage")
+        lineage = raw_lineage if isinstance(raw_lineage, dict) else {}
+        lineage_id = str(lineage.get("lineage_id", "")) or task_id
+        if (
+            legacy_resume is True
+            and map_state.get("status") == "running"
+            and task_id
+            and lineage_id
+        ):
+            map_state["resume_authorization"] = {
+                "task_id": task_id,
+                "lineage_id": lineage_id,
+            }
+        else:
+            map_state.setdefault("resume_authorization", None)
+
+    if source_version < 7:
+        raw_groups = migrated.get("delegate_groups")
+        if isinstance(raw_groups, dict):
+            for raw_group in raw_groups.values():
+                if not isinstance(raw_group, dict):
+                    continue
+                legacy_remaining = raw_group.pop("remaining", None)
+                if (
+                    isinstance(legacy_remaining, list)
+                    and legacy_remaining
+                    and not isinstance(raw_group.get("scheduler_plan"), dict)
+                ):
+                    raw_group["migration_error"] = (
+                        "legacy delegate group has no scheduler graph; "
+                        "pending children were blocked during migration"
+                    )
 
     migrated["map_task_state"] = map_state
     migrated["schema_version"] = SESSION_SCHEMA_VERSION

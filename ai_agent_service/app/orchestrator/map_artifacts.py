@@ -9,15 +9,45 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 from app.storage.atomic import atomic_write_json
 
 MAP_ARTIFACT_SCHEMA: Final = "map_tool_artifacts_v1"
-MAP_ARTIFACT_VERSION: Final = 1
+MAP_ARTIFACT_VERSION: Final = 2
+MAP_COORDINATED_COMMIT_VERSION: Final = 1
 MAX_MAP_ARTIFACT_PAGE_ITEMS: Final = 200
 MAX_MAP_ARTIFACT_FILE_BYTES: Final = 100 * 1024 * 1024
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+MAP_COORDINATED_COMMIT_FAILPOINTS: Final[frozenset[str]] = frozenset(
+    {
+        "artifact_prepare_before_write",
+        "artifact_prepare_after_write",
+        "session_publish_before_write",
+        "session_publish_after_write",
+        "commit_marker_before_write",
+        "commit_marker_after_write",
+        "cleanup_before_write",
+        "cleanup_after_write",
+    }
+)
+
+
+class CoordinatedCommitFailureInjector(Protocol):
+    """定义仅由测试组合注入的协调提交故障边界。"""
+
+    def hit(self, name: str) -> None:
+        """在命名边界触发测试定义的确定性故障。"""
+
+
+class MapArtifactTurnConflictError(ValueError):
+    """A committed turn id was reused with a different canonical fingerprint."""
+
+    def __init__(self, turn_id: str) -> None:
+        """Initialize a stable typed integrity conflict."""
+        super().__init__(f"conflicting committed map artifact turn: {turn_id}")
+        self.turn_id = turn_id
+        self.error_code = "map_artifact_turn_identity_conflict"
 
 
 def _safe_session_name(value: str) -> str:
@@ -38,6 +68,37 @@ def _canonical_fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _session_references_turn(
+    value: Any,
+    turn_id: str,
+    entry_fingerprints: dict[str, str],
+) -> bool:
+    """Return whether a Session contains every exact locator for a prepared turn."""
+    found: set[str] = set()
+
+    def visit(item: Any) -> None:
+        """Walk JSON-native Session values and collect matching locators."""
+        if isinstance(item, dict):
+            if (
+                item.get("artifact_turn_id") == turn_id
+                and isinstance(item.get("artifact_entry_id"), str)
+            ):
+                entry_id = str(item["artifact_entry_id"])
+                if (
+                    entry_fingerprints.get(entry_id)
+                    == item.get("artifact_fingerprint")
+                ):
+                    found.add(entry_id)
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return bool(entry_fingerprints) and set(entry_fingerprints).issubset(found)
+
+
 @dataclass(frozen=True)
 class MapArtifactLocator:
     """定位聚合文件中的一个地图工具结果。"""
@@ -45,16 +106,20 @@ class MapArtifactLocator:
     artifact_ref: str
     turn_id: str
     entry_id: str
+    fingerprint: str = ""
     artifact_kind: str = "map_tool_result"
 
     def as_dict(self) -> dict[str, str]:
         """返回适合写入 LLM history 的结构化定位信息。"""
-        return {
+        payload = {
             "artifact_ref": self.artifact_ref,
             "artifact_turn_id": self.turn_id,
             "artifact_entry_id": self.entry_id,
             "artifact_kind": self.artifact_kind,
         }
+        if self.fingerprint:
+            payload["artifact_fingerprint"] = self.fingerprint
+        return payload
 
 
 @dataclass
@@ -121,6 +186,14 @@ class MapArtifactStore:
 
     project_root: Path
     session_id: str
+    failure_injector: CoordinatedCommitFailureInjector | None = None
+
+    def _hit_failpoint(self, name: str) -> None:
+        """仅在构造时显式注入测试依赖后触发命名故障。"""
+        if name not in MAP_COORDINATED_COMMIT_FAILPOINTS:
+            raise ValueError(f"unknown coordinated commit failpoint: {name}")
+        if self.failure_injector is not None:
+            self.failure_injector.hit(name)
 
     @property
     def session_root(self) -> Path:
@@ -142,9 +215,19 @@ class MapArtifactStore:
         """返回工程根目录相对引用。"""
         return self.path.relative_to(self.project_root).as_posix()
 
-    def locator(self, turn_id: str, entry_id: str) -> MapArtifactLocator:
+    def locator(
+        self,
+        turn_id: str,
+        entry_id: str,
+        fingerprint: str = "",
+    ) -> MapArtifactLocator:
         """创建指向聚合文件条目的定位器。"""
-        return MapArtifactLocator(self.relative_ref, turn_id, entry_id)
+        return MapArtifactLocator(
+            self.relative_ref,
+            turn_id,
+            entry_id,
+            fingerprint,
+        )
 
     def merge_turn(self, staged: StagedMapArtifactTurn) -> None:
         """在 Session 提交后原子合并暂存 turn，拒绝覆盖不同指纹。"""
@@ -157,8 +240,135 @@ class MapArtifactStore:
             "fingerprint": staged.fingerprint,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "entries": staged.entries,
+            "publication_state": "committed",
         }
         atomic_write_json(self.path, document)
+
+    def prepare_turn(self, staged: StagedMapArtifactTurn) -> bool:
+        """Durably prepare an artifact turn before Session locator publication."""
+        document = self._load_document()
+        existing = document["turns"].get(staged.turn_id)
+        if isinstance(existing, dict):
+            if existing.get("fingerprint") != staged.fingerprint:
+                raise MapArtifactTurnConflictError(staged.turn_id)
+            if existing.get("publication_state") == "prepared":
+                return True
+            return False
+        if not self.assert_mergeable(staged, document=document):
+            return False
+        old_digest = _canonical_fingerprint(document)
+        document["turns"][staged.turn_id] = {
+            "request_id": staged.request_id,
+            "fingerprint": staged.fingerprint,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "entries": staged.entries,
+            "publication_state": "prepared",
+        }
+        document.setdefault("coordinated_commits", {})[staged.turn_id] = {
+            "schema_version": MAP_COORDINATED_COMMIT_VERSION,
+            "session_id": staged.session_id,
+            "turn_id": staged.turn_id,
+            "entry_ids": sorted(staged.entries),
+            "entry_fingerprints": {
+                entry_id: str(entry.get("fingerprint", ""))
+                for entry_id, entry in staged.entries.items()
+            },
+            "fingerprint": staged.fingerprint,
+            "old_document_digest": old_digest,
+            "new_document_digest": _canonical_fingerprint(document["turns"]),
+            "temporary_paths": [],
+            "lifecycle_state": "prepared",
+        }
+        self._hit_failpoint("artifact_prepare_before_write")
+        atomic_write_json(self.path, document)
+        self._hit_failpoint("artifact_prepare_after_write")
+        return True
+
+    def commit_prepared_turn(self, staged: StagedMapArtifactTurn) -> None:
+        """Publish a prepared artifact after the Session locator is durable."""
+        document = self._load_document()
+        turn = document["turns"].get(staged.turn_id)
+        commit = document.get("coordinated_commits", {}).get(staged.turn_id)
+        if not isinstance(turn, dict) or not isinstance(commit, dict):
+            if not self.assert_mergeable(staged, document=document):
+                return
+            raise ValueError("prepared coordinated artifact commit was not found")
+        if (
+            turn.get("fingerprint") != staged.fingerprint
+            or commit.get("fingerprint") != staged.fingerprint
+        ):
+            raise MapArtifactTurnConflictError(staged.turn_id)
+        turn["publication_state"] = "committed"
+        commit["lifecycle_state"] = "committed"
+        self._hit_failpoint("commit_marker_before_write")
+        atomic_write_json(self.path, document)
+        self._hit_failpoint("commit_marker_after_write")
+        document["coordinated_commits"].pop(staged.turn_id, None)
+        self._hit_failpoint("cleanup_before_write")
+        atomic_write_json(self.path, document)
+        self._hit_failpoint("cleanup_after_write")
+
+    def discard_prepared_turn(self, staged: StagedMapArtifactTurn) -> None:
+        """Remove an unreferenced prepared turn after Session publication fails."""
+        document = self._load_document()
+        turn = document["turns"].get(staged.turn_id)
+        if not isinstance(turn, dict):
+            return
+        if (
+            turn.get("publication_state") == "prepared"
+            and turn.get("fingerprint") == staged.fingerprint
+        ):
+            document["turns"].pop(staged.turn_id, None)
+            document.setdefault("coordinated_commits", {}).pop(
+                staged.turn_id,
+                None,
+            )
+            atomic_write_json(self.path, document)
+
+    def reconcile_with_session(self, session_payload: dict[str, Any]) -> None:
+        """Resolve prepared turns from exact locators in a durable Session."""
+        document = self._load_document()
+        changed = False
+        for turn_id, commit_value in list(
+            document.get("coordinated_commits", {}).items()
+        ):
+            if not isinstance(commit_value, dict):
+                continue
+            turn = document["turns"].get(turn_id)
+            if not isinstance(turn, dict):
+                document["coordinated_commits"].pop(turn_id, None)
+                changed = True
+                continue
+            if turn.get("publication_state") == "committed":
+                document["coordinated_commits"].pop(turn_id, None)
+                changed = True
+                continue
+            entry_fingerprints_value = commit_value.get(
+                "entry_fingerprints",
+                {},
+            )
+            entry_fingerprints = (
+                {
+                    str(entry_id): str(entry_fingerprint)
+                    for entry_id, entry_fingerprint in entry_fingerprints_value.items()
+                }
+                if isinstance(entry_fingerprints_value, dict)
+                else {}
+            )
+            referenced = _session_references_turn(
+                session_payload,
+                str(turn_id),
+                entry_fingerprints,
+            )
+            if referenced:
+                turn["publication_state"] = "committed"
+                commit_value["lifecycle_state"] = "committed"
+            else:
+                document["turns"].pop(turn_id, None)
+            document["coordinated_commits"].pop(turn_id, None)
+            changed = True
+        if changed:
+            atomic_write_json(self.path, document)
 
     def assert_mergeable(
         self,
@@ -174,10 +384,18 @@ class MapArtifactStore:
         if not isinstance(existing, dict):
             return True
         if existing.get("fingerprint") != staged.fingerprint:
-            raise ValueError(
-                f"conflicting committed map artifact turn: {staged.turn_id}"
-            )
+            raise MapArtifactTurnConflictError(staged.turn_id)
         return False
+
+    def max_reserved_turn_counter(self) -> int:
+        """返回 artifact 文档中已占用的最大 ``tN`` turn 序号。"""
+        document = self._load_document()
+        maximum = 0
+        for turn_id in document["turns"]:
+            match = re.fullmatch(r"t([1-9][0-9]*)", str(turn_id))
+            if match is not None:
+                maximum = max(maximum, int(match.group(1)))
+        return maximum
 
     def read_page(
         self,
@@ -186,6 +404,7 @@ class MapArtifactStore:
         turn_id: str = "",
         entry_id: str = "",
         field: str = "",
+        fingerprint: str = "",
         offset: int = 0,
         limit: int = 50,
         staged: StagedMapArtifactTurn | None = None,
@@ -202,6 +421,10 @@ class MapArtifactStore:
                 entry_id=entry_id,
                 staged=staged,
             )
+            if not fingerprint:
+                raise ValueError("aggregated map artifact requires artifact_fingerprint")
+            if entry.get("fingerprint") != fingerprint:
+                raise ValueError("map artifact locator fingerprint mismatch")
         else:
             entry, source = self._read_legacy_entry(path), "legacy"
         result = entry.get("result")
@@ -251,6 +474,7 @@ class MapArtifactStore:
                 "version": MAP_ARTIFACT_VERSION,
                 "session_id": self.session_id,
                 "turns": {},
+                "coordinated_commits": {},
             }
         if self.path.stat().st_size > MAX_MAP_ARTIFACT_FILE_BYTES:
             raise ValueError("map artifact file exceeds size limit")
@@ -263,6 +487,8 @@ class MapArtifactStore:
             raise ValueError("map artifact belongs to another session")
         if not isinstance(payload.get("turns"), dict):
             raise ValueError("map artifact turns must be an object")
+        if not isinstance(payload.get("coordinated_commits"), dict):
+            payload["coordinated_commits"] = {}
         return payload
 
     def _resolve_aggregated_entry(
@@ -285,6 +511,8 @@ class MapArtifactStore:
         turn = document["turns"].get(turn_id)
         if not isinstance(turn, dict):
             raise ValueError(f"map artifact turn was not found: {turn_id}")
+        if turn.get("publication_state", "committed") != "committed":
+            raise ValueError(f"map artifact turn is not committed: {turn_id}")
         entries = turn.get("entries")
         if not isinstance(entries, dict) or not isinstance(entries.get(entry_id), dict):
             raise ValueError(f"map artifact entry was not found: {entry_id}")

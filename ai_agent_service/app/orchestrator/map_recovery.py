@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from typing import Any
 
@@ -15,6 +16,20 @@ from app.orchestrator.runtime_contracts import RetryCategory, RetryIdentity
 
 STRUCTURED_REPAIR_MAX_ATTEMPTS = 3
 SEMANTIC_RETRY_MAX_ATTEMPTS = 3
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    """Read a positive integer setting without making imports fragile."""
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+TASK_CONVERGENCE_MAX_ATTEMPTS = _positive_env_int(
+    "MAP_TASK_CONVERGENCE_MAX_ATTEMPTS",
+    3,
+)
 
 _VOLATILE_OPERATION_KEYS = frozenset(
     {
@@ -136,6 +151,88 @@ def record_semantic_retry(
     return entry
 
 
+def record_plan_attempt(
+    state: Any,
+    *,
+    stage: str,
+    target: str,
+    revision: int,
+    operation: Any,
+    root_error_code: str,
+    threshold: int = TASK_CONVERGENCE_MAX_ATTEMPTS,
+) -> dict[str, Any]:
+    """Record exact idempotence and revision-independent task convergence."""
+    task_identity = str(
+        getattr(state, "task_lineage_id", "")
+        or getattr(state, "task_id", "")
+        or "__unbound_task__"
+    )
+    operation_signature = normalized_operation_signature(operation)
+    exact_payload = {
+        "task": task_identity,
+        "stage": stage,
+        "target": target,
+        "revision": revision,
+        "operation": operation_signature,
+        "root_error_code": root_error_code,
+    }
+    exact_key = _identity_digest(exact_payload)
+    root_error_family = root_error_code.split(":", 1)[0] or "planning"
+    convergence_payload = {
+        "task": task_identity,
+        "target": target,
+        "operation": "create_plan",
+        "root_error_family": root_error_family,
+    }
+    convergence_key = _identity_digest(convergence_payload)
+    previous_exact = state.plan_attempt_registry.get(exact_key, {})
+    previous_convergence = state.task_convergence_registry.get(
+        convergence_key,
+        {},
+    )
+    exact_count = int(previous_exact.get("count", 0)) + 1
+    convergence_count = int(previous_convergence.get("count", 0)) + 1
+    exact_attempt = {
+        **exact_payload,
+        "key": exact_key,
+        "count": exact_count,
+        "threshold": threshold,
+        "exhausted": exact_count >= threshold,
+    }
+    convergence = {
+        **convergence_payload,
+        "key": convergence_key,
+        "count": convergence_count,
+        "threshold": threshold,
+        "exhausted": convergence_count >= threshold,
+        "latest_revision": revision,
+        "latest_exact_key": exact_key,
+        "first_revision": previous_convergence.get("first_revision", revision),
+    }
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "plan_attempt_recorded",
+            target or "__workflow__",
+            revision,
+            {
+                "exact_key": exact_key,
+                "convergence_key": convergence_key,
+                "exact_attempt": exact_attempt,
+                "convergence": convergence,
+            },
+        ),
+    )
+    return {
+        "exact": exact_attempt,
+        "convergence": convergence,
+        "exhausted": bool(
+            exact_attempt["exhausted"] or convergence["exhausted"]
+        ),
+    }
+
+
 def retry_pause_report(
     state: Any,
     *,
@@ -195,6 +292,17 @@ def _normalize_operation(value: Any) -> Any:
     if isinstance(value, str):
         return re.sub(r"\s+", " ", value).strip()
     return value
+
+
+def _identity_digest(value: dict[str, Any]) -> str:
+    """Return a stable readable-prefix identity digest."""
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _missing_input_names(values: list[Any]) -> list[str]:

@@ -176,7 +176,7 @@ class AutoCompactSettingsTests(unittest.TestCase):
     def test_defaults(self) -> None:
         settings = AppSettings(llm_base_url="http://localhost")
         self.assertTrue(settings.auto_compact_enabled)
-        self.assertEqual(settings.auto_compact_token_threshold, 200_000)
+        self.assertEqual(settings.auto_compact_token_threshold, 160_000)
         self.assertEqual(settings.auto_compact_keep_recent, 12)
 
 

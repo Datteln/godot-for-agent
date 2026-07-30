@@ -103,7 +103,10 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         timeout_s=resolved_settings.llm_request_timeout_s,
         fallback_model=resolved_settings.llm_fallback_model,
     )
-    store = SessionStore(resolved_settings.resolved_session_store_dir())
+    store = SessionStore(
+        resolved_settings.resolved_session_store_dir(),
+        project_root=resolved_settings.project_root,
+    )
     event_store = EventStore()
     recovery_store = RecoveryPointerStore(
         resolved_settings.resolved_recovery_pointer_path(),

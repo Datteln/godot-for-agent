@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Approved batches are consumed only by committed writes
-The system MUST retain a platform-validation approval until the matching map write is durably committed, and MUST advance workflow revision state only from that committed result.
+The system MUST retain a platform-validation approval until the matching map write is durably committed, MUST compare its expected revision with the authoritative Godot revision after recovery and immediately before mutation, and MUST advance workflow revision state only from a matching committed result.
 
 #### Scenario: Platform batch passes validation
 - **WHEN** a candidate batch passes platform validation for a canonical target and revision
@@ -21,4 +21,12 @@ The system MUST retain a platform-validation approval until the matching map wri
 
 #### Scenario: Target revision changes before commit
 - **WHEN** authoritative observation shows that the target no longer has the approval's expected revision
-- **THEN** the approval becomes stale and the system requires fresh platform facts and validation before writing
+- **THEN** the runtime returns a typed conflict containing the authoritative revision before creating a transaction journal, opening an Undo batch, mutating map content, or consuming the approval, and requires fresh platform facts and validation
+
+#### Scenario: Revision conflict reconciles service state
+- **WHEN** Godot rejects a write because its authoritative revision differs from the service's persisted `latest_revisions`
+- **THEN** the service reducer records the trusted actual revision, invalidates approvals for the stale revision, and does not retry a mutation until the affected target has been reread and revalidated
+
+#### Scenario: Service exits after Godot commit
+- **WHEN** Godot durably commits revision `N+1` but the service exits before reducing the committed result and later retries from persisted revision `N`
+- **THEN** the post-recovery authoritative revision check rejects the stale retry before mutation and the service reconciles to `N+1` without applying or consuming a second batch

@@ -17,6 +17,10 @@ from app.orchestrator.runtime_contracts import MapWorkflowEvent
 REDUCER_OWNED_FIELDS = frozenset(
     {
         "stage",
+        "counters",
+        "structure_revision",
+        "plan_version",
+        "auto_iterations",
         "failure_frontier",
         "unresolved_issues",
         "completed_goals",
@@ -33,16 +37,26 @@ REDUCER_OWNED_FIELDS = frozenset(
         "tool_failure_fingerprints",
         "approved_platform_plans",
         "latest_revisions",
+        "latest_layers",
         "region_reads",
         "region_summaries",
+        "context_state",
         "completion_blockers",
         "checkpoint",
+        "resume_authorization",
         "pause_report",
         "evidence_registry",
         "retry_registry",
+        "plan_attempt_registry",
+        "task_convergence_registry",
         "transaction_journals",
         "workflow_scopes",
         "workflow_events",
+    }
+)
+DIRECT_WRITE_HYDRATION_ALLOWLIST = frozenset(
+    {
+        ("map_progress.py", "MapTaskState.from_dict"),
     }
 )
 
@@ -125,7 +139,26 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
     scope["revision"] = event.revision
     payload = deepcopy(event.payload)
 
-    if event.event_type == "stage_transition":
+    if event.event_type == "task_epoch_started":
+        task_id = str(payload.get("task_id", "")).strip()
+        lineage_id = str(payload.get("lineage_id", "")).strip()
+        if not task_id:
+            raise ValueError("task_epoch_started requires task_id")
+        for field_name, default_value in reduced.task_epoch_reset_values().items():
+            setattr(reduced, field_name, deepcopy(default_value))
+        reduced.task_id = task_id
+        reduced.task_lineage_id = lineage_id
+        reduced.status = "running"
+        reduced.stage = "read"
+        scopes = reduced.workflow_scopes
+        scope = {
+            "target": event.target,
+            "revision": event.revision,
+            "stage": "read",
+            "task_id": task_id,
+            "lineage_id": lineage_id,
+        }
+    elif event.event_type == "stage_transition":
         next_stage = str(payload.get("stage", ""))
         allowed = MAP_RUNTIME_STAGE_TRANSITIONS.get(reduced.stage, frozenset())
         if next_stage not in allowed:
@@ -140,12 +173,43 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
             raise ValueError("blockers_replaced requires blockers array")
         reduced.completion_blockers = deepcopy(blockers)
         scope["blockers"] = deepcopy(blockers)
+    elif event.event_type == "blocker_upserted":
+        blocker_key = str(payload.get("blocker_key", "")).strip()
+        blocker = payload.get("blocker")
+        if not blocker_key or not isinstance(blocker, dict):
+            raise ValueError("blocker_upserted requires blocker_key and blocker")
+        reduced.completion_blockers = [
+            item
+            for item in reduced.completion_blockers
+            if item.get("blocker_key") != blocker_key
+        ]
+        reduced.completion_blockers.append(deepcopy(blocker))
+        scope["blockers"] = deepcopy(reduced.completion_blockers)
+    elif event.event_type == "blockers_removed":
+        blocker_keys = payload.get("blocker_keys")
+        if not isinstance(blocker_keys, list):
+            raise ValueError("blockers_removed requires blocker_keys array")
+        key_set = {str(item) for item in blocker_keys}
+        reduced.completion_blockers = [
+            item
+            for item in reduced.completion_blockers
+            if str(item.get("blocker_key", "")) not in key_set
+        ]
+        scope["blockers"] = deepcopy(reduced.completion_blockers)
     elif event.event_type == "checkpoint_replaced":
         checkpoint = payload.get("checkpoint")
         if checkpoint is not None and not isinstance(checkpoint, dict):
             raise ValueError("checkpoint_replaced requires object or null")
         reduced.checkpoint = deepcopy(checkpoint)
         scope["checkpoint"] = deepcopy(checkpoint)
+    elif event.event_type == "resume_authorization_replaced":
+        authorization = payload.get("authorization")
+        if authorization is not None and not isinstance(authorization, dict):
+            raise ValueError(
+                "resume_authorization_replaced requires object or null"
+            )
+        reduced.resume_authorization = deepcopy(authorization)
+        scope["resume_authorization"] = deepcopy(authorization)
     elif event.event_type == "pending_batches_replaced":
         batches = payload.get("batches", [])
         if not isinstance(batches, list):
@@ -178,12 +242,46 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
             raise ValueError("retry_recorded requires retry_key and retry")
         reduced.retry_registry[retry_key] = deepcopy(retry)
         scope.setdefault("retry_keys", []).append(retry_key)
+    elif event.event_type == "plan_attempt_recorded":
+        exact_key = str(payload.get("exact_key", "")).strip()
+        convergence_key = str(payload.get("convergence_key", "")).strip()
+        exact_attempt = payload.get("exact_attempt")
+        convergence = payload.get("convergence")
+        if (
+            not exact_key
+            or not convergence_key
+            or not isinstance(exact_attempt, dict)
+            or not isinstance(convergence, dict)
+        ):
+            raise ValueError(
+                "plan_attempt_recorded requires exact and convergence records"
+            )
+        reduced.plan_attempt_registry[exact_key] = deepcopy(exact_attempt)
+        reduced.task_convergence_registry[convergence_key] = deepcopy(
+            convergence
+        )
+        scope.setdefault("plan_attempt_keys", []).append(exact_key)
+        scope["task_convergence_key"] = convergence_key
     elif event.event_type == "progress_recorded":
         category = str(payload.get("category", "unknown"))
         count = int(payload.get("count", 0))
         progress = scope.setdefault("progress", {})
         progress[category] = count
         reduced.no_progress_streaks[scope_key] = count
+    elif event.event_type == "counter_incremented":
+        counter_name = str(payload.get("counter", "")).strip()
+        amount = payload.get("amount", 1)
+        if (
+            counter_name not in vars(reduced.counters)
+            or isinstance(amount, bool)
+            or not isinstance(amount, int)
+        ):
+            raise ValueError("counter_incremented requires a known counter and integer amount")
+        setattr(
+            reduced.counters,
+            counter_name,
+            int(getattr(reduced.counters, counter_name)) + amount,
+        )
     elif event.event_type == "revision_recorded":
         reduced.latest_revisions[scope_key] = event.revision
         reduced.latest_revisions[event.target] = event.revision
@@ -196,11 +294,6 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
         ]
         for stale_key in stale_keys:
             reduced.workflow_scopes.pop(stale_key, None)
-    elif event.event_type == "scope_patch":
-        patch = payload.get("patch")
-        if not isinstance(patch, dict):
-            raise ValueError("scope_patch requires patch object")
-        scope.update(deepcopy(patch))
     elif event.event_type == "owned_field_replaced":
         field_name = str(payload.get("field", ""))
         if field_name not in REDUCER_OWNED_FIELDS or field_name in {
@@ -298,6 +391,63 @@ def replace_map_state_field(
     )
 
 
+def consume_map_resume_authorization(
+    state: Any,
+    *,
+    task_id: str,
+    lineage_id: str,
+) -> bool:
+    """原子消费并校验一次性地图恢复授权。"""
+    authorization = getattr(state, "resume_authorization", None)
+    if not isinstance(authorization, dict):
+        return False
+    valid = (
+        state.status == "running"
+        and bool(task_id)
+        and bool(lineage_id)
+        and str(authorization.get("task_id", "")) == task_id
+        and str(authorization.get("lineage_id", "")) == lineage_id
+    )
+    target, revision = workflow_scope_identity(state)
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "resume_authorization_replaced",
+            target,
+            revision,
+            {"authorization": None},
+        ),
+    )
+    return valid
+
+
+def increment_map_counter(
+    state: Any,
+    counter_name: str,
+    amount: int = 1,
+    *,
+    target: str | None = None,
+    revision: int | None = None,
+) -> None:
+    """通过 reducer 事件递增一个已声明的地图任务计数器。"""
+    scope_target, scope_revision = workflow_scope_identity(
+        state,
+        target,
+        revision,
+    )
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "counter_incremented",
+            scope_target,
+            scope_revision,
+            {"counter": counter_name, "amount": amount},
+        ),
+    )
+
+
 def record_map_revision(state: Any, target: str, revision: int) -> None:
     """通过事件记录 revision 并失效同目标旧 revision 作用域。"""
     dispatch_map_workflow_event(
@@ -330,38 +480,84 @@ def record_map_validation(
     )
 
 
-def migrate_legacy_workflow_scopes(state: Any) -> None:
-    """把旧的未统一字段投影到 target/revision scope，并丢弃陈旧 gate。"""
-    if state.workflow_scopes:
+def completion_blocker_key(state: Any, blocker: dict[str, Any]) -> str:
+    """Return the stable task/target/revision/source/issue blocker identity."""
+    issue_payload = blocker.get(
+        "structured_issue",
+        blocker.get("structured_issues", blocker.get("issues", [])),
+    )
+    issue_encoded = json.dumps(
+        issue_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    issue_identity = str(blocker.get("issue_id", "")).strip() or hashlib.sha256(
+        issue_encoded.encode("utf-8")
+    ).hexdigest()[:24]
+    parts = {
+        "task": str(getattr(state, "task_id", "")),
+        "target": str(blocker.get("target", "")),
+        "revision": blocker.get("required_revision"),
+        "source": str(
+            blocker.get("source", blocker.get("tool", blocker.get("reason", "")))
+        ),
+        "issue": issue_identity,
+    }
+    encoded = json.dumps(
+        parts,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def upsert_completion_blocker(state: Any, blocker: dict[str, Any]) -> str:
+    """Upsert one blocker through the reducer and return its stable key."""
+    blocker_key = completion_blocker_key(state, blocker)
+    normalized = {
+        **deepcopy(blocker),
+        "task_id": str(getattr(state, "task_id", "")),
+        "blocker_key": blocker_key,
+    }
+    target = str(normalized.get("target", "")).strip() or "__workflow__"
+    revision_value = normalized.get("required_revision")
+    revision = (
+        revision_value
+        if isinstance(revision_value, int) and not isinstance(revision_value, bool)
+        else getattr(state, "structure_revision", 0)
+    )
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "blocker_upserted",
+            target,
+            revision,
+            {"blocker_key": blocker_key, "blocker": normalized},
+        ),
+    )
+    return blocker_key
+
+
+def remove_completion_blockers(state: Any, blocker_keys: list[str]) -> None:
+    """Remove exact blocker identities through one reducer event."""
+    if not blocker_keys:
         return
-    targets = set(state.latest_revisions) | set(state.latest_validations)
-    for target in sorted(targets):
-        if "::" in target:
-            continue
-        revision = state.latest_revisions.get(target)
-        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-            continue
-        scope_key = map_workflow_scope_key(target, revision)
-        scope: dict[str, Any] = {
-            "target": target,
-            "revision": revision,
-            "stage": state.stage,
-        }
-        validation = state.latest_validations.get(target)
-        if isinstance(validation, dict):
-            validation_revision = validation.get("map_revision")
-            if validation_revision in {None, revision}:
-                scope["validation"] = deepcopy(validation)
-        blockers = [
-            deepcopy(item)
-            for item in state.completion_blockers
-            if isinstance(item, dict)
-            and str(item.get("target", target)) == target
-            and item.get("required_revision") in {None, revision}
-        ]
-        if blockers:
-            scope["blockers"] = blockers
-        state.workflow_scopes[scope_key] = scope
+    target, revision = workflow_scope_identity(state)
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "blockers_removed",
+            target,
+            revision,
+            {"blocker_keys": list(dict.fromkeys(blocker_keys))},
+        ),
+    )
 
 
 def find_direct_map_state_writes(paths: list[Path]) -> list[str]:
@@ -385,6 +581,8 @@ def find_direct_map_state_writes(paths: list[Path]) -> list[str]:
                     and target.attr in REDUCER_OWNED_FIELDS
                     and _looks_like_map_state_expression(target.value)
                 ):
+                    if _direct_write_is_allowlisted(path, node, tree):
+                        continue
                     findings.append(
                         f"{path}:{getattr(node, 'lineno', 0)}:{target.attr}"
                     )
@@ -397,11 +595,59 @@ def find_direct_map_state_writes(paths: list[Path]) -> list[str]:
                 and node.func.value.attr in REDUCER_OWNED_FIELDS
                 and _looks_like_map_state_expression(node.func.value.value)
             ):
+                if _direct_write_is_allowlisted(path, node, tree):
+                    continue
                 findings.append(
                     f"{path}:{getattr(node, 'lineno', 0)}:"
                     f"{node.func.value.attr}.{node.func.attr}"
                 )
     return findings
+
+
+def _direct_write_is_allowlisted(
+    path: Path,
+    node: ast.AST,
+    tree: ast.Module,
+) -> bool:
+    """Allow only the exact pre-construction hydration method."""
+    line = int(getattr(node, "lineno", 0))
+    for class_node in (
+        item for item in tree.body if isinstance(item, ast.ClassDef)
+    ):
+        for function_node in (
+            item
+            for item in class_node.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            identity = (
+                path.name,
+                f"{class_node.name}.{function_node.name}",
+            )
+            end_line = int(
+                getattr(function_node, "end_lineno", function_node.lineno)
+            )
+            if (
+                identity in DIRECT_WRITE_HYDRATION_ALLOWLIST
+                and function_node.lineno <= line <= end_line
+            ):
+                return True
+    return False
+
+
+def check_repository_map_state_writes() -> int:
+    """Run the repository direct-state-write guard as a console check."""
+    app_root = Path(__file__).resolve().parents[1]
+    paths = [
+        *app_root.joinpath("orchestrator").rglob("*.py"),
+        *app_root.joinpath("query").rglob("*.py"),
+    ]
+    findings = find_direct_map_state_writes(paths)
+    if findings:
+        raise RuntimeError(
+            "direct reducer-owned MapTaskState writes found:\n"
+            + "\n".join(findings)
+        )
+    return 0
 
 
 def _looks_like_map_state_expression(value: ast.expr) -> bool:

@@ -3,10 +3,20 @@ extends Node
 
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 const MapTransactionPolicy = preload("res://addons/ai_agent/undo/map_transaction_policy.gd")
+const MapTransactionIO = preload("res://addons/ai_agent/undo/map_transaction_io.gd")
 
 const MAP_TRANSACTION_JOURNAL_DIR := "res://.ai_agent_service/map_agent/transactions"
+const MAP_TRANSACTION_JOURNAL_SCHEMA_VERSION := 2
+const MAP_TRANSACTION_JOURNAL_STATES := [
+	"prepared",
+	"applying",
+	"committing",
+	"committed",
+	"rolled_back",
+]
 
-var undo_redo: EditorUndoRedoManager
+# 生产注入 EditorUndoRedoManager；headless E2E 注入兼容的 UndoRedo。
+var undo_redo: Object
 var editor_interface: EditorInterface
 
 var _batch_desc := ""
@@ -21,14 +31,29 @@ var _map_transaction_snapshot_bytes := 0
 var _map_transaction_journal_sequence := 0
 var _map_transaction_latest_revision := 0
 var _map_transaction_scene_snapshot := {}
+var _map_transaction_approval_records: Array[Dictionary] = []
 var _map_transaction_error := {}
 var _map_recovery_blocked := false
 var _map_recovery_details := {}
+var _map_recovery_in_progress := false
+var _transaction_io = MapTransactionIO.new()
+var _map_transaction_journal_dir := MAP_TRANSACTION_JOURNAL_DIR
 
 
 func configure(interface: EditorInterface) -> void:
 	editor_interface = interface
-	call_deferred("_recover_incomplete_map_transaction")
+	_recover_incomplete_map_transaction()
+
+
+func configure_test_transaction_io(adapter: RefCounted, journal_dir: String) -> Error:
+	## 仅供 headless 测试注入 adapter 与 user:// 隔离目录。
+	if adapter == null or not adapter.has_method("hit"):
+		return ERR_INVALID_PARAMETER
+	if not journal_dir.begins_with("user://"):
+		return ERR_INVALID_PARAMETER
+	_transaction_io = adapter
+	_map_transaction_journal_dir = journal_dir.trim_suffix("/")
+	return OK
 
 
 func begin_batch(description: String) -> void:
@@ -52,13 +77,21 @@ func active_map_transaction_id() -> String:
 
 func map_recovery_status() -> Dictionary:
 	return {
-		"ok": not _map_recovery_blocked,
+		"ok": not _map_recovery_blocked and not _map_recovery_in_progress,
 		"blocked": _map_recovery_blocked,
+		"in_progress": _map_recovery_in_progress,
 		"details": _map_recovery_details.duplicate(true),
 	}
 
 
 func ensure_map_recovery_ready() -> Dictionary:
+	if _map_recovery_in_progress:
+		return {
+			"ok": false,
+			"error_code": "map_transaction_recovery_in_progress",
+			"message": "Map transaction recovery is still in progress.",
+			"recovery": _map_recovery_details.duplicate(true),
+		}
 	if _map_recovery_blocked:
 		_recover_incomplete_map_transaction()
 	if _map_recovery_blocked:
@@ -78,7 +111,10 @@ func prepare_map_write_group(
 	transaction_id: String,
 	description: String,
 	target: String,
-	base_revision: int
+	base_revision: int,
+	approval_id: String = "",
+	approval_fingerprint: String = "",
+	approval_expected_revision: int = -1
 ) -> Dictionary:
 	var recovery := ensure_map_recovery_ready()
 	if not bool(recovery.get("ok", false)):
@@ -121,6 +157,7 @@ func prepare_map_write_group(
 		_map_transaction_journal_sequence = 0
 		_map_transaction_latest_revision = base_revision
 		_map_transaction_scene_snapshot = _capture_scene_before_snapshot(normalized_id)
+		_map_transaction_approval_records.clear()
 		_map_transaction_error = {}
 		var journal_error := _persist_map_transaction_journal("prepared")
 		if journal_error != OK:
@@ -129,7 +166,7 @@ func prepare_map_write_group(
 				"transaction_id": normalized_id,
 				"error_code": "map_transaction_journal_write_failed",
 				"error": journal_error,
-				"journal_dir": MAP_TRANSACTION_JOURNAL_DIR,
+				"journal_dir": _map_transaction_journal_dir,
 			}
 			_clear()
 			return {
@@ -139,6 +176,14 @@ func prepare_map_write_group(
 				"error": journal_error,
 				"recovery": _map_recovery_details.duplicate(true),
 			}
+	var approval_error := _remember_transaction_approval(
+		approval_id,
+		approval_fingerprint,
+		approval_expected_revision
+	)
+	if not approval_error.is_empty():
+		_map_transaction_error = approval_error
+		return approval_error
 	_map_transaction_tool_count += 1
 	var limit_error := MapTransactionPolicy.validate_group_limits(
 		_map_transaction_started_at_ms,
@@ -150,6 +195,42 @@ func prepare_map_write_group(
 		abort_batch()
 		return limit_error
 	return {"ok": true, "map_transaction_id": _map_transaction_id}
+
+
+func _remember_transaction_approval(
+	approval_id: String,
+	approval_fingerprint: String,
+	expected_revision: int
+) -> Dictionary:
+	var normalized_id := approval_id.strip_edges()
+	var normalized_fingerprint := approval_fingerprint.strip_edges()
+	if normalized_id == "" and normalized_fingerprint == "":
+		return {}
+	if normalized_id == "" or normalized_fingerprint == "" or expected_revision < 0:
+		return {
+			"ok": false,
+			"error_code": "platform_approval_identity_invalid",
+			"message": "Approved writes require id, fingerprint, and expected revision.",
+		}
+	for record in _map_transaction_approval_records:
+		if str(record.get("approval_id", "")) != normalized_id:
+			continue
+		if (
+			str(record.get("batch_fingerprint", "")) != normalized_fingerprint
+			or int(record.get("expected_revision", -1)) != expected_revision
+		):
+			return {
+				"ok": false,
+				"error_code": "platform_approval_identity_conflict",
+				"message": "The same approval id was reused with different immutable content.",
+			}
+		return {}
+	_map_transaction_approval_records.append({
+		"approval_id": normalized_id,
+		"batch_fingerprint": normalized_fingerprint,
+		"expected_revision": expected_revision,
+	})
+	return {}
 
 
 func update_map_transaction_revision(transaction_id: String, revision: int) -> void:
@@ -410,6 +491,7 @@ func commit_map_write_group(
 		abort_batch()
 		return revision_mismatch
 	var committed_id := _map_transaction_id
+	var committed_approvals := _map_transaction_approval_records.duplicate(true)
 	var journal_error := _persist_map_transaction_journal("committing")
 	if journal_error != OK:
 		var persistence_error := {
@@ -421,13 +503,90 @@ func commit_map_write_group(
 		_map_transaction_error = persistence_error
 		abort_batch()
 		return persistence_error
-	_commit_active_batch()
-	_delete_map_transaction_journals(committed_id)
+	var commit_before_error: Error = _transaction_io.hit("commit_before_apply")
+	if commit_before_error != OK:
+		_map_recovery_blocked = true
+		_map_recovery_details = {
+			"transaction_id": committed_id,
+			"error_code": "map_transaction_commit_boundary_interrupted",
+			"error": commit_before_error,
+			"durable_status": "committing",
+			"boundary": "commit_before_apply",
+			"journal_dir": _map_transaction_journal_dir,
+		}
+		_clear()
+		return {
+			"ok": false,
+			"error_code": "map_transaction_commit_boundary_interrupted",
+			"map_transaction_id": committed_id,
+			"map_transaction_status": "committing",
+			"boundary": "commit_before_apply",
+			"recovery": _map_recovery_details.duplicate(true),
+		}
+	_commit_active_batch(false)
+	var commit_after_error: Error = _transaction_io.hit("commit_after_apply")
+	if commit_after_error != OK:
+		_map_recovery_blocked = true
+		_map_recovery_details = {
+			"transaction_id": committed_id,
+			"error_code": "map_transaction_commit_boundary_interrupted",
+			"error": commit_after_error,
+			"durable_status": "committing",
+			"boundary": "commit_after_apply",
+			"journal_dir": _map_transaction_journal_dir,
+		}
+		_clear()
+		return {
+			"ok": false,
+			"error_code": "map_transaction_commit_boundary_interrupted",
+			"map_transaction_id": committed_id,
+			"map_transaction_status": "committing",
+			"boundary": "commit_after_apply",
+			"recovery": _map_recovery_details.duplicate(true),
+		}
+	var committed_error := _persist_map_transaction_journal("committed")
+	if committed_error != OK:
+		_map_recovery_blocked = true
+		_map_recovery_details = {
+			"transaction_id": committed_id,
+			"error_code": "map_transaction_committed_marker_write_failed",
+			"error": committed_error,
+			"journal_dir": _map_transaction_journal_dir,
+			"recovery_action": (
+				"The Undo action committed, but its terminal journal marker was not durable. "
+				+ "Inspect the map and journal before manually resolving this transaction."
+			),
+		}
+		_clear()
+		return {
+			"ok": false,
+			"error_code": "map_transaction_committed_marker_write_failed",
+			"message": "The map commit is durable but its terminal journal marker could not be persisted.",
+			"error": committed_error,
+			"map_transaction_id": committed_id,
+			"map_transaction_status": "committing",
+			"map_revision": revision,
+			"recovery": _map_recovery_details.duplicate(true),
+		}
+	var cleanup_error := _delete_map_transaction_journals(committed_id)
+	_clear()
+	if cleanup_error != OK:
+		_map_recovery_blocked = true
+		_map_recovery_details = {
+			"transaction_id": committed_id,
+			"error_code": "map_transaction_cleanup_failed",
+			"error": cleanup_error,
+			"durable_status": "committed",
+			"journal_dir": _map_transaction_journal_dir,
+		}
 	return {
 		"ok": true,
 		"map_transaction_id": committed_id,
 		"map_transaction_status": "committed",
 		"map_revision": revision,
+		"committed_revision": revision,
+		"approval_records": committed_approvals,
+		"cleanup_pending": cleanup_error != OK,
 	}
 
 
@@ -447,7 +606,17 @@ func abort_map_write_group(transaction_id: String, reason: String) -> Dictionary
 			"active_map_transaction_id": _map_transaction_id,
 		}
 	var aborted_id := _map_transaction_id
-	abort_batch()
+	var rollback_error := abort_batch()
+	if rollback_error != OK:
+		return {
+			"ok": false,
+			"error_code": "map_transaction_rolled_back_marker_write_failed",
+			"message": "The before-state was restored but the rolled-back marker was not durable.",
+			"error": rollback_error,
+			"map_transaction_id": aborted_id,
+			"map_transaction_status": "prepared",
+			"recovery": _map_recovery_details.duplicate(true),
+		}
 	return {
 		"ok": true,
 		"map_transaction_id": aborted_id,
@@ -456,7 +625,7 @@ func abort_map_write_group(transaction_id: String, reason: String) -> Dictionary
 	}
 
 
-func _commit_active_batch() -> void:
+func _commit_active_batch(clear_after: bool = true) -> void:
 	if not _active:
 		return
 	if undo_redo == null or _ops.is_empty():
@@ -465,7 +634,8 @@ func _commit_active_batch() -> void:
 				"description": _batch_desc,
 				"ops": _ops.size(),
 			})
-		_clear()
+		if clear_after:
+			_clear()
 		return
 
 	FrontendLogger.info(editor_interface, "UndoManager", "Committing undo batch.", {
@@ -476,20 +646,58 @@ func _commit_active_batch() -> void:
 	for op in _ops:
 		match op.get("type", ""):
 			"file_write":
-				undo_redo.add_do_method(self, "_write_file_text", op["path"], op["after"])
+				if undo_redo is UndoRedo:
+					undo_redo.add_do_method(
+						Callable(self, "_write_file_text").bind(
+							op["path"],
+							op["after"]
+						)
+					)
+				else:
+					undo_redo.add_do_method(
+						self,
+						"_write_file_text",
+						op["path"],
+						op["after"]
+					)
 				## undo 时使用 _write_file_text_state 而非 _write_file_text，
 				## 这样 before_exists=false（本批次新建的文件）会执行删除而非写入空内容，
 				## 确保撤销操作真正恢复到批次开始前的文件系统状态。
-				undo_redo.add_undo_method(
-					self,
-					"_write_file_text_state",
-					op["path"],
-					op["before"],
-					op["before_exists"]
-				)
+				if undo_redo is UndoRedo:
+					undo_redo.add_undo_method(
+						Callable(self, "_write_file_text_state").bind(
+							op["path"],
+							op["before"],
+							op["before_exists"]
+						)
+					)
+				else:
+					undo_redo.add_undo_method(
+						self,
+						"_write_file_text_state",
+						op["path"],
+						op["before"],
+						op["before_exists"]
+					)
 			"binary_file_write":
-				undo_redo.add_do_method(self, "_write_file_bytes", op["path"], op["after"], true)
-				undo_redo.add_undo_method(self, "_write_file_bytes", op["path"], op["before"], op["before_exists"])
+				if undo_redo is UndoRedo:
+					undo_redo.add_do_method(
+						Callable(self, "_write_file_bytes").bind(
+							op["path"],
+							op["after"],
+							true
+						)
+					)
+					undo_redo.add_undo_method(
+						Callable(self, "_write_file_bytes").bind(
+							op["path"],
+							op["before"],
+							op["before_exists"]
+						)
+					)
+				else:
+					undo_redo.add_do_method(self, "_write_file_bytes", op["path"], op["after"], true)
+					undo_redo.add_undo_method(self, "_write_file_bytes", op["path"], op["before"], op["before_exists"])
 			"node_add":
 				undo_redo.add_do_method(self, "_add_node", op["parent"], op["node"], op["owner"])
 				undo_redo.add_undo_method(self, "_remove_node", op["parent"], op["node"])
@@ -529,12 +737,13 @@ func _commit_active_batch() -> void:
 				undo_redo.add_do_method(self, "_apply_animation_track", op["animation"], op["track_path"], op["after"])
 				undo_redo.add_undo_method(self, "_apply_animation_track", op["animation"], op["track_path"], op["before"])
 	undo_redo.commit_action(false)
-	_clear()
+	if clear_after:
+		_clear()
 
 
-func abort_batch() -> void:
+func abort_batch() -> Error:
 	if not _active:
-		return
+		return OK
 	FrontendLogger.warn(editor_interface, "UndoManager", "Aborting undo batch; reverting recorded ops.", {
 		"description": _batch_desc,
 		"ops": _ops.size(),
@@ -625,9 +834,30 @@ func abort_batch() -> void:
 				else:
 					FrontendLogger.warn(editor_interface, "UndoManager", "Skipping undo of animation_track: animation is no longer valid.")
 	var transaction_id := _map_transaction_id
-	_clear()
+	var terminal_error := OK
 	if transaction_id != "":
-		_delete_map_transaction_journals(transaction_id)
+		terminal_error = _persist_map_transaction_journal("rolled_back")
+		if terminal_error != OK:
+			_map_recovery_blocked = true
+			_map_recovery_details = {
+				"transaction_id": transaction_id,
+				"error_code": "map_transaction_rolled_back_marker_write_failed",
+				"error": terminal_error,
+				"journal_dir": _map_transaction_journal_dir,
+			}
+		else:
+			var cleanup_error := _delete_map_transaction_journals(transaction_id)
+			if cleanup_error != OK:
+				_map_recovery_blocked = true
+				_map_recovery_details = {
+					"transaction_id": transaction_id,
+					"error_code": "map_transaction_cleanup_failed",
+					"error": cleanup_error,
+					"durable_status": "rolled_back",
+					"journal_dir": _map_transaction_journal_dir,
+				}
+	_clear()
+	return terminal_error
 
 
 func _append_operation(op: Dictionary) -> Error:
@@ -644,7 +874,7 @@ func _append_operation(op: Dictionary) -> Error:
 		_ops.pop_back()
 		_map_transaction_error = limit_error
 		return ERR_OUT_OF_MEMORY
-	var journal_error := _persist_map_transaction_journal("prepared")
+	var journal_error := _persist_map_transaction_journal("applying")
 	if journal_error != OK:
 		_ops.pop_back()
 		_map_transaction_error = {
@@ -666,8 +896,8 @@ func _capture_scene_before_snapshot(transaction_id: String) -> Dictionary:
 	var root := editor_interface.get_edited_scene_root()
 	if root == null or str(root.scene_file_path).strip_edges() == "":
 		return {}
-	var dir_error := DirAccess.make_dir_recursive_absolute(
-		ProjectSettings.globalize_path(MAP_TRANSACTION_JOURNAL_DIR)
+	var dir_error: Error = _transaction_io.make_dir_recursive(
+		ProjectSettings.globalize_path(_map_transaction_journal_dir)
 	)
 	if dir_error != OK and dir_error != ERR_ALREADY_EXISTS:
 		return {}
@@ -676,14 +906,20 @@ func _capture_scene_before_snapshot(transaction_id: String) -> Dictionary:
 		return {}
 	var safe_id := transaction_id.validate_filename()
 	var snapshot_path := "%s/%s.scene-before.tscn" % [
-		MAP_TRANSACTION_JOURNAL_DIR,
+		_map_transaction_journal_dir,
 		safe_id,
 	]
-	var save_error := ResourceSaver.save(packed, snapshot_path)
+	var save_error: Error = _transaction_io.save_snapshot(packed, snapshot_path)
 	if save_error != OK:
 		return {}
-	var snapshot_bytes := FileAccess.get_file_as_bytes(
+	var snapshot_result: Dictionary = _transaction_io.read_bytes(
 		ProjectSettings.globalize_path(snapshot_path)
+	)
+	if not bool(snapshot_result.get("ok", false)):
+		return {}
+	var snapshot_bytes: PackedByteArray = snapshot_result.get(
+		"bytes",
+		PackedByteArray()
 	)
 	return {
 		"scene_path": str(root.scene_file_path),
@@ -712,13 +948,16 @@ func _journal_snapshot_size() -> int:
 func _persist_map_transaction_journal(status: String) -> Error:
 	if _map_transaction_id == "":
 		return OK
-	var absolute_dir := ProjectSettings.globalize_path(MAP_TRANSACTION_JOURNAL_DIR)
-	var dir_error := DirAccess.make_dir_recursive_absolute(absolute_dir)
+	if status not in MAP_TRANSACTION_JOURNAL_STATES:
+		return ERR_INVALID_PARAMETER
+	var absolute_dir := ProjectSettings.globalize_path(_map_transaction_journal_dir)
+	var dir_error: Error = _transaction_io.make_dir_recursive(absolute_dir)
 	if dir_error != OK and dir_error != ERR_ALREADY_EXISTS:
 		return dir_error
 	_map_transaction_journal_sequence += 1
+	var operations := _serialize_recovery_operations()
 	var payload := {
-		"schema_version": 1,
+		"schema_version": MAP_TRANSACTION_JOURNAL_SCHEMA_VERSION,
 		"transaction_id": _map_transaction_id,
 		"target": _map_transaction_target,
 		"base_revision": _map_transaction_base_revision,
@@ -728,29 +967,76 @@ func _persist_map_transaction_journal(status: String) -> Error:
 		"snapshot_bytes": _map_transaction_snapshot_bytes,
 		"sequence": _map_transaction_journal_sequence,
 		"status": status,
+		"approval_records": _map_transaction_approval_records.duplicate(true),
 		"scene_snapshot": _map_transaction_scene_snapshot.duplicate(true),
-		"operations": _serialize_recovery_operations(),
+		"operations": operations,
+		"before_fingerprint": _recovery_operations_fingerprint(operations, "before"),
+		"after_fingerprint": _active_operations_fingerprint("after"),
 	}
+	return _write_map_transaction_journal(payload)
+
+
+func _write_map_transaction_journal(payload: Dictionary) -> Error:
+	var transaction_id := str(payload.get("transaction_id", ""))
+	var sequence := int(payload.get("sequence", 0))
 	var envelope := payload.duplicate(true)
-	envelope["checksum"] = _sha256_text(JSON.stringify(payload))
-	var safe_id := _map_transaction_id.validate_filename()
+	envelope["checksum"] = _journal_checksum(payload)
+	var safe_id := transaction_id.validate_filename()
 	var journal_path := "%s/%s.%08d.json" % [
-		MAP_TRANSACTION_JOURNAL_DIR,
+		_map_transaction_journal_dir,
 		safe_id,
-		_map_transaction_journal_sequence,
+		sequence,
 	]
-	var file := FileAccess.open(
+	var status := str(payload.get("status", "prepared"))
+	return _transaction_io.write_text(
 		ProjectSettings.globalize_path(journal_path),
-		FileAccess.WRITE
+		JSON.stringify(envelope, "\t"),
+		"journal_%s_before_write" % status,
+		"journal_%s_after_write" % status
 	)
-	if file == null:
-		var open_error := FileAccess.get_open_error()
-		return open_error if open_error != OK else FAILED
-	file.store_string(JSON.stringify(envelope, "\t"))
-	file.flush()
-	var write_error := file.get_error()
-	file.close()
-	return write_error if write_error != ERR_FILE_EOF else OK
+
+
+func _persist_recovery_terminal(journal: Dictionary, status: String) -> Error:
+	if status not in ["committed", "rolled_back"]:
+		return ERR_INVALID_PARAMETER
+	var terminal := journal.duplicate(true)
+	terminal["schema_version"] = MAP_TRANSACTION_JOURNAL_SCHEMA_VERSION
+	terminal["sequence"] = int(journal.get("sequence", 0)) + 1
+	terminal["status"] = status
+	return _write_map_transaction_journal(terminal)
+
+
+func _recovery_operations_fingerprint(operations: Array, side: String) -> String:
+	var values: Array = []
+	for operation_value in operations:
+		if not (operation_value is Dictionary):
+			continue
+		var operation: Dictionary = operation_value
+		values.append({
+			"type": str(operation.get("type", "")),
+			"path": str(operation.get("path", operation.get("node_path", ""))),
+			"value": operation.get(side + "_sha256", operation.get(side + "_base64", "")),
+			"exists": operation.get(side + "_exists", true),
+		})
+	return _sha256_text(JSON.stringify(values))
+
+
+func _active_operations_fingerprint(side: String) -> String:
+	var values: Array = []
+	for operation in _ops:
+		var value = operation.get(side)
+		var encoded := ""
+		if value is PackedByteArray:
+			encoded = _sha256_bytes(value)
+		else:
+			encoded = _sha256_text(JSON.stringify(value))
+		values.append({
+			"type": str(operation.get("type", "")),
+			"path": str(operation.get("path", "")),
+			"value": encoded,
+			"exists": operation.get(side + "_exists", true),
+		})
+	return _sha256_text(JSON.stringify(values))
 
 
 func _serialize_recovery_operations() -> Array:
@@ -763,7 +1049,10 @@ func _serialize_recovery_operations() -> Array:
 					"type": op_type,
 					"path": str(op.get("path", "")),
 					"before": str(op.get("before", "")),
+					"before_sha256": _sha256_text(str(op.get("before", ""))),
+					"after_sha256": _sha256_text(str(op.get("after", ""))),
 					"before_exists": bool(op.get("before_exists", true)),
+					"after_exists": true,
 				})
 			"binary_file_write":
 				serialized.append({
@@ -772,7 +1061,10 @@ func _serialize_recovery_operations() -> Array:
 					"before_base64": Marshalls.raw_to_base64(
 						op.get("before", PackedByteArray())
 					),
+					"before_sha256": _sha256_bytes(op.get("before", PackedByteArray())),
+					"after_sha256": _sha256_bytes(op.get("after", PackedByteArray())),
 					"before_exists": bool(op.get("before_exists", true)),
+					"after_exists": true,
 				})
 			"tile_cells":
 				serialized.append({
@@ -815,41 +1107,119 @@ func _node_path_from_scene(value: Variant) -> String:
 
 
 func _recover_incomplete_map_transaction() -> void:
+	if _map_recovery_in_progress:
+		return
+	_map_recovery_in_progress = true
+	var recovery_started_at_ms := Time.get_ticks_msec()
+	_map_recovery_details = {
+		"phase": "loading_journal",
+		"started_at_ms": recovery_started_at_ms,
+	}
 	var journal_result := _latest_map_transaction_journal()
 	if not bool(journal_result.get("found", false)):
 		_map_recovery_blocked = false
 		_map_recovery_details = {}
+		_map_recovery_in_progress = false
 		return
 	if not bool(journal_result.get("ok", false)):
 		_map_recovery_blocked = true
 		_map_recovery_details = journal_result
+		_map_recovery_in_progress = false
 		return
 	var journal: Dictionary = journal_result.get("journal", {})
+	_map_recovery_details = {
+		"phase": "classifying",
+		"transaction_id": str(journal.get("transaction_id", "")),
+		"status": str(journal.get("status", "")),
+	}
 	var transaction_id := str(journal.get("transaction_id", ""))
 	var status := str(journal.get("status", ""))
+	var schema_version := int(journal.get("schema_version", 0))
+	if schema_version != MAP_TRANSACTION_JOURNAL_SCHEMA_VERSION:
+		_map_recovery_blocked = true
+		_map_recovery_details = _recovery_error(
+			journal,
+			"map_transaction_journal_schema_unsupported",
+			"Legacy or unknown transaction journals require explicit manual recovery."
+		)
+		_map_recovery_in_progress = false
+		return
+	if status not in MAP_TRANSACTION_JOURNAL_STATES:
+		_map_recovery_blocked = true
+		_map_recovery_details = _recovery_error(
+			journal,
+			"map_transaction_journal_state_invalid",
+			"The transaction journal contains an unknown lifecycle state."
+		)
+		_map_recovery_in_progress = false
+		return
 	if status in ["committed", "rolled_back"]:
-		_delete_map_transaction_journals(transaction_id)
-		_map_recovery_blocked = false
-		_map_recovery_details = {}
+		var terminal_cleanup_error := _delete_map_transaction_journals(transaction_id)
+		_map_recovery_blocked = terminal_cleanup_error != OK
+		_map_recovery_details = (
+			{}
+			if terminal_cleanup_error == OK
+			else {
+				"transaction_id": transaction_id,
+				"error_code": "map_transaction_cleanup_failed",
+				"error": terminal_cleanup_error,
+				"durable_status": status,
+				"journal_dir": _map_transaction_journal_dir,
+			}
+		)
+		_map_recovery_in_progress = false
+		return
+	if status == "committing":
+		_map_recovery_blocked = true
+		_map_recovery_details = _recovery_error(
+			journal,
+			"map_transaction_commit_outcome_ambiguous",
+			"The process exited after commit intent became durable but before a terminal marker."
+		)
+		_map_recovery_in_progress = false
 		return
 	var restore_error := _restore_map_transaction_journal(journal)
 	if not restore_error.is_empty():
 		_map_recovery_blocked = true
 		_map_recovery_details = restore_error
+		_map_recovery_in_progress = false
 		return
-	_delete_map_transaction_journals(transaction_id)
-	_map_recovery_blocked = false
-	_map_recovery_details = {
-		"transaction_id": transaction_id,
-		"status": "rolled_back_after_restart",
-	}
+	var terminal_error := _persist_recovery_terminal(journal, "rolled_back")
+	if terminal_error != OK:
+		_map_recovery_blocked = true
+		_map_recovery_details = _recovery_error(
+			journal,
+			"map_transaction_rolled_back_marker_write_failed",
+			"The before-state was restored but its terminal marker could not be persisted.",
+			terminal_error
+		)
+		_map_recovery_in_progress = false
+		return
+	var cleanup_error := _delete_map_transaction_journals(transaction_id)
+	_map_recovery_blocked = cleanup_error != OK
+	_map_recovery_details = (
+		{
+			"transaction_id": transaction_id,
+			"status": "rolled_back_after_restart",
+			"elapsed_ms": Time.get_ticks_msec() - recovery_started_at_ms,
+		}
+		if cleanup_error == OK
+		else {
+			"transaction_id": transaction_id,
+			"error_code": "map_transaction_cleanup_failed",
+			"error": cleanup_error,
+			"durable_status": "rolled_back",
+			"journal_dir": _map_transaction_journal_dir,
+		}
+	)
+	_map_recovery_in_progress = false
 
 
 func _latest_map_transaction_journal() -> Dictionary:
-	var absolute_dir := ProjectSettings.globalize_path(MAP_TRANSACTION_JOURNAL_DIR)
-	if not DirAccess.dir_exists_absolute(absolute_dir):
+	var absolute_dir := ProjectSettings.globalize_path(_map_transaction_journal_dir)
+	if not _transaction_io.dir_exists(absolute_dir):
 		return {"ok": true, "found": false}
-	var files := DirAccess.get_files_at(absolute_dir)
+	var files: PackedStringArray = _transaction_io.list_files(absolute_dir)
 	var journal_files: Array[String] = []
 	for file_name in files:
 		if str(file_name).ends_with(".json"):
@@ -857,10 +1227,36 @@ func _latest_map_transaction_journal() -> Dictionary:
 	journal_files.sort()
 	if journal_files.is_empty():
 		return {"ok": true, "found": false}
-	var latest_path := MAP_TRANSACTION_JOURNAL_DIR + "/" + journal_files[-1]
-	var text := FileAccess.get_file_as_string(
-		ProjectSettings.globalize_path(latest_path)
-	)
+	var latest_path := _map_transaction_journal_dir + "/" + journal_files[-1]
+	var absolute_latest_path := ProjectSettings.globalize_path(latest_path)
+	var journal_bytes: int = _transaction_io.file_size(absolute_latest_path)
+	if journal_bytes < 0:
+		return {
+			"ok": false,
+			"found": true,
+			"error_code": "map_transaction_journal_read_failed",
+			"journal_path": latest_path,
+		}
+	if journal_bytes > MapTransactionPolicy.MAX_JOURNAL_BYTES:
+		return {
+			"ok": false,
+			"found": true,
+			"error_code": "map_transaction_journal_oversized",
+			"message": "The transaction journal exceeds the configured recovery bound.",
+			"journal_path": latest_path,
+			"bytes": journal_bytes,
+			"max_bytes": MapTransactionPolicy.MAX_JOURNAL_BYTES,
+		}
+	var read_result: Dictionary = _transaction_io.read_text(absolute_latest_path)
+	if not bool(read_result.get("ok", false)):
+		return {
+			"ok": false,
+			"found": true,
+			"error_code": "map_transaction_journal_read_failed",
+			"journal_path": latest_path,
+			"error": int(read_result.get("error", FAILED)),
+		}
+	var text := str(read_result.get("text", ""))
 	var parsed = JSON.parse_string(text)
 	if not (parsed is Dictionary):
 		return {
@@ -874,7 +1270,7 @@ func _latest_map_transaction_journal() -> Dictionary:
 	var supplied_checksum := str(envelope.get("checksum", ""))
 	var payload := envelope.duplicate(true)
 	payload.erase("checksum")
-	var actual_checksum := _sha256_text(JSON.stringify(payload))
+	var actual_checksum := _journal_checksum(payload)
 	if supplied_checksum == "" or supplied_checksum != actual_checksum:
 		return {
 			"ok": false,
@@ -884,6 +1280,20 @@ func _latest_map_transaction_journal() -> Dictionary:
 			"journal_path": latest_path,
 			"expected_checksum": supplied_checksum,
 			"actual_checksum": actual_checksum,
+		}
+	var operations = payload.get("operations", [])
+	if (
+		not (operations is Array)
+		or operations.size() > MapTransactionPolicy.MAX_RECOVERY_OPERATIONS
+	):
+		return {
+			"ok": false,
+			"found": true,
+			"error_code": "map_transaction_recovery_operation_limit",
+			"message": "The journal operation list exceeds the configured recovery bound.",
+			"journal_path": latest_path,
+			"operation_count": operations.size() if operations is Array else -1,
+			"max_operations": MapTransactionPolicy.MAX_RECOVERY_OPERATIONS,
 		}
 	return {
 		"ok": true,
@@ -898,13 +1308,24 @@ func _restore_map_transaction_journal(journal: Dictionary) -> Dictionary:
 	if scene_snapshot is Dictionary and not scene_snapshot.is_empty():
 		var snapshot_path := str(scene_snapshot.get("snapshot_path", ""))
 		var absolute_snapshot := ProjectSettings.globalize_path(snapshot_path)
-		if not FileAccess.file_exists(absolute_snapshot):
+		if not _transaction_io.file_exists(absolute_snapshot):
 			return _recovery_error(
 				journal,
 				"map_transaction_snapshot_missing",
 				"The scene before-snapshot is missing."
 			)
-		var snapshot_bytes := FileAccess.get_file_as_bytes(absolute_snapshot)
+		var snapshot_result: Dictionary = _transaction_io.read_bytes(absolute_snapshot)
+		if not bool(snapshot_result.get("ok", false)):
+			return _recovery_error(
+				journal,
+				"map_transaction_snapshot_read_failed",
+				"The scene before-snapshot could not be read.",
+				int(snapshot_result.get("error", FAILED))
+			)
+		var snapshot_bytes: PackedByteArray = snapshot_result.get(
+			"bytes",
+			PackedByteArray()
+		)
 		if _sha256_bytes(snapshot_bytes) != str(scene_snapshot.get("sha256", "")):
 			return _recovery_error(
 				journal,
@@ -996,7 +1417,7 @@ func _recovery_error(
 		"target": str(journal.get("target", "")),
 		"base_revision": journal.get("base_revision"),
 		"latest_revision": journal.get("latest_revision"),
-		"journal_dir": MAP_TRANSACTION_JOURNAL_DIR,
+		"journal_dir": _map_transaction_journal_dir,
 		"recovery_action": (
 			"Restore the listed before snapshot manually, then remove only the "
 			+ "matching transaction journal files."
@@ -1004,19 +1425,29 @@ func _recovery_error(
 	}
 
 
-func _delete_map_transaction_journals(transaction_id: String) -> void:
+func _delete_map_transaction_journals(transaction_id: String) -> Error:
 	if transaction_id == "":
-		return
-	var absolute_dir := ProjectSettings.globalize_path(MAP_TRANSACTION_JOURNAL_DIR)
-	if not DirAccess.dir_exists_absolute(absolute_dir):
-		return
+		return OK
+	var absolute_dir := ProjectSettings.globalize_path(_map_transaction_journal_dir)
+	if not _transaction_io.dir_exists(absolute_dir):
+		return OK
 	var safe_id := transaction_id.validate_filename()
-	for file_name_value in DirAccess.get_files_at(absolute_dir):
+	var matching_files: Array[String] = []
+	for file_name_value in _transaction_io.list_files(absolute_dir):
 		var file_name := str(file_name_value)
-		if not file_name.begins_with(safe_id + "."):
-			continue
+		if file_name.begins_with(safe_id + "."):
+			matching_files.append(file_name)
+	matching_files.sort()
+	var terminal_file := ""
+	for file_name in matching_files:
+		if file_name.ends_with(".json"):
+			terminal_file = file_name
+	if terminal_file != "":
+		matching_files.erase(terminal_file)
+		matching_files.append(terminal_file)
+	for file_name in matching_files:
 		var absolute_path := absolute_dir.path_join(file_name)
-		var remove_error := DirAccess.remove_absolute(absolute_path)
+		var remove_error: Error = _transaction_io.remove_file(absolute_path)
 		if remove_error != OK:
 			FrontendLogger.warn(
 				editor_interface,
@@ -1024,10 +1455,39 @@ func _delete_map_transaction_journals(transaction_id: String) -> void:
 				"Failed to remove a completed map transaction journal.",
 				{"path": absolute_path, "error": remove_error}
 			)
+			# Terminal marker is deliberately removed last. Stop at the first
+			# failure so a durable terminal state remains available for retry.
+			return remove_error
+	return OK
 
 
 func _sha256_text(value: String) -> String:
 	return _sha256_bytes(value.to_utf8_buffer())
+
+
+func _journal_checksum(payload: Dictionary) -> String:
+	## JSON 解析会把整数恢复为浮点数，先按 JSON 数值语义规范化再哈希。
+	return _sha256_text(JSON.stringify(_canonical_json_value(payload)))
+
+
+func _canonical_json_value(value: Variant) -> Variant:
+	if value is Dictionary:
+		var normalized := {}
+		var keys: Array = value.keys()
+		keys.sort_custom(func(left: Variant, right: Variant) -> bool:
+			return str(left) < str(right)
+		)
+		for key in keys:
+			normalized[str(key)] = _canonical_json_value(value[key])
+		return normalized
+	if value is Array:
+		var normalized_array: Array = []
+		for item in value:
+			normalized_array.append(_canonical_json_value(item))
+		return normalized_array
+	if value is int:
+		return float(value)
+	return value
 
 
 func _sha256_bytes(value: PackedByteArray) -> String:
@@ -1050,25 +1510,23 @@ func _clear() -> void:
 	_map_transaction_journal_sequence = 0
 	_map_transaction_latest_revision = 0
 	_map_transaction_scene_snapshot = {}
+	_map_transaction_approval_records.clear()
 
 
 func _write_file_text(path: String, text: String) -> Error:
 	var absolute := ProjectSettings.globalize_path(path)
 	var dir_path := absolute.get_base_dir()
-	var dir_error := DirAccess.make_dir_recursive_absolute(dir_path)
+	var dir_error: Error = _transaction_io.make_dir_recursive(dir_path)
 	if dir_error != OK and dir_error != ERR_ALREADY_EXISTS:
 		FrontendLogger.error(editor_interface, "UndoManager", "Failed to create directory.", {"path": path, "error": dir_error})
 		return dir_error
-	var file := FileAccess.open(absolute, FileAccess.WRITE)
-	if file == null:
-		var open_error := FileAccess.get_open_error()
-		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file.", {"path": path, "error": open_error})
-		return open_error if open_error != OK else FAILED
-	file.store_string(text)
-	file.flush()
-	var write_error := file.get_error()
-	file.close()
-	if write_error != OK and write_error != ERR_FILE_EOF:
+	var write_error: Error = _transaction_io.write_text(
+		absolute,
+		text,
+		"restore_before_write",
+		"restore_after_write"
+	)
+	if write_error != OK:
 		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file contents.", {"path": path, "error": write_error})
 		return write_error
 	if ResourceLoader.exists(path):
@@ -1082,9 +1540,9 @@ func _write_file_text_state(path: String, text: String, exists: bool) -> Error:
 	if exists:
 		return _write_file_text(path, text)
 	var absolute := ProjectSettings.globalize_path(path)
-	if not FileAccess.file_exists(absolute):
+	if not _transaction_io.file_exists(absolute):
 		return OK
-	var remove_error := DirAccess.remove_absolute(absolute)
+	var remove_error: Error = _transaction_io.remove_plain(absolute)
 	if remove_error != OK:
 		FrontendLogger.error(
 			editor_interface,
@@ -1098,26 +1556,14 @@ func _write_file_text_state(path: String, text: String, exists: bool) -> Error:
 func _write_file_bytes(path: String, bytes: PackedByteArray, exists: bool) -> Error:
 	var absolute := ProjectSettings.globalize_path(path)
 	if not exists:
-		if FileAccess.file_exists(absolute):
-			var remove_error := DirAccess.remove_absolute(absolute)
+		if _transaction_io.file_exists(absolute):
+			var remove_error: Error = _transaction_io.remove_plain(absolute)
 			if remove_error != OK:
 				FrontendLogger.error(editor_interface, "UndoManager", "Failed to remove file.", {"path": path, "error": remove_error})
 				return remove_error
 		return OK
-	var dir_error := DirAccess.make_dir_recursive_absolute(absolute.get_base_dir())
-	if dir_error != OK and dir_error != ERR_ALREADY_EXISTS:
-		FrontendLogger.error(editor_interface, "UndoManager", "Failed to create directory.", {"path": path, "error": dir_error})
-		return dir_error
-	var file := FileAccess.open(absolute, FileAccess.WRITE)
-	if file == null:
-		var open_error := FileAccess.get_open_error()
-		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file.", {"path": path, "error": open_error})
-		return open_error if open_error != OK else FAILED
-	file.store_buffer(bytes)
-	file.flush()
-	var write_error := file.get_error()
-	file.close()
-	if write_error != OK and write_error != ERR_FILE_EOF:
+	var write_error: Error = _transaction_io.write_bytes(absolute, bytes)
+	if write_error != OK:
 		FrontendLogger.error(editor_interface, "UndoManager", "Failed to write file contents.", {"path": path, "error": write_error})
 		return write_error
 	return OK

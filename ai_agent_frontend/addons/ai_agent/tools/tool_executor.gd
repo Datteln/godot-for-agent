@@ -212,6 +212,19 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			## canonical 信息可能改变 revision key，需重新计算。
 			map_revision_key = _map_revision_key(name, input)
 		if requires_map_revision:
+			if (
+				map_revision_tracker != null
+				and map_revision_tracker.has_method("synchronize_mutation_boundary")
+			):
+				var sync_result: Dictionary = map_revision_tracker.synchronize_mutation_boundary()
+				if not bool(sync_result.get("ok", false)):
+					return AgentDTO.tool_result(
+						str(tool_call.get("id", "")),
+						str(tool_call.get("frame_id", "")),
+						"error",
+						sync_result,
+						str(sync_result.get("error_code", "map_revision_sync_failed"))
+					)
 			var revision_error := _validate_map_write_revision(input, map_revision_key)
 			if not revision_error.is_empty():
 				return AgentDTO.tool_result(
@@ -633,7 +646,10 @@ func _begin_map_write_batch(
 			str(input.get("map_transaction_id", "")),
 			description,
 			key,
-			int(input.get("map_transaction_base_revision", input.get("expected_revision", 0)))
+			int(input.get("map_transaction_base_revision", input.get("expected_revision", 0))),
+			str(input.get("approval_id", "")),
+			str(input.get("approval_batch_fingerprint", "")),
+			int(input.get("approval_expected_revision", -1))
 		)
 		if not bool(prepared.get("ok", false)):
 			if map_revision_tracker != null:
@@ -686,6 +702,14 @@ func _finish_map_write_batch(tool_name: String, input: Dictionary, result: Dicti
 		result["map_revision"] = next_revision
 		result["revision_key"] = key
 		result["write_batch_id"] = str(input.get("write_batch_id", ""))
+		if input.has("approval_id"):
+			result["approval_id"] = str(input.get("approval_id", ""))
+			result["approval_batch_fingerprint"] = str(
+				input.get("approval_batch_fingerprint", "")
+			)
+			result["approval_expected_revision"] = int(
+				input.get("approval_expected_revision", previous_revision)
+			)
 		result["plan_version"] = int(input.get("plan_version", 0))
 		result["batch_index"] = int(input.get("batch_index", 0))
 		result["worker"] = str(input.get("worker", ""))
@@ -839,6 +863,10 @@ func _finish_map_transaction_validation(
 		result["map_transaction_id"] = transaction_id
 		return result
 	result["map_transaction_status"] = "committed"
+	result["committed_revision"] = int(
+		committed.get("committed_revision", revision_value)
+	)
+	result["approval_records"] = committed.get("approval_records", [])
 	return result
 
 

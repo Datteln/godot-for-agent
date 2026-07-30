@@ -13,6 +13,11 @@ const MODE_APPROVED_WRITE_GROUP := "approved_write_group"
 const MAX_TOOLS := 12
 const MAX_DURATION_MS := 120_000
 const MAX_SNAPSHOT_BYTES := 16 * 1024 * 1024
+const MAX_JOURNAL_BYTES := 32 * 1024 * 1024
+# 10k 是当前同步 recovery 在 250ms 策略内验证过的最大 fixture；
+# 更大的 journal fail closed，避免首次写入在主线程阻塞数秒。
+const MAX_RECOVERY_OPERATIONS := 10_000
+const MAX_RECOVERY_LATENCY_MS := 250
 
 
 static func mode(input: Dictionary) -> String:

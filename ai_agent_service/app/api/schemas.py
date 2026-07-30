@@ -149,6 +149,7 @@ class ChatErrorResponse(BaseModel):
 
     type: Literal["error"] = "error"
     text: str
+    error_code: str | None = None
 
 
 ChatResponse = Annotated[

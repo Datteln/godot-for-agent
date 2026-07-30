@@ -20,7 +20,11 @@ def test_edit_map_is_registered_as_previewed_map_write() -> None:
         assert tool.writes_project is True
         assert tool.needs_preview is True
         assert tool.render_kind == "map"
-        assert tool.schema["parameters"]["required"] == ["operations"]
+        assert tool.schema["parameters"]["required"] == [
+            "operations",
+            "expected_revision",
+            "target_path",
+        ]
         actions = tool.schema["parameters"]["properties"]["operations"]["items"]["properties"]["action"]
         assert actions["enum"] == ["fill", "erase", "copy"]
         assert "GridMap" in tool.schema["description"]
@@ -50,22 +54,22 @@ def test_describe_map_region_is_registered_as_read_only_map_tool() -> None:
         REGISTRY.update(previous)
 
 
-def test_map_agent_is_instructed_and_allowed_to_use_edit_map() -> None:
+def test_map_agent_delegates_map_writes_instead_of_editing_directly() -> None:
     path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
     agent = load_agent_file(path)
 
-    assert "edit_map" in agent.tools
-    assert "不要因为" in agent.prompt
-    assert "GridMap" in agent.prompt
+    assert "edit_map" not in agent.tools
+    assert {"delegate", "delegate_many", "read_map_artifact"} <= set(agent.tools)
+    assert "地图修改只通过 Godot 原生工具" in agent.prompt
 
 
-def test_map_agent_must_read_real_region_before_blending_terrain() -> None:
+def test_map_agent_delegates_real_region_reads() -> None:
     path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
     agent = load_agent_file(path)
 
-    assert "describe_map_region" in agent.tools
-    assert "必须先用 `describe_map_region`" in agent.prompt
-    assert "node_position" in agent.prompt
+    assert "describe_map_region" not in agent.tools
+    assert "精确格子事实必须委派给兼容的 reader" in agent.prompt
+    assert "不代替专职 agent 发明地图事实" in agent.prompt
 
 
 def test_scene_agent_must_read_map_region_before_aligning_nodes() -> None:
@@ -76,12 +80,13 @@ def test_scene_agent_must_read_map_region_before_aligning_nodes() -> None:
     assert "node_position" in agent.prompt
 
 
-def test_coordinator_routes_map_edits_to_native_map_tool() -> None:
+def test_coordinator_routes_map_edits_to_map_agent() -> None:
     path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "coordinator.md"
     agent = load_agent_file(path)
 
-    assert "直接调用 `edit_map`" in agent.prompt
-    assert "不得因为 `.tscn`" in agent.prompt
+    assert "委派给 `map-agent`" in agent.prompt
+    assert "coordinator 不直接修改地图内容" in agent.prompt
+    assert "不得直接改写 `.tscn`" in agent.prompt
 
 
 def test_coordinator_plan_for_map_steps_stays_high_level() -> None:
@@ -102,14 +107,14 @@ def test_coordinator_routes_map_analysis_steps_to_map_agent_not_programming_agen
     assert "不要把这类步骤分给 `programming-agent` 或 `advisor`" in agent.prompt
 
 
-def test_map_agent_batches_follow_read_plan_edit_verify_loop() -> None:
+def test_map_agent_requires_reader_and_artifact_boundaries() -> None:
     path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
     agent = load_agent_file(path)
 
-    assert "读边界 → 写块计划 → 小批 `edit_map` → 核对结果 → 必要时重读" in agent.prompt
-    assert "预期 `cells` 数量" in agent.prompt
-    assert "不必每批重读" in agent.prompt
-    assert "更新这一块的计划" in agent.prompt
+    assert "地图专业职责委派工作" in agent.prompt
+    assert "完整地图上下文" in agent.prompt
+    assert "read_map_artifact" in agent.prompt
+    assert "两种 schema 不混用" in agent.prompt
 
 
 def test_describe_map_region_schema_warns_about_legacy_tilemap_layers() -> None:
@@ -133,10 +138,9 @@ def test_describe_map_region_schema_warns_about_legacy_tilemap_layers() -> None:
         REGISTRY.update(previous)
 
 
-def test_map_agent_must_check_real_layers_before_picking_map_layer() -> None:
+def test_map_agent_must_not_guess_layer_or_revision() -> None:
     path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
     agent = load_agent_file(path)
 
-    assert "`layers` 字段" in agent.prompt
-    assert "不要默认 `map_layer=0`" in agent.prompt
-    assert "physics_layer" in agent.prompt
+    assert "不猜测资源、节点、图层或 revision" in agent.prompt
+    assert "精确格子事实必须委派给兼容的 reader" in agent.prompt

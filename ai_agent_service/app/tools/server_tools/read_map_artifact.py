@@ -28,6 +28,7 @@ READ_MAP_ARTIFACT_SCHEMA: dict[str, Any] = {
             "artifact_ref": {"type": "string"},
             "artifact_turn_id": {"type": "string"},
             "artifact_entry_id": {"type": "string"},
+            "artifact_fingerprint": {"type": "string"},
             "field": {"type": "string"},
             "offset": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 200},
@@ -45,6 +46,7 @@ async def read_map_artifact_handler(
     artifact_ref = args.get("artifact_ref")
     turn_id = args.get("artifact_turn_id")
     entry_id = args.get("artifact_entry_id")
+    fingerprint = args.get("artifact_fingerprint")
     if not isinstance(artifact_ref, str) or not artifact_ref:
         return artifact_read_error(
             str(artifact_ref or ""),
@@ -69,6 +71,14 @@ async def read_map_artifact_handler(
             artifact_ref,
             "map_tool_result",
             ValueError("artifact_entry_id 必须是字符串"),
+        )
+    if fingerprint is None:
+        fingerprint = ""
+    if not isinstance(fingerprint, str):
+        return artifact_read_error(
+            artifact_ref,
+            "map_tool_result",
+            ValueError("artifact_fingerprint 必须是字符串"),
         )
     field = args.get("field", "")
     offset = args.get("offset", 0)
@@ -97,6 +107,7 @@ async def read_map_artifact_handler(
             artifact_ref,
             turn_id=turn_id,
             entry_id=entry_id,
+            fingerprint=fingerprint,
             field=field,
             offset=offset,
             limit=limit,

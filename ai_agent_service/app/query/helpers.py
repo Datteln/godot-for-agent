@@ -68,6 +68,7 @@ from app.orchestrator.map_workers import (
     MAP_WRITE_TOOL_NAMES,
 )
 from app.orchestrator.map_workflow import (
+    increment_map_counter,
     record_map_revision,
     record_map_validation,
     replace_map_state_field,
@@ -1372,7 +1373,13 @@ def _invalidate_stale_map_revision_state(
         )
     # 使用 transition_stage() 而非直接赋值 stage，确保阶段转换钩子（如日志/事件）正常触发
     state.transition_stage("read")
-    state.plan_version = 0
+    replace_map_state_field(
+        state,
+        "plan_version",
+        0,
+        target=target,
+        revision=current_revision,
+    )
     replace_map_state_field(
         state,
         "latest_validations",
@@ -1502,6 +1509,13 @@ def _remember_latest_map_revision(
                 )
                 revision = None
         if revision is not None and (previous is None or revision > previous):
+            if str(result.get("error_code", "")) == "map_revision_conflict":
+                _invalidate_stale_map_revision_state(
+                    session,
+                    target,
+                    previous if isinstance(previous, int) else revision,
+                    revision,
+                )
             touched_region = _map_write_touched_region(tool_args, result)
             if (
                 previous is not None
@@ -1538,7 +1552,12 @@ def _remember_latest_map_revision(
                 target=target,
                 revision=revision,
             )
-            session.map_task_state.counters.revision_advances += 1
+            increment_map_counter(
+                session.map_task_state,
+                "revision_advances",
+                target=target,
+                revision=revision,
+            )
             logger.info(
                 "Latest map revision updated session=%s target=%s previous=%s current=%s",
                 session.session_id,
@@ -1548,7 +1567,15 @@ def _remember_latest_map_revision(
             )
     if map_layer is not None:
         previous_layer = session.map_task_state.latest_layers.get(target)
-        session.map_task_state.latest_layers[target] = map_layer
+        latest_layers = dict(session.map_task_state.latest_layers)
+        latest_layers[target] = map_layer
+        replace_map_state_field(
+            session.map_task_state,
+            "latest_layers",
+            latest_layers,
+            target=target,
+            revision=revision if isinstance(revision, int) else None,
+        )
         logger.info(
             "Latest map layer updated session=%s target=%s previous=%s current=%s",
             session.session_id,
@@ -1714,35 +1741,97 @@ def _remember_map_validation(
     revision_value = (
         revision if isinstance(revision, int) and not isinstance(revision, bool) else None
     )
-    fingerprint = _map_validation_fingerprint(tool_name, result, target, revision_value)
+    raw_issues = result.get("issues")
+    raw_structured_issues = result.get("structured_issues")
+    normalized_issues = list(raw_issues) if isinstance(raw_issues, list) else []
+    normalized_structured_issues = (
+        list(raw_structured_issues)
+        if isinstance(raw_structured_issues, list)
+        else []
+    )
+    collection_error: str | None = None
+    if raw_issues is not None and not isinstance(raw_issues, list):
+        collection_error = "validation_issues_malformed"
+    elif raw_structured_issues is not None and not isinstance(
+        raw_structured_issues, list
+    ):
+        collection_error = "validation_structured_issues_malformed"
+    scope_error: str | None = None
+    if not target:
+        scope_error = "validation_target_missing"
+    elif revision_value is None:
+        scope_error = "validation_revision_missing"
+    contract_error = scope_error or collection_error
+    if contract_error is not None:
+        normalized_issues.append(contract_error)
+        normalized_structured_issues.append(
+            {
+                "code": contract_error,
+                "message": (
+                    "validation result lacks an exact target/revision scope"
+                    if scope_error is not None
+                    else "validation result issues fields violate their collection contract"
+                ),
+            }
+        )
+    normalized_result = {
+        **result,
+        "issues": normalized_issues,
+        "structured_issues": normalized_structured_issues,
+        "passed": result.get("passed") is True and contract_error is None,
+        "blocking_completion": (
+            result.get("blocking_completion") is True or contract_error is not None
+        ),
+    }
+    fingerprint = _map_validation_fingerprint(
+        tool_name,
+        normalized_result,
+        target,
+        revision_value,
+    )
     previous = session.map_task_state.latest_validations.get(target)
     previous_fingerprint = previous.get("fingerprint") if isinstance(previous, dict) else None
     previous_revision = previous.get("map_revision") if isinstance(previous, dict) else None
     count = session.map_task_state.validation_failure_counts.get(fingerprint, 0)
-    if not _map_validation_is_successful(result):
+    if not _map_validation_is_successful(normalized_result):
         count = (
             count + 1
             if previous_fingerprint == fingerprint and previous_revision == revision_value
             else 1
         )
-        session.map_task_state.validation_failure_counts[fingerprint] = count
+        failure_counts = dict(session.map_task_state.validation_failure_counts)
+        failure_counts[fingerprint] = count
+        replace_map_state_field(
+            session.map_task_state,
+            "validation_failure_counts",
+            failure_counts,
+            target=target or "__validation__",
+            revision=revision_value or 0,
+        )
     else:
         count = 0
     state = {
+        **normalized_result,
         "target": target,
         "map_revision": revision_value,
-        "region": result.get("region", {}),
-        "passed": result.get("passed") is True,
-        "blocking_completion": result.get("blocking_completion") is True,
-        "issues": result.get("issues", []),
-        "structured_issues": result.get("structured_issues", []),
+        "region": normalized_result.get("region", {}),
+        "passed": normalized_result.get("passed") is True,
+        "blocking_completion": normalized_result.get("blocking_completion") is True,
+        "issues": normalized_issues,
+        "structured_issues": normalized_structured_issues,
         "fingerprint": fingerprint,
         "repeat_count": count,
-        "next_stage": "reviewer" if _map_validation_is_successful(result) else "planner",
+        "next_stage": (
+            "reviewer"
+            if _map_validation_is_successful(normalized_result)
+            else "planner"
+        ),
+        "scope_error": scope_error,
+        "contract_error": contract_error,
     }
     record_map_validation(
         session.map_task_state,
-        target,
+        target or "__validation__",
         revision_value or 0,
         state,
     )

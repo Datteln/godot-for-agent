@@ -60,6 +60,21 @@ func current_revision(key: String) -> int:
 	return int(_revisions.get(key, 0))
 
 
+func synchronize_mutation_boundary() -> Dictionary:
+	## 在任何写事务创建前同步磁盘 revision 与当前内容指纹。
+	## 这使 Undo/Redo 或进程重启后的 drift 在 expected_revision CAS 前可见。
+	if _controlled_write_depth > 0:
+		return {
+			"ok": false,
+			"error_code": "map_revision_sync_during_controlled_write",
+			"message": "Cannot synchronize authoritative revision during an active controlled write.",
+		}
+	_scan_for_external_changes()
+	_load_revisions()
+	_capture_current_scene()
+	return {"ok": true}
+
+
 func advance_controlled_write(key: String, undo_manager: Node) -> Dictionary:
 	_load_revisions()
 	var previous_revision := int(_revisions.get(key, 0))
@@ -89,13 +104,21 @@ func _connect_undo_signals(undo_redo_manager: Object) -> void:
 	for signal_name in ["version_changed", "history_changed"]:
 		if not undo_redo_manager.has_signal(signal_name):
 			continue
-		var callback := Callable(self, "_request_scan")
+		var callback := Callable(self, "_synchronize_history_change")
 		if not undo_redo_manager.is_connected(signal_name, callback):
 			undo_redo_manager.connect(signal_name, callback)
 
 
 func _request_scan() -> void:
 	_scan_requested = true
+
+
+func _synchronize_history_change() -> void:
+	## 键盘和程序化 Undo/Redo 走同一个同步入口。
+	if _controlled_write_depth > 0:
+		_scan_requested = true
+		return
+	_scan_for_external_changes()
 
 
 func _scan_for_external_changes() -> void:

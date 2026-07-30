@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -80,6 +81,7 @@ from app.orchestrator.map_recovery import (
     SEMANTIC_RETRY_MAX_ATTEMPTS,
     STRUCTURED_REPAIR_MAX_ATTEMPTS,
     record_semantic_retry,
+    record_plan_attempt,
     retry_pause_report,
     safe_structured_diagnostic,
     structured_error_category,
@@ -92,7 +94,7 @@ from app.orchestrator.evidence import scoped_evidence
 from app.orchestrator.map_resources import normalize_edit_map_resources
 from app.orchestrator.plan_scheduler import PlanGraph, PlanGraphError
 from app.orchestrator.runtime_contracts import PlanStepResult, UnapprovedWriteRejection
-from app.orchestrator.map_workflow import replace_map_state_field
+from app.orchestrator.map_workflow import increment_map_counter, replace_map_state_field
 
 MAX_AGENT_DEPTH = 4
 EVENT_TEXT_PREVIEW_CHARS = 24_000
@@ -950,11 +952,12 @@ async def _continue_delegate_group(
     delegate_result = _map_delegate_result_payload(done, text, artifact_store)
     group.setdefault("results", []).append(delegate_result)
     _plan_step_completed(session, done, delegate_result, event_callback)
+    child: Any = None
 
     if group.get("plan_driven") is True and session.pending_plan is not None:
         try:
             graph = PlanGraph.from_dict(session.pending_plan)
-        except PlanGraphError as exc:
+        except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
             logger.error(
                 "Delegate plan continuation failed session=%s group=%s error=%s",
                 session.session_id,
@@ -964,17 +967,24 @@ async def _continue_delegate_group(
             graph = None
         runnable = graph.runnable_steps() if graph is not None else ()
         if runnable:
+            assert graph is not None
             next_step = runnable[0]
-            next_task = graph.task_payload(next_step.step_id)
-            child = await _delegate_child_frame(
-                session=session,
-                parent_id=str(group["parent_frame_id"]),
-                call_id=None,
-                group_id=done.pending_delegate_group_id,
-                args=next_task,
-                depth=int(group["depth"]),
-                prompt_factory=prompt_factory,
-            )
+            try:
+                next_task = graph.task_payload(next_step.step_id)
+                child = await _delegate_child_frame(
+                    session=session,
+                    parent_id=str(group["parent_frame_id"]),
+                    call_id=None,
+                    group_id=done.pending_delegate_group_id,
+                    args=next_task,
+                    depth=int(group["depth"]),
+                    prompt_factory=prompt_factory,
+                )
+            except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+                child = {
+                    "error_code": "plan_dependency_or_stage_blocked",
+                    "message": str(exc),
+                }
             if isinstance(child, Frame):
                 session.agent_stack.append(child)
                 _plan_step_started(
@@ -995,23 +1005,43 @@ async def _continue_delegate_group(
             failure_text = (
                 child
                 if isinstance(child, str)
-                else "调度器已解锁的子任务参数不合法或 agent 不存在"
+                else (
+                    str(child.get("message", ""))
+                    if isinstance(child, dict)
+                    else "调度器已解锁的子任务参数不合法或 agent 不存在"
+                )
             )
             group["results"].append(
                 {
                     "agent": next_step.agent,
                     "summary": failure_text,
                     "error": True,
+                    "error_code": (
+                        child.get("error_code")
+                        if isinstance(child, dict)
+                        else "child_frame_creation_failed"
+                    ),
                 }
             )
-            failed_graph = graph.fail_unstarted(
-                next_step.step_id,
-                "child_frame_creation_failed",
-            )
-            session.pending_plan = _with_plan_runtime_metadata(
-                failed_graph.to_dict(),
-                session.pending_plan,
-            )
+            try:
+                failed_graph = graph.fail_unstarted(
+                    next_step.step_id,
+                    "child_frame_creation_failed",
+                )
+            except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+                group["results"].append(
+                    {
+                        "agent": next_step.agent,
+                        "summary": str(exc),
+                        "error": True,
+                        "error_code": "plan_failure_reduction_blocked",
+                    }
+                )
+            else:
+                session.pending_plan = _with_plan_runtime_metadata(
+                    failed_graph.to_dict(),
+                    session.pending_plan,
+                )
     elif isinstance(group.get("scheduler_plan"), dict):
         try:
             group_graph = PlanGraph.from_dict(group["scheduler_plan"])
@@ -1135,7 +1165,7 @@ async def _continue_delegate_group(
                     ),
                 )
             group["scheduler_plan"] = group_graph.to_dict()
-        except PlanGraphError as exc:
+        except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
             logger.error(
                 "Delegate group scheduler update failed session=%s group=%s error=%s",
                 session.session_id,
@@ -1145,96 +1175,97 @@ async def _continue_delegate_group(
             group_graph = None
         runnable = group_graph.runnable_steps() if group_graph is not None else ()
         if runnable:
+            assert group_graph is not None
             next_step = runnable[0]
-            next_task = group_graph.task_payload(next_step.step_id)
-            child = await _delegate_child_frame(
-                session=session,
-                parent_id=str(group["parent_frame_id"]),
-                call_id=None,
-                group_id=done.pending_delegate_group_id,
-                args=next_task,
-                depth=int(group["depth"]),
-                prompt_factory=prompt_factory,
-            )
-            if isinstance(child, Frame):
-                session.agent_stack.append(child)
-                group["scheduler_plan"] = group_graph.start(
-                    next_step.step_id,
-                    child.id,
-                ).to_dict()
-                logger.info(
-                    "Delegate scheduler continued session=%s group_id=%s "
-                    "step=%s child_frame=%s",
-                    session.session_id,
-                    done.pending_delegate_group_id,
-                    next_step.step_id,
-                    child.id,
+            try:
+                next_task = group_graph.task_payload(next_step.step_id)
+                child = await _delegate_child_frame(
+                    session=session,
+                    parent_id=str(group["parent_frame_id"]),
+                    call_id=None,
+                    group_id=done.pending_delegate_group_id,
+                    args=next_task,
+                    depth=int(group["depth"]),
+                    prompt_factory=prompt_factory,
                 )
-                return
+            except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+                child = {
+                    "error_code": "plan_dependency_or_stage_blocked",
+                    "message": str(exc),
+                }
+            if isinstance(child, Frame):
+                try:
+                    started_graph = group_graph.start(
+                        next_step.step_id,
+                        child.id,
+                    )
+                except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+                    child = {
+                        "error_code": "plan_stage_transition_blocked",
+                        "message": str(exc),
+                    }
+                else:
+                    session.agent_stack.append(child)
+                    group["scheduler_plan"] = started_graph.to_dict()
+                    logger.info(
+                        "Delegate scheduler continued session=%s group_id=%s "
+                        "step=%s child_frame=%s",
+                        session.session_id,
+                        done.pending_delegate_group_id,
+                        next_step.step_id,
+                        child.id,
+                    )
+                    return
             failure_text = (
                 child
                 if isinstance(child, str)
-                else "调度器已解锁的子任务参数不合法或 agent 不存在"
+                else (
+                    str(child.get("message", ""))
+                    if isinstance(child, dict)
+                    else "调度器已解锁的子任务参数不合法或 agent 不存在"
+                )
             )
             group["results"].append(
                 {
                     "agent": next_step.agent,
                     "summary": failure_text,
                     "error": True,
+                    "error_code": (
+                        child.get("error_code")
+                        if isinstance(child, dict)
+                        else "child_frame_creation_failed"
+                    ),
                 }
             )
-            group["scheduler_plan"] = group_graph.fail_unstarted(
-                next_step.step_id,
-                "child_frame_creation_failed",
-            ).to_dict()
-
-    remaining = group.setdefault("remaining", [])
-    while isinstance(remaining, list) and remaining:
-        next_task = remaining.pop(0)
-        if not isinstance(next_task, dict):
-            group["results"].append(
-                {
-                    "agent": "",
-                    "summary": "子任务参数不合法，已跳过",
-                    "error": True,
-                }
-            )
-            continue
-        child = await _delegate_child_frame(
-            session=session,
-            parent_id=str(group["parent_frame_id"]),
-            call_id=None,
-            group_id=done.pending_delegate_group_id,
-            args=next_task,
-            depth=int(group["depth"]),
-            prompt_factory=prompt_factory,
-        )
-        if isinstance(child, Frame):
-            session.agent_stack.append(child)
-            _plan_step_started(session, child, event_callback)
-            logger.info(
-                "Delegate group continued session=%s group_id=%s child_frame=%s agent=%s remaining=%d",
-                session.session_id,
-                done.pending_delegate_group_id,
-                child.id,
-                child.agent.name,
-                len(remaining),
-            )
-            return
-        if isinstance(child, str):
-            summary = child
-        else:
-            summary = "子任务参数不合法或 agent 不存在，已跳过"
-        group["results"].append(
-            {
-                "agent": str(next_task.get("agent", "")),
-                "summary": summary,
-                "error": True,
-            }
-        )
+            try:
+                failed_graph = group_graph.fail_unstarted(
+                    next_step.step_id,
+                    "child_frame_creation_failed",
+                )
+            except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+                group["results"].append(
+                    {
+                        "agent": next_step.agent,
+                        "summary": str(exc),
+                        "error": True,
+                        "error_code": "plan_failure_reduction_blocked",
+                    }
+                )
+            else:
+                group["scheduler_plan"] = failed_graph.to_dict()
 
     parent = _find_frame(session, str(group["parent_frame_id"]))
     if parent is not None:
+        migration_error = str(group.get("migration_error", "")).strip()
+        if migration_error:
+            group["results"].append(
+                {
+                    "agent": "",
+                    "summary": migration_error,
+                    "error": True,
+                    "error_code": "legacy_delegate_group_blocked",
+                }
+            )
         parent.messages.append(
             _tool_message(
                 str(group["tool_call_id"]),
@@ -1815,8 +1846,10 @@ def _apply_reader_structured_completion(
             target=target,
             revision=revision,
         )
-        state.context_state["reader_result"] = _slim_map_delegate_value(payload)
-        state.context_state.pop("reader_exhausted", None)
+        context_state = dict(state.context_state)
+        context_state["reader_result"] = _slim_map_delegate_value(payload)
+        context_state.pop("reader_exhausted", None)
+        replace_map_state_field(state, "context_state", context_state)
         logger.info(
             "Map reader completion advanced workflow session=%s target=%s layer=%s revision=%s",
             session.session_id,
@@ -1889,8 +1922,11 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
         canonical = session.map_task_state.latest_validations.get(target)
         canonical_matches = (
             isinstance(canonical, dict)
-            and (not target or canonical.get("target") in ("", target))
-            and (revision is None or canonical.get("map_revision") in (None, revision))
+            and bool(target)
+            and isinstance(revision, int)
+            and not isinstance(revision, bool)
+            and canonical.get("target") == target
+            and canonical.get("map_revision") == revision
         )
         canonical_success = (
             canonical_matches
@@ -1962,18 +1998,29 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
                     revision=revision,
                 )
             else:
+                blockers = _clear_map_blockers(
+                    session.map_task_state.completion_blockers,
+                    target,
+                    revision,
+                    "validator_failed",
+                )
                 replace_map_state_field(
                     session.map_task_state,
                     "completion_blockers",
-                    [{
-                        "tool": frame.agent.name,
-                        "reason": "validator_failed",
-                        "issues": issue_list
-                        or ["validator failed or no canonical tool validation was recorded"],
-                        "target": target,
-                        "required_revision": revision,
-                        "next_stage": "planner",
-                    }],
+                    _append_map_blocker_once(
+                        blockers,
+                        {
+                            "tool": frame.agent.name,
+                            "reason": "validator_failed",
+                            "issues": issue_list
+                            or [
+                                "validator failed or no canonical tool validation was recorded"
+                            ],
+                            "target": target,
+                            "required_revision": revision,
+                            "next_stage": "planner",
+                        },
+                    ),
                     target=target,
                     revision=revision,
                 )
@@ -1999,16 +2046,25 @@ def _apply_map_structured_completion_result(session: Session, frame: Frame, text
             revision=revision,
         )
     else:
+        blockers = _clear_map_blockers(
+            session.map_task_state.completion_blockers,
+            target,
+            revision,
+            "reviewer_failed",
+        )
         replace_map_state_field(
             session.map_task_state,
             "completion_blockers",
-            [{
-                "tool": frame.agent.name,
-                "reason": "reviewer_failed",
-                "issues": issue_list or ["reviewer observation did not pass"],
-                "target": target,
-                "required_revision": revision,
-            }],
+            _append_map_blocker_once(
+                blockers,
+                {
+                    "tool": frame.agent.name,
+                    "reason": "reviewer_failed",
+                    "issues": issue_list or ["reviewer observation did not pass"],
+                    "target": target,
+                    "required_revision": revision,
+                },
+            ),
             target=target,
             revision=revision,
         )
@@ -2120,7 +2176,13 @@ async def _finish_frame(
     done = session.agent_stack.pop()
     # 本轮整改：用 map_stage=="reader" 代替 name=="map-reader-agent"
     if done.agent.map_stage == "reader":
-        session.map_task_state.context_state.pop("reader_exhausted", None)
+        context_state = dict(session.map_task_state.context_state)
+        context_state.pop("reader_exhausted", None)
+        replace_map_state_field(
+            session.map_task_state,
+            "context_state",
+            context_state,
+        )
     logger.info(
         "Child frame finished session=%s frame=%s agent=%s text_length=%d",
         session.session_id,
@@ -2217,7 +2279,13 @@ async def _handle_frame_turns_exhausted(
     )
     # 本轮整改：用 map_stage=="reader" 代替 name=="map-reader-agent"
     if frame.agent.map_stage == "reader":
-        session.map_task_state.context_state["reader_exhausted"] = True
+        context_state = dict(session.map_task_state.context_state)
+        context_state["reader_exhausted"] = True
+        replace_map_state_field(
+            session.map_task_state,
+            "context_state",
+            context_state,
+        )
     return None
 
 
@@ -2315,24 +2383,6 @@ def _append_delegate_protocol_errors(frame: Frame, calls: list[Any]) -> None:
             _tool_message(
                 call.id,
                 "`delegate` 必须是本轮唯一的 tool call；本轮所有工具均未执行，请重试",
-                is_error=True,
-            )
-        )
-
-
-def _append_single_tool_call_protocol_errors(frame: Frame, calls: list[Any]) -> None:
-    """Reject multi-tool assistant turns so the UI can render atomic workflow steps."""
-    logger.warning(
-        "Single-tool protocol violation frame=%s agent=%s tool_calls=%d",
-        frame.id,
-        frame.agent.name,
-        len(calls),
-    )
-    for call in calls:
-        frame.messages.append(
-            _tool_message(
-                call.id,
-                "每轮 assistant 只能调用一个工具；本轮所有工具均未执行，请只选择一个工具后重试",
                 is_error=True,
             )
         )
@@ -2638,12 +2688,10 @@ def _latest_map_progress_revision(session: Session) -> int | None:
 
 
 def _sync_map_progress_budget(session: Session, frame: Frame) -> None:
-    """地图 revision 前进时开启新的生产性迭代预算。"""
+    """Track revision progress without resetting task-level convergence budgets."""
     revision = _latest_map_progress_revision(session)
     if revision == frame.map_progress_revision:
         return
-    frame.persistent_turn_count = 0
-    frame.persistent_edit_map_turn_count = 0
     frame.map_progress_revision = revision
 
 
@@ -2701,14 +2749,14 @@ def _cached_map_region_summary(
             continue
         region = entry.get("region", {})
         if isinstance(region, dict) and _region_contains(region, requested_region):
-            session.map_task_state.counters.read_cache_hits += 1
+            increment_map_counter(session.map_task_state, "read_cache_hits")
             return {**entry, "cache_hit": True, "cache_reason": "same_revision_region_covered"}
     return None
 
 
 def _resumed_full_map_read_error(session: Session, args: dict[str, Any]) -> str | None:
     """恢复任务时拒绝重新读取已知整图范围。"""
-    if not session.map_task_state.resumed_from_checkpoint:
+    if not session.map_request_scope.explicit_continuation:
         return None
     target = args.get("target_path")
     layer = args.get("map_layer")
@@ -3070,7 +3118,88 @@ def _handle_create_plan(
             _tool_message(call_id, f"create_plan 依赖图不合法：{exc}", is_error=True)
         )
         return
+    state = session.map_task_state
+    frontier = (
+        state.failure_frontier
+        if isinstance(state.failure_frontier, dict)
+        else {}
+    )
+    target = str(frontier.get("target", "")).strip()
+    if not target and state.latest_revisions:
+        target = sorted(state.latest_revisions)[0].split("::", 1)[0]
+    revision = max(state.latest_revisions.values(), default=0)
+    root_error_code = str(
+        frontier.get("error_code")
+        or frontier.get("blocked_reason")
+        or "planning"
+    )
+    attempt: dict[str, Any] | None = None
+    if state.status == "running":
+        attempt = record_plan_attempt(
+            state,
+            stage=state.stage,
+            target=target or "__workflow__",
+            revision=revision,
+            operation={"summary": summary.strip(), "steps": steps},
+            root_error_code=root_error_code,
+        )
+        if bool(attempt.get("exhausted", False)):
+            report = {
+                "type": "map_task_convergence_exhausted",
+                "exact_attempt": attempt["exact"],
+                "task_convergence": attempt["convergence"],
+                "root_error_code": root_error_code,
+                "recovery_guidance": (
+                    "Inspect the first root cause or explicitly start a distinct "
+                    "task epoch; sub-step revision progress does not reset this count."
+                ),
+            }
+            state.make_checkpoint(
+                "create_plan convergence circuit breaker exhausted",
+                report,
+                pause_kind="no_progress_exhausted",
+            )
+            frame.messages.append(
+                _tool_message(
+                    call_id,
+                    {
+                        "ok": False,
+                        "error_code": "map_task_convergence_exhausted",
+                        "report": report,
+                    },
+                    is_error=True,
+                )
+            )
+            return
+    exact_key = (
+        str(attempt["exact"].get("key", ""))
+        if isinstance(attempt, dict)
+        else ""
+    )
+    if (
+        exact_key
+        and isinstance(session.pending_plan, dict)
+        and session.pending_plan.get("semantic_attempt_key") == exact_key
+    ):
+        existing_graph = PlanGraph.from_dict(session.pending_plan)
+        frame.messages.append(
+            _tool_message(
+                call_id,
+                {
+                    "ok": True,
+                    "idempotent_replay": True,
+                    "tasks": [
+                        existing_graph.task_payload(step.step_id)
+                        for step in existing_graph.steps
+                    ],
+                    "note": "相同语义计划已存在；保留当前 running/terminal 步骤结果。",
+                },
+            )
+        )
+        return
     session.pending_plan = graph.to_dict()
+    if exact_key:
+        session.pending_plan["semantic_attempt_key"] = exact_key
     session.pending_plan["owner_frame_id"] = frame.id
     session.pending_plan["request_lineage_id"] = frame.map_request_lineage_id or ""
     session.pending_plan["map_task_id"] = frame.map_task_id or ""
@@ -3291,15 +3420,34 @@ async def _start_delegate_group(
             frame.messages.append(
                 _tool_message(
                     call_id,
-                    "当前计划没有可运行步骤；请检查前置步骤终态",
+                    {
+                        "ok": False,
+                        "status": "blocked",
+                        "error_code": "plan_predecessor_not_succeeded",
+                        "message": "当前计划没有可运行步骤；请检查前置步骤终态",
+                    },
                     is_error=True,
                 )
             )
             return False
         first_step = runnable[0]
         plan_step_id = first_step.step_id
-        first = graph.task_payload(first_step.step_id)
-        tasks: list[dict[str, Any]] = []
+        try:
+            first = graph.task_payload(first_step.step_id)
+        except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+            frame.messages.append(
+                _tool_message(
+                    call_id,
+                    {
+                        "ok": False,
+                        "error_code": "plan_dependency_binding_failed",
+                        "step_id": first_step.step_id,
+                        "message": str(exc),
+                    },
+                    is_error=True,
+                )
+            )
+            return False
         contract_tasks = [
             {
                 "agent": step.agent,
@@ -3347,13 +3495,36 @@ async def _start_delegate_group(
         runnable = group_graph.runnable_steps()
         if not runnable:
             frame.messages.append(
-                _tool_message(call_id, "delegate_many 没有可运行根步骤", is_error=True)
+                _tool_message(
+                    call_id,
+                    {
+                        "ok": False,
+                        "status": "blocked",
+                        "error_code": "plan_predecessor_not_succeeded",
+                        "message": "delegate_many 没有可运行根步骤",
+                    },
+                    is_error=True,
+                )
             )
             return False
         first_step = runnable[0]
         plan_step_id = first_step.step_id
-        first = group_graph.task_payload(first_step.step_id)
-        tasks = []
+        try:
+            first = group_graph.task_payload(first_step.step_id)
+        except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+            frame.messages.append(
+                _tool_message(
+                    call_id,
+                    {
+                        "ok": False,
+                        "error_code": "plan_dependency_binding_failed",
+                        "step_id": first_step.step_id,
+                        "message": str(exc),
+                    },
+                    is_error=True,
+                )
+            )
+            return False
         contract_tasks = [
             {
                 "agent": step.agent,
@@ -3402,7 +3573,6 @@ async def _start_delegate_group(
         "tool_call_id": call_id,
         "request_lineage_id": frame.map_request_lineage_id or "",
         "map_task_id": frame.map_task_id or "",
-        "remaining": tasks,
         "results": [],
         "depth": frame.depth + 1,
         "plan_driven": plan_driven,
@@ -3410,54 +3580,114 @@ async def _start_delegate_group(
             None if plan_driven else group_graph.to_dict()
         ),
     }
-    child = await _delegate_child_frame(
-        session=session,
-        parent_id=frame.id,
-        call_id=None,
-        group_id=group_id,
-        args=first,
-        depth=frame.depth + 1,
-        prompt_factory=prompt_factory,
-    )
+    workflow_snapshot = copy.deepcopy(session.map_task_state)
+    try:
+        child = await _delegate_child_frame(
+            session=session,
+            parent_id=frame.id,
+            call_id=None,
+            group_id=group_id,
+            args=first,
+            depth=frame.depth + 1,
+            prompt_factory=prompt_factory,
+        )
+    except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+        session.map_task_state = workflow_snapshot
+        session.delegate_groups.pop(group_id, None)
+        frame.messages.append(
+            _tool_message(
+                call_id,
+                {
+                    "ok": False,
+                    "error_code": "plan_child_creation_blocked",
+                    "step_id": plan_step_id,
+                    "message": str(exc),
+                },
+                is_error=True,
+            )
+        )
+        return False
     if isinstance(child, str):
+        session.map_task_state = workflow_snapshot
         session.delegate_groups.pop(group_id, None)
         if plan_driven and session.pending_plan is not None and plan_step_id is not None:
-            active_graph = PlanGraph.from_dict(session.pending_plan)
-            failed_graph = active_graph.fail_unstarted(
-                plan_step_id,
-                "child_frame_creation_failed",
-            )
-            session.pending_plan = _with_plan_runtime_metadata(
-                failed_graph.to_dict(),
-                session.pending_plan,
-            )
+            try:
+                active_graph = PlanGraph.from_dict(session.pending_plan)
+                failed_graph = active_graph.fail_unstarted(
+                    plan_step_id,
+                    "child_frame_creation_failed",
+                )
+            except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+                logger.error(
+                    "Failed to reduce child creation outcome session=%s step=%s error=%s",
+                    session.session_id,
+                    plan_step_id,
+                    exc,
+                )
+            else:
+                session.pending_plan = _with_plan_runtime_metadata(
+                    failed_graph.to_dict(),
+                    session.pending_plan,
+                )
         logger.warning(
             "Delegate_many rejected: invalid first task session=%s frame=%s error=%s",
             session.session_id,
             frame.id,
             child,
         )
-        frame.messages.append(_tool_message(call_id, child, is_error=True))
+        frame.messages.append(
+            _tool_message(
+                call_id,
+                {
+                    "ok": False,
+                    "status": "blocked",
+                    "error_code": "plan_child_contract_blocked",
+                    "step_id": plan_step_id,
+                    "message": child,
+                },
+                is_error=True,
+            )
+        )
         return False
     if child is None:
+        session.map_task_state = workflow_snapshot
         session.delegate_groups.pop(group_id, None)
         if plan_driven and session.pending_plan is not None and plan_step_id is not None:
-            active_graph = PlanGraph.from_dict(session.pending_plan)
-            failed_graph = active_graph.fail_unstarted(
-                plan_step_id,
-                "invalid_delegate_task",
-            )
-            session.pending_plan = _with_plan_runtime_metadata(
-                failed_graph.to_dict(),
-                session.pending_plan,
-            )
+            try:
+                active_graph = PlanGraph.from_dict(session.pending_plan)
+                failed_graph = active_graph.fail_unstarted(
+                    plan_step_id,
+                    "invalid_delegate_task",
+                )
+            except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+                logger.error(
+                    "Failed to reduce invalid child payload session=%s step=%s error=%s",
+                    session.session_id,
+                    plan_step_id,
+                    exc,
+                )
+            else:
+                session.pending_plan = _with_plan_runtime_metadata(
+                    failed_graph.to_dict(),
+                    session.pending_plan,
+                )
         logger.warning(
             "Delegate_many rejected: invalid first task session=%s frame=%s",
             session.session_id,
             frame.id,
         )
         frame.messages.append(
-            _tool_message(call_id, "delegate_many 首个子任务不合法", is_error=True)
+            _tool_message(
+                call_id,
+                {
+                    "ok": False,
+                    "status": "blocked",
+                    "error_code": "plan_child_payload_invalid",
+                    "step_id": plan_step_id,
+                    "message": "delegate_many 首个子任务不合法",
+                },
+                is_error=True,
+            )
         )
         return False
     session.agent_stack.append(child)
@@ -3465,11 +3695,29 @@ async def _start_delegate_group(
         _plan_step_started(session, child, event_callback, plan_step_id)
     else:
         group = session.delegate_groups[group_id]
-        group_graph = PlanGraph.from_dict(group["scheduler_plan"])
-        group["scheduler_plan"] = group_graph.start(
-            str(plan_step_id),
-            child.id,
-        ).to_dict()
+        try:
+            group_graph = PlanGraph.from_dict(group["scheduler_plan"])
+            group["scheduler_plan"] = group_graph.start(
+                str(plan_step_id),
+                child.id,
+            ).to_dict()
+        except (PlanGraphError, KeyError, TypeError, ValueError) as exc:
+            session.map_task_state = workflow_snapshot
+            session.agent_stack.pop()
+            session.delegate_groups.pop(group_id, None)
+            frame.messages.append(
+                _tool_message(
+                    call_id,
+                    {
+                        "ok": False,
+                        "error_code": "plan_stage_transition_blocked",
+                        "step_id": plan_step_id,
+                        "message": str(exc),
+                    },
+                    is_error=True,
+                )
+            )
+            return False
     logger.info(
         "Delegate_many group started session=%s group_id=%s parent_frame=%s child_frame=%s total_tasks=%d",
         session.session_id,
@@ -3905,7 +4153,7 @@ async def run_turn(
                 )
                 return ErrorResult(text=map_pause_message(session.map_task_state))
             _sync_map_progress_budget(session, frame)
-            session.map_task_state.counters.llm_turns += 1
+            increment_map_counter(session.map_task_state, "llm_turns")
         used = (
             frame.persistent_turn_count if persistent_map_budget else frame_turns.get(frame.id, 0)
         )
@@ -4711,7 +4959,11 @@ async def run_turn(
                 call.name in MAP_WRITE_TOOL_NAMES for call in front_calls
             ):
                 state = session.map_task_state
-                state.plan_version = max(1, state.plan_version)
+                replace_map_state_field(
+                    state,
+                    "plan_version",
+                    max(1, state.plan_version),
+                )
                 for batch_index, call in enumerate(front_calls):
                     call.input.setdefault("plan_version", state.plan_version)
                     call.input.setdefault("batch_index", batch_index)

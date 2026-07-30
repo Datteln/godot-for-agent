@@ -47,10 +47,11 @@ def evaluate_map_completion(state: Any) -> CompletionGateDecision:
         validation = scope.get("validation")
         if not isinstance(validation, dict):
             validation = state.latest_validations.get(target)
-        if not isinstance(validation, dict) or validation.get("map_revision") not in {
-            None,
-            revision,
-        }:
+        if (
+            not isinstance(validation, dict)
+            or validation.get("target") != target
+            or validation.get("map_revision") != revision
+        ):
             blockers.append(
                 {
                     "target": target,
@@ -67,7 +68,11 @@ def evaluate_map_completion(state: Any) -> CompletionGateDecision:
                     "target": target,
                     "required_revision": revision,
                     "reason": "validation_failed",
-                    "issues": list(validation.get("issues", [])),
+                    "issues": (
+                        list(validation.get("issues", []))
+                        if isinstance(validation.get("issues"), list)
+                        else []
+                    ),
                 }
             )
         evidence = scoped_evidence(
@@ -100,6 +105,13 @@ def evaluate_map_completion(state: Any) -> CompletionGateDecision:
             {
                 "reason": "workflow_paused",
                 "issues": [state.pause_reason or "map workflow is paused"],
+            }
+        )
+    elif state.status in {"idle", "cancelled"}:
+        blockers.append(
+            {
+                "reason": "workflow_not_active",
+                "issues": [f"map workflow status={state.status} cannot complete"],
             }
         )
     return CompletionGateDecision(

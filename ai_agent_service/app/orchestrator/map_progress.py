@@ -5,16 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from dataclasses import MISSING, asdict, dataclass, field, fields
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from app.orchestrator.map_contracts import MAP_RUNTIME_STAGE_TRANSITIONS
 from app.orchestrator.map_workers import MAP_PLAN_TOOL_NAMES, PLATFORM_PLAN_TOOL_NAMES
 from app.orchestrator.map_workflow import (
     assert_map_workflow_write_allowed,
     dispatch_map_workflow_event,
+    increment_map_counter,
+    map_workflow_scope_key,
     make_map_workflow_event,
-    migrate_legacy_workflow_scopes,
     replace_map_state_field,
     workflow_scope_identity,
 )
@@ -79,11 +80,24 @@ class MapTaskCounters:
     pauses: int = 0
 
 
+MapTaskFieldScope = Literal["task", "revision", "session"]
+
+
+@dataclass(frozen=True)
+class MapTaskFieldLifecycle:
+    """声明一个地图状态字段的生命周期与恢复策略。"""
+
+    scope: MapTaskFieldScope
+    reset_policy: Literal["dataclass_default"] = "dataclass_default"
+    resume_policy: Literal["preserve"] = "preserve"
+
+
 @dataclass
 class MapTaskState:
     """集中保存可序列化、可恢复的地图任务状态。"""
 
     task_id: str = ""
+    task_lineage_id: str = ""
     status: MapTaskStatus = "idle"
     stage: str = "read"
     # 独立场景结构版本：每次场景结构发生根本性变化时递增，
@@ -114,7 +128,7 @@ class MapTaskState:
     completion_blockers: list[dict[str, Any]] = field(default_factory=list)
     auto_iterations: int = 0
     checkpoint: dict[str, Any] | None = None
-    resumed_from_checkpoint: bool = False
+    resume_authorization: dict[str, str] | None = None
     pause_kind: MapTaskPauseKind = ""
     pause_reason: str = ""
     pause_report: dict[str, Any] = field(default_factory=dict)
@@ -123,6 +137,8 @@ class MapTaskState:
     workflow_scopes: dict[str, dict[str, Any]] = field(default_factory=dict)
     evidence_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
     retry_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
+    plan_attempt_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
+    task_convergence_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
     transaction_journals: list[dict[str, Any]] = field(default_factory=list)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -170,8 +186,13 @@ class MapTaskState:
           pending_batches、validation_cache/contracts/workflows、planning_attempts、
           approved_platform_plans、region_reads/summaries、context_state 等
         """
-        self.structure_revision += 1
-        self.plan_version += 1
+        next_structure_revision = self.structure_revision + 1
+        replace_map_state_field(
+            self,
+            "structure_revision",
+            next_structure_revision,
+        )
+        replace_map_state_field(self, "plan_version", self.plan_version + 1)
         self.transition_stage("read")
         for field_name, empty_value in (
             ("failure_frontier", None),
@@ -194,7 +215,7 @@ class MapTaskState:
             ("pause_report", {}),
         ):
             replace_map_state_field(self, field_name, empty_value)
-        self.context_state.clear()
+        replace_map_state_field(self, "context_state", {})
         return self.structure_revision
 
     def start(self, task_id: str) -> None:
@@ -202,16 +223,9 @@ class MapTaskState:
 
         由 start_new_task 内部调用，不直接暴露给外部调用方。
         """
-        self.transition_status("running")
-        self.task_id = task_id
-        self.transition_stage("read")
-        self.resumed_from_checkpoint = False
-        self.pause_kind = ""
-        self.pause_reason = ""
-        replace_map_state_field(self, "pause_report", {})
-        replace_map_state_field(self, "checkpoint", None)
+        self.start_new_task(task_id)
 
-    def start_new_task(self, task_id: str) -> None:
+    def start_new_task(self, task_id: str, *, lineage_id: str = "") -> None:
         """显式替换未暂停的旧任务并启动一个独立新任务。
 
         若当前有运行中的任务会先取消它；暂停中的任务必须先恢复或取消再替换，
@@ -219,20 +233,35 @@ class MapTaskState:
         """
         if self.status == "paused":
             raise ValueError("paused map task must be resumed or cancelled before replacement")
-        if self.status == "running":
-            self.cancel("replaced_by_new_task")
-        self.start(task_id)
+        dispatch_map_workflow_event(
+            self,
+            make_map_workflow_event(
+                self,
+                "task_epoch_started",
+                "__workflow__",
+                0,
+                {
+                    "task_id": task_id,
+                    "lineage_id": lineage_id,
+                },
+            ),
+        )
 
-    def resume(self) -> None:
+    def resume(self, *, lineage_id: str | None = None) -> None:
         """显式恢复已暂停任务。
 
-        仅当 status == paused 时可用；恢复后标记 resumed_from_checkpoint，
-        并清空无进展计数器避免旧 streak 误触发再次暂停。
+        仅当 status == paused 时可用；专用命令可同时签发绑定 lineage 的一次性
+        授权，普通上下文续接则在当前请求内恢复而不签发后续授权。
         """
         if self.status != "paused":
             raise ValueError(f"cannot resume map task with status={self.status}")
         self.transition_status("running")
-        self.resumed_from_checkpoint = True
+        authorization = (
+            {"task_id": self.task_id, "lineage_id": lineage_id}
+            if isinstance(lineage_id, str) and lineage_id
+            else None
+        )
+        replace_map_state_field(self, "resume_authorization", authorization)
         self.pause_kind = ""
         self.pause_reason = ""
         replace_map_state_field(self, "no_progress_streaks", {})
@@ -243,6 +272,8 @@ class MapTaskState:
         if self.status != "running":
             raise ValueError(f"cannot complete map task with status={self.status}")
         self.transition_status("completed")
+        replace_map_state_field(self, "plan_attempt_registry", {})
+        replace_map_state_field(self, "task_convergence_registry", {})
 
     def cancel(self, reason: str) -> None:
         """取消运行中或暂停中的地图任务并冻结残留批次。
@@ -255,19 +286,51 @@ class MapTaskState:
         self.transition_status("cancelled")
         self.pause_kind = ""
         self.pause_reason = reason
-        self.resumed_from_checkpoint = False
+        replace_map_state_field(self, "resume_authorization", None)
         replace_map_state_field(self, "pending_batches", [])
         replace_map_state_field(self, "completion_blockers", [])
         replace_map_state_field(self, "checkpoint", None)
         replace_map_state_field(self, "pause_report", {})
+        replace_map_state_field(self, "plan_attempt_registry", {})
+        replace_map_state_field(self, "task_convergence_registry", {})
 
     def to_dict(self) -> dict[str, Any]:
         """将任务状态转换为 JSON 可序列化字典。"""
         return asdict(self)
 
+    def task_epoch_reset_values(self) -> dict[str, Any]:
+        """按字段生命周期元数据生成新任务 epoch 的完整默认值。"""
+        declared = set(MAP_TASK_FIELD_LIFECYCLE)
+        actual = {item.name for item in fields(self)}
+        if declared != actual:
+            missing = sorted(actual - declared)
+            stale = sorted(declared - actual)
+            raise RuntimeError(
+                "MapTaskState lifecycle metadata mismatch: "
+                f"missing={missing}, stale={stale}"
+            )
+        reset_values: dict[str, Any] = {}
+        for item in fields(self):
+            lifecycle = MAP_TASK_FIELD_LIFECYCLE[item.name]
+            if lifecycle.scope == "session":
+                continue
+            if item.default_factory is not MISSING:
+                reset_values[item.name] = item.default_factory()
+            elif item.default is not MISSING:
+                reset_values[item.name] = deepcopy(item.default)
+            else:
+                raise RuntimeError(
+                    f"MapTaskState field has no reset default: {item.name}"
+                )
+        return reset_values
+
     @classmethod
     def from_dict(cls, value: Any) -> MapTaskState:
         """从持久化字典恢复地图任务状态。"""
+        if isinstance(value, cls):
+            raise TypeError(
+                "MapTaskState hydration accepts raw persisted dictionaries only"
+            )
         if not isinstance(value, dict):
             return cls()
         field_names = set(cls.__dataclass_fields__)
@@ -303,6 +366,8 @@ class MapTaskState:
             "workflow_scopes",
             "evidence_registry",
             "retry_registry",
+            "plan_attempt_registry",
+            "task_convergence_registry",
             "pause_report",
         ):
             if not isinstance(data.get(key), dict):
@@ -326,9 +391,21 @@ class MapTaskState:
             data["stage"] = "read"
         if data.get("pause_kind") not in _MAP_PAUSE_KINDS:
             data["pause_kind"] = ""
-        state = cls(**data)
-        migrate_legacy_workflow_scopes(state)
-        return state
+        legacy_resume = value.get("resumed_from_checkpoint")
+        if (
+            "resume_authorization" not in data
+            and legacy_resume is True
+            and isinstance(data.get("task_id"), str)
+            and data["task_id"]
+        ):
+            data["resume_authorization"] = {
+                "task_id": data["task_id"],
+                "lineage_id": data["task_id"],
+            }
+        if not isinstance(data.get("resume_authorization"), dict):
+            data["resume_authorization"] = None
+        _migrate_legacy_workflow_scope_data(data)
+        return cls(**data)
 
     def make_checkpoint(
         self,
@@ -364,7 +441,7 @@ class MapTaskState:
             target=target,
             revision=revision,
         )
-        self.counters.pauses += 1
+        increment_map_counter(self, "pauses", target=target, revision=revision)
         checkpoint = {
             "task_id": self.task_id,
             "status": self.status,
@@ -393,6 +470,99 @@ class MapTaskState:
             ),
         )
         return checkpoint
+
+
+def _migrate_legacy_workflow_scope_data(data: dict[str, Any]) -> None:
+    """在构造 live state 前把旧投影迁移为 revision scope。"""
+    scopes = data.get("workflow_scopes")
+    if isinstance(scopes, dict) and scopes:
+        return
+    latest_revisions = data.get("latest_revisions")
+    latest_validations = data.get("latest_validations")
+    blockers = data.get("completion_blockers")
+    if not isinstance(latest_revisions, dict):
+        latest_revisions = {}
+    if not isinstance(latest_validations, dict):
+        latest_validations = {}
+    if not isinstance(blockers, list):
+        blockers = []
+    migrated_scopes: dict[str, dict[str, Any]] = {}
+    targets = set(latest_revisions) | set(latest_validations)
+    for target_value in sorted(targets, key=str):
+        target = str(target_value)
+        if "::" in target:
+            continue
+        revision = latest_revisions.get(target_value)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            continue
+        scope: dict[str, Any] = {
+            "target": target,
+            "revision": revision,
+            "stage": str(data.get("stage", "read")),
+        }
+        validation = latest_validations.get(target_value)
+        if (
+            isinstance(validation, dict)
+            and validation.get("map_revision") == revision
+        ):
+            scope["validation"] = deepcopy(validation)
+        scoped_blockers = [
+            deepcopy(item)
+            for item in blockers
+            if isinstance(item, dict)
+            and str(item.get("target", target)) == target
+            and item.get("required_revision") in {None, revision}
+        ]
+        if scoped_blockers:
+            scope["blockers"] = scoped_blockers
+        migrated_scopes[map_workflow_scope_key(target, revision)] = scope
+    data["workflow_scopes"] = migrated_scopes
+
+
+MAP_TASK_FIELD_LIFECYCLE: Final[dict[str, MapTaskFieldLifecycle]] = {
+    "task_id": MapTaskFieldLifecycle("task"),
+    "task_lineage_id": MapTaskFieldLifecycle("task"),
+    "status": MapTaskFieldLifecycle("task"),
+    "stage": MapTaskFieldLifecycle("task"),
+    "structure_revision": MapTaskFieldLifecycle("task"),
+    "plan_version": MapTaskFieldLifecycle("task"),
+    "counters": MapTaskFieldLifecycle("task"),
+    "failure_frontier": MapTaskFieldLifecycle("task"),
+    "unresolved_issues": MapTaskFieldLifecycle("task"),
+    "completed_goals": MapTaskFieldLifecycle("task"),
+    "pending_batches": MapTaskFieldLifecycle("task"),
+    "executed_batches": MapTaskFieldLifecycle("task"),
+    "validation_cache": MapTaskFieldLifecycle("revision"),
+    "validation_contracts": MapTaskFieldLifecycle("revision"),
+    "validation_workflows": MapTaskFieldLifecycle("revision"),
+    "no_progress_streaks": MapTaskFieldLifecycle("revision"),
+    "latest_validations": MapTaskFieldLifecycle("revision"),
+    "validation_failure_counts": MapTaskFieldLifecycle("revision"),
+    "planning_attempts": MapTaskFieldLifecycle("task"),
+    "planning_fingerprints": MapTaskFieldLifecycle("task"),
+    "tool_failure_fingerprints": MapTaskFieldLifecycle("task"),
+    "approved_platform_plans": MapTaskFieldLifecycle("revision"),
+    "latest_revisions": MapTaskFieldLifecycle("revision"),
+    "latest_layers": MapTaskFieldLifecycle("revision"),
+    "region_reads": MapTaskFieldLifecycle("revision"),
+    "region_summaries": MapTaskFieldLifecycle("revision"),
+    "context_state": MapTaskFieldLifecycle("task"),
+    "completion_blockers": MapTaskFieldLifecycle("revision"),
+    "auto_iterations": MapTaskFieldLifecycle("task"),
+    "checkpoint": MapTaskFieldLifecycle("task"),
+    "resume_authorization": MapTaskFieldLifecycle("task"),
+    "pause_kind": MapTaskFieldLifecycle("task"),
+    "pause_reason": MapTaskFieldLifecycle("task"),
+    "pause_report": MapTaskFieldLifecycle("task"),
+    "workflow_schema_version": MapTaskFieldLifecycle("session"),
+    "workflow_events": MapTaskFieldLifecycle("session"),
+    "workflow_scopes": MapTaskFieldLifecycle("revision"),
+    "evidence_registry": MapTaskFieldLifecycle("revision"),
+    "retry_registry": MapTaskFieldLifecycle("task"),
+    "plan_attempt_registry": MapTaskFieldLifecycle("task"),
+    "task_convergence_registry": MapTaskFieldLifecycle("task"),
+    "transaction_journals": MapTaskFieldLifecycle("task"),
+}
 
 
 def _minimal_pause_report(
@@ -681,7 +851,7 @@ def cached_validation_result(
     cached = session.map_task_state.validation_cache.get(fingerprint)
     if not isinstance(cached, dict):
         return None
-    session.map_task_state.counters.validation_cache_hits += 1
+    increment_map_counter(session.map_task_state, "validation_cache_hits")
     return {
         **cached,
         "cache_hit": True,
@@ -741,7 +911,7 @@ def record_no_progress(session: Session, target: str, reason: str) -> dict[str, 
         target=scoped_target,
         revision=revision,
     )
-    state.counters.no_progress_events += 1
+    increment_map_counter(state, "no_progress_events", target=target, revision=revision)
     if streak < SEMANTIC_RETRY_MAX_ATTEMPTS:
         return None
     report = retry_pause_report(
@@ -784,13 +954,17 @@ def record_no_progress(session: Session, target: str, reason: str) -> dict[str, 
     return checkpoint
 
 
-def resume_map_task(state: MapTaskState) -> None:
+def resume_map_task(
+    state: MapTaskState,
+    *,
+    lineage_id: str | None = None,
+) -> None:
     """从检查点恢复任务，同时保留地图事实和批次进度。
 
-    委托给 state.resume() 统一执行：校验状态合法性、推进 status、
-    标记 resumed_from_checkpoint 并清空无进展计数器。
+    委托给 state.resume() 统一执行：校验状态合法性、推进 status，并按需
+    签发绑定当前 task/lineage 的一次性恢复授权。
     """
-    state.resume()
+    state.resume(lineage_id=lineage_id)
 
 
 def _target(tool_args: dict[str, Any]) -> str:
@@ -1109,7 +1283,11 @@ def map_write_stage_error(
                 "请勿让 writer 自行拼接 fill。"
             )
         return None
-    if approval.get("map_revision") != revision:
+    approval_revision = approval.get(
+        "expected_revision",
+        approval.get("map_revision"),
+    )
+    if approval_revision != revision:
         approvals = dict(session.map_task_state.approved_platform_plans)
         approvals.pop(scope, None)
         replace_map_state_field(
@@ -1120,18 +1298,21 @@ def map_write_stage_error(
             revision=revision,
         )
         return (
-            f"平台方案基于 map revision {approval.get('map_revision')}，当前 revision 为 "
+            f"平台方案基于 map revision {approval_revision}，当前 revision 为 "
             f"{revision}；旧编译批次已失效，请重新读取边界并提交 "
             "validate_platform_level_plan。"
         )
-    approval = deepcopy(approval)
-    batches_value = approval.get("remaining_batches")
-    batches = list(batches_value) if isinstance(batches_value, list) else []
+    records = _platform_approval_records(approval, target)
     matched_index = next(
         (
             index
-            for index, batch in enumerate(batches)
-            if _compiled_batch_matches(tool_name, tool_args, batch)
+            for index, record in enumerate(records)
+            if record.get("expected_revision") == revision
+            and _compiled_batch_matches(
+                tool_name,
+                tool_args,
+                record.get("batch"),
+            )
         ),
         None,
     )
@@ -1142,32 +1323,19 @@ def map_write_stage_error(
             "编译出的剩余 edit_map_batches。禁止 coordinator/writer 临时拼接连续实心 "
             "fill、修改批次 operations，或执行未获批准的可站立路线。"
         )
-    approved_batch = batches.pop(matched_index)
-    tool_args["plan_version"] = approval.get("plan_version")
+    record = records[matched_index]
+    approved_batch = record.get("batch", {})
+    tool_args["plan_version"] = record.get(
+        "plan_version",
+        approval.get("plan_version"),
+    )
     tool_args["batch_index"] = approved_batch.get("batch_index", matched_index)
     tool_args["validated_platform_batch"] = True
-    if isinstance(revision, int) and not isinstance(revision, bool):
-        approval["map_revision"] = revision + 1
-    approval["remaining_batches"] = batches
-    approvals = dict(session.map_task_state.approved_platform_plans)
-    approvals[scope] = approval
-    replace_map_state_field(
-        session.map_task_state,
-        "approved_platform_plans",
-        approvals,
-        target=target,
-        revision=revision,
-    )
-    workflow["next_stage"] = "write"
-    workflows = dict(session.map_task_state.validation_workflows)
-    workflows[scope] = workflow
-    replace_map_state_field(
-        session.map_task_state,
-        "validation_workflows",
-        workflows,
-        target=target,
-        revision=revision,
-    )
+    tool_args["approval_id"] = record.get("approval_id")
+    tool_args["approval_batch_fingerprint"] = record.get("batch_fingerprint")
+    tool_args["approval_expected_revision"] = record.get("expected_revision")
+    # Preflight is deliberately non-consuming. The matching record is removed
+    # only after Godot returns a durable committed transaction result.
     return None
 
 
@@ -1185,6 +1353,78 @@ def _compiled_batch_matches(
         return False
     expected_cells = batch.get("expected_cells")
     return expected_cells is None or tool_args.get("expected_cells") == expected_cells
+
+
+def _platform_batch_fingerprint(
+    tool_name: str,
+    batch: dict[str, Any],
+    target: str,
+    expected_revision: int,
+) -> str:
+    """Return the canonical immutable identity of one approved batch."""
+    payload = {
+        "tool": tool_name,
+        "target": target,
+        "expected_revision": expected_revision,
+        "operations": batch.get("operations"),
+        "expected_cells": batch.get("expected_cells"),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _platform_approval_records(
+    approval: dict[str, Any],
+    target: str,
+) -> list[dict[str, Any]]:
+    """Normalize persisted approval data without mutating the stored record."""
+    records_value = approval.get("records")
+    if isinstance(records_value, list):
+        return [
+            deepcopy(record)
+            for record in records_value
+            if isinstance(record, dict)
+            and isinstance(record.get("batch"), dict)
+        ]
+    # Compatibility for schema versions that stored a mutable remaining queue.
+    batches_value = approval.get("remaining_batches")
+    batches = batches_value if isinstance(batches_value, list) else []
+    base_revision = approval.get("map_revision")
+    if not isinstance(base_revision, int) or isinstance(base_revision, bool):
+        return []
+    plan_version = approval.get("plan_version")
+    records: list[dict[str, Any]] = []
+    for index, batch_value in enumerate(batches):
+        if not isinstance(batch_value, dict):
+            continue
+        batch = deepcopy(batch_value)
+        tool_name = str(batch.get("tool", "edit_map"))
+        expected_revision = base_revision + index
+        fingerprint = _platform_batch_fingerprint(
+            tool_name,
+            batch,
+            target,
+            expected_revision,
+        )
+        records.append(
+            {
+                "approval_id": hashlib.sha256(
+                    f"{target}:{plan_version}:{fingerprint}".encode("utf-8")
+                ).hexdigest()[:32],
+                "target": target,
+                "expected_revision": expected_revision,
+                "batch_fingerprint": fingerprint,
+                "plan_version": plan_version,
+                "batch": batch,
+            }
+        )
+    return records
 
 
 def _looks_like_platform_route_write(
@@ -1242,13 +1482,17 @@ def platform_write_requires_validation(
     layer = tool_args.get("map_layer")
     map_layer = layer if isinstance(layer, int) and not isinstance(layer, bool) else None
     revision = latest_map_revision(session, target, map_layer)
-    if approval.get("map_revision") != revision:
+    if approval.get(
+        "expected_revision",
+        approval.get("map_revision"),
+    ) != revision:
         return True
 
-    batches_value = approval.get("remaining_batches")
-    batches = batches_value if isinstance(batches_value, list) else []
+    records = _platform_approval_records(approval, target)
     return not any(
-        _compiled_batch_matches(tool_name, tool_args, batch) for batch in batches
+        record.get("expected_revision") == revision
+        and _compiled_batch_matches(tool_name, tool_args, record.get("batch"))
+        for record in records
     )
 
 
@@ -1377,7 +1621,14 @@ def remember_map_plan_progress(
         )
     state = session.map_task_state
     state.transition_stage("write")
-    state.plan_version += 1
+    next_plan_version = state.plan_version + 1
+    replace_map_state_field(
+        state,
+        "plan_version",
+        next_plan_version,
+        target=target,
+        revision=current_revision,
+    )
     replace_map_state_field(
         state,
         "failure_frontier",
@@ -1403,14 +1654,50 @@ def remember_map_plan_progress(
     )
     if tool_name in PLATFORM_PLAN_TOOL_NAMES:
         batches = _platform_edit_batches(result)
+        records: list[dict[str, Any]] = []
+        if not isinstance(current_revision, int) or isinstance(current_revision, bool):
+            replace_map_state_field(
+                state,
+                "unresolved_issues",
+                ["platform_approval_revision_missing"],
+                target=target,
+                revision=None,
+            )
+            state.transition_stage("plan")
+            return
         for index, batch in enumerate(batches):
             batch["batch_index"] = index
+            batch_tool = str(batch.get("tool", "edit_map"))
+            expected_revision = current_revision + index
+            fingerprint = _platform_batch_fingerprint(
+                batch_tool,
+                batch,
+                target,
+                expected_revision,
+            )
+            records.append(
+                {
+                    "approval_id": hashlib.sha256(
+                        (
+                            f"{target}:{next_plan_version}:"
+                            f"{expected_revision}:{fingerprint}"
+                        ).encode("utf-8")
+                    ).hexdigest()[:32],
+                    "target": target,
+                    "expected_revision": expected_revision,
+                    "batch_fingerprint": fingerprint,
+                    "plan_version": next_plan_version,
+                    "batch": deepcopy(batch),
+                }
+            )
         approvals = dict(state.approved_platform_plans)
         approvals[scope] = {
             "tool": tool_name,
+            "target": target,
+            "expected_revision": current_revision,
             "map_revision": current_revision,
-            "plan_version": state.plan_version,
-            "remaining_batches": batches,
+            "plan_version": next_plan_version,
+            "records": records,
         }
         replace_map_state_field(
             state,
@@ -1419,6 +1706,97 @@ def remember_map_plan_progress(
             target=target,
             revision=current_revision,
         )
+
+
+def consume_committed_platform_approvals(
+    session: Session,
+    result: dict[str, Any],
+    transaction_entry: dict[str, Any],
+) -> bool:
+    """Consume immutable approvals only from a matching durable commit result."""
+    if result.get("map_transaction_status") != "committed":
+        return False
+    committed_revision = result.get("committed_revision", result.get("map_revision"))
+    if not isinstance(committed_revision, int) or isinstance(committed_revision, bool):
+        return False
+    claimed_value = result.get(
+        "approval_records",
+        transaction_entry.get("approval_records"),
+    )
+    if not isinstance(claimed_value, list) or not claimed_value:
+        return False
+    claimed = {
+        str(record.get("approval_id", "")): str(
+            record.get("batch_fingerprint", "")
+        )
+        for record in claimed_value
+        if isinstance(record, dict)
+        and str(record.get("approval_id", "")).strip()
+        and str(record.get("batch_fingerprint", "")).strip()
+    }
+    if not claimed:
+        return False
+
+    state = session.map_task_state
+    approvals = dict(state.approved_platform_plans)
+    workflows = dict(state.validation_workflows)
+    consumed_any = False
+    for scope, approval_value in list(approvals.items()):
+        approval = deepcopy(approval_value)
+        target = str(approval.get("target", scope.split("::", 1)[0]))
+        records = _platform_approval_records(approval, target)
+        matched = [
+            record
+            for record in records
+            if claimed.get(str(record.get("approval_id", "")))
+            == str(record.get("batch_fingerprint", ""))
+        ]
+        if not matched:
+            continue
+        expected_committed_revision = max(
+            int(record.get("expected_revision", -1)) for record in matched
+        ) + 1
+        if expected_committed_revision != committed_revision:
+            continue
+        consumed_ids = {
+            str(record.get("approval_id", "")) for record in matched
+        }
+        remaining = [
+            record
+            for record in records
+            if str(record.get("approval_id", "")) not in consumed_ids
+        ]
+        if remaining:
+            approval["records"] = remaining
+            approval["expected_revision"] = min(
+                int(record["expected_revision"]) for record in remaining
+            )
+            approval["map_revision"] = approval["expected_revision"]
+            approvals[scope] = approval
+        else:
+            approvals.pop(scope, None)
+        workflow_value = workflows.get(scope)
+        if isinstance(workflow_value, dict):
+            workflow = dict(workflow_value)
+            workflow["map_revision"] = committed_revision
+            workflow["next_stage"] = "write" if remaining else "validator"
+            workflows[scope] = workflow
+        consumed_any = True
+    if not consumed_any:
+        return False
+    replace_map_state_field(
+        state,
+        "approved_platform_plans",
+        approvals,
+        revision=committed_revision,
+    )
+    replace_map_state_field(
+        state,
+        "validation_workflows",
+        workflows,
+        revision=committed_revision,
+    )
+    return True
 
 
 def remember_validation_progress(
@@ -1512,7 +1890,12 @@ def remember_validation_progress(
         target=target,
         revision=revision,
     )
-    session.map_task_state.counters.validations += 1
+    increment_map_counter(
+        session.map_task_state,
+        "validations",
+        target=target,
+        revision=revision,
+    )
     streaks = dict(session.map_task_state.no_progress_streaks)
     streaks[scope] = 0
     replace_map_state_field(
@@ -1529,37 +1912,17 @@ def reset_map_task_progress(
     frame: Frame | None = None,
     *,
     task_id: str | None = None,
+    lineage_id: str = "",
 ) -> None:
     """在新用户地图任务开始时重置合同、阶段和当前帧的进展周期。
 
-    通过 state.start_new_task() 统一处理状态转换：若当前有运行中任务会先取消，
-    暂停中任务会拒绝替换（必须先恢复或取消），然后启动独立新任务。
+    通过单个 task_epoch_started reducer 事件按生命周期元数据完整初始化状态。
     """
     state = session.map_task_state
-    state.start_new_task(task_id or f"map-{session.session_id}-{session.turn_counter + 1}")
-    state.plan_version = 0
-    state.counters = MapTaskCounters()
-    for field_name, empty_value in (
-        ("failure_frontier", None),
-        ("unresolved_issues", []),
-        ("completed_goals", []),
-        ("pending_batches", []),
-        ("executed_batches", []),
-        ("validation_cache", {}),
-        ("validation_contracts", {}),
-        ("validation_workflows", {}),
-        ("no_progress_streaks", {}),
-        ("planning_attempts", {}),
-        ("planning_fingerprints", {}),
-        ("tool_failure_fingerprints", {}),
-        ("approved_platform_plans", {}),
-        ("completion_blockers", []),
-    ):
-        replace_map_state_field(state, field_name, empty_value)
-    state.context_state.pop("reader_exhausted", None)
-    replace_map_state_field(state, "checkpoint", None)
-    state.resumed_from_checkpoint = False
-    state.pause_reason = ""
+    state.start_new_task(
+        task_id or f"map-{session.session_id}-{session.turn_counter + 1}",
+        lineage_id=lineage_id,
+    )
     if frame is None:
         return
     frame.persistent_turn_count = 0

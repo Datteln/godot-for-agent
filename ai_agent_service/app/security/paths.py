@@ -49,7 +49,7 @@ def _matches_deny(rel: str, deny_patterns: list[str]) -> bool:
     return False
 
 
-def path_ok(target: str, security: SecuritySettings, write: bool = False) -> bool:
+def path_ok(target: object, security: SecuritySettings, write: bool = False) -> bool:
     """校验目标路径是否落在工程根内且未被安全规则拒绝。
 
     校验顺序：先解析为绝对路径并确认未越出 `project_root`（拒绝 `..`、
@@ -65,6 +65,13 @@ def path_ok(target: str, security: SecuritySettings, write: bool = False) -> boo
     Returns:
         路径合法且未被拒绝时返回 True，否则返回 False。
     """
+    if not isinstance(target, str):
+        logger.debug(
+            "Path rejected reason=non_string target_type=%s write=%s",
+            type(target).__name__,
+            write,
+        )
+        return False
     target_path = Path(target)
     if target_path.is_absolute():
         logger.debug("Path rejected reason=absolute target=%s write=%s", target, write)
@@ -110,18 +117,48 @@ def all_paths_ok(
         所有出现在 `args` 中的路径参数均通过 `path_ok` 时返回 True；
         `path_args` 为空（工具不涉及路径参数）时同样返回 True。
     """
-    return all(path_ok(args[name], security, write) for name in path_args if name in args)
+    return all(
+        isinstance(args[name], str) and path_ok(args[name], security, write)
+        for name in path_args
+        if name in args
+    )
 
 
-def capture_path_ok(target: str, security: SecuritySettings, write: bool = False) -> bool:
+def _has_malformed_godot_scheme(target: str) -> bool:
+    """判断路径是否使用了缺少双斜杠的 Godot 伪 scheme。"""
+    lowered = target.casefold()
+    return any(
+        lowered.startswith(prefix)
+        for prefix in ("user:", "res:")
+    ) and not any(
+        lowered.startswith(prefix)
+        for prefix in ("user://", "res://")
+    )
+
+
+def capture_path_ok(target: object, security: SecuritySettings, write: bool = False) -> bool:
     """校验截图/图片路径，同时支持工程路径与受限的 Godot `user://` 空间。
 
     `user://` 仅作为 Godot 管理的临时截图空间，不映射到项目根规则；该分支仍
     严格拒绝空路径、目录穿越、反斜杠穿越与其他 URI scheme。`res://` 会先
     转成项目相对路径，再复用项目路径的完整 allow/deny 边界。
     """
+    if not isinstance(target, str):
+        logger.debug(
+            "Capture path rejected reason=non_string target_type=%s write=%s",
+            type(target).__name__,
+            write,
+        )
+        return False
     cleaned = target.strip().replace("\\", "/")
     if not cleaned:
+        return False
+    if _has_malformed_godot_scheme(cleaned):
+        logger.debug(
+            "Capture path rejected reason=malformed_scheme target=%s write=%s",
+            target,
+            write,
+        )
         return False
     if cleaned.startswith("user://"):
         relative = cleaned.removeprefix("user://").lstrip("/")

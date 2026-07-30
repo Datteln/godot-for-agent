@@ -23,6 +23,7 @@ from app.events.store import EventStore
 from app.llm.provider import AssistantTurn, LLMProvider
 from app.memory.store import MemoryStore
 from app.orchestrator.agent import _requires_create_plan_before_map_delegate
+from app.orchestrator.map_progress import MapTaskState
 from app.query.engine import QueryEngine, _schedule_map_completion_continuation
 from app.recovery.pointer import RecoveryPointerStore
 from app.sessions.store import Session, SessionStore, _safe_filename, session_from_dict
@@ -120,15 +121,17 @@ class MapCompletionContinuationTests(unittest.TestCase):
                     ],
                 )
             ],
-            map_completion_blockers=[
-                {
-                    "tool": "validate_map_region",
-                    "reason": "blocking_completion",
-                    "issues": ["platformer design has overly tall solid columns"],
-                    "target": "TileMap",
-                    "required_revision": 82,
-                }
-            ],
+            map_task_state=MapTaskState(
+                completion_blockers=[
+                    {
+                        "tool": "validate_map_region",
+                        "reason": "blocking_completion",
+                        "issues": ["platformer design has overly tall solid columns"],
+                        "target": "TileMap",
+                        "required_revision": 82,
+                    }
+                ]
+            ),
         )
 
         self.assertTrue(_schedule_map_completion_continuation(session))
@@ -147,6 +150,7 @@ class MapPlanningProtocolTests(unittest.TestCase):
             source="bundled",
             description="",
             prompt="",
+            role="coordinator",
         )
         frame = Frame(id="f1", agent=agent, messages=[])
         session = Session(session_id="map-session", agent_stack=[frame])

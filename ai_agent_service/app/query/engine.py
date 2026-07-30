@@ -56,6 +56,7 @@ from app.orchestrator.map_workers import (
 )
 from app.orchestrator.map_progress import (
     MAP_PLATFORM_PLAN_MAX_ATTEMPTS,
+    consume_committed_platform_approvals,
     latest_map_revision,
     map_platform_plan_attempt_count,
     parse_map_plan_outcome,
@@ -82,11 +83,17 @@ from app.query.tool_result_submission import (
 )
 from app.orchestrator.map_artifacts import (
     CURRENT_MAP_ARTIFACT_TURN,
+    CoordinatedCommitFailureInjector,
+    MapArtifactTurnConflictError,
     MapArtifactLocator,
     MapArtifactStore,
     StagedMapArtifactTurn,
 )
-from app.orchestrator.map_workflow import replace_map_state_field
+from app.orchestrator.map_workflow import (
+    consume_map_resume_authorization,
+    increment_map_counter,
+    replace_map_state_field,
+)
 from app.orchestrator.evidence import (
     EvidenceValidationError,
     register_screenshot_evidence,
@@ -99,6 +106,7 @@ from app.orchestrator.completion_gate import (
 from app.orchestrator.map_request_scope import (
     MapRequestScope,
     bind_map_task,
+    invalidate_completion_candidate,
     is_continuation_intent,
     mark_completion_candidate,
     new_request_scope,
@@ -107,7 +115,7 @@ from app.rag.asset_llm_client import AssetLLMClient, AssetLLMConfig
 from app.rag.factory import create_codebase_index
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import SecuritySettings, security_settings_from_app
-from app.sessions.store import Session, SessionStore
+from app.sessions.store import Session, SessionStore, session_to_dict
 from app.skills.catalog import SkillCatalog
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
@@ -138,6 +146,7 @@ def _map_completion_candidate_is_current(session: Session) -> bool:
     return (
         scope.activates_map_gate
         and scope.completion_candidate
+        and session.map_task_state.status in {"running", "completed"}
         and scope.map_task_id == session.map_task_state.task_id
         and frame is not None
         and frame.map_request_lineage_id == scope.lineage_id
@@ -228,13 +237,10 @@ def _can_contextually_resume_map_task(session: Session, user_message: str) -> bo
 def _activate_user_request_scope(
     session: Session,
     request: ChatRequest,
+    *,
+    dedicated_resume_authorized: bool = False,
 ) -> tuple[MapRequestScope, bool]:
     """Classify a user request and explicitly start or resume a map task."""
-    dedicated_resume_authorized = (
-        session.map_task_state.resumed_from_checkpoint
-        and session.map_task_state.status == "running"
-        and bool(session.map_task_state.task_id)
-    )
     contextual_resume_authorized = _can_contextually_resume_map_task(
         session,
         request.user_message or "",
@@ -279,7 +285,12 @@ def _activate_user_request_scope(
             task_digest = hashlib.sha256(scope.lineage_id.encode("utf-8")).hexdigest()[:20]
             task_id = f"map-request-{task_digest}"
             root = session.agent_stack[0] if session.agent_stack else None
-            reset_map_task_progress(session, root, task_id=task_id)
+            reset_map_task_progress(
+                session,
+                root,
+                task_id=task_id,
+                lineage_id=scope.lineage_id,
+            )
             scope = bind_map_task(scope, task_id)
             session.map_task_lineage = {
                 "task_id": task_id,
@@ -645,7 +656,7 @@ def _remember_map_batch_result(
             else None
         ),
     )
-    state.counters.executed_batches += 1
+    increment_map_counter(state, "executed_batches")
     transaction_id = str(tool_args.get("map_transaction_id", "")).strip()
     if transaction_id:
         journals = list(state.transaction_journals)
@@ -667,9 +678,36 @@ def _remember_map_batch_result(
         batch_id = str(tool_args.get("write_batch_id", ""))
         if batch_id and batch_id not in operation_ids:
             operation_ids.append(batch_id)
+        approval_records = list(transaction_entry.get("approval_records", []))
+        approval_id = str(tool_args.get("approval_id", "")).strip()
+        approval_fingerprint = str(
+            tool_args.get("approval_batch_fingerprint", "")
+        ).strip()
+        approval_expected_revision = tool_args.get(
+            "approval_expected_revision"
+        )
+        if (
+            approval_id
+            and approval_fingerprint
+            and isinstance(approval_expected_revision, int)
+            and not isinstance(approval_expected_revision, bool)
+            and not any(
+                record.get("approval_id") == approval_id
+                for record in approval_records
+                if isinstance(record, dict)
+            )
+        ):
+            approval_records.append(
+                {
+                    "approval_id": approval_id,
+                    "batch_fingerprint": approval_fingerprint,
+                    "expected_revision": approval_expected_revision,
+                }
+            )
         transaction_entry.update(
             {
                 "operation_ids": operation_ids,
+                "approval_records": approval_records,
                 "final_revision": (
                     result.get("map_revision") if isinstance(result, dict) else None
                 ),
@@ -696,14 +734,49 @@ def _remember_map_batch_result(
             ),
         )
     if error is None:
-        state.counters.writes += 1
+        if state.pending_batches:
+            first = state.pending_batches[0]
+            first_input = first.get("input", {}) if isinstance(first, dict) else {}
+            if (
+                isinstance(first_input, dict)
+                and first_input.get("write_batch_id")
+                == tool_args.get("write_batch_id")
+            ):
+                replace_map_state_field(
+                    state,
+                    "pending_batches",
+                    state.pending_batches[1:],
+                    target=str(tool_args.get("target_path", "")) or None,
+                    revision=(
+                        result.get("map_revision")
+                        if isinstance(result, dict)
+                        and isinstance(result.get("map_revision"), int)
+                        else None
+                    ),
+                )
+        increment_map_counter(state, "writes")
         # 通过 transition_stage 推进阶段，内部会触发派生状态（如缓存）的失效
         state.transition_stage("validate" if not state.pending_batches else "write")
         if not state.pending_batches and session.latest_context_used_tokens >= 32_000:
             session.force_compact_next_turn = True
         return
-    state.counters.failed_batches += 1
-    replace_map_state_field(state, "pending_batches", [])
+    increment_map_counter(state, "failed_batches")
+    approval_expected_revision = tool_args.get("approval_expected_revision")
+    current_revision = latest_map_revision(
+        session,
+        str(tool_args.get("target_path", "")),
+        (
+            tool_args.get("map_layer")
+            if isinstance(tool_args.get("map_layer"), int)
+            and not isinstance(tool_args.get("map_layer"), bool)
+            else None
+        ),
+    )
+    if (
+        not str(tool_args.get("approval_id", "")).strip()
+        or approval_expected_revision != current_revision
+    ):
+        replace_map_state_field(state, "pending_batches", [])
     # 批次失败时回退到 plan 阶段，重新规划
     state.transition_stage("plan")
     replace_map_state_field(state, "unresolved_issues", [error])
@@ -744,6 +817,8 @@ def _remember_map_transaction_validation(
     updated["error"] = None if successful else str(
         result.get("message", "map validation failed")
     )
+    if successful and updated["status"] == "committed":
+        consume_committed_platform_approvals(session, result, updated)
     journals = [
         item
         for item in journals
@@ -769,11 +844,6 @@ def _resume_map_batch_queue(session: Session) -> ChatToolCallsResponse | None:
     if not state.pending_batches or state.unresolved_issues:
         return None
     raw = state.pending_batches[0]
-    replace_map_state_field(
-        state,
-        "pending_batches",
-        state.pending_batches[1:],
-    )
     input_args = raw.get("input", {})
     if not isinstance(input_args, dict):
         replace_map_state_field(state, "pending_batches", [])
@@ -892,6 +962,9 @@ class QueryEngine:
         recovery_store: RecoveryPointerStore | None = None,
         cache_engine: CacheDecisionEngine | None = None,
         cache_metrics: CacheMetricsCollector | None = None,
+        coordinated_commit_failure_injector: (
+            CoordinatedCommitFailureInjector | None
+        ) = None,
     ) -> None:
         """构造 QueryEngine。
 
@@ -902,6 +975,8 @@ class QueryEngine:
             base_security: 启动时解析出的安全边界；缺省时从 settings 构造。
             cache_engine: 上下文缓存决策引擎（§16.1）；缺省时构造新实例。
             cache_metrics: 缓存命中率观测聚合器；缺省时构造新实例。
+            coordinated_commit_failure_injector: 仅测试组合传入的命名故障依赖；
+                生产默认关闭，且不从请求或持久化载荷读取。
         """
         self._settings = settings
         self._store = session_store
@@ -913,6 +988,9 @@ class QueryEngine:
         self._recovery = recovery_store
         self._cache_engine = cache_engine or CacheDecisionEngine()
         self._cache_metrics = cache_metrics or CacheMetricsCollector()
+        self._coordinated_commit_failure_injector = (
+            coordinated_commit_failure_injector
+        )
         self._verify_runner = VerifyRunner(
             settings,
             llm,
@@ -1033,7 +1111,12 @@ class QueryEngine:
                 tool_args=tool_args,
                 result=result,
             )
-            return store.locator(publication_buffer.turn_id, tool_use_id)
+            entry = publication_buffer.map_artifact_turn.entries[tool_use_id]
+            return store.locator(
+                publication_buffer.turn_id,
+                tool_use_id,
+                str(entry.get("fingerprint", "")),
+            )
         staged = StagedMapArtifactTurn(
             session_id=session_id,
             turn_id=turn_id,
@@ -1056,7 +1139,12 @@ class QueryEngine:
                 exc,
             )
             return None
-        return store.locator(turn_id, tool_use_id)
+        entry = staged.entries[tool_use_id]
+        return store.locator(
+            turn_id,
+            tool_use_id,
+            str(entry.get("fingerprint", "")),
+        )
 
     def session_history(
         self, session_id: str, limit: int = 200, before: int = 0
@@ -1158,6 +1246,17 @@ class QueryEngine:
                     phase="accepted",
                 )
                 session = self._store.get_or_create(request.session_id, self.available_tools)
+                try:
+                    MapArtifactStore(
+                        self._settings.project_root,
+                        session.session_id,
+                        self._coordinated_commit_failure_injector,
+                    ).reconcile_with_session(session_to_dict(session))
+                except (OSError, TypeError, ValueError):
+                    logger.exception(
+                        "Map artifact startup reconciliation failed session=%s",
+                        session.session_id,
+                    )
                 # 确保事件存储的序列号与会话历史计数器对齐，
                 # 防止因崩溃恢复或跨进程导致的序列偏移
                 if self._events is not None:
@@ -1321,15 +1420,21 @@ class QueryEngine:
                         tool_batch_identity,
                         response,
                     )
+                artifact_store: MapArtifactStore | None = None
+                artifact_prepared = False
                 try:
                     if (
                         publication_buffer is not None
                         and publication_buffer.map_artifact_turn.entries
                     ):
-                        MapArtifactStore(
+                        artifact_store = MapArtifactStore(
                             self._settings.project_root,
                             working_session.session_id,
-                        ).assert_mergeable(publication_buffer.map_artifact_turn)
+                            self._coordinated_commit_failure_injector,
+                        )
+                        artifact_prepared = artifact_store.prepare_turn(
+                            publication_buffer.map_artifact_turn
+                        )
                     self._set_turn_progress(
                         request.session_id,
                         owner_id=progress_owner,
@@ -1337,8 +1442,52 @@ class QueryEngine:
                         turn_id=progress_turn_id,
                         phase="committing",
                     )
+                    if self._coordinated_commit_failure_injector is not None:
+                        self._coordinated_commit_failure_injector.hit(
+                            "session_publish_before_write"
+                        )
                     self._store.save(working_session)
+                    if self._coordinated_commit_failure_injector is not None:
+                        self._coordinated_commit_failure_injector.hit(
+                            "session_publish_after_write"
+                        )
+                except MapArtifactTurnConflictError as exc:
+                    if publication_buffer is not None:
+                        self._resolve_submission_previews(
+                            publication_buffer,
+                            committed=False,
+                            reason="turn_identity_conflict",
+                        )
+                    self._store.replace_in_memory(request.session_id, snapshot)
+                    logger.error(
+                        "Map artifact turn identity conflict session=%s turn=%s",
+                        request.session_id,
+                        exc.turn_id,
+                    )
+                    return ChatErrorResponse(
+                        text=(
+                            "工具结果 turn_id 与已提交内容冲突；原提交已保留，"
+                            "请在新的更大 turn_id 下重试"
+                        ),
+                        error_code=exc.error_code,
+                    )
                 except (OSError, TypeError, ValueError):
+                    if (
+                        artifact_prepared
+                        and artifact_store is not None
+                        and publication_buffer is not None
+                    ):
+                        try:
+                            artifact_store.discard_prepared_turn(
+                                publication_buffer.map_artifact_turn
+                            )
+                        except (OSError, TypeError, ValueError):
+                            logger.exception(
+                                "Failed to discard unreferenced prepared map artifact "
+                                "session=%s turn=%s",
+                                request.session_id,
+                                publication_buffer.turn_id,
+                            )
                     if publication_buffer is not None:
                         self._resolve_submission_previews(
                             publication_buffer,
@@ -1356,6 +1505,29 @@ class QueryEngine:
                     )
                 session = working_session
                 if publication_buffer is not None:
+                    if artifact_prepared and artifact_store is not None:
+                        try:
+                            artifact_store.commit_prepared_turn(
+                                publication_buffer.map_artifact_turn
+                            )
+                        except (OSError, TypeError, ValueError):
+                            logger.exception(
+                                "Prepared map artifact finalization failed; "
+                                "attempting reconciliation session=%s turn=%s",
+                                request.session_id,
+                                publication_buffer.turn_id,
+                            )
+                            try:
+                                artifact_store.reconcile_with_session(
+                                    session_to_dict(working_session)
+                                )
+                            except (OSError, TypeError, ValueError):
+                                logger.exception(
+                                    "Map artifact reconciliation remains pending "
+                                    "session=%s turn=%s",
+                                    request.session_id,
+                                    publication_buffer.turn_id,
+                                )
                     self._flush_submission_publications(publication_buffer)
                     self._resolve_submission_previews(
                         publication_buffer,
@@ -1401,6 +1573,21 @@ class QueryEngine:
                 has_results,
             )
             return ChatErrorResponse(text="user_message 与 tool_results 必须二选一")
+
+        dedicated_resume_authorized = False
+        if has_user:
+            state = session.map_task_state
+            task_lineage = session.map_task_lineage
+            lineage_id = (
+                str(task_lineage.get("lineage_id", ""))
+                or str(session.map_request_scope.lineage_id)
+                or state.task_id
+            )
+            dedicated_resume_authorized = consume_map_resume_authorization(
+                state,
+                task_id=state.task_id,
+                lineage_id=lineage_id,
+            )
 
         security = self._security_for_request(request)
         model_override = _normalize_model_override(request.model)
@@ -1560,6 +1747,7 @@ class QueryEngine:
             request_scope, resumed_existing_map_task = _activate_user_request_scope(
                 session,
                 request,
+                dedicated_resume_authorized=dedicated_resume_authorized,
             )
             frame = session.top_frame()
             if frame is None:
@@ -1574,7 +1762,6 @@ class QueryEngine:
                 # 显式自然语言续接或 resume_map_task 命令后的首次用户消息：
                 # 仅属于该 map-edit lineage 的请求才恢复检查点与批次。
                 resumed_existing_map_task
-                and session.map_task_state.resumed_from_checkpoint
                 and session.map_task_state.checkpoint is not None
             ):
                 frame.messages.append(
@@ -1586,7 +1773,6 @@ class QueryEngine:
                         ),
                     }
                 )
-                session.map_task_state.resumed_from_checkpoint = False
                 resumed_batch = _resume_map_batch_queue(session)
                 if resumed_batch is not None:
                     self._emit_tool_call_response(
@@ -1595,9 +1781,6 @@ class QueryEngine:
                         "Resumed map batch from explicit command session=%s turn_id=%s count=%d",
                     )
                     return resumed_batch
-            elif session.map_task_state.resumed_from_checkpoint:
-                # dedicated resume 授权只消费一次；后续普通消息不得继续沿用。
-                session.map_task_state.resumed_from_checkpoint = False
             self._emit(
                 session.session_id,
                 "user_submitted",
@@ -1713,7 +1896,11 @@ class QueryEngine:
             if not scheduled:
                 break
             map_gate_continuations += 1
-            session.map_task_state.auto_iterations += 1
+            replace_map_state_field(
+                session.map_task_state,
+                "auto_iterations",
+                session.map_task_state.auto_iterations + 1,
+            )
             step = await self._run_agent_turn(
                 session,
                 security,
@@ -2319,7 +2506,7 @@ class QueryEngine:
                     result_for_gate,
                 )
                 if tool_name == "describe_map_region" and result.status == "applied":
-                    session.map_task_state.counters.reads += 1
+                    increment_map_counter(session.map_task_state, "reads")
                     target = str(result_for_gate.get("target", tool_args.get("target_path", "")))
                     streaks = dict(session.map_task_state.no_progress_streaks)
                     streaks[target] = 0
@@ -2334,7 +2521,7 @@ class QueryEngine:
                     and result.status == "applied"
                     and "plan_version" not in tool_args
                 ):
-                    session.map_task_state.counters.writes += 1
+                    increment_map_counter(session.map_task_state, "writes")
                     session.map_task_state.transition_stage("validate")
                 if session.latest_context_used_tokens >= 32_000 and tool_name in {
                     "plan_map_layout",
@@ -2377,19 +2564,19 @@ class QueryEngine:
                 validation_state = _remember_map_validation(
                     session, tool_name, result_for_gate, tool_args
                 )
-                validation_success = _map_validation_is_successful(result_for_gate)
+                validation_success = _map_validation_is_successful(validation_state)
                 mode = validation_mode(tool_args)
                 remember_validation_progress(
                     session,
                     tool_name,
                     tool_args,
-                    result_for_gate,
+                    validation_state,
                     validation_success,
                 )
                 _remember_map_transaction_validation(
                     session,
                     tool_args,
-                    result_for_gate,
+                    validation_state,
                     validation_success,
                 )
                 if tool_name == "validate_map_region" and mode == "diagnostic":
@@ -2399,7 +2586,7 @@ class QueryEngine:
                         [{
                             "tool": tool_name,
                             "reason": "map_diagnostic_complete",
-                            "issues": result_for_gate.get("issues", [])
+                            "issues": validation_state.get("issues", [])
                             or ["diagnostic finished; planner must produce a changed map plan"],
                             "target": validation_state["target"],
                             "required_revision": validation_state["map_revision"],
@@ -2744,7 +2931,7 @@ class QueryEngine:
 
         仅在任务处于 ``paused`` 状态且无 pending 前端工具调用时允许恢复。
         恢复操作本身只修改状态并持久化，实际的批次执行由下一轮 chat 请求
-        驱动（通过 ``resumed_from_checkpoint`` 路径），避免在此处隐式触发
+        驱动（通过一次性 resume authorization 路径），避免在此处隐式触发
         长时间运行的写操作。
 
         Args:
@@ -2770,7 +2957,13 @@ class QueryEngine:
                     "status": state.status,
                     "reason": "front_tools_still_pending",
                 }
-            resume_map_task(state)
+            task_lineage = session.map_task_lineage
+            lineage_id = (
+                str(task_lineage.get("lineage_id", ""))
+                or str(session.map_request_scope.lineage_id)
+                or state.task_id
+            )
+            resume_map_task(state, lineage_id=lineage_id)
             self._store.save(session)
             result = {
                 "resumed": True,
@@ -2814,6 +3007,13 @@ class QueryEngine:
                 }
             task_id = state.task_id
             state.cancel("cancelled_by_user")
+            session.map_request_scope = invalidate_completion_candidate(
+                session.map_request_scope
+            )
+            session.map_task_lineage = {
+                **session.map_task_lineage,
+                "completion_candidate": False,
+            }
             self._store.save(session)
             result = {
                 "cancelled": True,
@@ -3094,20 +3294,6 @@ class QueryEngine:
         publication_buffer: _SubmissionPublicationBuffer,
     ) -> None:
         """在 Session 成功提交后按 artifact、事件顺序发布暂存副作用。"""
-        if publication_buffer.map_artifact_turn.entries:
-            try:
-                MapArtifactStore(
-                    self._settings.project_root,
-                    publication_buffer.session.session_id,
-                ).merge_turn(publication_buffer.map_artifact_turn)
-            except (OSError, TypeError, ValueError) as exc:
-                logger.error(
-                    "Committed session map artifact publication failed session=%s "
-                    "turn=%s error=%s",
-                    publication_buffer.session.session_id,
-                    publication_buffer.turn_id,
-                    exc,
-                )
         if self._events is None:
             return
         for session_id, event_type, payload in publication_buffer.events:
