@@ -337,6 +337,14 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
         "map_progress_revision": frame.map_progress_revision,
         "forced_completion_text": frame.forced_completion_text,
         "force_text_only": frame.force_text_only,
+        "structured_attempt_count": frame.structured_attempt_count,
+        "structured_correction_limit": frame.structured_correction_limit,
+        "response_contract_mode": frame.response_contract_mode,
+        "response_contract_schema_digest": frame.response_contract_schema_digest,
+        "structured_response_model": frame.structured_response_model,
+        "structured_finish_reason": frame.structured_finish_reason,
+        "structured_thinking_budget": frame.structured_thinking_budget,
+        "structured_diagnostics": frame.structured_diagnostics,
         "map_reader_detailed_region_ready": frame.map_reader_detailed_region_ready,
         # 地图子 Frame 的可信阶段合同与运行时证据，用于跨轮次恢复时保持流水线状态一致
         "map_stage_contract": frame.map_stage_contract,
@@ -429,6 +437,35 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
             else None
         ),
         force_text_only=data.get("force_text_only") is True,
+        structured_attempt_count=_as_int(data.get("structured_attempt_count")),
+        structured_correction_limit=_as_int(data.get("structured_correction_limit")),
+        response_contract_mode=(
+            data["response_contract_mode"]
+            if data.get("response_contract_mode")
+            in {"json_schema", "json_object", "prompt_only"}
+            else None
+        ),
+        response_contract_schema_digest=(
+            str(data["response_contract_schema_digest"])
+            if data.get("response_contract_schema_digest") is not None
+            else None
+        ),
+        structured_response_model=(
+            str(data["structured_response_model"])
+            if data.get("structured_response_model") is not None
+            else None
+        ),
+        structured_finish_reason=(
+            str(data["structured_finish_reason"])
+            if data.get("structured_finish_reason") is not None
+            else None
+        ),
+        structured_thinking_budget=_as_int(data.get("structured_thinking_budget")),
+        structured_diagnostics=[
+            dict(item)
+            for item in _as_list(data.get("structured_diagnostics"))
+            if isinstance(item, dict)
+        ],
         map_reader_detailed_region_ready=data.get("map_reader_detailed_region_ready") is True,
         map_stage_contract=_as_dict(data.get("map_stage_contract")),
         map_request_lineage_id=(

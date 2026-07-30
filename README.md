@@ -326,6 +326,10 @@ Invoke-RestMethod `
 | `AI_AGENT_LLM_ADVISOR_MODEL` | *(空=用 llm_model)* | advisor effort 模型 |
 | `AI_AGENT_LLM_FALLBACK_MODEL` | *(空=不降级)* | 主模型不可用时的降级模型 |
 | `AI_AGENT_LLM_REQUEST_TIMEOUT_S` | `60.0` | 单次 LLM 请求超时（秒） |
+| `AI_AGENT_MAP_WORKER_STRUCTURED_OUTPUT_ENABLED` | `true` | 启用地图 worker 同 Frame 结构化纠错 |
+| `AI_AGENT_MAP_WORKER_RESPONSE_CONTRACT_MODE` | `prompt_only` | 最终结构化回合模式：`json_schema` / `json_object` / `prompt_only` |
+| `AI_AGENT_MAP_WORKER_STRUCTURED_CORRECTION_LIMIT` | `1` | 单个地图 worker Frame 的本地纠错上限（0–5） |
+| `AI_AGENT_MAP_WORKER_STRUCTURED_THINKING_BUDGET` | `0` | 最终结构化回合的 bounded thinking token 预算 |
 
 #### Thinking 预算
 

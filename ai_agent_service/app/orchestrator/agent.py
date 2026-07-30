@@ -34,7 +34,13 @@ from app.agents.bundled import get_agent
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
 from app.llm.cache_decision_engine import CacheDecision, CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnapshot
-from app.llm.provider import AssistantTurn, LLMError, LLMProvider, ToolCallRequest
+from app.llm.provider import (
+    AssistantTurn,
+    LLMError,
+    LLMProvider,
+    ResponseContract,
+    ToolCallRequest,
+)
 
 # ── 本轮整改：将 history 体积控制工具下沉到独立模块，避免 agent.py 膨胀 ──
 from app.history_bounds import (
@@ -56,6 +62,12 @@ from app.orchestrator.map_contracts import (
     MAP_WORKER_NEXT_STAGES,
     MAP_WORKER_RESULT_SCHEMA,
     MAP_WORKER_STAGES,
+    MapResponseMode,
+    arm_map_worker_structured_completion,
+    map_worker_required_fields,
+    render_map_worker_response_guidance,
+    specialized_map_worker_schema,
+    validate_map_worker_schema,
 )
 from app.orchestrator.map_workers import (
     # 本轮整改：验证工具名与 mode→stage 映射表集中定义，避免硬编码散落
@@ -1285,26 +1297,7 @@ async def _continue_delegate_group(
     session.delegate_groups.pop(done.pending_delegate_group_id, None)
 
 
-_MAP_WORKER_RESULT_FIELDS = frozenset(
-    {
-        "stage",
-        "worker",
-        "mode",
-        "objective",
-        "target_path",
-        "map_layer",
-        "map_revision",
-        "region",
-        "summary",
-        "facts",
-        "proposed_batches",
-        "write_results",
-        "validation",
-        "missing_inputs",
-        "risks",
-        "next_stage",
-    }
-)
+_MAP_WORKER_RESULT_FIELDS = map_worker_required_fields()
 _MAP_WORKER_STAGES = MAP_WORKER_STAGES
 _MAP_OUTPUT_SCHEMA_V1 = MAP_WORKER_RESULT_SCHEMA
 _MAP_DELEGATE_LIST_LIMIT = 12
@@ -1403,6 +1396,20 @@ def _json_object_from_text(text: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _json_parse_offset(text: str) -> int | None:
+    """在 JSON 解析失败时返回安全字符偏移，不保留原始内容。"""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 3 and lines[-1].strip() == "```":
+            stripped = "\n".join(lines[1:-1]).strip()
+    try:
+        json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        return exc.pos
+    return None
+
+
 def _slim_map_delegate_value(
     value: Any,
     field_name: str = "",
@@ -1465,8 +1472,12 @@ def _map_structured_output_error(
     missing = sorted(_MAP_WORKER_RESULT_FIELDS - set(payload))
     if missing:
         return "map_worker_result_v1 缺少字段：" + ", ".join(missing)
-    if payload.get("stage") not in _MAP_WORKER_STAGES:
-        return "stage 必须是 reader/planner/writer/validator/repairer/reviewer 之一。"
+    schema_errors = validate_map_worker_schema(
+        payload,
+        specialized_map_worker_schema(frame),
+    )
+    if schema_errors:
+        return "map_worker_result_v1 schema 校验失败：" + "; ".join(schema_errors[:8])
     violations = validate_frame_result(frame, payload)
     if violations:
         violation = violations[0]
@@ -1558,7 +1569,7 @@ def _repair_map_structured_output(
         validation = {}
     raw_issues = validation.get("issues")
     issues = list(raw_issues) if isinstance(raw_issues, list) else []
-    issues.append(f"structured_output_repaired: {error}")
+    issues.append(f"structured_output_repaired: {category}")
     raw_structured_issues = validation.get("structured_issues")
     structured_issues = (
         list(raw_structured_issues) if isinstance(raw_structured_issues, list) else []
@@ -1568,7 +1579,7 @@ def _repair_map_structured_output(
             "code": (
                 "structured_output_repair_exhausted" if exhausted else "structured_output_repaired"
             ),
-            "message": error,
+            "message": f"structured output rejected ({category})",
             "agent": frame.agent.name,
             "category": category,
             "attempt": attempt,
@@ -1584,16 +1595,36 @@ def _repair_map_structured_output(
             return []
         return [value]
 
-    map_revision = source.get("map_revision")
+    map_revision = frame.map_stage_contract.get(
+        "map_revision",
+        source.get("map_revision"),
+    )
     if isinstance(map_revision, bool) or not isinstance(map_revision, int):
-        map_revision = None
+        map_revision = 0
     map_layer = _normalized_map_layer_value(source)
+    if map_layer is None:
+        map_layer = 0
+    allowed_next = frame.allowed_next_stages or tuple(
+        frame.map_stage_contract.get("allowed_next_stages", ())
+    )
+    preferred_next = "validator" if stage == "writer" else "planner"
+    next_stage = (
+        preferred_next
+        if preferred_next in allowed_next
+        else (allowed_next[0] if allowed_next else stage)
+    )
     repaired = {
+        "contract_id": frame.contract_id or str(source.get("contract_id") or ""),
+        "result_schema": frame.result_schema or _MAP_OUTPUT_SCHEMA_V1,
         "stage": stage,
-        "worker": str(source.get("worker") or frame.agent.name),
+        "worker": frame.worker_instance_id or str(source.get("worker") or frame.agent.name),
         "mode": str(source.get("mode") or "partial"),
         "objective": str(source.get("objective") or _frame_objective(frame)),
-        "target_path": str(source.get("target_path") or ""),
+        "target_path": str(
+            frame.map_stage_contract.get("target_path")
+            or source.get("target_path")
+            or ""
+        ),
         "map_layer": map_layer,
         "map_revision": map_revision,
         "region": source.get("region") if isinstance(source.get("region"), dict) else {},
@@ -1612,7 +1643,7 @@ def _repair_map_structured_output(
             *list_value("risks"),
             "结构化输出曾不合规，本结果不能作为任务完成依据。",
         ],
-        "next_stage": "validator" if stage == "writer" else "planner",
+        "next_stage": next_stage,
         "repair": {
             "status": "exhausted" if exhausted else "repaired",
             "error_category": category,
@@ -1709,17 +1740,61 @@ def _frame_objective(frame: Frame) -> str:
     return frame.agent.description or frame.agent.name
 
 
+def _frame_semantic_operation(frame: Frame) -> dict[str, Any]:
+    """提取不含 Frame/调用 id 的稳定语义操作身份，同时区分并行目标。"""
+    objective_text = _frame_objective(frame)
+    objective: Any = objective_text
+    try:
+        parsed = json.loads(objective_text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        objective = parsed.get("objective", objective_text)
+        inputs = parsed.get("inputs")
+        if isinstance(inputs, dict):
+            objective = {
+                "objective": objective,
+                "inputs": {
+                    str(key): value
+                    for key, value in inputs.items()
+                    if str(key)
+                    not in {
+                        "artifact_ref",
+                        "artifact_refs",
+                        "call_id",
+                        "frame_id",
+                        "request_id",
+                        "tool_use_id",
+                    }
+                },
+            }
+    return {
+        "worker_mode": frame.agent.worker_mode,
+        "stage": _map_stage_for_frame(frame),
+        "objective": objective,
+        "output_schema": _map_output_schema_for_frame(frame),
+    }
+
+
 def _map_frame_exhausted_payload(frame: Frame, limit_label: str, limit: int) -> str:
     """为地图子帧预算耗尽生成合法的部分结果 JSON。"""
     issue = f"子 agent 达到自身{limit_label}上限（{limit}），已返回部分读取/执行结果。"
+    revision = frame.map_stage_contract.get("map_revision")
+    if not isinstance(revision, int) or isinstance(revision, bool):
+        revision = 0
+    allowed_next = frame.allowed_next_stages or tuple(
+        frame.map_stage_contract.get("allowed_next_stages", ())
+    )
     payload = {
+        "contract_id": frame.contract_id or "",
+        "result_schema": frame.result_schema or _MAP_OUTPUT_SCHEMA_V1,
         "stage": _map_stage_for_frame(frame),
-        "worker": frame.agent.name,
+        "worker": frame.worker_instance_id or frame.agent.name,
         "mode": "partial",
         "objective": _frame_objective(frame),
-        "target_path": "",
-        "map_layer": None,
-        "map_revision": None,
+        "target_path": str(frame.map_stage_contract.get("target_path") or ""),
+        "map_layer": 0,
+        "map_revision": revision,
         "region": {},
         "summary": issue,
         "facts": [],
@@ -1742,7 +1817,9 @@ def _map_frame_exhausted_payload(frame: Frame, limit_label: str, limit: int) -> 
             "需要父 agent 基于已返回的工具结果继续拆分任务，或用更具体的 target_path/map_layer/region 重新委派。"
         ],
         "risks": ["本子阶段未完整收敛，不能作为完成依据。"],
-        "next_stage": "replan",
+        "next_stage": "replan" if "replan" in allowed_next else (
+            allowed_next[0] if allowed_next else _map_stage_for_frame(frame)
+        ),
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -2091,6 +2168,98 @@ async def _finish_frame(
         structured_error = _map_structured_output_error(session, frame, text)
         if structured_error is not None:
             category = structured_error_category(structured_error)
+            raw_digest = hashlib.sha256(
+                text.encode("utf-8", errors="replace")
+            ).hexdigest()[:16]
+            safe_diagnostic = {
+                **safe_structured_diagnostic(structured_error),
+                "schema_version": _map_output_schema_for_frame(frame),
+                "response_mode": frame.response_contract_mode or "none",
+                "model": frame.structured_response_model or "unknown",
+                "temperature": 0.0,
+                "thinking_budget": frame.structured_thinking_budget,
+                "tools_enabled": False,
+                "finish_reason": frame.structured_finish_reason or "unknown",
+                "raw_chars": len(text),
+                "raw_digest": raw_digest,
+                "local_attempt": frame.structured_attempt_count + 1,
+            }
+            parse_offset = _json_parse_offset(text)
+            if parse_offset is not None:
+                safe_diagnostic["parse_offset"] = parse_offset
+            frame.structured_diagnostics.append(safe_diagnostic)
+            if (
+                frame.force_text_only
+                and frame.structured_attempt_count < frame.structured_correction_limit
+            ):
+                frame.structured_attempt_count += 1
+                immutable_constraints = {
+                    key: value
+                    for key, value in {
+                        "contract_id": frame.contract_id,
+                        "result_schema": frame.result_schema,
+                        "stage": frame.map_stage_contract.get("stage"),
+                        "worker": frame.worker_instance_id,
+                        "target_path": frame.map_stage_contract.get("target_path"),
+                        "map_revision": frame.map_stage_contract.get("map_revision"),
+                        "allowed_next_stages": list(frame.allowed_next_stages),
+                    }.items()
+                    if value is not None and value != ""
+                }
+                frame.messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Structured result correction required. "
+                            f"schema={_MAP_OUTPUT_SCHEMA_V1}; "
+                            f"category={category}; "
+                            "invalid_fields="
+                            + json.dumps(
+                                safe_diagnostic.get("fields", []),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            + "; frozen_constraints="
+                            + json.dumps(
+                                immutable_constraints,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            + ". 只重新输出一个完整 JSON object；不得调用工具，"
+                            "不得复述上一条原始输出。"
+                        ),
+                    }
+                )
+                logger.warning(
+                    "Map structured output correction scheduled session=%s frame=%s "
+                    "agent=%s category=%s schema=%s response_mode=%s "
+                    "local_attempt=%d/%d raw_chars=%d raw_digest=%s",
+                    session.session_id,
+                    frame.id,
+                    frame.agent.name,
+                    category,
+                    _MAP_OUTPUT_SCHEMA_V1,
+                    frame.response_contract_mode or "none",
+                    frame.structured_attempt_count,
+                    frame.structured_correction_limit,
+                    len(text),
+                    raw_digest,
+                )
+                _emit_orchestration_event(
+                    event_callback,
+                    "map_structured_correction_scheduled",
+                    {
+                        "frame_id": frame.id,
+                        "schema_version": _MAP_OUTPUT_SCHEMA_V1,
+                        "response_mode": frame.response_contract_mode or "none",
+                        "category": category,
+                        "local_attempt": frame.structured_attempt_count,
+                        "raw_chars": len(text),
+                        "raw_digest": raw_digest,
+                    },
+                )
+                return None
             source_payload = _json_object_from_text(text) or {}
             target = str(
                 source_payload.get(
@@ -2115,25 +2284,21 @@ async def _finish_frame(
                 stage=_map_stage_for_frame(frame),
                 target=target,
                 revision=revision,
-                operation={
-                    "agent": frame.agent.name,
-                    "stage": _map_stage_for_frame(frame),
-                    "objective": _frame_objective(frame),
-                    "output_schema": _map_output_schema_for_frame(frame),
-                },
+                operation=_frame_semantic_operation(frame),
                 threshold=STRUCTURED_REPAIR_MAX_ATTEMPTS,
             )
             # 本轮整改：日志新增 raw_chars + raw_digest，便于跨请求
             # 追踪同一次结构化输出拒绝/修复事件
             logger.warning(
                 "Map structured output rejected session=%s frame=%s agent=%s "
-                "error=%s raw_chars=%d raw_digest=%s",
+                "category=%s raw_chars=%d raw_digest=%s local_attempt=%d",
                 session.session_id,
                 frame.id,
                 frame.agent.name,
-                structured_error,
+                category,
                 len(text),
-                hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16],
+                raw_digest,
+                frame.structured_attempt_count,
             )
             text = _repair_map_structured_output(
                 frame,
@@ -2157,8 +2322,42 @@ async def _finish_frame(
                 len(text),
                 hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16],
             )
+            if bool(retry["exhausted"]):
+                report = retry_pause_report(
+                    session.map_task_state,
+                    stage=_map_stage_for_frame(frame),
+                    target=target,
+                    revision=revision,
+                    last_attempt=retry,
+                )
+                if session.map_task_state.status == "running":
+                    session.map_task_state.make_checkpoint(
+                        "structured_output_retry_exhausted",
+                        report,
+                        pause_kind="no_progress_exhausted",
+                    )
 
         _apply_map_structured_completion_result(session, frame, text)
+        if structured_error is None and frame.structured_attempt_count:
+            logger.info(
+                "Map structured output corrected session=%s frame=%s schema=%s "
+                "response_mode=%s local_attempts=%d",
+                session.session_id,
+                frame.id,
+                _MAP_OUTPUT_SCHEMA_V1,
+                frame.response_contract_mode or "none",
+                frame.structured_attempt_count,
+            )
+            _emit_orchestration_event(
+                event_callback,
+                "map_structured_correction_succeeded",
+                {
+                    "frame_id": frame.id,
+                    "schema_version": _MAP_OUTPUT_SCHEMA_V1,
+                    "response_mode": frame.response_contract_mode or "none",
+                    "local_attempts": frame.structured_attempt_count,
+                },
+            )
 
     if len(session.agent_stack) <= 1:
         logger.info("Root frame finished session=%s text_length=%d", session.session_id, len(text))
@@ -4033,6 +4232,10 @@ async def run_turn(
     cache_engine: CacheDecisionEngine | None = None,
     cache_metrics: CacheMetricsCollector | None = None,
     context_token_limit: int | None = None,
+    map_worker_structured_output_enabled: bool = True,
+    map_worker_response_contract_mode: MapResponseMode = "prompt_only",
+    map_worker_structured_correction_limit: int = 1,
+    map_worker_structured_thinking_budget: int = 0,
 ) -> StepResult:
     """驱动当前会话的活跃帧完成一轮（或多轮）编排循环。
 
@@ -4046,6 +4249,10 @@ async def run_turn(
         cache_engine: 上下文缓存决策引擎（§16.1）；为 None 或
             `llm.supports_prompt_cache=False` 时不标记任何显式缓存断点。
         cache_metrics: 缓存命中率观测聚合器；为 None 时不记录指标。
+        map_worker_structured_output_enabled: 是否启用同 Frame 结构化纠错。
+        map_worker_response_contract_mode: 最终地图 worker 回合的显式响应模式。
+        map_worker_structured_correction_limit: 单 Frame 本地纠错上限。
+        map_worker_structured_thinking_budget: 最终结构化回合的思考预算。
 
     Returns:
         `ToolCallsResult`（需前端执行/确认）、`FinalResult`（已得到最终回复）
@@ -4063,11 +4270,31 @@ async def run_turn(
     frame_turns: dict[str, int] = {}  # 非地图帧仍只统计本次 run_turn 的轮数
     # frame_id -> 其中单独计入 edit_map_max_turns 预算的轮数（tool_calls 仅含 edit_map 时）
     frame_edit_map_turns: dict[str, int] = {}
-    for loop_index in range(max_turns):
+    driver_turn_limit = (
+        max_turns
+        + max(0, map_worker_structured_correction_limit)
+        + 1
+    )
+    for loop_index in range(driver_turn_limit):
         frame = session.top_frame()
         if frame is None:
             logger.error("Agent run_turn failed: empty frame stack session=%s", session.session_id)
             return ErrorResult(text="会话没有活跃的 agent 帧", error_code="missing_agent_frame")
+
+        if (
+            frame.force_text_only
+            and _map_output_schema_for_frame(frame) == _MAP_OUTPUT_SCHEMA_V1
+            and frame.response_contract_mode is None
+        ):
+            arm_map_worker_structured_completion(
+                frame,
+                mode=map_worker_response_contract_mode,
+                correction_limit=(
+                    map_worker_structured_correction_limit
+                    if map_worker_structured_output_enabled
+                    else 0
+                ),
+            )
 
         if frame.forced_completion_text is not None:
             forced_text = frame.forced_completion_text
@@ -4119,7 +4346,17 @@ async def run_turn(
         )
         # 这里只做一个宽松的总量护栏（max_turns + edit_map_max_turns），防止帧无限循环；
         # 哪个预算先耗尽由下面 tool_calls 揭晓后的精确分类检查负责。
-        total_budget = frame.agent.max_turns + (frame.agent.edit_map_max_turns or 0)
+        structured_budget = (
+            frame.structured_correction_limit + 1
+            if frame.force_text_only
+            and _map_output_schema_for_frame(frame) == _MAP_OUTPUT_SCHEMA_V1
+            else 0
+        )
+        total_budget = (
+            frame.agent.max_turns
+            + (frame.agent.edit_map_max_turns or 0)
+            + structured_budget
+        )
         if used >= total_budget:
             result = await _handle_frame_turns_exhausted(
                 session,
@@ -4170,6 +4407,23 @@ async def run_turn(
                 model_selector,
                 model_override,
             )
+            final_structured_turn = (
+                frame.force_text_only
+                and _map_output_schema_for_frame(frame) == _MAP_OUTPUT_SCHEMA_V1
+            )
+            response_contract = (
+                ResponseContract(
+                    mode=frame.response_contract_mode or map_worker_response_contract_mode,
+                    schema_name=_MAP_OUTPUT_SCHEMA_V1,
+                    schema=specialized_map_worker_schema(frame),
+                    fallback_guidance=render_map_worker_response_guidance(
+                        frame,
+                        "prompt_only",
+                    ),
+                )
+                if final_structured_turn
+                else None
+            )
             if event_callback is not None and resolved_model is not None:
                 event_callback(
                     "agent_model_selected",
@@ -4197,8 +4451,12 @@ async def run_turn(
                 frame.messages,
                 visible_tools,
                 model=resolved_model,
-                temperature=_resolve_temperature(effort),
-                thinking_budget=resolve_thinking_budget(effort, thinking_budget_selector),
+                temperature=0.0 if final_structured_turn else _resolve_temperature(effort),
+                thinking_budget=(
+                    map_worker_structured_thinking_budget
+                    if final_structured_turn
+                    else resolve_thinking_budget(effort, thinking_budget_selector)
+                ),
                 on_delta=_delta_callback(
                     event_callback,
                     frame.id,
@@ -4217,6 +4475,7 @@ async def run_turn(
                     if cache_decision is not None and cache_decision.enabled
                     else None
                 ),
+                response_contract=response_contract,
             )
         except LLMError as exc:
             logger.warning(
@@ -4241,11 +4500,40 @@ async def run_turn(
             return ErrorResult(text=str(exc), error_code="provider_exhausted")
 
         frame.messages.append(turn.raw_message)
+        if final_structured_turn:
+            frame.structured_response_model = turn.model or resolved_model
+            frame.structured_finish_reason = turn.finish_reason
+            frame.structured_thinking_budget = map_worker_structured_thinking_budget
+            if turn.response_mode is not None:
+                frame.response_contract_mode = turn.response_mode
         _record_cache_metrics(cache_metrics, cache_decision, turn)
         _emit_context_usage_event(event_callback, frame, loop_index + 1, turn, context_token_limit)
         _emit_cache_hit_event(event_callback, frame, loop_index + 1, turn)
 
         if not turn.tool_calls:
+            if (
+                _map_output_schema_for_frame(frame) == _MAP_OUTPUT_SCHEMA_V1
+                and not frame.force_text_only
+            ):
+                arm_map_worker_structured_completion(
+                    frame,
+                    mode=map_worker_response_contract_mode,
+                    correction_limit=(
+                        map_worker_structured_correction_limit
+                        if map_worker_structured_output_enabled
+                        else 0
+                    ),
+                )
+                _emit_orchestration_event(
+                    event_callback,
+                    "map_structured_final_turn_armed",
+                    {
+                        "frame_id": frame.id,
+                        "schema_version": _MAP_OUTPUT_SCHEMA_V1,
+                        "response_mode": frame.response_contract_mode,
+                    },
+                )
+                continue
             finish_result = await _finish_frame(
                 session,
                 turn.content or "",
@@ -4892,16 +5180,14 @@ async def run_turn(
                 for item in server_calls
             )
             if artifact_read_completed:
-                frame.force_text_only = True
-                frame.messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "精确地图区域及其 artifact 已读取完成。下一轮禁止继续调用工具；"
-                            "立即把已确认的 target_path、map_layer、map_revision、边界、"
-                            "tile_size/cell_size 和资源事实整理为 map_worker_result_v1 JSON。"
-                        ),
-                    }
+                arm_map_worker_structured_completion(
+                    frame,
+                    mode=map_worker_response_contract_mode,
+                    correction_limit=(
+                        map_worker_structured_correction_limit
+                        if map_worker_structured_output_enabled
+                        else 0
+                    ),
                 )
                 logger.info(
                     "Map reader armed for text-only completion session=%s frame=%s",

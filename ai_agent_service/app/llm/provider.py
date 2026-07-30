@@ -10,7 +10,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
@@ -73,6 +73,24 @@ class AssistantTurn:
     cache_creation_tokens: int | None = None
     total_input_tokens: int | None = None
     model: str = ""
+    response_mode: Literal["json_schema", "json_object", "prompt_only"] | None = None
+
+
+@dataclass(frozen=True)
+class ResponseContract:
+    """单次补全的结构化响应合同，不改变 provider 或 Agent 的全局状态。
+
+    Attributes:
+        mode: 显式配置的响应格式能力模式。
+        schema_name: wire schema 的稳定版本名。
+        schema: 本次 Frame 专用的完整 JSON Schema。
+        fallback_guidance: 非原生模式或格式能力降级时追加的系统指导。
+    """
+
+    mode: Literal["json_schema", "json_object", "prompt_only"]
+    schema_name: str
+    schema: dict[str, Any]
+    fallback_guidance: str
 
 
 def _is_valid_token_count(value: Any) -> bool:
@@ -158,6 +176,7 @@ class LLMProvider(Protocol):
         on_delta: DeltaCallback | None = None,
         on_fallback: FallbackCallback | None = None,
         cache_breakpoints: list[CacheBreakpoint] | None = None,
+        response_contract: ResponseContract | None = None,
     ) -> AssistantTurn:
         """发起一次对话补全请求。
 
@@ -178,6 +197,7 @@ class LLMProvider(Protocol):
                 重试前触发一次；为 None 时不通知。
             cache_breakpoints: 待标记 `cache_control` 的消息下标（§16.1），
                 不支持显式缓存的 provider 可忽略该参数。
+            response_contract: 仅最终结构化回合使用的可选响应合同。
 
         Returns:
             模型本轮的回应。
@@ -254,6 +274,7 @@ class OpenAICompatibleProvider:
         on_delta: DeltaCallback | None = None,
         on_fallback: FallbackCallback | None = None,
         cache_breakpoints: list[CacheBreakpoint] | None = None,
+        response_contract: ResponseContract | None = None,
     ) -> AssistantTurn:
         """调用 `chat.completions.create` 并转换为 `AssistantTurn`。
 
@@ -272,6 +293,7 @@ class OpenAICompatibleProvider:
             cache_breakpoints: 待标记 `cache_control` 的消息下标（§16.1），
                 由编排层的 `CacheDecisionEngine` 决定；为 None 或空列表时不
                 注入任何缓存标记。
+            response_contract: 本次调用的可选结构化响应合同。
 
         Returns:
             模型本轮的回应。
@@ -281,8 +303,15 @@ class OpenAICompatibleProvider:
         """
         resolved_model = model or self._default_model
         try:
-            return await self._chat_once(
-                messages, tools, resolved_model, temperature, thinking_budget, on_delta, cache_breakpoints
+            return await self._chat_with_response_contract(
+                messages,
+                tools,
+                resolved_model,
+                temperature,
+                thinking_budget,
+                on_delta,
+                cache_breakpoints,
+                response_contract,
             )
         except LLMError as exc:
             if self._fallback_model is None or self._fallback_model == resolved_model:
@@ -297,9 +326,109 @@ class OpenAICompatibleProvider:
             )
             if on_fallback is not None:
                 on_fallback(resolved_model, self._fallback_model)
-            return await self._chat_once(
-                messages, tools, self._fallback_model, temperature, thinking_budget, on_delta, cache_breakpoints
+            return await self._chat_with_response_contract(
+                messages,
+                tools,
+                self._fallback_model,
+                temperature,
+                thinking_budget,
+                on_delta,
+                cache_breakpoints,
+                response_contract,
             )
+
+    async def _chat_with_response_contract(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        model: str,
+        temperature: float | None,
+        thinking_budget: int,
+        on_delta: DeltaCallback | None,
+        cache_breakpoints: list[CacheBreakpoint] | None,
+        response_contract: ResponseContract | None,
+    ) -> AssistantTurn:
+        """执行单模型请求，并仅对响应格式能力拒绝做一次窄降级。"""
+        try:
+            return await self._invoke_chat_once(
+                messages,
+                tools,
+                model,
+                temperature,
+                thinking_budget,
+                on_delta,
+                cache_breakpoints,
+                response_contract,
+            )
+        except LLMError as exc:
+            if (
+                response_contract is None
+                or response_contract.mode == "prompt_only"
+                or exc.status_code not in {400, 422}
+            ):
+                raise
+            next_mode: Literal["json_object", "prompt_only"] = (
+                "json_object"
+                if response_contract.mode == "json_schema"
+                else "prompt_only"
+            )
+            downgraded = ResponseContract(
+                mode=next_mode,
+                schema_name=response_contract.schema_name,
+                schema=response_contract.schema,
+                fallback_guidance=response_contract.fallback_guidance,
+            )
+            logger.warning(
+                "Structured response format rejected; retrying same model "
+                "model=%s from_mode=%s to_mode=%s status_code=%s",
+                model,
+                response_contract.mode,
+                next_mode,
+                exc.status_code,
+            )
+            return await self._invoke_chat_once(
+                messages,
+                tools,
+                model,
+                temperature,
+                thinking_budget,
+                on_delta,
+                cache_breakpoints,
+                downgraded,
+            )
+
+    async def _invoke_chat_once(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        model: str,
+        temperature: float | None,
+        thinking_budget: int,
+        on_delta: DeltaCallback | None,
+        cache_breakpoints: list[CacheBreakpoint] | None,
+        response_contract: ResponseContract | None,
+    ) -> AssistantTurn:
+        """兼容旧 provider test double，并在存在合同时传递新关键字。"""
+        if response_contract is None:
+            return await self._chat_once(
+                messages,
+                tools,
+                model,
+                temperature,
+                thinking_budget,
+                on_delta,
+                cache_breakpoints,
+            )
+        return await self._chat_once(
+            messages,
+            tools,
+            model,
+            temperature,
+            thinking_budget,
+            on_delta,
+            cache_breakpoints,
+            response_contract=response_contract,
+        )
 
     async def _chat_once(
         self,
@@ -310,6 +439,7 @@ class OpenAICompatibleProvider:
         thinking_budget: int = -1,
         on_delta: DeltaCallback | None = None,
         cache_breakpoints: list[CacheBreakpoint] | None = None,
+        response_contract: ResponseContract | None = None,
     ) -> AssistantTurn:
         """发起一次流式 `chat.completions.create` 请求并转换为 `AssistantTurn`。
 
@@ -322,6 +452,7 @@ class OpenAICompatibleProvider:
             on_delta: 流式增量回调，参见 `LLMProvider.chat`。
             cache_breakpoints: 待标记 `cache_control` 的消息下标，参见
                 `LLMProvider.chat`。
+            response_contract: 本次调用的可选结构化响应合同。
 
         Returns:
             模型本轮的回应。
@@ -347,6 +478,34 @@ class OpenAICompatibleProvider:
                 len(cache_breakpoints),
                 [bp.segment for bp in cache_breakpoints],
             )
+        has_wire_guidance = any(
+            message.get("role") == "system"
+            and isinstance(message.get("content"), str)
+            and "Wire JSON Schema:" in message["content"]
+            for message in request_messages
+        )
+        if (
+            response_contract is not None
+            and response_contract.mode != "json_schema"
+            and not has_wire_guidance
+        ):
+            request_messages = [
+                *request_messages,
+                {"role": "system", "content": response_contract.fallback_guidance},
+            ]
+
+        response_format: dict[str, Any] | None = None
+        if response_contract is not None and response_contract.mode == "json_schema":
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_contract.schema_name,
+                    "strict": True,
+                    "schema": response_contract.schema,
+                },
+            }
+        elif response_contract is not None and response_contract.mode == "json_object":
+            response_format = {"type": "json_object"}
 
         logger.info(
             "LLM chat request messages=%d tools=%d temperature=%s thinking_budget=%s",
@@ -378,6 +537,7 @@ class OpenAICompatibleProvider:
                     tools=tools or None,  # type: ignore[arg-type]
                     tool_choice="auto" if tools else None,
                     temperature=temperature,
+                    response_format=response_format,  # type: ignore[arg-type]
                     extra_body=extra_body,
                     stream=True,
                     reasoning_effort="xhigh",
@@ -514,4 +674,7 @@ class OpenAICompatibleProvider:
             cache_creation_tokens=cache_creation_tokens,
             total_input_tokens=total_input_tokens,
             model=model,
+            response_mode=(
+                response_contract.mode if response_contract is not None else None
+            ),
         )

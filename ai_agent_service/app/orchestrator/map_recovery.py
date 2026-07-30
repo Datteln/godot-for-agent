@@ -64,10 +64,42 @@ def structured_error_category(error: str) -> str:
 
 def safe_structured_diagnostic(error: str) -> dict[str, Any]:
     """保留可诊断类别与长度，不回显不可信原始 worker 内容。"""
-    normalized = " ".join(error.split())
+    field_names = sorted(
+        {
+            match
+            for match in re.findall(
+                r"(?:\$\.)?([A-Za-z_][A-Za-z0-9_]*)",
+                error,
+            )
+            if match
+            in {
+                "contract_id",
+                "result_schema",
+                "stage",
+                "worker",
+                "mode",
+                "objective",
+                "target_path",
+                "map_layer",
+                "map_revision",
+                "region",
+                "summary",
+                "facts",
+                "proposed_batches",
+                "write_results",
+                "validation",
+                "missing_inputs",
+                "risks",
+                "next_stage",
+                "passed",
+                "issues",
+                "structured_issues",
+            }
+        }
+    )
     return {
         "category": structured_error_category(error),
-        "message": normalized[:500],
+        "fields": field_names,
         "message_digest": hashlib.sha256(error.encode("utf-8")).hexdigest()[:16],
         "message_chars": len(error),
     }

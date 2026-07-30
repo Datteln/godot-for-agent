@@ -165,6 +165,10 @@ class Frame:
         forced_completion_text: 编排器已经确定当前子阶段应结束时保存的结构化
             收尾文本；`run_turn` 会在下一次调用 LLM 前消费它。
         force_text_only: 当前阶段事实已经齐全、下一轮只能输出最终文本时为 True。
+        structured_attempt_count: 当前 Frame 已消费的结构化纠错次数。
+        structured_correction_limit: 当前 Frame 允许的同 Frame 纠错上限。
+        response_contract_mode: 最终回合使用的显式 provider 响应模式。
+        response_contract_schema_digest: 当前专用 Schema 的安全稳定摘要。
         map_reader_detailed_region_ready: reader 已获得精确地图区域、只需完成一次
            必要 artifact 读取即可收尾时为 True。
         map_stage_contract: 地图子 Frame 的可信阶段、目标与 revision 合同；为空表示
@@ -193,6 +197,14 @@ class Frame:
     map_progress_revision: int | None = None
     forced_completion_text: str | None = None
     force_text_only: bool = False
+    structured_attempt_count: int = 0
+    structured_correction_limit: int = 0
+    response_contract_mode: Literal["json_schema", "json_object", "prompt_only"] | None = None
+    response_contract_schema_digest: str | None = None
+    structured_response_model: str | None = None
+    structured_finish_reason: str | None = None
+    structured_thinking_budget: int = 0
+    structured_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     map_reader_detailed_region_ready: bool = False
     # 地图子 Frame 的可信阶段合同：包含阶段、目标路径、revision 等运行时可信信息，
     # 为空 dict 表示该 Frame 不参与结构化地图流水线

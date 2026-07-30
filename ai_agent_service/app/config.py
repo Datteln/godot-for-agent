@@ -59,6 +59,28 @@ class AppSettings(BaseSettings):
         default=60.0,
         description="单次 LLM 请求超时时间（秒）。",
     )
+    map_worker_structured_output_enabled: bool = Field(
+        default=True,
+        description="是否启用地图 worker 的同 Frame 结构化纠错。",
+    )
+    map_worker_response_contract_mode: Literal[
+        "json_schema", "json_object", "prompt_only"
+    ] = Field(
+        default="prompt_only",
+        description="地图 worker 最终回合的显式响应合同模式。",
+    )
+    map_worker_structured_correction_limit: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        description="单个地图 worker Frame 最多执行的本地结构化纠错次数。",
+    )
+    map_worker_structured_thinking_budget: int = Field(
+        default=0,
+        ge=0,
+        le=32768,
+        description="地图 worker 最终结构化回合的 bounded thinking token 预算。",
+    )
     log_level: str = Field(
         default="DEBUG",
         description="服务日志等级，可选 DEBUG/INFO/WARNING/ERROR/CRITICAL。",

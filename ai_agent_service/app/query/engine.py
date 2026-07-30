@@ -56,6 +56,10 @@ from app.orchestrator.map_workers import (
     MAP_VALIDATION_TOOL_NAMES,
     PLATFORM_PLAN_TOOL_NAMES,
 )
+from app.orchestrator.map_contracts import (
+    MapResponseMode,
+    arm_map_worker_structured_completion,
+)
 from app.orchestrator.map_progress import (
     MAP_PLATFORM_PLAN_MAX_ATTEMPTS,
     consume_committed_platform_approvals,
@@ -581,20 +585,19 @@ def _map_reader_has_detailed_region(result: dict[str, Any]) -> bool:
     )
 
 
-def _arm_map_reader_text_completion(frame: Frame) -> None:
+def _arm_map_reader_text_completion(
+    frame: Frame,
+    *,
+    mode: MapResponseMode = "prompt_only",
+    correction_limit: int = 1,
+) -> None:
     """把 reader 的下一轮限制为无工具的结构化事实输出。"""
     if frame.force_text_only:
         return
-    frame.force_text_only = True
-    frame.messages.append(
-        {
-            "role": "system",
-            "content": (
-                "精确地图事实已经齐全。下一轮禁止继续调用工具；立即输出 "
-                "map_worker_result_v1 JSON，并明确 target_path、map_layer、"
-                "map_revision、边界、tile_size/cell_size 和资源事实。"
-            ),
-        }
+    arm_map_worker_structured_completion(
+        frame,
+        mode=mode,
+        correction_limit=correction_limit,
     )
 
 
@@ -1346,6 +1349,18 @@ class QueryEngine:
             pending_turn_id=session.pending_turn_id,
             context_used_tokens=_history_context_used_tokens(session, events),
             context_token_limit=self._settings.auto_compact_token_threshold,
+            map_worker_structured_output_enabled=(
+                self._settings.map_worker_structured_output_enabled
+            ),
+            map_worker_response_contract_mode=(
+                self._settings.map_worker_response_contract_mode
+            ),
+            map_worker_structured_correction_limit=(
+                self._settings.map_worker_structured_correction_limit
+            ),
+            map_worker_structured_thinking_budget=(
+                self._settings.map_worker_structured_thinking_budget
+            ),
             history_before=offset + len(page),
             history_has_more=start > 0 or omitted_inputs,
             pseudo_events=page_pseudo_events,
@@ -2451,6 +2466,18 @@ class QueryEngine:
             cache_engine=self._cache_engine,
             cache_metrics=self._cache_metrics,
             context_token_limit=self._settings.auto_compact_token_threshold,
+            map_worker_structured_output_enabled=(
+                self._settings.map_worker_structured_output_enabled
+            ),
+            map_worker_response_contract_mode=(
+                self._settings.map_worker_response_contract_mode
+            ),
+            map_worker_structured_correction_limit=(
+                self._settings.map_worker_structured_correction_limit
+            ),
+            map_worker_structured_thinking_budget=(
+                self._settings.map_worker_structured_thinking_budget
+            ),
         )
 
     def _defer_map_tool_calls_if_needed(
@@ -3166,7 +3193,15 @@ class QueryEngine:
                 and frame.map_reader_detailed_region_ready
                 and map_artifact_locator is None
             ):
-                _arm_map_reader_text_completion(frame)
+                _arm_map_reader_text_completion(
+                    frame,
+                    mode=self._settings.map_worker_response_contract_mode,
+                    correction_limit=(
+                        self._settings.map_worker_structured_correction_limit
+                        if self._settings.map_worker_structured_output_enabled
+                        else 0
+                    ),
+                )
             if isinstance(result_for_gate, dict):
                 _append_platform_planning_failure_hint(session, tool_name, result_for_gate)
             if (
