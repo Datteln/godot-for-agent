@@ -26,13 +26,18 @@ const LLM_FALLBACK_GRACE_S := 15.0
 ## 这个硬上限是兜底：哪怕事件一直在零星地来、后端实际已经死循环/卡死，
 ## 单条 `/chat` 请求也不会无限续期下去。
 const DEFAULT_CHAT_REQUEST_HARD_CAP_S := 1800.0
-const MAX_TOOL_RESULT_RETRIES := 3
 const EVENT_PAGE_LIMIT := 50
+const RECOVERY_FRONTEND_FAILPOINTS := {
+	"frontend_ack_before_adopt": true,
+	"frontend_ack_after_adopt": true,
+}
 
 var editor_interface: EditorInterface
 var service: Node
 var current_turn_id: String = ""
 var _handled_tool_turn_ids: Dictionary = {}
+var _session_epoch := ""
+var _resetting := false
 
 var _http: HTTPRequest
 var _event_http: HTTPRequest
@@ -49,6 +54,21 @@ var _request_timeout_timer: Timer
 var _timeout_generation := -1
 var _inflight_started_at_msec := 0
 var _inflight_item: Dictionary = {}
+var _test_failure_injector := Callable()
+
+
+func install_test_failure_injector(injector: Callable) -> void:
+	## 仅测试组合可直接注入；HTTP 请求和持久化数据没有配置入口。
+	_test_failure_injector = injector
+
+
+func _hit_test_failpoint(name: String) -> bool:
+	if not RECOVERY_FRONTEND_FAILPOINTS.has(name):
+		push_error("Unknown frontend recovery failpoint: %s" % name)
+		return false
+	if not _test_failure_injector.is_valid():
+		return false
+	return bool(_test_failure_injector.call(name))
 
 
 func _ready() -> void:
@@ -117,6 +137,9 @@ func _abandon_inflight_request() -> void:
 
 
 func send_user_message(text: String, context: Dictionary, model = null) -> void:
+	if _resetting:
+		error_occurred.emit("Session reset is still in progress.")
+		return
 	_suppress_events = false
 	_configure_event_timer()
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing user message.", {
@@ -125,6 +148,7 @@ func send_user_message(text: String, context: Dictionary, model = null) -> void:
 	})
 	var payload := {
 		"session_id": _session_id(),
+		"session_epoch": _session_epoch if _session_epoch != "" else null,
 		"request_id": _new_request_id(),
 		"user_message": text,
 		"context": context,
@@ -140,6 +164,9 @@ func send_user_message(text: String, context: Dictionary, model = null) -> void:
 
 
 func send_tool_results(results: Array, model = null) -> void:
+	if _resetting:
+		error_occurred.emit("Session reset is still in progress.")
+		return
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing tool results.", {"count": results.size()})
 	var valid_results: Array = []
 	var dropped := 0
@@ -164,14 +191,31 @@ func send_tool_results(results: Array, model = null) -> void:
 		valid_results.append(result)
 	if dropped > 0:
 		FrontendLogger.warn(editor_interface, "HTTP", "Dropped invalid tool results.", {"dropped": dropped, "kept": valid_results.size()})
-		emit_signal("error_occurred", "Invalid tool results; suppressed partial tool result submission.")
+		response_received.emit({
+			"type": "error",
+			"text": "Invalid tool results; the pending batch was preserved.",
+			"error_code": "front_tool_result_malformed",
+			"disposition": "wait_frontend",
+			"retryable": true,
+			"side_effect_state": "prepared",
+			"next_action": {"action": "correct_pending_tool_results", "owner": "frontend"},
+		})
 		return
 	if valid_results.is_empty():
 		FrontendLogger.warn(editor_interface, "HTTP", "No valid tool results to send; request suppressed.", {})
-		emit_signal("error_occurred", "No valid tool results to send.")
+		response_received.emit({
+			"type": "error",
+			"text": "No valid tool results were available; the pending batch was preserved.",
+			"error_code": "front_tool_result_malformed",
+			"disposition": "wait_frontend",
+			"retryable": true,
+			"side_effect_state": "prepared",
+			"next_action": {"action": "collect_pending_tool_results", "owner": "frontend"},
+		})
 		return
 	var payload := {
 		"session_id": _session_id(),
+		"session_epoch": _session_epoch if _session_epoch != "" else null,
 		"request_id": _new_request_id(),
 		"model": model,
 		"permission_mode": _setting("ai_agent/permission_mode"),
@@ -196,11 +240,13 @@ func _compact_summary_use_llm_override() -> Variant:
 func reset_session() -> void:
 	var abandoned_path := _inflight_path
 	var abandoned_session_id := _inflight_session_id
-	current_turn_id = ""
-	_handled_tool_turn_ids.clear()
+	_resetting = true
 	_request_generation += 1
 	_queue.clear()
 	_abandon_inflight_request()
+	_replace_event_http()
+	if _event_timer != null:
+		_event_timer.stop()
 	_suppress_events = false
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing session reset.", {"session_id": _session_id()})
 	if abandoned_path == "/chat":
@@ -217,12 +263,16 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 		"new_session_id": new_session_id,
 		"queue_size": _queue.size()
 	})
+	_resetting = true
 	_request_generation += 1
 	_queue.clear()
 	_abandon_inflight_request()
 	_replace_event_http()
+	if _event_timer != null:
+		_event_timer.stop()
 	current_turn_id = ""
 	_handled_tool_turn_ids.clear()
+	_session_epoch = ""
 	_last_event_seq = 0
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != new_session_id:
@@ -231,7 +281,6 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 			"cause": "user_interrupted"
 		})
 	_enqueue("POST", "/reset", {"session_id": new_session_id})
-	_configure_event_timer()
 
 
 func interrupt_current() -> void:
@@ -271,6 +320,7 @@ func switch_to_session(previous_session_id: String) -> void:
 	_replace_event_http()
 	current_turn_id = ""
 	_handled_tool_turn_ids.clear()
+	_session_epoch = ""
 	_last_event_seq = 0
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != _session_id():
@@ -349,6 +399,7 @@ func sync_event_cursor(last_event_seq: int) -> void:
 
 ## 从恢复指针同步本地事件序号与挂起的 turn_id，供恢复提示"接受"分支调用。
 func resume_from_pointer(pointer: Dictionary) -> void:
+	_session_epoch = str(pointer.get("session_epoch", ""))
 	_last_event_seq = max(_last_event_seq, int(pointer.get("last_event_seq", 0)))
 	var pending_turn_id = pointer.get("pending_turn_id")
 	current_turn_id = str(pending_turn_id) if pending_turn_id != null else ""
@@ -356,10 +407,13 @@ func resume_from_pointer(pointer: Dictionary) -> void:
 
 
 func poll_events() -> void:
+	if _resetting:
+		return
 	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
 		return
-	var path := "/chat/events?session_id=%s&after=%d&limit=%d" % [
+	var path := "/chat/events?session_id=%s&session_epoch=%s&after=%d&limit=%d" % [
 		_session_id().uri_encode(),
+		_session_epoch.uri_encode(),
 		_last_event_seq,
 		EVENT_PAGE_LIMIT,
 	]
@@ -554,27 +608,6 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			})
 			_pump()
 			return
-		var completed_payload: Variant = completed_item.get("payload", {})
-		var is_tool_result_request: bool = (
-			str(completed_item.get("path", "")) == "/chat"
-			and completed_payload is Dictionary
-			and completed_payload.has("tool_results")
-		)
-		var retry_count := int(completed_item.get("retry_count", 0))
-		var retryable_failure: bool = result != HTTPRequest.RESULT_SUCCESS or code >= 500
-		if is_tool_result_request and retryable_failure and retry_count < MAX_TOOL_RESULT_RETRIES:
-			completed_item["retry_count"] = retry_count + 1
-			var delay_s := 0.5 * pow(2.0, retry_count)
-			FrontendLogger.warn(editor_interface, "HTTP", "Retrying tool results with same request_id.", {
-				"attempt": retry_count + 1,
-				"delay_s": delay_s,
-				"code": code,
-			})
-			await get_tree().create_timer(delay_s).timeout
-			if completed_generation == _request_generation:
-				_queue.push_front(completed_item)
-				_pump()
-			return
 		# 后端对命令/记忆的参数错误改用 4xx + 结构化 body（含 ok/text）返回：HTTP
 		# 状态码语义正确，正文仍保留可读消息。这类"客户端错误"应按业务响应分发、
 		# 展示 text，而不是退化成一条 "HTTP 400" 传输错误。仅限传输成功 + 4xx +
@@ -594,6 +627,35 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			"result": result,
 			"body_chars": text.length()
 		})
+		if str(completed_item.get("path", "")) == "/reset":
+			if _hit_test_failpoint("frontend_ack_before_adopt"):
+				_pump()
+				return
+			_resetting = false
+			_configure_event_timer()
+			response_received.emit({
+				"ok": false,
+				"session_id": _session_id(),
+				"error_code": "reset_transport_failed",
+				"text": "HTTP %d: %s" % [code, text],
+			})
+			_pump()
+			return
+		if str(completed_item.get("path", "")) == "/chat":
+			response_received.emit({
+				"type": "error",
+				"text": "Chat response transport was lost; durable task state was preserved.",
+				"error_code": "response_transport_lost",
+				"disposition": "pause_for_user",
+				"retryable": true,
+				"side_effect_state": "ambiguous",
+				"next_action": {
+					"action": "reconnect_and_refresh_history",
+					"owner": "user",
+				},
+			})
+			_pump()
+			return
 		error_occurred.emit("HTTP %d: %s" % [code, text])
 		_pump()
 		return
@@ -611,32 +673,21 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			"type": str(response.get("type", "data")),
 			"keys": response.keys()
 		})
-		var response_payload: Variant = completed_item.get("payload", {})
-		var response_is_tool_result: bool = (
-			str(completed_item.get("path", "")) == "/chat"
-			and response_payload is Dictionary
-			and response_payload.has("tool_results")
-		)
-		var response_retry_count := int(completed_item.get("retry_count", 0))
-		var retryable_server_error: bool = (
-			str(response.get("type", "")) == "error"
-			and str(response.get("text", "")).contains("会话状态已回滚")
-		)
-		if (
-			response_is_tool_result
-			and retryable_server_error
-			and response_retry_count < MAX_TOOL_RESULT_RETRIES
-		):
-			completed_item["retry_count"] = response_retry_count + 1
-			var response_delay_s := 0.5 * pow(2.0, response_retry_count)
-			FrontendLogger.warn(editor_interface, "HTTP", "Retrying rolled-back tool results.", {
-				"attempt": response_retry_count + 1,
-				"delay_s": response_delay_s,
-			})
-			await get_tree().create_timer(response_delay_s).timeout
-			if completed_generation == _request_generation:
-				_queue.push_front(completed_item)
+		if str(completed_item.get("path", "")) == "/reset":
+			_resetting = false
+			if bool(response.get("ok", false)):
+				_session_epoch = str(response.get("session_epoch", ""))
+				_last_event_seq = int(response.get("last_event_seq", 0))
+				current_turn_id = ""
+				_handled_tool_turn_ids.clear()
+				_replace_event_http()
+				_suppress_events = false
+			_configure_event_timer()
+			if _hit_test_failpoint("frontend_ack_after_adopt"):
 				_pump()
+				return
+			response_received.emit(response)
+			_pump()
 			return
 		if response.has("cancelled") and response.has("last_event_seq"):
 			# `/chat/interrupt` 的确认：跳过中断前后后端可能残留写入的旧事件，
@@ -651,10 +702,36 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			})
 			_pump()
 			return
+		if _hit_test_failpoint("frontend_ack_before_adopt"):
+			_pump()
+			return
 		if response.get("type", "") == "tool_calls":
 			current_turn_id = str(response.get("turn_id", ""))
 			if current_turn_id != "":
 				_handled_tool_turn_ids[current_turn_id] = true
+		elif (
+			response.get("type", "") == "error"
+			and str(response.get("disposition", "")) == "retry_new_turn"
+		):
+			var raw_next_action: Variant = response.get("next_action", {})
+			var next_action: Dictionary = (
+				raw_next_action if raw_next_action is Dictionary else {}
+			)
+			var fresh_turn_id := str(next_action.get("turn_id", ""))
+			if fresh_turn_id != "":
+				current_turn_id = fresh_turn_id
+		if (
+			response.has("pseudo_events")
+			and str(response.get("session_id", "")) == _session_id()
+		):
+			_session_epoch = str(response.get("session_epoch", _session_epoch))
+			_last_event_seq = max(
+				_last_event_seq,
+				int(response.get("last_event_seq", 0))
+			)
+		if _hit_test_failpoint("frontend_ack_after_adopt"):
+			_pump()
+			return
 		response_received.emit(response)
 	else:
 		response_received.emit({"type": "data", "value": parsed})
@@ -662,11 +739,22 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 
 
 func _on_events_completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	if _resetting:
+		return
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
 		return
 	var parsed := JSON.parse_string(body.get_string_from_utf8())
 	var page := _parse_event_page(parsed, _last_event_seq)
 	if bool(page.get("valid", false)):
+		var response_epoch := str(page.get("session_epoch", ""))
+		if _session_epoch != "" and response_epoch != "" and response_epoch != _session_epoch:
+			FrontendLogger.info(editor_interface, "HTTP", "Ignoring stale event epoch.", {
+				"expected_epoch": _session_epoch,
+				"response_epoch": response_epoch,
+			})
+			return
+		if _session_epoch == "" and response_epoch != "":
+			_session_epoch = response_epoch
 		var events: Array = page.get("events", [])
 		var raw_progress: Variant = page.get("progress")
 		var has_live_progress: bool = raw_progress is Dictionary
@@ -716,6 +804,7 @@ func _parse_event_page(parsed: Variant, current_cursor: int) -> Dictionary:
 		"cursor": accepted_cursor,
 		"has_more": bool(parsed.get("has_more", false)),
 		"progress": parsed.get("progress"),
+		"session_epoch": str(parsed.get("session_epoch", "")),
 	}
 
 

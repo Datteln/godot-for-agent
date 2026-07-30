@@ -67,6 +67,8 @@ class PlanStep:
     result: PlanStepResult | None = None
     bound_inputs: dict[str, Any] | None = None
     recovery_attempt: int = 0
+    current_attempt_id: str | None = None
+    attempt_history: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def from_dict(cls, value: dict[str, Any], order: int) -> PlanStep:
@@ -76,9 +78,7 @@ class PlanStep:
             step_id = f"step-{order + 1}"
         bindings_value = value.get("input_bindings", [])
         bindings = tuple(
-            PlanInputBinding.from_dict(item)
-            for item in bindings_value
-            if isinstance(item, dict)
+            PlanInputBinding.from_dict(item) for item in bindings_value if isinstance(item, dict)
         )
         raw_result = value.get("result")
         result = None
@@ -101,9 +101,7 @@ class PlanStep:
                     else None
                 ),
                 blocked_by=tuple(
-                    str(item)
-                    for item in raw_result.get("blocked_by", [])
-                    if isinstance(item, str)
+                    str(item) for item in raw_result.get("blocked_by", []) if isinstance(item, str)
                 ),
             )
         expected_schema = value.get("expected_result_schema")
@@ -130,21 +128,23 @@ class PlanStep:
                 else None
             ),
             worker_spec=(
-                dict(value["worker_spec"])
-                if isinstance(value.get("worker_spec"), dict)
-                else None
+                dict(value["worker_spec"]) if isinstance(value.get("worker_spec"), dict) else None
             ),
             status=_coerce_status(value.get("status"), "pending"),
-            frame_id=(
-                str(value["frame_id"]) if value.get("frame_id") is not None else None
-            ),
+            frame_id=(str(value["frame_id"]) if value.get("frame_id") is not None else None),
             result=result,
             bound_inputs=(
-                dict(value["bound_inputs"])
-                if isinstance(value.get("bound_inputs"), dict)
-                else None
+                dict(value["bound_inputs"]) if isinstance(value.get("bound_inputs"), dict) else None
             ),
             recovery_attempt=int(value.get("recovery_attempt", 0)),
+            current_attempt_id=(
+                str(value["current_attempt_id"])
+                if value.get("current_attempt_id") is not None
+                else None
+            ),
+            attempt_history=tuple(
+                dict(item) for item in value.get("attempt_history", []) if isinstance(item, dict)
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -164,6 +164,8 @@ class PlanStep:
             "result": self.result.to_dict() if self.result is not None else None,
             "bound_inputs": self.bound_inputs,
             "recovery_attempt": self.recovery_attempt,
+            "current_attempt_id": self.current_attempt_id,
+            "attempt_history": [dict(item) for item in self.attempt_history],
         }
 
 
@@ -242,9 +244,7 @@ class PlanGraph:
             "summary": self.summary,
             "steps": [step.to_dict() for step in self.steps],
             "frame_steps": {
-                step.frame_id: step.step_id
-                for step in self.steps
-                if step.frame_id is not None
+                step.frame_id: step.step_id for step in self.steps if step.frame_id is not None
             },
         }
 
@@ -270,6 +270,9 @@ class PlanGraph:
                 status="running",
                 frame_id=frame_id,
                 bound_inputs=self.bind_inputs(step_id),
+                current_attempt_id=(
+                    f"{step_id}:attempt:{len(self.step(step_id).attempt_history) + 1}"
+                ),
             ),
         )
 
@@ -280,9 +283,65 @@ class PlanGraph:
             raise PlanGraphError(f"plan step is not running: {step_id}")
         graph = self._replace_step(
             step_id,
-            replace(step, status=result.status, result=result),
+            replace(
+                step,
+                status=result.status,
+                result=result,
+                attempt_history=(
+                    *step.attempt_history,
+                    {
+                        "attempt_id": step.current_attempt_id,
+                        "status": result.status,
+                        "error_code": result.error_code,
+                        "disposition": "terminal",
+                    },
+                ),
+                current_attempt_id=None,
+            ),
         )
         return graph._propagate_blocked()
+
+    def defer_attempt(
+        self,
+        step_id: str,
+        *,
+        disposition: str,
+        error_code: str,
+    ) -> PlanGraph:
+        """结束一次可恢复 attempt，但让步骤及后继保持 pending。
+
+        reader recovery、authoritative refresh、replacement 与 replan 都不是步骤
+        的永久失败；只有调用 ``finish(... failed ...)`` 才传播 dependency block。
+        """
+        step = self.step(step_id)
+        if step.status != "running":
+            raise PlanGraphError(f"plan step is not running: {step_id}")
+        if disposition not in {
+            "retry_new_attempt",
+            "refresh_and_replan",
+            "continue_agent",
+        }:
+            raise PlanGraphError(f"unsupported recoverable disposition: {disposition}")
+        return self._replace_step(
+            step_id,
+            replace(
+                step,
+                status="pending",
+                frame_id=None,
+                result=None,
+                bound_inputs=None,
+                attempt_history=(
+                    *step.attempt_history,
+                    {
+                        "attempt_id": step.current_attempt_id,
+                        "status": "recovering",
+                        "error_code": error_code,
+                        "disposition": disposition,
+                    },
+                ),
+                current_attempt_id=None,
+            ),
+        )
 
     def fail_unstarted(self, step_id: str, error_code: str) -> PlanGraph:
         """把无法创建 Frame 的 pending 步骤标记失败并传播阻断。"""
@@ -366,12 +425,21 @@ class PlanGraph:
             input_bindings=tuple((*original.input_bindings, retry_binding)),
             bound_inputs=None,
             recovery_attempt=attempt,
+            attempt_history=(
+                *original.attempt_history,
+                {
+                    "attempt_id": original.current_attempt_id,
+                    "status": "recovering",
+                    "error_code": "missing_canonical_inputs",
+                    "disposition": "continue_agent",
+                    "reader_step_id": reader_id,
+                },
+            ),
+            current_attempt_id=None,
         )
         graph = PlanGraph(
             summary=self.summary,
-            steps=tuple(
-                retry if step.step_id == step_id else step for step in self.steps
-            )
+            steps=tuple(retry if step.step_id == step_id else step for step in self.steps)
             + (reader,),
         )
         graph._validate()
@@ -396,11 +464,7 @@ class PlanGraph:
             return values
         for binding in step.input_bindings:
             dependency = self.step(binding.source_step_id)
-            source: Any = (
-                dependency.result.to_dict()
-                if dependency.result is not None
-                else None
-            )
+            source: Any = dependency.result.to_dict() if dependency.result is not None else None
             value = _read_path(source, binding.source_path)
             if value is None and binding.required:
                 raise PlanGraphError(
@@ -430,10 +494,7 @@ class PlanGraph:
         """返回替换单个步骤后的新图。"""
         return PlanGraph(
             summary=self.summary,
-            steps=tuple(
-                replacement if step.step_id == step_id else step
-                for step in self.steps
-            ),
+            steps=tuple(replacement if step.step_id == step_id else step for step in self.steps),
         )
 
     def _propagate_blocked(self) -> PlanGraph:

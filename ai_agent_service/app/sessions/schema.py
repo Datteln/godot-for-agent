@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Final
 
-SESSION_SCHEMA_VERSION: Final = 7
+SESSION_SCHEMA_VERSION: Final = 8
 
 _LEGACY_MAP_FIELDS: Final[dict[str, str]] = {
     "map_completion_blockers": "completion_blockers",
@@ -94,8 +94,7 @@ def migrate_session_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         if pause_kind is None:
             pause_kind = (
                 "no_progress_exhausted"
-                if map_state.get("status") == "paused"
-                and bool(map_state.get("pause_report"))
+                if map_state.get("status") == "paused" and bool(map_state.get("pause_report"))
                 else ""
             )
         map_state.setdefault("pause_kind", pause_kind)
@@ -138,6 +137,12 @@ def migrate_session_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
                         "legacy delegate group has no scheduler graph; "
                         "pending children were blocked during migration"
                     )
+
+    if source_version < 8:
+        # `session_epoch` 由 SessionStore 的独立 epoch barrier 补齐。这里保留空值，
+        # 让旧会话可以在首次加载时安全绑定到已经持久化的当前 epoch。
+        migrated.setdefault("session_epoch", "")
+        migrated.setdefault("task_run", None)
 
     migrated["map_task_state"] = map_state
     migrated["schema_version"] = SESSION_SCHEMA_VERSION

@@ -7,6 +7,7 @@ const AgentEventLog = preload("res://addons/ai_agent/state/agent_event_log.gd")
 
 var state := {
 	"session_id": "default",
+	"session_epoch": "",
 	"state": "idle",
 	"current_turn_id": "",
 	"pending_calls": [],
@@ -52,10 +53,13 @@ func add_events(new_events: Array) -> void:
 	changed.emit(state.duplicate(true))
 
 
-func reset() -> void:
+func reset(session_epoch: String = "", last_event_seq: int = 0) -> void:
 	_log.clear()
 	state["state"] = "idle"
+	state["session_epoch"] = session_epoch
 	state["current_turn_id"] = ""
 	state["pending_calls"] = []
+	state["last_event_seq"] = last_event_seq
 	state["event_log"] = []
+	state["recovery_pointer"] = null
 	changed.emit(state.duplicate(true))

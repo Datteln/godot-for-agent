@@ -124,6 +124,13 @@ func remember_server_file_read(path: String) -> bool:
 	return true
 
 
+func reset_session_state() -> void:
+	## 仅清理会话级读前写授权；Godot 权威 revision tracker 属于工程状态，
+	## reset 对话时必须保留。
+	if file_state_cache != null and file_state_cache.has_method("clear"):
+		file_state_cache.clear()
+
+
 ## 执行单个前端工具调用。部分工具（如 run_tests）内部使用 await 轮询子进程，
 ## 调用方必须 await 本函数，避免阻塞编辑器主线程。
 func execute(tool_call: Dictionary) -> Dictionary:

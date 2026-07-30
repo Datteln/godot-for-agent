@@ -23,18 +23,13 @@ class DelegateArtifactStore:
 
     project_root: Path
     session_id: str
+    session_epoch: str = ""
 
     @property
     def session_root(self) -> Path:
         """返回当前会话独占的 artifact 目录。"""
         session_digest = hashlib.sha256(self.session_id.encode("utf-8")).hexdigest()
-        return (
-            self.project_root
-            / ".ai_agent_service"
-            / "artifacts"
-            / session_digest
-            / "delegates"
-        )
+        return self.project_root / ".ai_agent_service" / "artifacts" / session_digest / "delegates"
 
     def store(
         self,
@@ -54,9 +49,7 @@ class DelegateArtifactStore:
         )
         encoded = canonical.encode("utf-8")
         if len(encoded) > MAX_DELEGATE_ARTIFACT_BYTES:
-            raise ValueError(
-                f"delegate artifact exceeds {MAX_DELEGATE_ARTIFACT_BYTES} bytes"
-            )
+            raise ValueError(f"delegate artifact exceeds {MAX_DELEGATE_ARTIFACT_BYTES} bytes")
         digest = hashlib.sha256(encoded).hexdigest()
         safe_frame = _FRAME_ID_RE.sub("_", frame_id).strip("._-") or "frame"
         path = self.session_root / f"{safe_frame}-{digest[:16]}.json"
@@ -65,6 +58,7 @@ class DelegateArtifactStore:
             {
                 "schema": DELEGATE_ARTIFACT_SCHEMA,
                 "session_id": self.session_id,
+                "session_epoch": self.session_epoch,
                 "frame_id": frame_id,
                 "agent": agent_name,
                 "result_schema": result_schema,
@@ -93,6 +87,8 @@ class DelegateArtifactStore:
             raise ValueError("unsupported delegate artifact schema")
         if payload.get("session_id") != self.session_id:
             raise ValueError("delegate artifact belongs to another session")
+        if self.session_epoch and str(payload.get("session_epoch", "")) != self.session_epoch:
+            raise ValueError("delegate artifact belongs to another session epoch")
         result = payload.get("result")
         if not isinstance(result, dict):
             raise ValueError("delegate artifact result must be an object")
@@ -104,6 +100,7 @@ class DelegateArtifactStore:
             "frame_id": payload.get("frame_id"),
             "agent": payload.get("agent"),
             "digest": payload.get("digest"),
+            "session_epoch": self.session_epoch,
             "available_fields": sorted(str(key) for key in result),
         }
         if not field:
@@ -131,7 +128,10 @@ class DelegateArtifactStore:
         if not artifact_ref or Path(artifact_ref).is_absolute():
             raise ValueError("artifact_ref must be a project-relative path")
         session_root = self.session_root.resolve()
-        candidate = (self.project_root / artifact_ref).resolve(strict=True)
+        try:
+            candidate = (self.project_root / artifact_ref).resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("delegate artifact was not found") from exc
         if candidate.parent != session_root or candidate.suffix.lower() != ".json":
             raise ValueError("artifact_ref is outside the current session delegate directory")
         return candidate

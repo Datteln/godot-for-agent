@@ -21,7 +21,16 @@ const RecoveryPrompt = preload("res://addons/ai_agent/ui/recovery_prompt.gd")
 const ToolExecutor = preload("res://addons/ai_agent/tools/tool_executor.gd")
 const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_renderer.gd")
 
-enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
+enum AgentState {
+	IDLE,
+	WAITING_LLM,
+	WAITING_CONFIRM,
+	EXECUTING,
+	COMPACTING,
+	RESETTING,
+	RECOVERING,
+	PAUSED,
+}
 
 const PENDING_TOOL_RESULTS_ERROR := "当前会话仍有待回传的工具结果，不能开始新的用户消息"
 const STREAM_RENDER_INTERVAL_MS := 120
@@ -129,6 +138,9 @@ var _last_context_usage_status := ""
 ## `compact_started` 到达时记录下当时的状态，供 `compact_boundary` 到达时还原；
 ## 压缩前后状态对应"这一轮原本在干什么"（等待模型/执行工具等），不是固定回到 IDLE。
 var _state_before_compact := AgentState.IDLE
+var _state_before_reset := AgentState.IDLE
+var _reset_previous_session_id := ""
+var _pending_new_session_id := ""
 
 var _state := AgentState.IDLE
 var _last_doctor_report: Dictionary = {}
@@ -575,7 +587,7 @@ func _theme_color(key: String) -> Color:
 
 func _on_send() -> void:
 	var text := _input.text.strip_edges()
-	if text == "" or _state != AgentState.IDLE:
+	if text == "" or _state not in [AgentState.IDLE, AgentState.PAUSED]:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "Ignored send request.", {
 			"empty": text == "",
 			"state": _status.text
@@ -921,8 +933,10 @@ func _on_response(response: Dictionary) -> void:
 		_append_message("system", ChatReportFormatter.memory_report(response))
 		return
 
-	if response.has("ok") and response.has("session_id") and response.size() == 2:
-		FrontendLogger.debug(editor_interface, "ChatPanel", "Reset acknowledged.", {"session_id": str(response.get("session_id", ""))})
+	if response.has("ok") and response.has("session_id") and (
+		response.has("session_epoch") or response.has("error_code")
+	):
+		_handle_reset_response(response)
 		return
 
 	if response.has("type") and response.get("type") == "data":
@@ -963,7 +977,7 @@ func _on_response(response: Dictionary) -> void:
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: error", {
 				"text": str(response.get("text", ""))
 			})
-			_on_error(str(response.get("text", "Unknown error")))
+			_on_problem(response)
 		_:
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: unknown", {
 				"type": str(response.get("type", ""))
@@ -1037,7 +1051,7 @@ func _command_default_args(command: Dictionary) -> Dictionary:
 
 
 func _run_selected_command(command_name: String, args: Dictionary) -> void:
-	if _state != AgentState.IDLE:
+	if _state not in [AgentState.IDLE, AgentState.PAUSED]:
 		_append_message("error", "当前任务尚未结束，暂时不能运行其他命令。")
 		return
 	_auto_scroll = true
@@ -1513,9 +1527,36 @@ func _on_error(message: String) -> void:
 	if state_store != null:
 		state_store.set_value("pending_calls", [])
 	_set_state(AgentState.IDLE)
-	if message == PENDING_TOOL_RESULTS_ERROR or message.contains("工具结果") or message.contains("tool result"):
-		_show_pending_results_notice()
-		_set_state(AgentState.WAITING_CONFIRM)
+
+
+func _on_problem(problem: Dictionary) -> void:
+	## 恢复控制只依赖稳定 disposition/side_effect_state，不解析本地化文本。
+	var message := str(problem.get("text", "Unknown error"))
+	var disposition := str(problem.get("disposition", "terminal"))
+	var side_effect_state := str(problem.get("side_effect_state", "none"))
+	FrontendLogger.error(editor_interface, "ChatPanel", "Structured task problem.", {
+		"error_code": str(problem.get("error_code", "")),
+		"disposition": disposition,
+		"side_effect_state": side_effect_state,
+		"attempt_id": str(problem.get("attempt_id", "")),
+	})
+	if disposition == "terminal":
+		_on_error(message)
+		return
+	_append_message("error", message)
+	if side_effect_state == "ambiguous":
+		_set_state(AgentState.PAUSED)
+		return
+	match disposition:
+		"continue_agent":
+			_set_state(AgentState.RECOVERING)
+		"retry_same_attempt", "retry_new_turn", "wait_frontend":
+			_show_pending_results_notice()
+			_set_state(AgentState.WAITING_CONFIRM)
+		"retry_new_attempt", "refresh_and_replan", "pause_for_user":
+			_set_state(AgentState.PAUSED)
+		_:
+			_set_state(AgentState.PAUSED)
 
 
 func _show_pending_results_notice() -> void:
@@ -1561,17 +1602,58 @@ func _on_reset() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Reset requested.", {"state": _status.text})
 	_auto_scroll = true
 	_interrupted_locally = false
+	_state_before_reset = _state
+	_reset_previous_session_id = _current_session_id()
+	_pending_new_session_id = ""
+	_set_state(AgentState.RESETTING)
+	_http_client.reset_session()
+
+
+func _handle_reset_response(response: Dictionary) -> void:
+	if not bool(response.get("ok", false)):
+		FrontendLogger.error(editor_interface, "ChatPanel", "Reset failed.", {
+			"error_code": str(response.get("error_code", "")),
+		})
+		_append_message("error", str(response.get("text", "Reset failed.")))
+		if _pending_new_session_id != "" and _reset_previous_session_id != "":
+			ConfigMigrations.set_value(
+				editor_interface,
+				"ai_agent/session_id",
+				_reset_previous_session_id
+			)
+		_pending_new_session_id = ""
+		_set_state(_state_before_reset)
+		return
+	FrontendLogger.info(editor_interface, "ChatPanel", "Reset acknowledged.", {
+		"session_id": str(response.get("session_id", "")),
+		"session_epoch": str(response.get("session_epoch", "")),
+		"last_event_seq": int(response.get("last_event_seq", 0)),
+	})
 	_event_queue.clear()
 	_draining_events = false
 	_clear_inline_confirmation()
+	_clear_pending_final_pair()
+	_finish_streaming()
+	_finish_reasoning_stream()
+	if _recovery_prompt != null and is_instance_valid(_recovery_prompt):
+		_recovery_prompt.hide()
 	if undo_manager != null:
 		undo_manager.abort_batch()
+	if _tool_executor != null and _tool_executor.has_method("reset_session_state"):
+		_tool_executor.reset_session_state()
 	_clear_messages()
-	_http_client.reset_session()
 	if state_store != null:
-		state_store.reset()
+		state_store.reset(
+			str(response.get("session_epoch", "")),
+			int(response.get("last_event_seq", 0))
+		)
+		state_store.set_value("session_id", str(response.get("session_id", "")))
+		state_store.set_value("recovery_pointer", null)
 	_update_context_usage_status(0, _context_token_limit)
 	_set_state(AgentState.IDLE)
+	if _pending_new_session_id != "":
+		_append_message("system", _ui("new_session_started") % _pending_new_session_id)
+	_pending_new_session_id = ""
 
 
 func _on_interrupt() -> void:
@@ -1590,33 +1672,25 @@ func _on_interrupt() -> void:
 	if state_store != null:
 		state_store.set_value("pending_calls", [])
 		state_store.set_value("current_turn_id", "")
-	_set_state(AgentState.IDLE)
+	_set_state(AgentState.PAUSED)
 	_append_message("system", _ui("interrupted"))
 
 
 func _on_new_session() -> void:
 	var previous_session_id := _current_session_id()
 	_save_session_to_history(previous_session_id)
-	var session_id := "session_%d" % int(Time.get_unix_time_from_system())
+	var session_id := "session_%s" % Crypto.new().generate_random_bytes(16).hex_encode()
 	FrontendLogger.info(editor_interface, "ChatPanel", "New session requested.", {"session_id": session_id})
 	_auto_scroll = true
 	_interrupted_locally = false
-	_event_queue.clear()
-	_draining_events = false
+	_state_before_reset = _state
+	_reset_previous_session_id = previous_session_id
+	_pending_new_session_id = session_id
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", session_id)
 	_save_session_to_history(session_id)
-	_clear_inline_confirmation()
-	if undo_manager != null:
-		undo_manager.abort_batch()
 	if _http_client != null:
 		_http_client.start_new_session(previous_session_id, session_id)
-	if state_store != null:
-		state_store.reset()
-		state_store.set_value("session_id", session_id)
-	_clear_messages()
-	_update_context_usage_status(0, _context_token_limit)
-	_set_state(AgentState.IDLE)
-	_append_message("system", _ui("new_session_started") % session_id)
+	_set_state(AgentState.RESETTING)
 
 
 func _on_recovery_accepted(pointer: Dictionary) -> void:
@@ -2278,6 +2352,12 @@ func _status_text_for_state(value: int) -> String:
 			base = _ui("executing")
 		AgentState.COMPACTING:
 			base = _ui("compacting")
+		AgentState.RESETTING:
+			base = "正在重置"
+		AgentState.RECOVERING:
+			base = "正在恢复"
+		AgentState.PAUSED:
+			base = "已暂停"
 	var parts: Array[String] = [base]
 	if _active_model_name != "":
 		parts.append(_active_model_name)
@@ -2308,11 +2388,13 @@ func _update_context_usage_status(used_tokens: int, token_limit: int) -> void:
 func _set_state(value: int) -> void:
 	var previous_state := _state
 	_state = value
-	_send_btn.disabled = value != AgentState.IDLE
-	_commands_btn.disabled = value != AgentState.IDLE or _commands_requested
-	_stop_btn.disabled = value == AgentState.IDLE
-	_new_session_btn.disabled = value == AgentState.EXECUTING
-	_model_input.editable = value == AgentState.IDLE
+	_send_btn.disabled = value not in [AgentState.IDLE, AgentState.PAUSED]
+	_commands_btn.disabled = (
+		value not in [AgentState.IDLE, AgentState.PAUSED] or _commands_requested
+	)
+	_stop_btn.disabled = value in [AgentState.IDLE, AgentState.RESETTING]
+	_new_session_btn.disabled = value in [AgentState.EXECUTING, AgentState.RESETTING]
+	_model_input.editable = value in [AgentState.IDLE, AgentState.PAUSED]
 	_refresh_status_text()
 	if previous_state != value:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "State changed.", {

@@ -68,7 +68,11 @@ async def read_delegate_artifact_handler(
             "map_delegate_result",
             ValueError("limit 必须是整数"),
         )
-    store = DelegateArtifactStore(ctx.security.project_root, ctx.session_id)
+    store = DelegateArtifactStore(
+        ctx.security.project_root,
+        ctx.session_id,
+        session_epoch=ctx.session_epoch,
+    )
     try:
         return store.read_page(
             artifact_ref,

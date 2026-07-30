@@ -61,9 +61,7 @@ def test_dependency_binding_success_creates_exact_writer_payload() -> None:
     assert [step.step_id for step in graph.runnable_steps()] == ["writer"]
     payload = graph.task_payload("writer")
     assert payload["plan_step_id"] == "writer"
-    assert payload["scheduler_inputs"] == {
-        "approved_batch": {"operations": [{"action": "fill"}]}
-    }
+    assert payload["scheduler_inputs"] == {"approved_batch": {"operations": [{"action": "fill"}]}}
 
 
 def test_missing_binding_becomes_typed_terminal_without_child_frame() -> None:
@@ -95,6 +93,25 @@ def test_failed_predecessor_blocks_every_dependent_step() -> None:
     assert writer.result is not None
     assert writer.result.error_code == "predecessor_not_succeeded"
     assert writer.result.blocked_by == ("reader",)
+
+
+def test_recoverable_attempt_keeps_successor_pending_until_true_terminal() -> None:
+    """验证 attempt 恢复不会被误当成步骤终态并传播 dependency block。"""
+    running = _two_step_graph().start("reader", "frame-reader")
+    recovering = running.defer_attempt(
+        "reader",
+        disposition="refresh_and_replan",
+        error_code="revision_conflict",
+    )
+
+    reader = recovering.step("reader")
+    writer = recovering.step("writer")
+    assert reader.status == "pending"
+    assert reader.result is None
+    assert reader.current_attempt_id is None
+    assert reader.attempt_history[-1]["status"] == "recovering"
+    assert writer.status == "pending"
+    assert writer.result is None
 
 
 def test_invalid_review_to_write_transition_leaves_state_unchanged() -> None:
@@ -282,10 +299,7 @@ def test_same_task_restart_retains_diagnostics_and_distinct_epoch_resets() -> No
     restored = MapTaskState.from_dict(deepcopy(state.to_dict()))
 
     assert restored.plan_attempt_registry == state.plan_attempt_registry
-    assert (
-        restored.task_convergence_registry
-        == state.task_convergence_registry
-    )
+    assert restored.task_convergence_registry == state.task_convergence_registry
     restored.start_new_task("task-2", lineage_id="lineage-2")
     assert restored.plan_attempt_registry == {}
     assert restored.task_convergence_registry == {}
@@ -319,7 +333,4 @@ def test_changed_root_error_family_gets_independent_convergence_diagnostic() -> 
 
     assert first["convergence"]["key"] != second["convergence"]["key"]
     assert len(state.task_convergence_registry) == 2
-    assert all(
-        diagnostic["count"] == 1
-        for diagnostic in state.task_convergence_registry.values()
-    )
+    assert all(diagnostic["count"] == 1 for diagnostic in state.task_convergence_registry.values())

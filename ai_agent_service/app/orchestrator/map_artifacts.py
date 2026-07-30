@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -79,15 +80,11 @@ def _session_references_turn(
     def visit(item: Any) -> None:
         """Walk JSON-native Session values and collect matching locators."""
         if isinstance(item, dict):
-            if (
-                item.get("artifact_turn_id") == turn_id
-                and isinstance(item.get("artifact_entry_id"), str)
+            if item.get("artifact_turn_id") == turn_id and isinstance(
+                item.get("artifact_entry_id"), str
             ):
                 entry_id = str(item["artifact_entry_id"])
-                if (
-                    entry_fingerprints.get(entry_id)
-                    == item.get("artifact_fingerprint")
-                ):
+                if entry_fingerprints.get(entry_id) == item.get("artifact_fingerprint"):
                     found.add(entry_id)
             for child in item.values():
                 visit(child)
@@ -108,6 +105,7 @@ class MapArtifactLocator:
     entry_id: str
     fingerprint: str = ""
     artifact_kind: str = "map_tool_result"
+    session_epoch: str = ""
 
     def as_dict(self) -> dict[str, str]:
         """返回适合写入 LLM history 的结构化定位信息。"""
@@ -119,6 +117,8 @@ class MapArtifactLocator:
         }
         if self.fingerprint:
             payload["artifact_fingerprint"] = self.fingerprint
+        if self.session_epoch:
+            payload["session_epoch"] = self.session_epoch
         return payload
 
 
@@ -129,6 +129,7 @@ class StagedMapArtifactTurn:
     session_id: str
     turn_id: str
     request_id: str | None
+    session_epoch: str = ""
     entries: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def add_entry(
@@ -154,9 +155,7 @@ class StagedMapArtifactTurn:
         existing = self.entries.get(tool_use_id)
         if existing is not None:
             if existing.get("fingerprint") != fingerprint:
-                raise ValueError(
-                    f"conflicting map artifact entry for tool_use_id: {tool_use_id}"
-                )
+                raise ValueError(f"conflicting map artifact entry for tool_use_id: {tool_use_id}")
             return
         self.entries[tool_use_id] = entry
 
@@ -164,11 +163,7 @@ class StagedMapArtifactTurn:
     def fingerprint(self) -> str:
         """返回忽略时间戳后的 turn 级规范指纹。"""
         stable_entries = {
-            entry_id: {
-                key: value
-                for key, value in entry.items()
-                if key != "created_at"
-            }
+            entry_id: {key: value for key, value in entry.items() if key != "created_at"}
             for entry_id, entry in self.entries.items()
         }
         return _canonical_fingerprint(stable_entries)
@@ -187,6 +182,7 @@ class MapArtifactStore:
     project_root: Path
     session_id: str
     failure_injector: CoordinatedCommitFailureInjector | None = None
+    session_epoch: str = ""
 
     def _hit_failpoint(self, name: str) -> None:
         """仅在构造时显式注入测试依赖后触发命名故障。"""
@@ -227,6 +223,7 @@ class MapArtifactStore:
             turn_id,
             entry_id,
             fingerprint,
+            session_epoch=self.session_epoch,
         )
 
     def merge_turn(self, staged: StagedMapArtifactTurn) -> None:
@@ -267,6 +264,7 @@ class MapArtifactStore:
         document.setdefault("coordinated_commits", {})[staged.turn_id] = {
             "schema_version": MAP_COORDINATED_COMMIT_VERSION,
             "session_id": staged.session_id,
+            "session_epoch": staged.session_epoch,
             "turn_id": staged.turn_id,
             "entry_ids": sorted(staged.entries),
             "entry_fingerprints": {
@@ -329,9 +327,7 @@ class MapArtifactStore:
         """Resolve prepared turns from exact locators in a durable Session."""
         document = self._load_document()
         changed = False
-        for turn_id, commit_value in list(
-            document.get("coordinated_commits", {}).items()
-        ):
+        for turn_id, commit_value in list(document.get("coordinated_commits", {}).items()):
             if not isinstance(commit_value, dict):
                 continue
             turn = document["turns"].get(turn_id)
@@ -379,6 +375,8 @@ class MapArtifactStore:
         """在 Session 提交前检查 turn 冲突；相同指纹表示幂等无需再写。"""
         if staged.session_id != self.session_id:
             raise ValueError("staged map artifact belongs to another session")
+        if staged.session_epoch != self.session_epoch:
+            raise ValueError("staged map artifact belongs to another session epoch")
         current = document if document is not None else self._load_document()
         existing = current["turns"].get(staged.turn_id)
         if not isinstance(existing, dict):
@@ -436,6 +434,7 @@ class MapArtifactStore:
             "artifact_entry_id": entry_id,
             "artifact_kind": entry.get("artifact_kind", "map_tool_result"),
             "source": source,
+            "session_epoch": self.session_epoch,
             "tool": entry.get("tool"),
             "fingerprint": entry.get("fingerprint"),
             "available_fields": sorted(str(key) for key in result),
@@ -473,6 +472,7 @@ class MapArtifactStore:
                 "schema": MAP_ARTIFACT_SCHEMA,
                 "version": MAP_ARTIFACT_VERSION,
                 "session_id": self.session_id,
+                "session_epoch": self.session_epoch,
                 "turns": {},
                 "coordinated_commits": {},
             }
@@ -485,6 +485,8 @@ class MapArtifactStore:
             raise ValueError("unsupported map artifact schema")
         if payload.get("session_id") != self.session_id:
             raise ValueError("map artifact belongs to another session")
+        if self.session_epoch and str(payload.get("session_epoch", "")) != self.session_epoch:
+            raise ValueError("map artifact belongs to another session epoch")
         if not isinstance(payload.get("turns"), dict):
             raise ValueError("map artifact turns must be an object")
         if not isinstance(payload.get("coordinated_commits"), dict):
@@ -502,6 +504,7 @@ class MapArtifactStore:
         if (
             staged is not None
             and staged.session_id == self.session_id
+            and staged.session_epoch == self.session_epoch
             and staged.turn_id == turn_id
         ):
             entry = staged.entries.get(entry_id)
@@ -542,3 +545,67 @@ class MapArtifactStore:
         if candidate != self.path.resolve() and not candidate.is_file():
             raise ValueError("legacy map artifact file was not found")
         return candidate
+
+
+def clear_session_artifacts(project_root: Path, session_id: str) -> None:
+    """精确删除一个 session 的所有旧版及 epoch 化 artifact 目录。
+
+    该操作只触碰 ``.ai_agent_service/artifacts`` 下由 session id 唯一推导出的
+    两个目录，不触碰 Godot 事务 journal、revision、registry 或工程内容。
+    """
+    artifact_root = (project_root / ".ai_agent_service" / "artifacts").resolve()
+    candidates = {
+        artifact_root / _safe_session_name(session_id),
+        artifact_root / hashlib.sha256(session_id.encode("utf-8")).hexdigest(),
+    }
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.parent != artifact_root:
+            raise ValueError("refusing to delete artifact path outside artifact root")
+        if resolved.exists():
+            shutil.rmtree(resolved)
+
+
+def adopt_legacy_artifact_epoch(
+    project_root: Path,
+    session_id: str,
+    session_epoch: str,
+) -> None:
+    """首次迁移旧 Session 时为既有 map/delegate artifact 补写 epoch。
+
+    该入口只应在 Session 自身尚无 epoch 时调用；reset 后创建的新 Session 从
+    一开始就有 epoch，因此不会把未清理的旧 artifact 误认领到新生命周期。
+    """
+    map_path = (
+        project_root
+        / ".ai_agent_service"
+        / "artifacts"
+        / _safe_session_name(session_id)
+        / "map_artifacts.json"
+    )
+    candidates = [map_path]
+    delegate_root = (
+        project_root
+        / ".ai_agent_service"
+        / "artifacts"
+        / hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        / "delegates"
+    )
+    if delegate_root.exists():
+        candidates.extend(delegate_root.glob("*.json"))
+    for path in candidates:
+        if not path.exists():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("session_id") != session_id:
+            raise ValueError("legacy artifact identity mismatch during epoch adoption")
+        stored_epoch = payload.get("session_epoch")
+        if stored_epoch not in {None, "", session_epoch}:
+            raise ValueError("legacy artifact already belongs to another epoch")
+        payload["session_epoch"] = session_epoch
+        commits = payload.get("coordinated_commits")
+        if isinstance(commits, dict):
+            for commit in commits.values():
+                if isinstance(commit, dict):
+                    commit["session_epoch"] = session_epoch
+        atomic_write_json(path, payload)

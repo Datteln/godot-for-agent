@@ -7,9 +7,13 @@ The scheduler MUST start a step only after every declared predecessor has comple
 - **WHEN** all dependencies of a pending step have typed status `succeeded` and their declared bindings resolve
 - **THEN** the scheduler makes that step runnable
 
-#### Scenario: A predecessor fails
-- **WHEN** any dependency fails, is cancelled, or is blocked
+#### Scenario: A predecessor reaches terminal failure
+- **WHEN** any dependency reaches an exhausted or proven permanent `failed`, explicit `cancelled`, or terminal `blocked` state
 - **THEN** the scheduler does not start the dependent step and records a typed blocked result that identifies the predecessor
+
+#### Scenario: A predecessor attempt is recoverable
+- **WHEN** a dependency attempt requests reader recovery, a new attempt, authoritative refresh, or replan
+- **THEN** the scheduler preserves the pending dependent step and does not propagate terminal blocked state while recovery remains available
 
 #### Scenario: A predecessor result cannot be bound
 - **WHEN** dependencies succeeded but a required result path or artifact reference is absent or malformed
@@ -38,6 +42,21 @@ Worker contract construction and workflow stage transitions MUST execute inside 
 #### Scenario: Task payload construction fails
 - **WHEN** a runnable step cannot produce a payload conforming to its worker contract
 - **THEN** the scheduler records the typed failure without creating a worker Frame or partially advancing workflow state
+
+### Requirement: Plan attempts and terminal step outcomes are distinct
+The scheduler MUST record each fallible execution as an attempt owned by a durable plan step. A failed attempt SHALL NOT make the step terminal while its typed recovery disposition permits reader recovery, retry, authoritative refresh, replacement, or replan. Only an exhausted or proven permanent failure may set terminal `failed` and propagate dependency blocking.
+
+#### Scenario: Reader recovery can satisfy missing inputs
+- **WHEN** a step attempt fails with typed missing inputs within its reader-recovery budget
+- **THEN** the step remains non-terminal, a reader attempt is scheduled, and dependent steps remain pending
+
+#### Scenario: Authoritative facts invalidate the current plan
+- **WHEN** an attempt returns a revision or fact conflict with disposition `refresh_and_replan`
+- **THEN** the scheduler records the attempt outcome, refreshes the authoritative input, and creates a new plan attempt without converting the durable task to terminal failure
+
+#### Scenario: Recovery is exhausted
+- **WHEN** all permitted recovery dispositions for a step reach their configured bounds
+- **THEN** the scheduler records one terminal failed or paused outcome with the first root cause and only then propagates dependency blocking
 
 ### Requirement: Delegate groups have one authoritative pending-step source
 The scheduler graph MUST be the sole source of pending delegate-group work. The runtime MUST NOT maintain or execute a parallel legacy `remaining` task queue.

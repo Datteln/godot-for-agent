@@ -14,6 +14,24 @@ from pydantic import BaseModel, Field
 PermissionMode = Literal["default", "plan", "auto_approve", "read_only", "full_access"]
 Effort = Literal["quick", "standard", "deep", "verify", "advisor"]
 InterruptCause = Literal["user_interrupted", "client_timeout"]
+RecoveryDisposition = Literal[
+    "continue_agent",
+    "retry_same_attempt",
+    "retry_new_attempt",
+    "retry_new_turn",
+    "refresh_and_replan",
+    "wait_frontend",
+    "pause_for_user",
+    "terminal",
+]
+SideEffectState = Literal[
+    "none",
+    "not_started",
+    "prepared",
+    "ambiguous",
+    "committed",
+    "rolled_back",
+]
 
 
 class Context(BaseModel):
@@ -101,7 +119,9 @@ class ChatRequest(BaseModel):
     """
 
     session_id: str
+    session_epoch: str | None = None
     request_id: str | None = None
+    recovery_token: str | None = None
     user_message: str | None = None
     context: Context | None = None
     language_hint: str | None = None
@@ -150,6 +170,14 @@ class ChatErrorResponse(BaseModel):
     type: Literal["error"] = "error"
     text: str
     error_code: str | None = None
+    task_id: str | None = None
+    attempt_id: str | None = None
+    checkpoint_id: str | None = None
+    disposition: RecoveryDisposition = "terminal"
+    retryable: bool = False
+    side_effect_state: SideEffectState = "none"
+    retry_token: str | None = None
+    next_action: dict[str, Any] | None = None
 
 
 ChatResponse = Annotated[
@@ -186,6 +214,11 @@ class ResetResponse(BaseModel):
 
     ok: bool
     session_id: str
+    session_epoch: str | None = None
+    last_event_seq: int = 0
+    cleanup_pending: bool = False
+    error_code: str | None = None
+    text: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -236,13 +269,17 @@ class ChatEventDTO(BaseModel):
 
     seq: int
     session_id: str
+    session_epoch: str = ""
     type: str
     payload: dict[str, Any] = Field(default_factory=dict)
-    delivery: Literal[
-        "provisional_preview",
-        "transactional",
-        "out_of_band_liveness",
-    ] | None = None
+    delivery: (
+        Literal[
+            "provisional_preview",
+            "transactional",
+            "out_of_band_liveness",
+        ]
+        | None
+    ) = None
     provisional: bool = False
     preview_id: str | None = None
     request_id: str | None = None
@@ -266,6 +303,7 @@ class ChatEventsResponse(BaseModel):
     """`GET /chat/events` 响应。"""
 
     events: list[ChatEventDTO]
+    session_epoch: str = ""
     progress: ChatProgressDTO | None = None
     cursor: int = 0
     has_more: bool = False
@@ -447,6 +485,7 @@ class SessionHistoryResponse(BaseModel):
 
     ok: bool = True
     session_id: str
+    session_epoch: str = ""
     last_event_seq: int = 0
     pending_turn_id: str | None = None
     context_used_tokens: int = 0
@@ -460,6 +499,7 @@ class RecoveryPointerDTO(BaseModel):
     """最小恢复指针（§14.3），不包含 token/API key/完整消息。"""
 
     session_id: str
+    session_epoch: str = ""
     last_event_seq: int
     pending_turn_id: str | None = None
     project_hash: str

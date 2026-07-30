@@ -101,7 +101,11 @@ async def read_map_artifact_handler(
             "map_tool_result",
             ValueError("limit 必须是整数"),
         )
-    store = MapArtifactStore(ctx.security.project_root, ctx.session_id)
+    store = MapArtifactStore(
+        ctx.security.project_root,
+        ctx.session_id,
+        session_epoch=ctx.session_epoch,
+    )
     try:
         return store.read_page(
             artifact_ref,

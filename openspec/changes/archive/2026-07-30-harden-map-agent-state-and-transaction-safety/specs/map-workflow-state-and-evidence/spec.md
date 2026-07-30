@@ -115,6 +115,36 @@ Completion-candidate eligibility and an allowed Completion Gate outcome MUST hav
 - **WHEN** the task is cancelled, replaced, or starts a distinct epoch
 - **THEN** the prior lineage's completion-candidate identity is cleared
 
+### Requirement: Attempt failure does not implicitly terminate its task
+The runtime MUST model a durable task separately from its request, model, tool, plan-step, and publication attempts. Every non-terminal attempt problem MUST preserve a task checkpoint and transition the task only to `running`, `recovering`, `waiting_frontend`, or `paused`. It MUST NOT implicitly transition the task to `idle`, `cancelled`, `completed`, or `failed_permanently`.
+
+#### Scenario: A provider attempt is exhausted
+- **WHEN** the configured provider attempt and fallback fail while a map task is active
+- **THEN** the runtime persists the attempt outcome and a resumable task checkpoint, then enters bounded recovery or a typed provider-exhausted pause without completing or cancelling the task
+
+#### Scenario: The response transport closes
+- **WHEN** the HTTP response body or event delivery closes after task execution has begun
+- **THEN** transport loss is recorded against the affected attempt identity and cannot by itself change durable task lifecycle or discard the task checkpoint
+
+#### Scenario: A recoverable coordinated-publication conflict occurs
+- **WHEN** Session or artifact publication returns a typed conflict whose original committed data is preserved
+- **THEN** the task enters recovery with the preserved checkpoint and the required fresh-turn action rather than becoming idle or terminal
+
+### Requirement: Task terminal transitions are closed and explicit
+A task SHALL enter `completed` only through an allowed Completion Gate outcome, `cancelled` only through explicit cancellation, and `failed_permanently` only after the runtime proves that no safe automatic or user-directed recovery is available. User interruption, provider exhaustion, retry-budget exhaustion, ambiguous commit state, transport loss, and recoverable integrity conflicts MUST produce a checkpointed recovery or pause state.
+
+#### Scenario: The user stops current execution
+- **WHEN** the user interrupts an active task without explicitly cancelling it
+- **THEN** the task persists a resumable pause and does not enter `cancelled` or `failed_permanently`
+
+#### Scenario: Automatic recovery reaches its bound
+- **WHEN** the applicable persisted recovery budget is exhausted
+- **THEN** the task pauses with the first root cause, attempt history, side-effect state, and recovery guidance instead of reporting completion or looping indefinitely
+
+#### Scenario: Completion Gate succeeds
+- **WHEN** the current task lineage satisfies the allowed Completion Gate outcome
+- **THEN** the reducer performs the single authoritative transition to `completed`
+
 ### Requirement: Capture paths reject malformed Godot scheme spellings
 Screenshot and image-review path validation MUST reject malformed lookalikes of the accepted `res://` and `user://` schemes before project-relative path resolution.
 

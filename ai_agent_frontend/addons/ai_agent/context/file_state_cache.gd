@@ -4,6 +4,11 @@ extends Node
 var _states: Dictionary = {}
 
 
+func clear() -> void:
+	## 会话 reset 后旧会话的 read-before-edit 授权不可继续复用。
+	_states.clear()
+
+
 func snapshot(path: String, known_full_read: bool = false) -> Dictionary:
 	var state := _make_state(path, known_full_read)
 	_states[path] = state

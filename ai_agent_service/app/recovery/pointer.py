@@ -24,6 +24,7 @@ class RecoveryPointer:
     pending_turn_id: str | None
     project_hash: str
     updated_at: str
+    session_epoch: str = ""
     map_checkpoint: dict[str, Any] | None = None
 
 
@@ -46,6 +47,7 @@ class RecoveryPointerStore:
         pending_turn_id: str | None,
         last_event_seq: int,
         map_checkpoint: dict[str, Any] | None = None,
+        session_epoch: str = "",
     ) -> None:
         """写入指定会话的最新恢复指针，不覆盖其他会话。"""
         pointer = RecoveryPointer(
@@ -54,6 +56,7 @@ class RecoveryPointerStore:
             last_event_seq=last_event_seq,
             project_hash=self._project_hash,
             updated_at=datetime.now(timezone.utc).isoformat(),
+            session_epoch=session_epoch,
             map_checkpoint=map_checkpoint,
         )
         # v2 格式：先读取全部已有指针，再按 session_id 覆盖/新增当前项，
@@ -64,10 +67,7 @@ class RecoveryPointerStore:
             self._path,
             {
                 "version": 2,
-                "pointers": {
-                    key: asdict(value)
-                    for key, value in pointers.items()
-                },
+                "pointers": {key: asdict(value) for key, value in pointers.items()},
             },
         )
         logger.info(
@@ -108,6 +108,8 @@ class RecoveryPointerStore:
                 # 旧版可能没有 map_checkpoint 字段或其值不是 dict，统一归一化为 None
                 if not isinstance(normalized.get("map_checkpoint"), dict):
                     normalized["map_checkpoint"] = None
+                if not isinstance(normalized.get("session_epoch"), str):
+                    normalized["session_epoch"] = ""
                 pointer = RecoveryPointer(**normalized)
                 # 按 project_hash 过滤：只保留属于当前工程的指针
                 if pointer.project_hash == self._project_hash:
@@ -162,10 +164,7 @@ class RecoveryPointerStore:
                 self._path,
                 {
                     "version": 2,
-                    "pointers": {
-                        key: asdict(value)
-                        for key, value in pointers.items()
-                    },
+                    "pointers": {key: asdict(value) for key, value in pointers.items()},
                 },
             )
         else:

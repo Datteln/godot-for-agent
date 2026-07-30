@@ -19,6 +19,7 @@ import re
 from collections.abc import Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -33,6 +34,7 @@ from app.api.schemas import (
     FrontToolCallDTO,
     InterruptCause,
     InterruptResponse,
+    ResetResponse,
     SessionHistoryResponse,
     ToolResult,
 )
@@ -88,6 +90,7 @@ from app.orchestrator.map_artifacts import (
     MapArtifactLocator,
     MapArtifactStore,
     StagedMapArtifactTurn,
+    clear_session_artifacts,
 )
 from app.orchestrator.map_workflow import (
     consume_map_resume_authorization,
@@ -114,8 +117,14 @@ from app.orchestrator.map_request_scope import (
 from app.rag.asset_llm_client import AssetLLMClient, AssetLLMConfig
 from app.rag.factory import create_codebase_index
 from app.recovery.pointer import RecoveryPointerStore
+from app.recovery.supervisor import (
+    RecoveryFailureInjector,
+    RecoverySupervisor,
+    RecoveryTokenError,
+)
 from app.security.settings import SecuritySettings, security_settings_from_app
-from app.sessions.store import Session, SessionStore, session_to_dict
+from app.sessions.store import Session, SessionStore, session_from_dict, session_to_dict
+from app.sessions.resource_registry import BACKEND_RESET_STEPS
 from app.skills.catalog import SkillCatalog
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
@@ -137,6 +146,22 @@ def _submission_event_delivery(event_type: str) -> str:
     if event_type == "turn_progress":
         return "out_of_band_liveness"
     return "transactional"
+
+
+def _rebase_artifact_turn_identity(value: Any, old_turn_id: str, new_turn_id: str) -> None:
+    """原地把一次未发布提交中的 artifact/turn 身份换到更大的 turn。"""
+    if isinstance(value, dict):
+        for key, item in list(value.items()):
+            if (
+                key in {"artifact_turn_id", "turn_id", "_submission_turn_id"}
+                and item == old_turn_id
+            ):
+                value[key] = new_turn_id
+            else:
+                _rebase_artifact_turn_identity(item, old_turn_id, new_turn_id)
+    elif isinstance(value, list):
+        for item in value:
+            _rebase_artifact_turn_identity(item, old_turn_id, new_turn_id)
 
 
 def _map_completion_candidate_is_current(session: Session) -> bool:
@@ -217,19 +242,14 @@ def _can_contextually_resume_map_task(session: Session, user_message: str) -> bo
     if not is_continuation_intent(user_message):
         return False
     state = session.map_task_state
-    if (
-        state.status != "paused"
-        or not state.task_id
-        or not isinstance(state.checkpoint, dict)
-    ):
+    if state.status != "paused" or not state.task_id or not isinstance(state.checkpoint, dict):
         return False
     previous_scope = session.map_request_scope
     task_lineage = session.map_task_lineage
     return (
         previous_scope.intent == "map_edit"
         and previous_scope.map_task_id == state.task_id
-        and previous_scope.lineage_id
-        == str(task_lineage.get("lineage_id", ""))
+        and previous_scope.lineage_id == str(task_lineage.get("lineage_id", ""))
         and state.task_id == str(task_lineage.get("task_id", ""))
     )
 
@@ -248,9 +268,7 @@ def _activate_user_request_scope(
     scope = new_request_scope(
         request_id=request.request_id,
         user_message=request.user_message or "",
-        dedicated_resume_authorized=(
-            dedicated_resume_authorized or contextual_resume_authorized
-        ),
+        dedicated_resume_authorized=(dedicated_resume_authorized or contextual_resume_authorized),
     )
     state = session.map_task_state
     resumed_existing_task = False
@@ -265,16 +283,13 @@ def _activate_user_request_scope(
                 resume_map_task(state)
             scope = bind_map_task(scope, state.task_id)
             task_lineage = session.map_task_lineage
-            if (
-                str(task_lineage.get("task_id", "")) == state.task_id
-                and str(task_lineage.get("lineage_id", ""))
+            if str(task_lineage.get("task_id", "")) == state.task_id and str(
+                task_lineage.get("lineage_id", "")
             ):
                 scope = replace(
                     scope,
                     lineage_id=str(task_lineage["lineage_id"]),
-                    completion_candidate=(
-                        task_lineage.get("completion_candidate") is True
-                    ),
+                    completion_candidate=(task_lineage.get("completion_candidate") is True),
                 )
             resumed_existing_task = True
             _bind_request_scope_to_frames(session, scope, all_frames=True)
@@ -435,7 +450,7 @@ def _step_to_response(step: StepResult) -> ChatResponse:
     if isinstance(step, FinalResult):
         return ChatFinalResponse(text=step.text)
     if isinstance(step, ErrorResult):
-        return ChatErrorResponse(text=step.text)
+        return ChatErrorResponse(text=step.text, error_code=step.error_code)
     raise TypeError(f"未知编排结果类型：{type(step)!r}")
 
 
@@ -542,8 +557,7 @@ def _writer_platform_validation_failure_text(
             "worker": frame.agent.name,
             "mode": "partial",
             "summary": (
-                "平台写入前校验未通过；Writer 未执行 edit_map，"
-                "已停止当前写入帧并返回 planner。"
+                "平台写入前校验未通过；Writer 未执行 edit_map，" "已停止当前写入帧并返回 planner。"
             ),
             "proposed_batches": [],
             "write_results": [],
@@ -651,8 +665,7 @@ def _remember_map_batch_result(
         target=str(tool_args.get("target_path", "")) or None,
         revision=(
             result.get("map_revision")
-            if isinstance(result, dict)
-            and isinstance(result.get("map_revision"), int)
+            if isinstance(result, dict) and isinstance(result.get("map_revision"), int)
             else None
         ),
     )
@@ -661,31 +674,27 @@ def _remember_map_batch_result(
     if transaction_id:
         journals = list(state.transaction_journals)
         matched = next(
-            (
-                item
-                for item in journals
-                if item.get("transaction_id") == transaction_id
-            ),
+            (item for item in journals if item.get("transaction_id") == transaction_id),
             None,
         )
-        transaction_entry = dict(matched) if isinstance(matched, dict) else {
-            "transaction_id": transaction_id,
-            "target": str(tool_args.get("target_path", "")),
-            "base_revision": tool_args.get("map_transaction_base_revision"),
-            "operation_ids": [],
-        }
+        transaction_entry = (
+            dict(matched)
+            if isinstance(matched, dict)
+            else {
+                "transaction_id": transaction_id,
+                "target": str(tool_args.get("target_path", "")),
+                "base_revision": tool_args.get("map_transaction_base_revision"),
+                "operation_ids": [],
+            }
+        )
         operation_ids = list(transaction_entry.get("operation_ids", []))
         batch_id = str(tool_args.get("write_batch_id", ""))
         if batch_id and batch_id not in operation_ids:
             operation_ids.append(batch_id)
         approval_records = list(transaction_entry.get("approval_records", []))
         approval_id = str(tool_args.get("approval_id", "")).strip()
-        approval_fingerprint = str(
-            tool_args.get("approval_batch_fingerprint", "")
-        ).strip()
-        approval_expected_revision = tool_args.get(
-            "approval_expected_revision"
-        )
+        approval_fingerprint = str(tool_args.get("approval_batch_fingerprint", "")).strip()
+        approval_expected_revision = tool_args.get("approval_expected_revision")
         if (
             approval_id
             and approval_fingerprint
@@ -715,11 +724,7 @@ def _remember_map_batch_result(
                 "error": error,
             }
         )
-        journals = [
-            item
-            for item in journals
-            if item.get("transaction_id") != transaction_id
-        ]
+        journals = [item for item in journals if item.get("transaction_id") != transaction_id]
         journals.append(transaction_entry)
         replace_map_state_field(
             state,
@@ -728,8 +733,7 @@ def _remember_map_batch_result(
             target=str(tool_args.get("target_path", "")) or None,
             revision=(
                 result.get("map_revision")
-                if isinstance(result, dict)
-                and isinstance(result.get("map_revision"), int)
+                if isinstance(result, dict) and isinstance(result.get("map_revision"), int)
                 else None
             ),
         )
@@ -737,10 +741,8 @@ def _remember_map_batch_result(
         if state.pending_batches:
             first = state.pending_batches[0]
             first_input = first.get("input", {}) if isinstance(first, dict) else {}
-            if (
-                isinstance(first_input, dict)
-                and first_input.get("write_batch_id")
-                == tool_args.get("write_batch_id")
+            if isinstance(first_input, dict) and first_input.get("write_batch_id") == tool_args.get(
+                "write_batch_id"
             ):
                 replace_map_state_field(
                     state,
@@ -749,8 +751,7 @@ def _remember_map_batch_result(
                     target=str(tool_args.get("target_path", "")) or None,
                     revision=(
                         result.get("map_revision")
-                        if isinstance(result, dict)
-                        and isinstance(result.get("map_revision"), int)
+                        if isinstance(result, dict) and isinstance(result.get("map_revision"), int)
                         else None
                     ),
                 )
@@ -794,11 +795,7 @@ def _remember_map_transaction_validation(
         return
     journals = list(session.map_task_state.transaction_journals)
     matched = next(
-        (
-            item
-            for item in journals
-            if item.get("transaction_id") == transaction_id
-        ),
+        (item for item in journals if item.get("transaction_id") == transaction_id),
         None,
     )
     if not isinstance(matched, dict):
@@ -810,20 +807,12 @@ def _remember_map_transaction_validation(
         if frontend_status in {"committed", "rolled_back", "failed"}
         else ("committed" if successful else "rolled_back")
     )
-    updated["final_revision"] = result.get(
-        "map_revision", updated.get("final_revision")
-    )
+    updated["final_revision"] = result.get("map_revision", updated.get("final_revision"))
     updated["validation_tool"] = result.get("validation_tool")
-    updated["error"] = None if successful else str(
-        result.get("message", "map validation failed")
-    )
+    updated["error"] = None if successful else str(result.get("message", "map validation failed"))
     if successful and updated["status"] == "committed":
         consume_committed_platform_approvals(session, result, updated)
-    journals = [
-        item
-        for item in journals
-        if item.get("transaction_id") != transaction_id
-    ]
+    journals = [item for item in journals if item.get("transaction_id") != transaction_id]
     journals.append(updated)
     replace_map_state_field(
         session.map_task_state,
@@ -962,9 +951,8 @@ class QueryEngine:
         recovery_store: RecoveryPointerStore | None = None,
         cache_engine: CacheDecisionEngine | None = None,
         cache_metrics: CacheMetricsCollector | None = None,
-        coordinated_commit_failure_injector: (
-            CoordinatedCommitFailureInjector | None
-        ) = None,
+        coordinated_commit_failure_injector: CoordinatedCommitFailureInjector | None = None,
+        recovery_failure_injector: RecoveryFailureInjector | None = None,
     ) -> None:
         """构造 QueryEngine。
 
@@ -988,8 +976,10 @@ class QueryEngine:
         self._recovery = recovery_store
         self._cache_engine = cache_engine or CacheDecisionEngine()
         self._cache_metrics = cache_metrics or CacheMetricsCollector()
-        self._coordinated_commit_failure_injector = (
-            coordinated_commit_failure_injector
+        self._coordinated_commit_failure_injector = coordinated_commit_failure_injector
+        self._recovery_supervisor = RecoverySupervisor(
+            recovery_failure_injector,
+            self._store.save_task_run,
         )
         self._verify_runner = VerifyRunner(
             settings,
@@ -1013,7 +1003,141 @@ class QueryEngine:
         # 覆盖掉真正持有锁、仍在运行的旧任务引用，导致 interrupt() 取消错对象。
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._turn_progress: dict[str, _TurnProgress] = {}
-        self._history_blocks_cache: dict[str, tuple[tuple[int, int, int], list[Any]]] = {}
+        self._history_blocks_cache: dict[
+            tuple[str, str],
+            tuple[tuple[int, int, int], list[Any]],
+        ] = {}
+        self._resume_incomplete_resets()
+
+    def _complete_reset_cleanup(self, record: dict[str, Any]) -> int:
+        """完成 epoch barrier 之后的幂等物理清理并返回 reset 边界序号。"""
+        session_id = str(record["session_id"])
+        new_epoch = str(record["new_epoch"])
+        persisted_highwater = int(record.get("last_event_seq", 0) or 0)
+        last_seq = persisted_highwater
+        handlers: dict[str, Callable[[], None]] = {
+            "event_content": lambda: self._reset_event_content(
+                record,
+                session_id,
+                new_epoch,
+                persisted_highwater,
+            ),
+            "in_memory_session": lambda: self._store.remove_session_payload(session_id),
+            "session_document": lambda: self._store.remove_session_payload(session_id),
+            "task_run_journal": lambda: self._store.remove_session_payload(session_id),
+            "map_artifacts": lambda: clear_session_artifacts(
+                self._settings.project_root,
+                session_id,
+            ),
+            "delegate_artifacts": lambda: clear_session_artifacts(
+                self._settings.project_root,
+                session_id,
+            ),
+            "recovery_pointer": lambda: (
+                self._recovery.clear(session_id) if self._recovery is not None else None
+            ),
+            "history_projection_cache": lambda: self._history_blocks_cache.pop(
+                (session_id, str(record.get("old_epoch", ""))),
+                None,
+            ),
+            "turn_progress": lambda: self._turn_progress.pop(session_id, None),
+        }
+        if set(handlers) != set(BACKEND_RESET_STEPS):
+            raise ValueError("reset handler registry does not match resource contracts")
+        self._store.checkpoint_reset(record, "cleaning")
+        for resource_id in BACKEND_RESET_STEPS:
+            if resource_id != "event_content" and self._store.reset_step_completed(
+                record, resource_id
+            ):
+                continue
+            self._store.hit_reset_failpoint(f"cleanup_before_{resource_id}")
+            handlers[resource_id]()
+            self._store.complete_reset_step(record, resource_id)
+            self._store.hit_reset_failpoint(f"cleanup_after_{resource_id}")
+        if self._events is not None:
+            last_seq = max(
+                int(record.get("last_event_seq", 0) or 0),
+                self._events.last_seq(session_id),
+            )
+        record["last_event_seq"] = last_seq
+        self._store.finish_reset(record)
+        return last_seq
+
+    def _reset_event_content(
+        self,
+        record: dict[str, Any],
+        session_id: str,
+        new_epoch: str,
+        persisted_highwater: int,
+    ) -> None:
+        """切换 EventStore epoch 并把 reset 边界序号写回 reset 记录。"""
+        if self._events is None:
+            return
+        if self._events.current_epoch(session_id) != new_epoch:
+            self._events.ensure_sequence(
+                session_id,
+                persisted_highwater,
+                session_epoch=new_epoch,
+            )
+            boundary = self._events.reset(session_id, new_epoch)
+            record["last_event_seq"] = boundary.seq
+        else:
+            record["last_event_seq"] = self._events.last_seq(session_id)
+
+    def _resume_incomplete_resets(self) -> None:
+        """服务启动时继续 epoch 已切换但尚未完成的 reset 清理。"""
+        for record in self._store.pending_reset_records():
+            try:
+                current_epoch = self._store.current_epoch(
+                    str(record["session_id"]),
+                    create=False,
+                )
+                if current_epoch != record.get("new_epoch"):
+                    self._store.abandon_reset(
+                        record,
+                        (
+                            "epoch_barrier_not_established"
+                            if current_epoch == record.get("old_epoch")
+                            else "reset_record_lost_epoch_ownership"
+                        ),
+                    )
+                    continue
+                self._complete_reset_cleanup(record)
+            except (OSError, TypeError, ValueError):
+                logger.exception(
+                    "Incomplete reset cleanup remains pending session=%s reset_id=%s",
+                    record.get("session_id"),
+                    record.get("reset_id"),
+                )
+
+    async def resume_pending_recoveries(self) -> int:
+        """启动时重建未终态 TaskRun 的监督状态并发布可观察恢复事件。"""
+        resumed = 0
+        for session_id in self._store.task_run_session_ids():
+            async with self._store.lock_for(session_id):
+                session = self._store.get_or_create(
+                    session_id,
+                    self.available_tools,
+                )
+                run = self._recovery_supervisor.resume_after_restart(session)
+                if run is None:
+                    continue
+                self._store.save_task_run(session)
+                self._emit(
+                    session_id,
+                    "recovery_resumed",
+                    {
+                        "task_id": run.get("task_id"),
+                        "attempt_id": run.get("current_attempt_id"),
+                        "checkpoint_id": run.get("checkpoint_id"),
+                        "disposition": run.get("active_disposition"),
+                        "side_effect_state": run.get("side_effect_state"),
+                        "next_action": run.get("next_action"),
+                        "status": run.get("status"),
+                    },
+                )
+                resumed += 1
+        return resumed
 
     @property
     def available_tools(self) -> set[str]:
@@ -1056,9 +1180,7 @@ class QueryEngine:
         """更新活跃请求的临时阶段，不触碰可恢复业务状态。"""
         current = self._turn_progress.get(session_id)
         heartbeat_seq = (
-            current.heartbeat_seq
-            if current is not None and current.owner_id == owner_id
-            else 0
+            current.heartbeat_seq if current is not None and current.owner_id == owner_id else 0
         )
         self._turn_progress[session_id] = _TurnProgress(
             owner_id=owner_id,
@@ -1102,7 +1224,12 @@ class QueryEngine:
             return None
         if tool_name in MAP_VALIDATION_TOOL_NAMES and _json_char_size(result) < 8_000:
             return None
-        store = MapArtifactStore(self._settings.project_root, session_id)
+        session = self._store.get_or_create(session_id, self.available_tools)
+        store = MapArtifactStore(
+            self._settings.project_root,
+            session_id,
+            session_epoch=session.session_epoch,
+        )
         publication_buffer = _PUBLICATION_BUFFER.get()
         if publication_buffer is not None:
             publication_buffer.map_artifact_turn.add_entry(
@@ -1121,6 +1248,7 @@ class QueryEngine:
             session_id=session_id,
             turn_id=turn_id,
             request_id=None,
+            session_epoch=session.session_epoch,
         )
         staged.add_entry(
             tool_use_id=tool_use_id,
@@ -1151,6 +1279,12 @@ class QueryEngine:
     ) -> SessionHistoryResponse:
         """Return frontend-renderable history for a persisted session."""
         session = self._store.get_or_create(session_id, self.available_tools)
+        if self._events is not None:
+            self._events.ensure_sequence(
+                session_id,
+                session.history_event_counter,
+                session_epoch=session.session_epoch,
+            )
         events = _persisted_history_events(session)
         if not events and self._events is not None:
             events = self._events.list_after(session_id, 0)
@@ -1184,12 +1318,13 @@ class QueryEngine:
                 len(recent_events),
                 recent_events[-1].seq if recent_events else 0,
             )
-            cached = self._history_blocks_cache.get(session.session_id)
+            history_cache_key = (session.session_id, session.session_epoch)
+            cached = self._history_blocks_cache.get(history_cache_key)
             if cached is not None and cached[0] == cache_key:
                 blocks = cached[1]
             else:
                 blocks = _structured_session_history(recent_frames, recent_events)
-                self._history_blocks_cache[session.session_id] = (cache_key, blocks)
+                self._history_blocks_cache[history_cache_key] = (cache_key, blocks)
         offset = min(max(before, 0), len(blocks))
         end = len(blocks) - offset
         start = max(0, end - limit) if limit > 0 else 0
@@ -1206,6 +1341,7 @@ class QueryEngine:
         )
         return SessionHistoryResponse(
             session_id=session.session_id,
+            session_epoch=session.session_epoch,
             last_event_seq=self._events.last_seq(session_id) if self._events is not None else 0,
             pending_turn_id=session.pending_turn_id,
             context_used_tokens=_history_context_used_tokens(session, events),
@@ -1246,11 +1382,30 @@ class QueryEngine:
                     phase="accepted",
                 )
                 session = self._store.get_or_create(request.session_id, self.available_tools)
+                resumed_run = self._recovery_supervisor.resume_after_restart(session)
+                if resumed_run is not None:
+                    self._store.save_task_run(session)
+                if (
+                    request.session_epoch is not None
+                    and request.session_epoch != session.session_epoch
+                ):
+                    return ChatErrorResponse(
+                        text="请求属于已重置的旧会话生命周期，请刷新会话状态后重试",
+                        error_code="stale_session_epoch",
+                        disposition="wait_frontend",
+                        retryable=True,
+                        side_effect_state="none",
+                        next_action={
+                            "action": "adopt_session_epoch",
+                            "session_epoch": session.session_epoch,
+                        },
+                    )
                 try:
                     MapArtifactStore(
                         self._settings.project_root,
                         session.session_id,
                         self._coordinated_commit_failure_injector,
+                        session.session_epoch,
                     ).reconcile_with_session(session_to_dict(session))
                 except (OSError, TypeError, ValueError):
                     logger.exception(
@@ -1263,6 +1418,7 @@ class QueryEngine:
                     self._events.ensure_sequence(
                         session.session_id,
                         session.history_event_counter,
+                        session_epoch=session.session_epoch,
                     )
                 logger.info(
                     "Chat request accepted session=%s request_id=%s has_user=%s tool_results=%d",
@@ -1290,14 +1446,17 @@ class QueryEngine:
                 # 2) 指纹不匹配 → 同一 turn_id 内容不同属于协议违规，拒绝请求
                 tool_batch_identity = _tool_result_batch_identity(request.tool_results)
                 if tool_batch_identity is not None:
-                    completed_turn = session.completed_tool_turn_cache.get(
-                        tool_batch_identity[0]
-                    )
+                    completed_turn = session.completed_tool_turn_cache.get(tool_batch_identity[0])
                     if isinstance(completed_turn, dict):
                         if completed_turn.get("fingerprint") != tool_batch_identity[1]:
-                            return ChatErrorResponse(
-                                text="同一 turn_id 已处理，但重试的 tool_results 内容不同"
+                            self._recovery_supervisor.begin_attempt(session, request)
+                            problem = self._recovery_supervisor.problem(
+                                session,
+                                error_code="tool_result_batch_mismatch",
+                                text="同一 turn_id 已处理，但重试的 tool_results 内容不同",
                             )
+                            self._store.save_task_run(session)
+                            return ChatErrorResponse(**problem)
                         cached_response = completed_turn.get("response")
                         if isinstance(cached_response, dict):
                             logger.info(
@@ -1306,6 +1465,18 @@ class QueryEngine:
                                 tool_batch_identity[0],
                             )
                             return _response_from_dict(cached_response)
+
+                try:
+                    self._recovery_supervisor.begin_attempt(session, request)
+                    self._store.save_task_run(session)
+                except RecoveryTokenError as exc:
+                    return ChatErrorResponse(
+                        text=str(exc),
+                        error_code="invalid_recovery_token",
+                        disposition="pause_for_user",
+                        retryable=False,
+                        side_effect_state="none",
+                    )
 
                 validated_tool_batch: ValidatedToolResultBatch | None = None
                 if request.tool_results is not None:
@@ -1322,11 +1493,15 @@ class QueryEngine:
                             exc.code,
                             exc.message,
                         )
-                        return ChatErrorResponse(text=exc.message)
+                        problem = self._recovery_supervisor.problem(
+                            session,
+                            error_code="tool_result_preflight_failed",
+                            text=exc.message,
+                        )
+                        self._store.save_task_run(session)
+                        return ChatErrorResponse(**problem)
                 progress_turn_id = (
-                    validated_tool_batch.turn_id
-                    if validated_tool_batch is not None
-                    else None
+                    validated_tool_batch.turn_id if validated_tool_batch is not None else None
                 )
                 self._set_turn_progress(
                     request.session_id,
@@ -1346,9 +1521,7 @@ class QueryEngine:
                 # 时回滚到本轮开始前的内存快照（本轮尚未 save()，磁盘仍是旧版本）。
                 snapshot = copy.deepcopy(session)
                 working_session = (
-                    copy.deepcopy(session)
-                    if validated_tool_batch is not None
-                    else session
+                    copy.deepcopy(session) if validated_tool_batch is not None else session
                 )
                 publication_buffer: _SubmissionPublicationBuffer | None = None
                 publication_token: Token[_SubmissionPublicationBuffer | None] | None = None
@@ -1358,6 +1531,7 @@ class QueryEngine:
                         session_id=working_session.session_id,
                         turn_id=validated_tool_batch.turn_id,
                         request_id=request.request_id,
+                        session_epoch=working_session.session_epoch,
                     )
                     publication_buffer = _SubmissionPublicationBuffer(
                         session=working_session,
@@ -1368,11 +1542,15 @@ class QueryEngine:
                     publication_token = _PUBLICATION_BUFFER.set(publication_buffer)
                     map_artifact_token = CURRENT_MAP_ARTIFACT_TURN.set(staged_map_turn)
                 try:
-                    response = await self._submit_locked(
+                    response, working_session = await self._submit_with_backend_recovery(
                         working_session,
                         request,
                         validated_tool_batch,
+                        snapshot=snapshot,
+                        publication_buffer=publication_buffer,
                     )
+                    if publication_buffer is not None:
+                        publication_buffer.session = working_session
                 except asyncio.CancelledError:
                     if publication_buffer is not None:
                         self._resolve_submission_previews(
@@ -1380,6 +1558,24 @@ class QueryEngine:
                             committed=False,
                             reason="cancelled",
                         )
+                    if isinstance(snapshot.task_run, dict):
+                        try:
+                            problem = self._recovery_supervisor.problem(
+                                snapshot,
+                                error_code="response_transport_lost",
+                                text="请求传输已中断；任务检查点和 attempt 身份已保留",
+                                side_effect_state="ambiguous",
+                                next_action={
+                                    "action": "reconnect_and_observe_attempt",
+                                },
+                            )
+                            snapshot.task_run["last_problem"] = problem
+                            self._store.save_task_run(snapshot)
+                        except (OSError, TypeError, ValueError):
+                            logger.exception(
+                                "Failed to persist cancelled transport state session=%s",
+                                request.session_id,
+                            )
                     self._store.replace_in_memory(request.session_id, snapshot)
                     raise
                 except Exception:
@@ -1389,23 +1585,68 @@ class QueryEngine:
                             committed=False,
                             reason="submission_failed",
                         )
+                    problem = self._recovery_supervisor.problem(
+                        snapshot,
+                        error_code="submission_internal_error",
+                        text=(
+                            "处理工具结果时发生内部错误；会话状态已回滚，"
+                            "后端已保留同一 attempt 的安全恢复检查点"
+                        ),
+                    )
                     self._store.replace_in_memory(request.session_id, snapshot)
+                    try:
+                        self._store.save_task_run(snapshot)
+                    except (OSError, TypeError, ValueError):
+                        logger.exception(
+                            "Failed to persist recovery problem session=%s",
+                            request.session_id,
+                        )
                     logger.exception(
                         "Chat request failed; restored session snapshot session=%s request_id=%s",
                         request.session_id,
                         request.request_id,
                     )
-                    return ChatErrorResponse(
-                        text=(
-                            "处理工具结果时发生内部错误；会话状态已回滚，"
-                            "待回传工具仍可使用同一 request_id 安全重试"
-                        )
-                    )
+                    return ChatErrorResponse(**problem)
                 finally:
                     if map_artifact_token is not None:
                         CURRENT_MAP_ARTIFACT_TURN.reset(map_artifact_token)
                     if publication_token is not None:
                         _PUBLICATION_BUFFER.reset(publication_token)
+
+                if isinstance(response, ChatErrorResponse) and response.attempt_id is None:
+                    problem = self._recovery_supervisor.problem(
+                        working_session,
+                        error_code=response.error_code or "internal_error",
+                        text=response.text,
+                        side_effect_state=(
+                            response.side_effect_state
+                            if response.side_effect_state != "none"
+                            else None
+                        ),
+                        next_action=response.next_action,
+                    )
+                    response = ChatErrorResponse(**problem)
+                    if publication_buffer is not None:
+                        problem_fields = response.model_dump(
+                            exclude={"type", "text"},
+                            exclude_none=True,
+                        )
+                        for _, event_type, event_payload in publication_buffer.events:
+                            if event_type == "error":
+                                event_payload.update(problem_fields)
+                else:
+                    if not isinstance(response, ChatErrorResponse):
+                        self._recovery_supervisor.complete_attempt(
+                            working_session,
+                            waiting_frontend=isinstance(response, ChatToolCallsResponse),
+                        )
+                        if working_session.map_task_state.status == "completed":
+                            self._recovery_supervisor.mark_terminal(
+                                working_session,
+                                outcome="completed",
+                                authorized_by="completion_gate",
+                            )
+                self._store.save_task_run(working_session)
 
                 if request.request_id is not None:
                     working_session.request_id_cache[request.request_id] = response.model_dump()
@@ -1431,6 +1672,7 @@ class QueryEngine:
                             self._settings.project_root,
                             working_session.session_id,
                             self._coordinated_commit_failure_injector,
+                            working_session.session_epoch,
                         )
                         artifact_prepared = artifact_store.prepare_turn(
                             publication_buffer.map_artifact_turn
@@ -1448,29 +1690,155 @@ class QueryEngine:
                         )
                     self._store.save(working_session)
                     if self._coordinated_commit_failure_injector is not None:
-                        self._coordinated_commit_failure_injector.hit(
-                            "session_publish_after_write"
-                        )
+                        self._coordinated_commit_failure_injector.hit("session_publish_after_write")
                 except MapArtifactTurnConflictError as exc:
-                    if publication_buffer is not None:
+                    try:
+                        if publication_buffer is None or artifact_store is None:
+                            raise ValueError("turn conflict has no recoverable publication")
+                        old_turn_id = exc.turn_id
+                        self._recovery_supervisor.hit_failpoint("fresh_turn_before_allocate")
+                        fresh_turn_id = working_session.new_turn_id()
+                        self._recovery_supervisor.hit_failpoint("fresh_turn_after_allocate")
+                        conflict_problem = self._recovery_supervisor.problem(
+                            working_session,
+                            error_code=exc.error_code,
+                            text=(
+                                "工具结果 turn_id 与已提交内容冲突；原提交已保留，"
+                                "后端正在新的更大 turn_id 下恢复"
+                            ),
+                            side_effect_state="committed",
+                            next_action={
+                                "action": "backend_rebase_and_commit",
+                                "turn_id": fresh_turn_id,
+                            },
+                        )
+                        recovery_token = conflict_problem.get("retry_token")
+                        if not isinstance(recovery_token, str) or not recovery_token:
+                            raise ValueError("turn conflict did not issue a recovery token")
+                        recovery_request = request.model_copy(
+                            update={"recovery_token": recovery_token}
+                        )
+                        self._recovery_supervisor.begin_attempt(
+                            working_session,
+                            recovery_request,
+                        )
+
+                        rebased_payload = session_to_dict(working_session)
+                        _rebase_artifact_turn_identity(
+                            rebased_payload,
+                            old_turn_id,
+                            fresh_turn_id,
+                        )
+                        recovered_session = session_from_dict(
+                            rebased_payload,
+                            self.available_tools,
+                        )
+                        recovered_session.turn_counter = max(
+                            recovered_session.turn_counter,
+                            working_session.turn_counter,
+                        )
+                        recovered_response_payload = response.model_dump()
+                        _rebase_artifact_turn_identity(
+                            recovered_response_payload,
+                            old_turn_id,
+                            fresh_turn_id,
+                        )
+                        recovered_response = _response_from_dict(recovered_response_payload)
+                        publication_buffer.session = recovered_session
+                        publication_buffer.turn_id = fresh_turn_id
+                        publication_buffer.map_artifact_turn.turn_id = fresh_turn_id
+                        for _, _, event_payload in publication_buffer.events:
+                            _rebase_artifact_turn_identity(
+                                event_payload,
+                                old_turn_id,
+                                fresh_turn_id,
+                            )
+                        artifact_prepared = artifact_store.prepare_turn(
+                            publication_buffer.map_artifact_turn
+                        )
+                        self._recovery_supervisor.complete_attempt(
+                            recovered_session,
+                            waiting_frontend=isinstance(
+                                recovered_response,
+                                ChatToolCallsResponse,
+                            ),
+                        )
+                        self._store.save_task_run(recovered_session)
+                        self._store.save(recovered_session)
+                        if artifact_prepared:
+                            artifact_store.commit_prepared_turn(
+                                publication_buffer.map_artifact_turn
+                            )
+                        self._flush_submission_publications(publication_buffer)
                         self._resolve_submission_previews(
                             publication_buffer,
-                            committed=False,
-                            reason="turn_identity_conflict",
+                            committed=True,
                         )
-                    self._store.replace_in_memory(request.session_id, snapshot)
-                    logger.error(
-                        "Map artifact turn identity conflict session=%s turn=%s",
-                        request.session_id,
-                        exc.turn_id,
-                    )
-                    return ChatErrorResponse(
-                        text=(
-                            "工具结果 turn_id 与已提交内容冲突；原提交已保留，"
-                            "请在新的更大 turn_id 下重试"
-                        ),
-                        error_code=exc.error_code,
-                    )
+                        self._record_recovery(
+                            recovered_session,
+                            recovered_response,
+                        )
+                        logger.warning(
+                            "Map artifact turn conflict recovered session=%s "
+                            "old_turn=%s fresh_turn=%s",
+                            request.session_id,
+                            old_turn_id,
+                            fresh_turn_id,
+                        )
+                        return recovered_response
+                    except (OSError, TypeError, ValueError, RecoveryTokenError):
+                        if (
+                            artifact_prepared
+                            and artifact_store is not None
+                            and publication_buffer is not None
+                        ):
+                            try:
+                                artifact_store.discard_prepared_turn(
+                                    publication_buffer.map_artifact_turn
+                                )
+                            except (OSError, TypeError, ValueError):
+                                logger.exception(
+                                    "Failed to discard rebased artifact session=%s",
+                                    request.session_id,
+                                )
+                        if publication_buffer is not None:
+                            self._resolve_submission_previews(
+                                publication_buffer,
+                                committed=False,
+                                reason="turn_identity_recovery_failed",
+                            )
+                        snapshot.turn_counter = max(
+                            snapshot.turn_counter,
+                            working_session.turn_counter,
+                        )
+                        fresh_turn_id = snapshot.new_turn_id()
+                        if snapshot.pending_turn_id is not None:
+                            snapshot.pending_turn_id = fresh_turn_id
+                        problem = self._recovery_supervisor.problem(
+                            snapshot,
+                            error_code=exc.error_code,
+                            text=(
+                                "工具结果 turn_id 与已提交内容冲突；原提交已保留，"
+                                "自动恢复失败，已保留新的 turn 检查点"
+                            ),
+                            side_effect_state="committed",
+                            next_action={
+                                "action": "resubmit_tool_results",
+                                "turn_id": fresh_turn_id,
+                            },
+                        )
+                        self._store.replace_in_memory(
+                            request.session_id,
+                            snapshot,
+                        )
+                        self._store.save_task_run(snapshot)
+                        self._store.save(snapshot)
+                        logger.exception(
+                            "Map artifact turn identity recovery failed " "session=%s turn=%s",
+                            request.session_id,
+                            exc.turn_id,
+                        )
+                        return ChatErrorResponse(**problem)
                 except (OSError, TypeError, ValueError):
                     if (
                         artifact_prepared
@@ -1494,15 +1862,26 @@ class QueryEngine:
                             committed=False,
                             reason="session_persistence_failed",
                         )
+                    problem = self._recovery_supervisor.problem(
+                        snapshot,
+                        error_code="session_persistence_failed",
+                        text="会话持久化失败；工具结果未提交，后端将从原检查点恢复",
+                        side_effect_state="rolled_back",
+                    )
                     self._store.replace_in_memory(request.session_id, snapshot)
+                    try:
+                        self._store.save_task_run(snapshot)
+                    except (OSError, TypeError, ValueError):
+                        logger.exception(
+                            "Failed to persist persistence-failure recovery state " "session=%s",
+                            request.session_id,
+                        )
                     logger.exception(
                         "Session commit failed; original session retained session=%s request_id=%s",
                         request.session_id,
                         request.request_id,
                     )
-                    return ChatErrorResponse(
-                        text="会话持久化失败；工具结果未提交，可安全重试同一批次"
-                    )
+                    return ChatErrorResponse(**problem)
                 session = working_session
                 if publication_buffer is not None:
                     if artifact_prepared and artifact_store is not None:
@@ -1556,6 +1935,103 @@ class QueryEngine:
                     if not tasks:
                         del self._active_tasks[request.session_id]
 
+    async def _submit_with_backend_recovery(
+        self,
+        session: Session,
+        request: ChatRequest,
+        validated_tool_batch: ValidatedToolResultBatch | None,
+        *,
+        snapshot: Session,
+        publication_buffer: _SubmissionPublicationBuffer | None,
+    ) -> tuple[ChatResponse, Session]:
+        """在已证明回滚的边界内由后端执行有界的新 Attempt 重试。"""
+        active = session
+        while True:
+            try:
+                response = await self._submit_locked(
+                    active,
+                    request,
+                    validated_tool_batch,
+                )
+                return response, active
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                retry_state = copy.deepcopy(snapshot)
+                retry_state.task_run = copy.deepcopy(active.task_run)
+                problem = self._recovery_supervisor.problem(
+                    retry_state,
+                    error_code="submission_internal_error",
+                    text=(
+                        "处理请求时发生内部错误；副作用已回滚，"
+                        "后端正在从持久检查点启动新的 attempt"
+                    ),
+                    side_effect_state="rolled_back",
+                )
+                has_visible_or_staged_publication = publication_buffer is not None and bool(
+                    publication_buffer.previews
+                    or publication_buffer.events
+                    or publication_buffer.map_artifact_turn.entries
+                )
+                if has_visible_or_staged_publication:
+                    assert publication_buffer is not None
+                    self._resolve_submission_previews(
+                        publication_buffer,
+                        committed=False,
+                        reason="submission_failed",
+                    )
+                    publication_buffer.events.clear()
+                    publication_buffer.previews.clear()
+                    publication_buffer.map_artifact_turn.entries.clear()
+                    problem = self._recovery_supervisor.force_pause(
+                        retry_state,
+                        problem,
+                        action="resume_from_clean_submission_checkpoint",
+                        reason="provisional_or_transactional_publication_was_discarded",
+                    )
+                self._store.replace_in_memory(request.session_id, retry_state)
+                self._store.save_task_run(retry_state)
+                next_action = problem.get("next_action")
+                owner = str(next_action.get("owner", "")) if isinstance(next_action, dict) else ""
+                token = problem.get("retry_token")
+                if (
+                    has_visible_or_staged_publication
+                    or problem.get("disposition") != "retry_new_attempt"
+                    or owner != "backend"
+                    or not isinstance(token, str)
+                    or not token
+                ):
+                    logger.exception(
+                        "Chat request recovery paused session=%s request_id=%s",
+                        request.session_id,
+                        request.request_id,
+                    )
+                    return ChatErrorResponse(**problem), retry_state
+                if publication_buffer is not None:
+                    self._resolve_submission_previews(
+                        publication_buffer,
+                        committed=False,
+                        reason="backend_retry_new_attempt",
+                    )
+                    publication_buffer.events.clear()
+                    publication_buffer.previews.clear()
+                    publication_buffer.map_artifact_turn.entries.clear()
+                    publication_buffer.session = retry_state
+                recovery_request = request.model_copy(update={"recovery_token": token})
+                self._recovery_supervisor.begin_attempt(
+                    retry_state,
+                    recovery_request,
+                )
+                self._store.save_task_run(retry_state)
+                delay_ms = (
+                    int(next_action.get("backoff_ms", 0) or 0)
+                    if isinstance(next_action, dict)
+                    else 0
+                )
+                if delay_ms > 0:
+                    await asyncio.sleep(delay_ms / 1000)
+                active = retry_state
+
     async def _submit_locked(
         self,
         session: Session,
@@ -1572,7 +2048,10 @@ class QueryEngine:
                 has_user,
                 has_results,
             )
-            return ChatErrorResponse(text="user_message 与 tool_results 必须二选一")
+            return ChatErrorResponse(
+                text="user_message 与 tool_results 必须二选一",
+                error_code="invalid_request_shape",
+            )
 
         dedicated_resume_authorized = False
         if has_user:
@@ -1664,9 +2143,7 @@ class QueryEngine:
                     agent.skills,
                     set(agent.effective_tools),
                     workflow_stage=(
-                        session.map_task_state.stage
-                        if agent.pipeline_kind == "map"
-                        else None
+                        session.map_task_state.stage if agent.pipeline_kind == "map" else None
                     ),
                     worker_mode=agent.worker_mode,
                     agent_role=agent.role,
@@ -1743,7 +2220,10 @@ class QueryEngine:
                     session.session_id,
                     session.pending_turn_id,
                 )
-                return ChatErrorResponse(text="当前会话仍有待回传的工具结果，不能开始新的用户消息")
+                return ChatErrorResponse(
+                    text="当前会话仍有待回传的工具结果，不能开始新的用户消息",
+                    error_code="pending_tool_results",
+                )
             request_scope, resumed_existing_map_task = _activate_user_request_scope(
                 session,
                 request,
@@ -1755,7 +2235,10 @@ class QueryEngine:
                     "User message rejected because session has no active frame session=%s",
                     session.session_id,
                 )
-                return ChatErrorResponse(text="会话没有活跃的 agent 帧")
+                return ChatErrorResponse(
+                    text="会话没有活跃的 agent 帧",
+                    error_code="missing_agent_frame",
+                )
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
             session.pending_verify_candidates.clear()
             if (
@@ -1954,6 +2437,7 @@ class QueryEngine:
             tool_ctx=ToolContext(
                 security=security,
                 session_id=session.session_id,
+                session_epoch=session.session_epoch,
                 skill_catalog=self._skill_catalog,
                 rag_index_path=self._settings.resolved_rag_index_path(),
             ),
@@ -2191,7 +2675,13 @@ class QueryEngine:
                 exc.code,
                 exc.message,
             )
-            return ChatErrorResponse(text=exc.message), []
+            return (
+                ChatErrorResponse(
+                    text=exc.message,
+                    error_code="tool_result_preflight_failed",
+                ),
+                [],
+            )
 
         results = [item.result for item in batch.items]
         frames = {frame.id: frame for frame in session.agent_stack}
@@ -2363,20 +2853,13 @@ class QueryEngine:
                             "contract_id": evidence.contract_id,
                         }
                     )
-            if (
-                result.status == "error"
-                and tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
-            ):
+            if result.status == "error" and tool_name in MAP_REVISION_GUARDED_TOOL_NAMES:
                 result_error = result.result if isinstance(result.result, dict) else {}
                 error_code = str(
-                    result.error_code
-                    or result_error.get("error_code")
-                    or "map_tool_error"
+                    result.error_code or result_error.get("error_code") or "map_tool_error"
                 )
                 error_message = str(
-                    result_error.get("message")
-                    or payload.get("message", "")
-                    or error_code
+                    result_error.get("message") or payload.get("message", "") or error_code
                 )
                 remember_map_tool_failure(
                     session,
@@ -2432,10 +2915,7 @@ class QueryEngine:
             )
             if result.status == "applied" or trusted_error_revision:
                 _remember_latest_map_revision(session, tool_name, tool_args, result_for_gate)
-            if (
-                result.status == "applied"
-                and tool_name in MAP_REVISION_GUARDED_TOOL_NAMES
-            ):
+            if result.status == "applied" and tool_name in MAP_REVISION_GUARDED_TOOL_NAMES:
                 session.map_request_scope = mark_completion_candidate(
                     session.map_request_scope,
                     lineage_id=str(metadata.get("request_lineage_id", "")),
@@ -2459,10 +2939,7 @@ class QueryEngine:
                     tool_args,
                     result_for_gate,
                 )
-                if (
-                    frame.agent.map_stage == "planner"
-                    and tool_name in PLATFORM_PLAN_TOOL_NAMES
-                ):
+                if frame.agent.map_stage == "planner" and tool_name in PLATFORM_PLAN_TOOL_NAMES:
                     plan_outcome = parse_map_plan_outcome(tool_name, result_for_gate)
                     attempt_count = map_platform_plan_attempt_count(session, tool_args)
                     if plan_outcome.executable or attempt_count >= MAP_PLATFORM_PLAN_MAX_ATTEMPTS:
@@ -2583,15 +3060,17 @@ class QueryEngine:
                     replace_map_state_field(
                         session.map_task_state,
                         "completion_blockers",
-                        [{
-                            "tool": tool_name,
-                            "reason": "map_diagnostic_complete",
-                            "issues": validation_state.get("issues", [])
-                            or ["diagnostic finished; planner must produce a changed map plan"],
-                            "target": validation_state["target"],
-                            "required_revision": validation_state["map_revision"],
-                            "next_stage": "planner",
-                        }],
+                        [
+                            {
+                                "tool": tool_name,
+                                "reason": "map_diagnostic_complete",
+                                "issues": validation_state.get("issues", [])
+                                or ["diagnostic finished; planner must produce a changed map plan"],
+                                "target": validation_state["target"],
+                                "required_revision": validation_state["map_revision"],
+                                "next_stage": "planner",
+                            }
+                        ],
                         target=str(validation_state["target"]),
                         revision=validation_state["map_revision"],
                     )
@@ -2672,11 +3151,7 @@ class QueryEngine:
                         if map_artifact_locator is not None
                         else None
                     ),
-                    (
-                        map_artifact_locator.as_dict()
-                        if map_artifact_locator is not None
-                        else None
-                    ),
+                    (map_artifact_locator.as_dict() if map_artifact_locator is not None else None),
                     frozenset(frame.agent.effective_tools),
                 )
                 if isinstance(payload, dict)
@@ -2769,7 +3244,7 @@ class QueryEngine:
                 logger.exception("Cancelled task raised after cancel session=%s", session_id)
         return bool(tasks)
 
-    async def reset(self, session_id: str) -> None:
+    async def reset(self, session_id: str) -> ResetResponse:
         """清空指定会话。
 
         先取消该会话仍在运行的 `/chat` 任务并等待其退出，再在持锁状态下清空
@@ -2777,11 +3252,60 @@ class QueryEngine:
         """
         await self._cancel_active_tasks(session_id)
         async with self._store.lock_for(session_id):
-            self._store.reset(session_id)
-            if self._recovery is not None:
-                self._recovery.clear(session_id)
-            self._emit(session_id, "reset", {})
-        logger.info("Session reset through QueryEngine session=%s", session_id)
+            old_session = self._store.get_or_create(session_id, self.available_tools)
+            event_highwater = max(
+                old_session.history_event_counter,
+                self._events.last_seq(session_id) if self._events is not None else 0,
+            )
+            try:
+                record = self._store.begin_reset(
+                    session_id,
+                    last_event_seq=event_highwater,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                logger.exception("Session reset epoch barrier failed session=%s", session_id)
+                return ResetResponse(
+                    ok=False,
+                    session_id=session_id,
+                    session_epoch=old_session.session_epoch,
+                    last_event_seq=event_highwater,
+                    error_code="reset_epoch_barrier_failed",
+                    text=f"无法建立会话重置隔离屏障：{exc}",
+                )
+            try:
+                last_seq = self._complete_reset_cleanup(record)
+            except (OSError, TypeError, ValueError):
+                logger.exception(
+                    "Session reset cleanup pending session=%s reset_id=%s",
+                    session_id,
+                    record.get("reset_id"),
+                )
+                current_epoch = str(record["new_epoch"])
+                last_seq = (
+                    self._events.last_seq(session_id)
+                    if self._events is not None
+                    else event_highwater
+                )
+                return ResetResponse(
+                    ok=True,
+                    session_id=session_id,
+                    session_epoch=current_epoch,
+                    last_event_seq=last_seq,
+                    cleanup_pending=True,
+                    text="会话已隔离；后台清理将在重启或下次重试时继续",
+                )
+        logger.info(
+            "Session reset through QueryEngine session=%s epoch=%s last_seq=%d",
+            session_id,
+            record["new_epoch"],
+            last_seq,
+        )
+        return ResetResponse(
+            ok=True,
+            session_id=session_id,
+            session_epoch=str(record["new_epoch"]),
+            last_event_seq=last_seq,
+        )
 
     async def interrupt(
         self,
@@ -2852,6 +3376,27 @@ class QueryEngine:
                     self._recovery.clear(session_id)
             elif had_pending_plan or map_checkpoint_created:
                 self._store.save(session)
+            if isinstance(session.task_run, dict):
+                try:
+                    problem = self._recovery_supervisor.problem(
+                        session,
+                        error_code=(
+                            "response_transport_lost" if cause == "client_timeout" else "user_stop"
+                        ),
+                        text=(
+                            "客户端连接中断；任务检查点已保留"
+                            if cause == "client_timeout"
+                            else "用户已停止当前执行；任务检查点已保留，可显式恢复"
+                        ),
+                        side_effect_state="none",
+                    )
+                    session.task_run["last_problem"] = problem
+                    self._store.save_task_run(session)
+                except ValueError:
+                    logger.exception(
+                        "Unable to record interrupted TaskRun session=%s",
+                        session_id,
+                    )
 
         self._emit(
             session_id,
@@ -2869,6 +3414,7 @@ class QueryEngine:
                 None,
                 last_seq,
                 session.map_task_state.checkpoint,
+                session_epoch=session.session_epoch,
             )
         logger.info(
             "Turn interrupted session=%s cause=%s cancelled=%s pending_discarded=%d last_seq=%d",
@@ -2889,7 +3435,12 @@ class QueryEngine:
         async with self._store.lock_for(session_id):
             session = self._store.get_or_create(session_id, self.available_tools)
             if session.pending_turn_id is None:
-                return ChatErrorResponse(text="当前会话没有等待回传的工具调用")
+                return ChatErrorResponse(
+                    text="当前会话没有等待回传的工具调用",
+                    error_code="pending_tool_results",
+                    disposition="wait_frontend",
+                    retryable=True,
+                )
 
             frames = {frame.id: frame for frame in session.agent_stack}
             discarded = 0
@@ -2964,6 +3515,15 @@ class QueryEngine:
                 or state.task_id
             )
             resume_map_task(state, lineage_id=lineage_id)
+            if isinstance(session.task_run, dict):
+                session.task_run["status"] = "recovering"
+                session.task_run["active_disposition"] = "retry_new_attempt"
+                session.task_run["next_action"] = {
+                    "action": "resume_from_checkpoint",
+                    "owner": "backend",
+                }
+                session.task_run["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._store.save_task_run(session)
             self._store.save(session)
             result = {
                 "resumed": True,
@@ -3007,13 +3567,18 @@ class QueryEngine:
                 }
             task_id = state.task_id
             state.cancel("cancelled_by_user")
-            session.map_request_scope = invalidate_completion_candidate(
-                session.map_request_scope
-            )
+            session.map_request_scope = invalidate_completion_candidate(session.map_request_scope)
             session.map_task_lineage = {
                 **session.map_task_lineage,
                 "completion_candidate": False,
             }
+            if isinstance(session.task_run, dict):
+                self._recovery_supervisor.mark_terminal(
+                    session,
+                    outcome="cancelled",
+                    authorized_by="explicit_cancel",
+                )
+                self._store.save_task_run(session)
             self._store.save(session)
             result = {
                 "cancelled": True,
@@ -3132,10 +3697,7 @@ class QueryEngine:
             if _submission_event_delivery(event_type) == "provisional_preview":
                 frame_id = str(staged_payload.get("frame_id") or "")
                 message_index = str(staged_payload.get("message_index") or "")
-                message_id = str(
-                    staged_payload.get("message_id")
-                    or f"{frame_id}:{message_index}"
-                )
+                message_id = str(staged_payload.get("message_id") or f"{frame_id}:{message_index}")
                 preview_id = str(
                     staged_payload.get("preview_id")
                     or (
@@ -3162,7 +3724,12 @@ class QueryEngine:
                 )
                 if self._events is None:
                     return 0
-                event = self._events.append(session_id, event_type, staged_payload)
+                event = self._events.append(
+                    session_id,
+                    event_type,
+                    staged_payload,
+                    session_epoch=publication_buffer.session.session_epoch,
+                )
                 publication_buffer.preview_event_count += 1
                 if publication_buffer.first_preview_seq == 0:
                     publication_buffer.first_preview_seq = event.seq
@@ -3188,9 +3755,7 @@ class QueryEngine:
                         publication_buffer.preview_event_count,
                     )
                 return event.seq
-            publication_buffer.events.append(
-                (session_id, event_type, staged_payload)
-            )
+            publication_buffer.events.append((session_id, event_type, staged_payload))
             return 0
         log_payload = _event_payload_for_log(payload)
         logger.debug(
@@ -3199,12 +3764,23 @@ class QueryEngine:
             event_type,
             json.dumps(log_payload, ensure_ascii=False, default=str),
         )
+        session: Session | None = None
         if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
             session = self._store.get_or_create(session_id, self.available_tools)
             self._record_persisted_history_event(session, event_type, payload)
         if self._events is None:
             return 0
-        event = self._events.append(session_id, event_type, payload)
+        epoch = (
+            session.session_epoch
+            if session is not None
+            else self._store.current_epoch(session_id, create=False)
+        )
+        event = self._events.append(
+            session_id,
+            event_type,
+            payload,
+            session_epoch=epoch,
+        )
         logger.debug("Event persisted session=%s seq=%d type=%s", session_id, event.seq, event_type)
         return event.seq
 
@@ -3219,11 +3795,7 @@ class QueryEngine:
         if publication_buffer.preview_resolved or not publication_buffer.previews:
             return
         publication_buffer.preview_resolved = True
-        event_type = (
-            "submission_preview_committed"
-            if committed
-            else "submission_preview_discarded"
-        )
+        event_type = "submission_preview_committed" if committed else "submission_preview_discarded"
         payload: dict[str, Any] = {
             "delivery": "provisional_preview",
             "provisional": False,
@@ -3239,6 +3811,7 @@ class QueryEngine:
                 publication_buffer.session.session_id,
                 event_type,
                 payload,
+                session_epoch=publication_buffer.session.session_epoch,
             )
             seq = event.seq
         else:
@@ -3274,8 +3847,7 @@ class QueryEngine:
                 session.latest_context_used_tokens = used_tokens
                 frame = session.top_frame()
                 is_map_frame = frame is not None and (
-                    frame.agent.pipeline_kind == "map"
-                    or bool(frame.agent.workflow_operations)
+                    frame.agent.pipeline_kind == "map" or bool(frame.agent.workflow_operations)
                 )
                 threshold = (
                     min(
@@ -3296,13 +3868,42 @@ class QueryEngine:
         """在 Session 成功提交后按 artifact、事件顺序发布暂存副作用。"""
         if self._events is None:
             return
-        for session_id, event_type, payload in publication_buffer.events:
+        for event_index, (session_id, event_type, payload) in enumerate(publication_buffer.events):
             try:
-                event = self._events.append(session_id, event_type, payload)
-            except OSError as exc:
+                payload.setdefault(
+                    "_delivery_id",
+                    hashlib.sha256(
+                        (
+                            f"{session_id}\0"
+                            f"{publication_buffer.session.session_epoch}\0"
+                            f"{publication_buffer.request_id or ''}\0"
+                            f"{publication_buffer.turn_id}\0"
+                            f"{event_index}\0{event_type}"
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                )
+                self._recovery_supervisor.hit_failpoint("event_delivery_before_publish")
+                event = self._events.append(
+                    session_id,
+                    event_type,
+                    payload,
+                    session_epoch=publication_buffer.session.session_epoch,
+                )
+                self._recovery_supervisor.hit_failpoint("event_delivery_after_publish")
+            except (OSError, ValueError) as exc:
+                self._recovery_supervisor.record_transport_loss(
+                    publication_buffer.session,
+                    transport="event",
+                )
+                try:
+                    self._store.save_task_run(publication_buffer.session)
+                except (OSError, TypeError, ValueError):
+                    logger.exception(
+                        "Failed to persist event delivery transport state session=%s",
+                        session_id,
+                    )
                 logger.error(
-                    "Committed session event publication failed session=%s "
-                    "type=%s error=%s",
+                    "Committed session event publication failed session=%s " "type=%s error=%s",
                     session_id,
                     event_type,
                     exc,
@@ -3326,6 +3927,7 @@ class QueryEngine:
                 session.pending_turn_id,
                 last_seq,
                 session.map_task_state.checkpoint,
+                session_epoch=session.session_epoch,
             )
             return
         if isinstance(response, ChatToolCallsResponse):
@@ -3334,6 +3936,7 @@ class QueryEngine:
                 session_id=session.session_id,
                 pending_turn_id=response.turn_id,
                 last_event_seq=last_seq,
+                session_epoch=session.session_epoch,
             )
             logger.info(
                 "Recovery pointer written session=%s turn_id=%s last_seq=%d",

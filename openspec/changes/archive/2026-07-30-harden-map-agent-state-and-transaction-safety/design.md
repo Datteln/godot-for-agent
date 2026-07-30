@@ -8,6 +8,8 @@ The map-agent runtime already has the intended architectural pieces—dependency
 - the Godot journal cannot distinguish an uncommitted edit from a committed edit whose journal cleanup failed;
 - Undo/Redo restores revision metadata, then the external-change scanner treats the restored content as a new edit and increments it again;
 - Session persistence and artifact publication can expose a locator before its artifact is durable;
+- user reset deletes only part of a Session boundary, so reused Session ids can retain committed turn identities, map/delegate artifacts, event history, file-read authorization, recovery pointers, or frontend state from the prior conversation;
+- recoverable tool, provider, transport, scheduler, and coordinated-publication attempt failures collapse into the same chat error path, while the frontend clears pending state and returns to idle as though the durable task had ended;
 - scheduler binding and worker-stage errors escape as exceptions, while repeated `create_plan` calls can overwrite useful terminal state or keep advancing revisions without converging;
 - deferred recovery and permissive path argument handling leave first-write and file-boundary races.
 
@@ -23,6 +25,8 @@ The change crosses the Python orchestration service, Godot editor integration, a
 - Make transaction recovery distinguish prepared, ambiguous, committed, and rolled-back edits without guessing.
 - Keep Undo/Redo content, revision metadata, and the external-change fingerprint synchronized.
 - Coordinate Session locator and map-artifact publication so readers never observe a dangling locator.
+- Make user reset an acknowledged session-epoch transition that isolates and eventually removes every session-owned resource without deleting authoritative project state.
+- Separate durable task lifecycle from request/LLM/tool/submission attempts so non-terminal failures preserve a checkpoint and advance through an explicit recovery policy.
 - Convert orchestration boundary failures into typed plan outcomes and bound both identical plan retries and cross-revision non-convergence.
 - Gate the first write on recovery and enforce typed, scheme-aware path boundaries.
 
@@ -33,6 +37,8 @@ The change crosses the Python orchestration service, Godot editor integration, a
 - Changing heartbeat or token-stream semantics owned by `stream-chat-events-during-atomic-submissions`.
 - Recovering semantic aliases that cannot be derived from canonical editor facts.
 - Automatically resolving an ambiguous journal state by choosing either rollback or commit.
+- Treating user reset as project rollback: committed Godot edits, authoritative map revisions, resource registries, spatial indexes, blueprints, crash-recovery journals, and user-global configuration/memory remain outside the reset boundary.
+- Retrying every error indefinitely or replaying a whole `/chat` request after an unknown side effect; recovery remains bounded and side-effect-aware.
 
 ## Decisions
 
@@ -131,6 +137,54 @@ Journal/filesystem operations will be accessed through a narrow adapter whose pr
 
 Failpoints are construction- or environment-gated test dependencies, are disabled in production, and cannot be selected by tool requests or persisted user data. Tests first prove that the production composition has no enabled failpoints, then use the harness to assert recovery invariants. This makes the failure suites an executable prerequisite rather than assuming that static engine APIs can be forced to fail.
 
+### 10. Treat user reset as a durable session-epoch transition
+
+A user reset is broader than deleting the serialized `Session` document and narrower than reverting the project. Every logical conversation is identified by `(session_id, session_epoch)`. The epoch is an opaque, collision-resistant value persisted independently of the deletable Session body. Reset first serializes with active submissions and establishes a new epoch through a durable reset record or atomic epoch update. From that point, all reads and writes reject or ignore data from the prior epoch even if physical cleanup is incomplete. Session ids created for new chats also use a collision-resistant identifier rather than a seconds-resolution timestamp.
+
+The reset boundary is explicit:
+
+| Reset or invalidate | Preserve |
+| --- | --- |
+| Session document and in-memory Session object | Committed Godot project/map content |
+| pending submission state, turn counter allocation, completed-turn and idempotency caches | Authoritative Godot map revision files |
+| Session map artifacts and delegate artifacts | Transaction journals still required for crash recovery |
+| buffered business events, history projections, history-block caches, and recovery pointer/UI | Resource registry, spatial index, blueprints, and derived project data |
+| per-session file-read/edit authorization and other tool safety caches | User-global configuration, memory, and RAG sources |
+| frontend messages, pending tool batches, undo UI state, dialogs, and per-session cursors | Application-wide preferences and credentials |
+
+Artifact, cache, event, and recovery storage is keyed or guarded by the epoch. This prevents a reset Session whose turn counter begins again from colliding with a prior `t4`, makes old map/delegate artifact locators unreadable, and prevents a file read in the previous conversation from authorizing an edit in the new one. Physical cleanup of the prior epoch is mandatory and retryable, but cleanup failure after the durable epoch switch cannot make old data visible again. A reset that cannot establish the logical boundary returns a typed failure and leaves the old conversation active; it never reports partial success.
+
+Event sequence numbers remain monotonic high-water marks for a reused `session_id`; reset does not rewind them. After switching epochs, the service discards prior-epoch event content, emits a reset-boundary event in the new epoch, and returns `session_epoch` plus `last_event_seq` in the reset acknowledgement. The client enters a non-sendable `resetting` state, cancels or replaces the old event request, waits for the acknowledgement, adopts the returned epoch/cursor, clears session-owned UI state, and only then resumes polling and input. Late responses tagged with the old epoch are ignored. On failure, the client retains or reloads the old conversation and displays the typed error instead of showing an empty successful reset.
+
+Recovery is idempotent across process exit and partial deletion. Startup completes any reset record by reasserting the epoch barrier and retrying cleanup of the exact old-epoch paths. Cleanup uses explicit resolved paths and must not delete authoritative map transaction journals or project state. This ordering is preferred over delete-in-place because deletion across Session, artifact, event, and cache stores cannot be atomic and otherwise turns an intermediate failure into a mixed conversation.
+
+### 11. Separate durable tasks from fallible attempts
+
+A map task is a durable `TaskRun` identified by task/lineage and session epoch. Each `/chat` request, LLM call, server-tool call, front-tool submission, plan-step execution, and coordinated-publication try is an `Attempt` owned by that task. Ending an attempt does not end its task. Attempt records persist `attempt_id`, checkpoint identity, error code and scope, canonical input identity, retry count, observed side-effect state, recovery disposition, retry token where needed, and the next action. Transport closure such as `GeneratorExit` is only an attempt-delivery symptom and cannot itself mutate task lifecycle.
+
+Problem outcomes use a closed recovery-disposition set:
+
+| Disposition | Meaning |
+| --- | --- |
+| `continue_agent` | Append a typed tool/protocol failure to the active Frame and continue the current agent loop |
+| `retry_same_attempt` | Retry the identical idempotent identity only when the boundary proves that no conflicting side effect occurred |
+| `retry_new_attempt` | Preserve the task checkpoint and start a new bounded attempt |
+| `retry_new_turn` | Preserve prior committed data, allocate a strictly greater turn, and resume through a recovery token |
+| `refresh_and_replan` | Read authoritative facts/revision, invalidate stale approval or bindings, and construct a new plan attempt |
+| `wait_frontend` | Preserve pending calls and wait for the matching front-tool result or confirmation |
+| `pause_for_user` | Persist a typed pause and recovery guidance when automatic action would be unsafe or its budget is exhausted |
+| `terminal` | Complete, explicitly cancel, or record a proven permanent failure according to the task terminal policy |
+
+Every problem payload carries `task_id`, `attempt_id`, `checkpoint_id`, stable `error_code`, `disposition`, `retryable`, `side_effect_state`, optional `retry_token`, and `next_action`. Text is presentation only and never drives recovery. A retry token is single-use and bound to session epoch, task, checkpoint, canonical attempt identity, and expected side-effect state. It cannot authorize broader tools, targets, writes, or permissions.
+
+A backend Recovery Supervisor applies the disposition after the attempt transaction is reconciled. It owns provider fallback, bounded backoff, fresh-turn allocation, authoritative refresh, replan, and restart continuation. The frontend never blindly replays a whole `/chat` request or independently chooses a model. It may execute an explicitly returned front tool or send a bound recovery token, but the backend remains the source of retry identity and safety. Each recovery class has a separate configurable budget; exhaustion produces a durable typed pause with the first root cause and recovery report rather than `completed`, `idle`, or an unstructured error loop.
+
+The frontend represents `running`, `recovering`, `waiting_frontend`, `paused`, and the true terminal states separately. It dispatches problem payloads by disposition instead of routing all `type=error` responses through one cleanup function. Pending tool calls, approval, recovery identity, and an open Undo batch are retained or resolved according to `side_effect_state`; only a terminal outcome, explicit discard, confirmed rollback, reset, or cancellation may clear them. Late transport failures for a superseded attempt are ignored by attempt identity.
+
+Plan-step failures follow the same distinction. A failed attempt may schedule reader recovery, replan, or a replacement attempt and is not yet a terminal failed step. Only an exhausted or proven permanent step failure becomes terminal and propagates `blocked` to dependent steps. This prevents a recoverable child failure from collapsing the entire DAG while preserving fail-closed dependency ordering.
+
+The task terminal policy is closed: Completion Gate success produces `completed`; explicit user cancellation produces `cancelled`; a proven permanent failure may produce `failed_permanently` with retained diagnostics. User stop, provider exhaustion, retry exhaustion, ambiguous commit state, transport loss, and recoverable integrity conflicts produce a checkpointed pause or recovery state, never implicit completion or cancellation. This design is preferred over text-based retry detection because it keeps safety, liveness, and UI behavior consistent across every error source.
+
 ## Risks / Trade-offs
 
 - **[Risk] Existing persisted journals do not have the new state field** → Add a versioned migration that treats only provably open legacy journals as uncommitted; ambiguous legacy data blocks writes with recovery guidance.
@@ -142,9 +196,14 @@ Failpoints are construction- or environment-gated test dependencies, are disable
 - **[Risk] Hydration/migration exceptions become an honor-system reducer bypass** → Limit raw migration to one exact pre-construction boundary, validate the whole value before publishing it, reject live-state inputs, and use reducer events for every post-construction change.
 - **[Risk] Godot commits but the service crashes before reducing the committed result** → Keep the approval unconsumed in persisted service state, reject its stale revision at the post-recovery Godot CAS, and reconcile the service from the typed conflict or replayed committed result before retry.
 - **[Trade-off] A task-level convergence breaker can pause legitimate multi-revision work** → Count only completed plan cycles without an explicit convergence checkpoint, keep exact attempt history, and make the bound configurable while requiring a distinct task epoch or proven task progress to reset it.
+- **[Risk] Reset spans several independently persisted stores** → Establish a durable epoch barrier first, key every session-owned reader by epoch, and retry exact-path cleanup from a reset record so partial deletion never reconnects old state.
+- **[Trade-off] Preserving the event sequence high-water means reset does not restart cursors at zero** → Return the authoritative cursor in the reset acknowledgement and treat epoch, rather than sequence reuse, as the conversation boundary.
 - **[Risk] Synchronous recovery can stall the Godot main thread on a large journal** → Start one recovery operation eagerly, enforce explicit input bounds, expose progress, benchmark the maximum supported fixture, and chunk/yield work where necessary without allowing mutation to overtake recovery.
 - **[Risk] Test failpoints leak into production behavior** → Inject adapters only through test composition, make production defaults incapable of enabling failpoints from request data, and test that guard explicitly.
 - **[Risk] A rolled-back request lowers the in-memory turn counter and a later save persists it, so reallocated turn ids collide with committed turns** → Persist `max(persisted, in-memory)` on every save (as the history event counter already does) and never lower the counter on rollback, so committed turn ids are never reused; report any residual conflict as a typed integrity failure with a fresh-turn retry path.
+- **[Risk] Automatic recovery repeats a side effect whose outcome is unknown** → Require reconciled `side_effect_state` and a bound idempotency/retry identity before automatic retry; ambiguous effects pause for recovery instead of replaying.
+- **[Risk] Recovery supervision becomes another infinite loop** → Give each disposition class a separate persisted budget and backoff, retain the first root cause, and transition to a typed pause when its bound is reached.
+- **[Trade-off] Durable TaskRun/Attempt records add state and migration cost** → Introduce compatibility defaults for existing active tasks and keep attempt payloads compact while preserving checkpoint, identity, disposition, and diagnostic history.
 
 ## Migration Plan
 
@@ -155,7 +214,9 @@ Failpoints are construction- or environment-gated test dependencies, are disable
 5. Add immutable approval ids, authoritative mutation-boundary CAS, and post-commit consumption after journal recovery is in place.
 6. Introduce coordinated Session/artifact commit records by extending the existing turn/fingerprint idempotency path; migrate no artifact content because existing committed documents remain readable.
 7. Remove the legacy delegate `remaining` queue and enable strict revision, malformed-path, and direct-write checks after compatibility loaders, internal call sites, and stale tests are updated.
-8. Run unit, integration, deterministic failure-injection, restart, and end-to-end suites, including interaction with the separate streaming-liveness change.
+8. Introduce the persisted session epoch and compatibility default, epoch-guard every session-owned store, then enable acknowledged reset cleanup and frontend `resetting` behavior before accepting reset as complete.
+9. Introduce compatible durable TaskRun/Attempt records and structured problem dispositions, then enable the Recovery Supervisor and disposition-aware frontend without using response text as control flow.
+10. Run unit, integration, deterministic failure-injection, restart, reset-isolation, attempt-recovery, and end-to-end suites, including interaction with the separate streaming-liveness change.
 
 Rollback keeps the compatibility readers for old journals and artifact documents. The new writers can be disabled together only before any new-format ambiguous transaction exists; otherwise recovery must first reach `committed`, `rolled_back`, or a verified clean state.
 

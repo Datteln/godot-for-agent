@@ -135,7 +135,9 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Initial automatic RAG index build failed; starting file watcher anyway")
+            logger.exception(
+                "Initial automatic RAG index build failed; starting file watcher anyway"
+            )
         await rag_build_manager.watch(
             poll_interval_s=resolved_settings.rag_auto_watch_interval_s,
             debounce_s=resolved_settings.rag_auto_watch_debounce_s,
@@ -145,6 +147,12 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         nonlocal auto_build_task
+        resumed_recoveries = await query_engine.resume_pending_recoveries()
+        if resumed_recoveries:
+            logger.info(
+                "Resumed durable task recovery journals count=%d",
+                resumed_recoveries,
+            )
         if resolved_settings.rag_auto_build_enabled:
             logger.info("Scheduling automatic RAG index build")
             auto_build_task = asyncio.create_task(

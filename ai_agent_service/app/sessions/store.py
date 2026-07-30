@@ -12,7 +12,9 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -28,6 +30,7 @@ from app.sessions.schema import (
     session_payload_version,
 )
 from app.storage.atomic import atomic_write_json
+from app.sessions.resource_registry import RESET_FAILPOINTS, ResetFailureInjector
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +86,7 @@ class Session:
     """
 
     session_id: str
+    session_epoch: str = ""
     agent_stack: list[Frame] = field(default_factory=list)
     pending_turn_id: str | None = None
     pending_tool_call_ids: set[str] = field(default_factory=set)
@@ -111,6 +115,7 @@ class Session:
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
+    task_run: dict[str, Any] | None = None
     _turn_counter_reserver: Callable[[str, int], None] | None = field(
         default=None,
         repr=False,
@@ -191,9 +196,7 @@ class Session:
                 else self.map_request_scope.lineage_id
             )
             map_task_id = (
-                frame.map_task_id
-                if frame is not None
-                else self.map_request_scope.map_task_id
+                frame.map_task_id if frame is not None else self.map_request_scope.map_task_id
             )
             item["request_lineage_id"] = lineage_id or ""
             item["map_task_id"] = map_task_id or ""
@@ -433,29 +436,19 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
             if data.get("map_request_lineage_id") is not None
             else None
         ),
-        map_task_id=(
-            str(data["map_task_id"]) if data.get("map_task_id") is not None else None
-        ),
-        contract_id=(
-            str(data["contract_id"]) if data.get("contract_id") is not None else None
-        ),
+        map_task_id=(str(data["map_task_id"]) if data.get("map_task_id") is not None else None),
+        contract_id=(str(data["contract_id"]) if data.get("contract_id") is not None else None),
         worker_instance_id=(
-            str(data["worker_instance_id"])
-            if data.get("worker_instance_id") is not None
-            else None
+            str(data["worker_instance_id"]) if data.get("worker_instance_id") is not None else None
         ),
         result_schema=(
             str(data["result_schema"]) if data.get("result_schema") is not None else None
         ),
         allowed_next_stages=tuple(
-            str(item)
-            for item in _as_list(data.get("allowed_next_stages"))
-            if isinstance(item, str)
+            str(item) for item in _as_list(data.get("allowed_next_stages")) if isinstance(item, str)
         ),
         map_evidence=[
-            dict(item)
-            for item in data.get("map_evidence", [])
-            if isinstance(item, dict)
+            dict(item) for item in data.get("map_evidence", []) if isinstance(item, dict)
         ],
         compact_snapshot=compact_snapshot,
     )
@@ -474,6 +467,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         # 持久化 schema 版本：供 migrate_session_payload 判断是否需要升级
         "schema_version": SESSION_SCHEMA_VERSION,
         "session_id": session.session_id,
+        "session_epoch": session.session_epoch,
         "agent_stack": [_frame_to_dict(f) for f in session.agent_stack],
         "pending_turn_id": session.pending_turn_id,
         "pending_tool_call_ids": sorted(session.pending_tool_call_ids),
@@ -500,6 +494,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
         "rag_context": session.rag_context,
+        "task_run": session.task_run,
     }
 
 
@@ -570,6 +565,7 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
     map_task_state = MapTaskState.from_dict(data.get("map_task_state"))
     return Session(
         session_id=str(data["session_id"]),
+        session_epoch=str(data.get("session_epoch", "")),
         agent_stack=[
             _frame_from_dict(f, available_tools)
             for f in _as_list(data.get("agent_stack"))
@@ -620,6 +616,7 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         history_event_counter=history_event_counter,
         history_events=history_events,
         rag_context=str(data.get("rag_context", "")),
+        task_run=(dict(data["task_run"]) if isinstance(data.get("task_run"), dict) else None),
     )
 
 
@@ -660,6 +657,7 @@ class SessionStore:
         storage_dir: Path,
         *,
         project_root: Path | None = None,
+        reset_failure_injector: ResetFailureInjector | None = None,
     ) -> None:
         """初始化会话存储。
 
@@ -670,8 +668,205 @@ class SessionStore:
         """
         self._storage_dir = storage_dir
         self._project_root = project_root
+        self._reset_failure_injector = reset_failure_injector
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+    def hit_reset_failpoint(self, name: str) -> None:
+        """仅在构造时注入测试依赖后触发命名 reset 故障。"""
+        if name not in RESET_FAILPOINTS:
+            raise ValueError(f"unknown reset failpoint: {name}")
+        if self._reset_failure_injector is not None:
+            self._reset_failure_injector.hit(name)
+
+    @staticmethod
+    def _new_epoch() -> str:
+        """生成不可预测、可安全写入 JSON/路径摘要的会话 epoch。"""
+        return secrets.token_urlsafe(24)
+
+    def _epoch_path_for(self, session_id: str) -> Path:
+        """返回独立于 Session 正文的 epoch barrier 路径。"""
+        return self._storage_dir / "_epochs" / f"{_safe_filename(session_id)}.json"
+
+    def _reset_path_for(self, session_id: str) -> Path:
+        """返回幂等 reset 记录路径。"""
+        return self._storage_dir / "_resets" / f"{_safe_filename(session_id)}.json"
+
+    def _task_run_path_for(self, session_id: str) -> Path:
+        """返回独立 Attempt journal 路径，避免破坏 Session 原子提交边界。"""
+        return self._storage_dir / "_attempts" / f"{_safe_filename(session_id)}.json"
+
+    def current_epoch(self, session_id: str, *, create: bool = True) -> str | None:
+        """读取当前持久化 epoch；首次会话可按需原子创建。"""
+        path = self._epoch_path_for(session_id)
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                epoch = payload.get("session_epoch") if isinstance(payload, dict) else None
+                if isinstance(epoch, str) and epoch:
+                    return epoch
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                logger.exception(
+                    "Session epoch barrier is unreadable session=%s path=%s", session_id, path
+                )
+                raise
+            raise ValueError(f"invalid session epoch barrier: {path}")
+        if not create:
+            return None
+        epoch = self._new_epoch()
+        atomic_write_json(
+            path,
+            {
+                "version": 1,
+                "session_id": session_id,
+                "session_epoch": epoch,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return epoch
+
+    def begin_reset(
+        self,
+        session_id: str,
+        *,
+        last_event_seq: int = 0,
+    ) -> dict[str, Any]:
+        """持久化 reset 记录并先切换 epoch，形成不可回退的逻辑隔离屏障。"""
+        old_epoch = self.current_epoch(session_id)
+        new_epoch = self._new_epoch()
+        reset_id = secrets.token_urlsafe(18)
+        record: dict[str, Any] = {
+            "version": 1,
+            "reset_id": reset_id,
+            "session_id": session_id,
+            "old_epoch": old_epoch,
+            "new_epoch": new_epoch,
+            "last_event_seq": max(0, last_event_seq),
+            "state": "prepared",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        reset_path = self._reset_path_for(session_id)
+        atomic_write_json(reset_path, record)
+        try:
+            self.hit_reset_failpoint("reset_record_after_prepare")
+            self.hit_reset_failpoint("epoch_barrier_before_write")
+            atomic_write_json(
+                self._epoch_path_for(session_id),
+                {
+                    "version": 1,
+                    "session_id": session_id,
+                    "session_epoch": new_epoch,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except (OSError, TypeError, ValueError):
+            if self.current_epoch(session_id, create=False) == old_epoch:
+                reset_path.unlink(missing_ok=True)
+            raise
+        try:
+            self.hit_reset_failpoint("epoch_barrier_after_write")
+        except (OSError, TypeError, ValueError):
+            logger.exception(
+                "Reset failpoint fired after durable epoch barrier session=%s",
+                session_id,
+            )
+        record["state"] = "epoch_switched"
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            atomic_write_json(reset_path, record)
+            self.hit_reset_failpoint("reset_record_after_epoch_switch")
+        except (OSError, TypeError, ValueError):
+            logger.exception(
+                "Reset checkpoint failed after durable epoch barrier session=%s",
+                session_id,
+            )
+        self._sessions.pop(session_id, None)
+        return record
+
+    def pending_reset_records(self) -> list[dict[str, Any]]:
+        """枚举需在启动时继续清理的 reset 记录。"""
+        reset_dir = self._storage_dir / "_resets"
+        if not reset_dir.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        for path in reset_dir.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                logger.warning("Ignoring unreadable reset record path=%s", path)
+                continue
+            if (
+                isinstance(payload, dict)
+                and payload.get("state") not in {"cleaned", "aborted"}
+                and isinstance(payload.get("session_id"), str)
+            ):
+                records.append(payload)
+        return records
+
+    def abandon_reset(self, record: dict[str, Any], reason: str) -> None:
+        """在 epoch 从未切换或记录已失去所有权时终止 reset 记录。"""
+        abandoned = dict(record)
+        abandoned["state"] = "aborted"
+        abandoned["abort_reason"] = reason
+        abandoned["updated_at"] = datetime.now(timezone.utc).isoformat()
+        atomic_write_json(
+            self._reset_path_for(str(record["session_id"])),
+            abandoned,
+        )
+
+    def remove_session_payload(self, session_id: str) -> None:
+        """删除精确 Session 正文；epoch barrier 与 reset 记录不在此处删除。"""
+        self._sessions.pop(session_id, None)
+        self._path_for(session_id).unlink(missing_ok=True)
+        self._task_run_path_for(session_id).unlink(missing_ok=True)
+
+    def finish_reset(self, record: dict[str, Any]) -> None:
+        """把 reset 记录推进为 cleaned；重复调用保持幂等。"""
+        session_id = str(record["session_id"])
+        current_epoch = self.current_epoch(session_id, create=False)
+        if current_epoch != record.get("new_epoch"):
+            raise ValueError("reset record no longer owns the current session epoch")
+        completed = dict(record)
+        completed["state"] = "cleaned"
+        completed["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.hit_reset_failpoint("reset_record_before_cleaned")
+        atomic_write_json(self._reset_path_for(session_id), completed)
+        try:
+            self.hit_reset_failpoint("reset_record_after_cleaned")
+        except (OSError, TypeError, ValueError):
+            logger.exception(
+                "Reset failpoint fired after durable cleaned marker session=%s",
+                session_id,
+            )
+
+    def reset_step_completed(self, record: dict[str, Any], resource_id: str) -> bool:
+        """返回 reset 记录是否已持久完成指定资源清理。"""
+        completed = record.get("completed_resources", [])
+        return isinstance(completed, list) and resource_id in completed
+
+    def complete_reset_step(
+        self,
+        record: dict[str, Any],
+        resource_id: str,
+    ) -> None:
+        """幂等记录一个资源清理步骤，支持崩溃后从精确边界继续。"""
+        completed_raw = record.get("completed_resources", [])
+        completed = [str(item) for item in completed_raw] if isinstance(completed_raw, list) else []
+        if resource_id not in completed:
+            completed.append(resource_id)
+        record["completed_resources"] = completed
+        self.checkpoint_reset(record, f"cleaning:{resource_id}")
+
+    def checkpoint_reset(self, record: dict[str, Any], state: str) -> None:
+        """持久化 reset 清理进度，供崩溃后幂等续跑。"""
+        checkpoint = dict(record)
+        checkpoint["state"] = state
+        checkpoint["updated_at"] = datetime.now(timezone.utc).isoformat()
+        atomic_write_json(
+            self._reset_path_for(str(checkpoint["session_id"])),
+            checkpoint,
+        )
+        record.update(checkpoint)
 
     def lock_for(self, session_id: str) -> asyncio.Lock:
         """返回（必要时创建）某会话的 per-session 锁。
@@ -707,7 +902,25 @@ class SessionStore:
             )
             return existing
         restored = self._load(session_id, available_tools)
-        session = restored if restored is not None else Session(session_id=session_id)
+        epoch = self.current_epoch(session_id)
+        session = (
+            restored
+            if restored is not None
+            else Session(session_id=session_id, session_epoch=epoch or "")
+        )
+        if not session.session_epoch:
+            session.session_epoch = epoch or ""
+        elif session.session_epoch != epoch:
+            logger.warning(
+                "Ignoring stale Session payload session=%s stored_epoch=%s current_epoch=%s",
+                session_id,
+                session.session_epoch,
+                epoch,
+            )
+            session = Session(session_id=session_id, session_epoch=epoch or "")
+        task_run = self._load_task_run(session_id, session.session_epoch)
+        if task_run is not None:
+            session.task_run = task_run
         session._turn_counter_reserver = self._reserve_turn_counter
         self._sessions[session_id] = session
         if restored is None:
@@ -727,16 +940,34 @@ class SessionStore:
         Args:
             session: 待保存的会话。
         """
+        current_epoch = self.current_epoch(session.session_id)
+        if not session.session_epoch:
+            if self._project_root is not None:
+                from app.orchestrator.map_artifacts import adopt_legacy_artifact_epoch
+
+                adopt_legacy_artifact_epoch(
+                    self._project_root,
+                    session.session_id,
+                    current_epoch or "",
+                )
+            session.session_epoch = current_epoch or ""
+        if session.session_epoch != current_epoch:
+            raise ValueError(
+                "refusing to persist stale Session epoch "
+                f"session={session.session_id} stored={session.session_epoch!r} "
+                f"current={current_epoch!r}"
+            )
         path = self._path_for(session.session_id)
         persisted = self._read_persisted_payload(path)
-        session.turn_counter = max(
-            session.turn_counter,
-            _as_int(persisted.get("turn_counter")),
-        )
-        session.history_event_counter = max(
-            session.history_event_counter,
-            _as_int(persisted.get("history_event_counter")),
-        )
+        if persisted.get("session_epoch") == session.session_epoch:
+            session.turn_counter = max(
+                session.turn_counter,
+                _as_int(persisted.get("turn_counter")),
+            )
+            session.history_event_counter = max(
+                session.history_event_counter,
+                _as_int(persisted.get("history_event_counter")),
+            )
         session._turn_counter_reserver = self._reserve_turn_counter
         atomic_write_json(path, session_to_dict(session))
         self._sessions[session.session_id] = session
@@ -748,6 +979,64 @@ class SessionStore:
             len(session.request_id_cache),
             path,
         )
+
+    def save_task_run(self, session: Session) -> None:
+        """独立持久化 TaskRun/Attempt，不提前发布 Session 业务状态。"""
+        current_epoch = self.current_epoch(session.session_id)
+        if session.session_epoch != current_epoch:
+            raise ValueError("refusing to persist TaskRun for a stale session epoch")
+        if session.task_run is None:
+            self._task_run_path_for(session.session_id).unlink(missing_ok=True)
+            return
+        atomic_write_json(
+            self._task_run_path_for(session.session_id),
+            {
+                "version": 1,
+                "session_id": session.session_id,
+                "session_epoch": session.session_epoch,
+                "task_run": session.task_run,
+            },
+        )
+
+    def _load_task_run(
+        self,
+        session_id: str,
+        session_epoch: str,
+    ) -> dict[str, Any] | None:
+        """读取当前 epoch 的独立 Attempt journal；旧 epoch 一律忽略。"""
+        path = self._task_run_path_for(session_id)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            logger.warning("TaskRun journal is unreadable session=%s path=%s", session_id, path)
+            return None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("session_id") != session_id
+            or payload.get("session_epoch") != session_epoch
+            or not isinstance(payload.get("task_run"), dict)
+        ):
+            return None
+        return dict(payload["task_run"])
+
+    def task_run_session_ids(self) -> list[str]:
+        """枚举拥有独立 TaskRun journal 的会话 id。"""
+        task_dir = self._storage_dir / "_attempts"
+        if not task_dir.exists():
+            return []
+        session_ids: list[str] = []
+        for path in task_dir.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                logger.warning("Ignoring unreadable TaskRun journal path=%s", path)
+                continue
+            session_id = payload.get("session_id") if isinstance(payload, dict) else None
+            if isinstance(session_id, str) and session_id:
+                session_ids.append(session_id)
+        return sorted(set(session_ids))
 
     def replace_in_memory(self, session_id: str, session: Session) -> None:
         """仅替换内存态会话，不触碰磁盘。
@@ -785,13 +1074,18 @@ class SessionStore:
         """Durably reserve a turn number before exposing it to a caller."""
         path = self._path_for(session_id)
         payload = self._read_persisted_payload(path)
+        current_epoch = self.current_epoch(session_id)
+        if payload and payload.get("session_epoch") not in {None, "", current_epoch}:
+            payload = {}
         if value <= _as_int(payload.get("turn_counter")):
             return
         if not payload:
             payload = {
                 "schema_version": SESSION_SCHEMA_VERSION,
                 "session_id": session_id,
+                "session_epoch": current_epoch,
             }
+        payload["session_epoch"] = current_epoch
         payload["turn_counter"] = value
         atomic_write_json(path, payload)
 
@@ -801,13 +1095,14 @@ class SessionStore:
         Args:
             session_id: 待清空的会话 id。
         """
-        self._sessions.pop(session_id, None)
-        path = self._path_for(session_id)
-        if path.exists():
-            path.unlink()
-            logger.info("Session reset removed persisted file session=%s path=%s", session_id, path)
-        else:
-            logger.info("Session reset session=%s no persisted file", session_id)
+        record = self.begin_reset(session_id)
+        self.remove_session_payload(session_id)
+        self.finish_reset(record)
+        logger.info(
+            "Session reset completed session=%s epoch=%s",
+            session_id,
+            record["new_epoch"],
+        )
 
     def _path_for(self, session_id: str) -> Path:
         """返回某会话对应的本地 JSON 文件路径。
@@ -843,6 +1138,18 @@ class SessionStore:
             source_version = session_payload_version(data)
             migrated_data, migrated = migrate_session_payload(data)
             session = session_from_dict(migrated_data, available_tools)
+            current_epoch = self.current_epoch(session_id)
+            if not session.session_epoch:
+                session.session_epoch = current_epoch or ""
+                migrated = True
+            elif session.session_epoch != current_epoch:
+                logger.info(
+                    "Stale Session payload isolated session=%s stored_epoch=%s current_epoch=%s",
+                    session_id,
+                    session.session_epoch,
+                    current_epoch,
+                )
+                return None
             if self._project_root is not None:
                 from app.orchestrator.map_artifacts import MapArtifactStore
 
@@ -851,6 +1158,7 @@ class SessionStore:
                     MapArtifactStore(
                         self._project_root,
                         session_id,
+                        session_epoch=session.session_epoch,
                     ).max_reserved_turn_counter(),
                 )
         except (OSError, ValueError, KeyError, TypeError) as exc:

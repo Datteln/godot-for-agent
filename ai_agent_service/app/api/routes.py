@@ -100,7 +100,10 @@ COMMANDS: list[CommandInfo] = [
         args_schema={
             "type": "object",
             "properties": {
-                "effort": {"type": "string", "enum": ["quick", "standard", "deep", "verify", "advisor"]}
+                "effort": {
+                    "type": "string",
+                    "enum": ["quick", "standard", "deep", "verify", "advisor"],
+                }
             },
             "required": ["effort"],
         },
@@ -162,8 +165,7 @@ def create_router(
     @router.post("/reset", response_model=ResetResponse)
     async def reset(request: ResetRequest) -> ResetResponse:
         logger.info("HTTP /reset session=%s", request.session_id)
-        await query_engine.reset(request.session_id)
-        return ResetResponse(ok=True, session_id=request.session_id)
+        return await query_engine.reset(request.session_id)
 
     @router.post("/chat/discard-pending", response_model=ChatResponse)
     async def discard_pending(request: ResetRequest) -> ChatResponse:
@@ -190,7 +192,11 @@ def create_router(
             output_style_catalog=output_style_catalog,
             memory_store=memory_store,
         )
-        logger.info("HTTP /doctor warnings=%d tools=%d", len(response.warnings), len(response.registered_tools))
+        logger.info(
+            "HTTP /doctor warnings=%d tools=%d",
+            len(response.warnings),
+            len(response.registered_tools),
+        )
         return response
 
     @router.get("/skills", response_model=SkillsResponse)
@@ -203,13 +209,12 @@ def create_router(
     async def output_styles() -> OutputStylesResponse:
         summaries = output_style_catalog.summaries()
         logger.info("HTTP /output-styles count=%d", len(summaries))
-        return OutputStylesResponse(
-            output_styles=[summary.__dict__ for summary in summaries]
-        )
+        return OutputStylesResponse(output_styles=[summary.__dict__ for summary in summaries])
 
     @router.get("/chat/events", response_model=ChatEventsResponse)
     async def chat_events(
         session_id: str,
+        session_epoch: str | None = None,
         after: int = Query(default=0, ge=0),
         limit: int = Query(
             default=_DEFAULT_EVENT_PAGE_LIMIT,
@@ -217,11 +222,15 @@ def create_router(
             le=_MAX_EVENT_PAGE_LIMIT,
         ),
     ) -> ChatEventsResponse:
-        page = event_store.page_after(session_id, after, limit=limit)
+        page = event_store.page_after(
+            session_id,
+            after,
+            limit=limit,
+            session_epoch=session_epoch,
+        )
         raw_progress = query_engine.turn_progress(session_id)
         logger.debug(
-            "HTTP /chat/events session=%s after=%d limit=%d count=%d "
-            "cursor=%d has_more=%s",
+            "HTTP /chat/events session=%s after=%d limit=%d count=%d " "cursor=%d has_more=%s",
             session_id,
             after,
             limit,
@@ -234,6 +243,7 @@ def create_router(
                 ChatEventDTO(
                     seq=event.seq,
                     session_id=event.session_id,
+                    session_epoch=event.session_epoch,
                     type=event.type,
                     payload=event.payload,
                     delivery=event.payload.get("delivery"),
@@ -246,11 +256,8 @@ def create_router(
                 )
                 for event in page.events
             ],
-            progress=(
-                ChatProgressDTO(**raw_progress)
-                if raw_progress is not None
-                else None
-            ),
+            session_epoch=page.session_epoch,
+            progress=(ChatProgressDTO(**raw_progress) if raw_progress is not None else None),
             cursor=page.cursor,
             has_more=page.has_more,
         )
@@ -277,6 +284,7 @@ def create_router(
             exists=True,
             pointer=RecoveryPointerDTO(
                 session_id=pointer.session_id,
+                session_epoch=pointer.session_epoch,
                 last_event_seq=pointer.last_event_seq,
                 pending_turn_id=pointer.pending_turn_id,
                 project_hash=pointer.project_hash,
@@ -298,7 +306,9 @@ def create_router(
         return COMMANDS
 
     @router.post("/commands/{name}", response_model=CommandResponse)
-    async def run_command(name: str, request: CommandRequest, response: Response) -> CommandResponse:
+    async def run_command(
+        name: str, request: CommandRequest, response: Response
+    ) -> CommandResponse:
         logger.info("HTTP /commands/%s session=%s", name, request.session_id)
 
         def _err(text: str, code: int = status.HTTP_400_BAD_REQUEST) -> CommandResponse:
@@ -409,7 +419,9 @@ def create_router(
                 return _err("set_output_style 需要 session_id")
             output_style = str(request.args.get("output_style", "default"))
             if output_style_catalog.get(output_style) is None:
-                logger.warning("Command set_output_style rejected: unknown output_style=%s", output_style)
+                logger.warning(
+                    "Command set_output_style rejected: unknown output_style=%s", output_style
+                )
                 return _err(f"未知 OutputStyle：{output_style}")
             await query_engine.set_output_style(request.session_id, output_style)
             return CommandResponse(ok=True, text=f"OutputStyle 已设置为 {output_style}")
@@ -425,9 +437,7 @@ def create_router(
     async def memory_list() -> MemoryResponse:
         items = memory_store.list()
         logger.info("HTTP /memory list count=%d", len(items))
-        return MemoryResponse(
-            items=[MemoryItemDTO(**item.__dict__) for item in items]
-        )
+        return MemoryResponse(items=[MemoryItemDTO(**item.__dict__) for item in items])
 
     @router.post("/memory", response_model=MemoryResponse)
     async def memory_update(request: MemoryRequest, response: Response) -> MemoryResponse:

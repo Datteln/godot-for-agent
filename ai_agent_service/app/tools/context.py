@@ -24,6 +24,7 @@ class ToolContext:
         security: 当前会话的安全边界配置，handler 内的路径访问必须经
             `app.security.paths.path_ok`/`all_paths_ok` 校验后才可读取。
         session_id: 当前会话 id，仅用于日志/审计关联，不作为信任凭据。
+        session_epoch: 当前会话生命周期 epoch，用于拒绝 reset 前的旧 locator。
         skill_catalog: Skill 工具读取目录时使用的目录索引。
         effective_tools: 当前活跃 agent 帧实际可见的工具集合；server 工具可用它
             避免泄露当前入口/agent 不可见的工具元数据。
@@ -37,6 +38,7 @@ class ToolContext:
 
     security: SecuritySettings
     session_id: str
+    session_epoch: str = ""
     skill_catalog: SkillCatalog | None = None
     effective_tools: frozenset[str] = frozenset()
     agent_effective_tools: frozenset[str] = frozenset()
