@@ -298,23 +298,32 @@ EFFORT_TEMPERATURE: dict[EffortLevel, float] = {
     "advisor": 0.3,
 }
 
-# effort 档位 -> thinking token 预算；verify 设为 0 关闭 thinking 以保证确定性；
-# -1 表示"不限预算"（沿用 enable_thinking:true 无 budget 的原有行为）。
+# effort 档位 -> thinking token 预算；deep/advisor/verify 设为 -1（不限预算，
+# enable_thinking:true 无 budget），quick/standard 保留上限；-1 表示不限预算。
 EFFORT_THINKING_BUDGET: dict[EffortLevel, int] = {
-    "quick": 1024,
-    "standard": 4096,
-    "deep": 16384,
-    "verify": 0,
-    "advisor": 2048,
+    "quick": 4096,
+    "standard": 16384,
+    "deep": -1,
+    "verify": -1,
+    "advisor": -1,
 }
+
+
+# 固定档位 agent：委派子帧始终保留自身声明的 effort，不被 session.effort 覆盖。
+# advisor 需保持低温评审，map-reviewer/map-validator 需保持确定性复核档；
+# 其余子 agent（含 programming-agent 与所有 standard 类）跟随会话档位。
+FIXED_EFFORT_AGENTS: frozenset[str] = frozenset(
+    {"advisor", "map-reviewer-agent", "map-validator-agent"}
+)
 
 
 def _resolve_effort(session: Session, frame: Frame) -> EffortLevel:
     """解析当前帧应使用的 effort 档位（§6.5）。
 
-    根帧采用 `session.effort`（用户可调整的全局档位）；委派子帧始终使用
-    各自 `AgentDefinition.effort` 的声明值，避免会话级档位覆盖子 agent
-    已校准的默认档位（如 advisor 应始终保持低温）。
+    根帧采用 `session.effort`（用户可调整的全局档位）；委派子帧中，固定档位
+    agent（`FIXED_EFFORT_AGENTS`）保留自身声明 effort 不被覆盖，其余子 agent
+    跟随 `session.effort`，使会话级档位对非固定档 agent 整体生效。`session.effort`
+    非法时回退到子 agent 自身声明值，避免静默用错档位。
 
     Args:
         session: 当前会话。
@@ -324,6 +333,10 @@ def _resolve_effort(session: Session, frame: Frame) -> EffortLevel:
         合法的 `EffortLevel`。
     """
     if frame.parent_id is None and session.effort in EFFORT_LEVELS:
+        return cast(EffortLevel, session.effort)
+    if frame.agent.name in FIXED_EFFORT_AGENTS:
+        return frame.agent.effort
+    if session.effort in EFFORT_LEVELS:
         return cast(EffortLevel, session.effort)
     return frame.agent.effort
 

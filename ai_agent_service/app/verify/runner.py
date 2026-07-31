@@ -158,12 +158,26 @@ class VerifyRunner:
                 "message_index": len(frame.messages),
             },
         )
+        def _on_fallback(primary: str, fallback: str) -> None:
+            self._emit(
+                session.session_id,
+                "agent_model_fallback",
+                {
+                    "frame_id": frame_id,
+                    "loop": 0,
+                    "primary_model": primary,
+                    "fallback_model": fallback,
+                    "source": "verify",
+                },
+            )
+
         result = await self._run_semantic_verify(
             security,
             tool_name,
             candidate.get("input", {}),
             path,
             model_override,
+            on_fallback=_on_fallback,
         )
         self._emit(
             session.session_id,
@@ -212,8 +226,18 @@ class VerifyRunner:
         tool_input: dict[str, Any],
         path: str,
         model_override: str | None = None,
+        on_fallback: Callable[[str, str], None] | None = None,
     ) -> VerifyResultDTO:
-        """调用 LLM 对改动后的文件内容做语义和逻辑校验。"""
+        """调用 LLM 对改动后的文件内容做语义和逻辑校验。
+
+        Args:
+            security: 当前会话的安全边界配置。
+            tool_name: 触发校验的编辑工具名。
+            tool_input: 该工具调用的入参。
+            path: 被编辑文件的路径。
+            model_override: 请求级模型覆盖；为 None 时用 verify 档默认。
+            on_fallback: 主模型降级到 fallback 时的回调，转发为降级事件。
+        """
         try:
             file_payload = await read_file_handler(
                 {"path": path, "limit": 20000},
@@ -242,6 +266,7 @@ class VerifyRunner:
                 thinking_budget=resolve_thinking_budget(
                     self._settings.verify_effort, self._thinking_budget_for_effort
                 ),
+                on_fallback=on_fallback,
             )
         except LLMError as exc:
             logger.warning("Verify semantic LLM call failed path=%s error=%s", path, exc)

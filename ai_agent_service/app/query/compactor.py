@@ -140,7 +140,7 @@ class SessionCompactor:
                 continue
             previous = frame.compact_snapshot
             summary = await self._build_compact_summary(
-                previous, old_messages, use_llm=summary_use_llm
+                previous, old_messages, use_llm=summary_use_llm, session_id=session_id
             )
             digest = _compact_digest(summary)
             revision = (
@@ -243,16 +243,20 @@ class SessionCompactor:
         old_messages: list[dict[str, Any]],
         *,
         use_llm: bool,
+        session_id: str,
     ) -> str:
         """生成最终压缩摘要，失败时回退机械摘要。"""
         if use_llm and old_messages:
-            body = await self._summarize_via_llm(previous, old_messages)
+            body = await self._summarize_via_llm(previous, old_messages, session_id)
             if body:
                 return _wrap_compact_summary(body)
         return _compact_summary_text(previous, old_messages)
 
     async def _summarize_via_llm(
-        self, previous: CompactSnapshot | None, old_messages: list[dict[str, Any]]
+        self,
+        previous: CompactSnapshot | None,
+        old_messages: list[dict[str, Any]],
+        session_id: str,
     ) -> str | None:
         """调用 LLM 把旧摘要与本次移除消息融合为摘要正文。"""
         source = _mechanical_summary_body(previous, old_messages)
@@ -265,6 +269,14 @@ class SessionCompactor:
             "只输出摘要正文，不要添加任何前后缀或标记。"
         )
         model = self._settings.compact_summary_model or self._model_for_effort("quick")
+
+        def _on_fallback(primary: str, fallback: str) -> None:
+            self._emit(
+                session_id,
+                "agent_model_fallback",
+                {"primary_model": primary, "fallback_model": fallback, "source": "compact_summary"},
+            )
+
         try:
             turn = await self._llm.chat(
                 messages=[
@@ -275,6 +287,7 @@ class SessionCompactor:
                 model=model,
                 temperature=0.0,
                 thinking_budget=0,
+                on_fallback=_on_fallback,
             )
         except LLMError as exc:
             logger.warning("Compact LLM summarize failed, falling back to mechanical: %s", exc)

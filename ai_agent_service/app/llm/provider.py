@@ -6,6 +6,7 @@ Responses / Anthropic / Gemini provider 而不改编排层。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -30,6 +31,25 @@ FallbackCallback = Callable[[str, str], None]
 
 # 流式增量事件的最小推送间隔（秒），避免逐 token 产生事件淹没事件队列。
 _DELTA_MIN_INTERVAL_S = 0.5
+
+# 单次 chat() 内模型级重试上限（含主模型与降级模型的组合尝试）；与 _chat_once
+# 内的流式重连（max_stream_attempts，针对单次请求的连接抖动）是两个层次。
+_MAX_CHAT_ATTEMPTS = 5
+# 指数退避基数与上限（秒）；仅对可重试错误在重试之间等待。
+_RETRY_BACKOFF_BASE_S = 0.5
+_RETRY_BACKOFF_CAP_S = 8.0
+
+
+def _is_retryable_llm_error(exc: LLMError) -> bool:
+    """判断 LLM 错误是否可重试。
+
+    连接/超时错误（`status_code` 为 None）与 429、5xx 视为可重试；401/403/400
+    等鉴权与参数类错误不可重试，直接抛出以避免无谓重试与降级。
+    """
+    code = exc.status_code
+    if code is None:
+        return True
+    return code == 429 or 500 <= code < 600
 
 
 @dataclass(frozen=True)
@@ -278,8 +298,10 @@ class OpenAICompatibleProvider:
     ) -> AssistantTurn:
         """调用 `chat.completions.create` 并转换为 `AssistantTurn`。
 
-        主模型请求失败时，若配置了 `fallback_model` 且与本次请求的模型不同，
-        会自动用 `fallback_model` 重试一次（§15 降级策略）。
+        主模型请求失败时，在当轮内最多进行 `_MAX_CHAT_ATTEMPTS` 次尝试：前 2 次
+        用主模型，之后转 `fallback_model`（若配置且不同）。仅 429/5xx/超时/连接
+        错误重试并带指数退避；401/403/400 等不可重试错误直接抛出。首次切换到
+        降级模型时经 `on_fallback` 发一次事件（§15 降级策略）。
 
         Args:
             messages: 当前 agent 帧的完整消息列表。
@@ -302,40 +324,61 @@ class OpenAICompatibleProvider:
             LLMError: 主模型与降级模型均连接失败、超时或返回错误状态码时抛出。
         """
         resolved_model = model or self._default_model
-        try:
-            return await self._chat_with_response_contract(
-                messages,
-                tools,
-                resolved_model,
-                temperature,
-                thinking_budget,
-                on_delta,
-                cache_breakpoints,
-                response_contract,
+        max_attempts = _MAX_CHAT_ATTEMPTS
+        fallback_emitted = False
+        last_exc: LLMError | None = None
+        for attempt in range(1, max_attempts + 1):
+            # 前 2 次（含首次）用主模型；之后转降级模型（若配置且与主模型不同）。
+            use_fallback = (
+                attempt > 2
+                and self._fallback_model is not None
+                and self._fallback_model != resolved_model
             )
-        except LLMError as exc:
-            if self._fallback_model is None or self._fallback_model == resolved_model:
-                logger.warning(
-                    "LLM chat failed without fallback status_code=%s",
-                    exc.status_code,
-                )
-                raise
-            logger.warning(
-                "LLM chat failed; retrying configured fallback status_code=%s",
-                exc.status_code,
-            )
-            if on_fallback is not None:
+            current_model = self._fallback_model if use_fallback else resolved_model
+            if use_fallback and not fallback_emitted and on_fallback is not None:
                 on_fallback(resolved_model, self._fallback_model)
-            return await self._chat_with_response_contract(
-                messages,
-                tools,
-                self._fallback_model,
-                temperature,
-                thinking_budget,
-                on_delta,
-                cache_breakpoints,
-                response_contract,
-            )
+                fallback_emitted = True
+            try:
+                return await self._chat_with_response_contract(
+                    messages,
+                    tools,
+                    current_model,
+                    temperature,
+                    thinking_budget,
+                    on_delta,
+                    cache_breakpoints,
+                    response_contract,
+                )
+            except LLMError as exc:
+                last_exc = exc
+                if not _is_retryable_llm_error(exc):
+                    logger.warning(
+                        "LLM chat non-retryable failure model=%s status_code=%s",
+                        current_model,
+                        exc.status_code,
+                    )
+                    raise
+                if attempt >= max_attempts:
+                    logger.warning(
+                        "LLM chat exhausted retries attempts=%d model=%s status_code=%s",
+                        attempt,
+                        current_model,
+                        exc.status_code,
+                    )
+                    raise
+                delay = min(_RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP_S)
+                logger.warning(
+                    "LLM chat retryable failure; retrying attempt=%d/%d model=%s status_code=%s delay=%.2f",
+                    attempt,
+                    max_attempts,
+                    current_model,
+                    exc.status_code,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        # 理论上不可达：循环要么 return，要么在最后一次重试失败后 raise。
+        assert last_exc is not None
+        raise last_exc
 
     async def _chat_with_response_contract(
         self,

@@ -454,7 +454,7 @@ func _build_ui() -> void:
 	_sync_permission_selection()
 
 	_effort_options = OptionButton.new()
-	for effort in ["quick", "standard", "deep", "verify", "advisor"]:
+	for effort in ["quick", "standard", "deep"]:
 		_effort_options.add_item(effort)
 	status_row.add_child(_effort_options)
 	_sync_effort_selection()
@@ -2099,6 +2099,10 @@ func _sync_effort_selection() -> void:
 	if editor_interface == null:
 		return
 	var current := str(ConfigMigrations.get_value(editor_interface, "ai_agent/effort"))
+	# verify/advisor 是固定内部档位，不再暴露给用户；历史值降级回 standard。
+	if current == "verify" or current == "advisor":
+		current = "standard"
+		ConfigMigrations.set_value(editor_interface, "ai_agent/effort", "standard")
 	for index in range(_effort_options.get_item_count()):
 		if _effort_options.get_item_text(index) == current:
 			_effort_options.select(index)

@@ -7,6 +7,7 @@ import copy
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -623,7 +624,7 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["disposition"], "continue_agent")
 
     async def test_provider_fallback_is_selected_only_inside_backend(self) -> None:
-        """primary 失败后的 fallback 由 provider 边界选择一次。"""
+        """primary 失败后由 provider 边界按 5 次预算重试，并切到 fallback 一次。"""
         provider = object.__new__(OpenAICompatibleProvider)
         provider._default_model = "primary"  # type: ignore[attr-defined]
         provider._fallback_model = "fallback"  # type: ignore[attr-defined]
@@ -647,19 +648,21 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
             )
 
         provider._chat_once = fake_chat_once  # type: ignore[method-assign]
-        result = await provider.chat(
-            [],
-            [],
-            on_fallback=lambda primary, fallback: fallbacks.append((primary, fallback)),
-        )
-        self.assertEqual(calls, ["primary", "fallback"])
+        with mock.patch("app.llm.provider.asyncio.sleep", new=mock.AsyncMock()):
+            result = await provider.chat(
+                [],
+                [],
+                on_fallback=lambda primary, fallback: fallbacks.append((primary, fallback)),
+            )
+        # 前 2 次主模型（含首次）失败后切到降级模型；fallback 首次切换发一次事件。
+        self.assertEqual(calls, ["primary", "primary", "fallback"])
         self.assertEqual(fallbacks, [("primary", "fallback")])
         self.assertEqual(result.model, "fallback")
 
     async def test_provider_primary_and_fallback_exhaustion_propagates_once(
         self,
     ) -> None:
-        """primary/fallback 都失败时由模型边界报告耗尽，不由前端选模型。"""
+        """primary/fallback 都失败时由模型边界按 5 次预算耗尽后报告一次。"""
         provider = object.__new__(OpenAICompatibleProvider)
         provider._default_model = "primary"  # type: ignore[attr-defined]
         provider._fallback_model = "fallback"  # type: ignore[attr-defined]
@@ -671,14 +674,16 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
             model: str,
             *_args: Any,
         ) -> AssistantTurn:
-            """记录并拒绝两个 provider attempt。"""
+            """记录并拒绝每个 provider attempt。"""
             calls.append(model)
             raise LLMError(f"{model} failed")
 
         provider._chat_once = failing_chat_once  # type: ignore[method-assign]
-        with self.assertRaises(LLMError):
-            await provider.chat([], [])
-        self.assertEqual(calls, ["primary", "fallback"])
+        with mock.patch("app.llm.provider.asyncio.sleep", new=mock.AsyncMock()):
+            with self.assertRaises(LLMError):
+                await provider.chat([], [])
+        # 5 次预算耗尽：主模型 2 次 + 降级模型 3 次。
+        self.assertEqual(calls, ["primary", "primary", "fallback", "fallback", "fallback"])
 
     async def test_event_delivery_failpoints_are_idempotent_transport_state(
         self,

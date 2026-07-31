@@ -4,7 +4,6 @@ description: 专注脚本、资源文本、Godot API、代码检索和代码修�
 tools: [list_files, read_file, grep_code, search_codebase, read_class_docs, read_debugger_errors, read_runtime_state, read_profiler_snapshot, apply_text_edit, propose_script_edit, propose_tests, run_tests, run_headless_self_test, run_system_command, execute_gd_script, git_status, git_diff, list_export_presets, export_project, load_skill, search_tools]
 skills: [godot-code-reading]
 model: inherit
-effort: deep
 max_turns: 10
 can_delegate: false
 ---
