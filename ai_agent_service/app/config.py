@@ -70,8 +70,8 @@ class AppSettings(BaseSettings):
         description="地图 worker 最终回合的显式响应合同模式。",
     )
     map_worker_structured_correction_limit: int = Field(
-        default=1,
-        ge=0,
+        default=2,
+        ge=2,
         le=5,
         description="单个地图 worker Frame 最多执行的本地结构化纠错次数。",
     )

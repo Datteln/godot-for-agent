@@ -61,7 +61,7 @@ from app.orchestrator.map_contracts import (
     arm_map_worker_structured_completion,
 )
 from app.orchestrator.map_progress import (
-    MAP_PLATFORM_PLAN_MAX_ATTEMPTS,
+    build_map_progress_digest,
     consume_committed_platform_approvals,
     latest_map_revision,
     map_platform_plan_attempt_count,
@@ -495,7 +495,7 @@ def _planner_completion_text(
     summary = (
         "LLM 显式平台规划已通过确定性校验，规划阶段由服务端自动结束。"
         if outcome.executable
-        else (f"平台规划在 {MAP_PLATFORM_PLAN_MAX_ATTEMPTS} 次修订内未通过，" "规划阶段已停止。")
+        else "平台规划反复未通过校验，已触发无进展停止，规划阶段已停止。"
     )
     payload = {
         "stage": "planner",
@@ -589,7 +589,7 @@ def _arm_map_reader_text_completion(
     frame: Frame,
     *,
     mode: MapResponseMode = "prompt_only",
-    correction_limit: int = 1,
+    correction_limit: int = 2,
 ) -> None:
     """把 reader 的下一轮限制为无工具的结构化事实输出。"""
     if frame.force_text_only:
@@ -2115,7 +2115,9 @@ class QueryEngine:
                 session.output_style,
             ),
             structure_context=project_context,
-            dynamic_context=session.rag_context,
+            dynamic_context=(session.rag_context or "") + build_map_progress_digest(
+                session, project_root=security.project_root
+            ),
             query=request.user_message or "",
         )
         root_snapshot = session.agent_stack[0].compact_snapshot if session.agent_stack else None
@@ -2185,7 +2187,7 @@ class QueryEngine:
                     session.output_style,
                 ),
                 structure_context=project_context,
-                dynamic_context=task_rag_context,
+                dynamic_context=(task_rag_context or "") + build_map_progress_digest(session),
                 query=task,
             )
             return cast(
@@ -2960,7 +2962,7 @@ class QueryEngine:
                         "completion_candidate": True,
                     }
             if isinstance(result_for_gate, dict):
-                remember_map_plan_progress(
+                plan_progress = remember_map_plan_progress(
                     session,
                     tool_name,
                     tool_args,
@@ -2969,7 +2971,12 @@ class QueryEngine:
                 if frame.agent.map_stage == "planner" and tool_name in PLATFORM_PLAN_TOOL_NAMES:
                     plan_outcome = parse_map_plan_outcome(tool_name, result_for_gate)
                     attempt_count = map_platform_plan_attempt_count(session, tool_args)
-                    if plan_outcome.executable or attempt_count >= MAP_PLATFORM_PLAN_MAX_ATTEMPTS:
+                    # plan-specific 计数上限已移除；改由通用 no-progress 语义重试兜底
+                    #（remember_map_plan_progress 失败时记入语义重试，达阈值即 exhausted）。
+                    retry_exhausted = bool(
+                        plan_progress.get("exhausted")
+                    ) if isinstance(plan_progress, dict) else False
+                    if plan_outcome.executable or retry_exhausted:
                         frame.forced_completion_text = _planner_completion_text(
                             frame,
                             tool_name,
@@ -2978,12 +2985,13 @@ class QueryEngine:
                         )
                         logger.info(
                             "Scheduled deterministic planner completion session=%s frame=%s "
-                            "tool=%s executable=%s attempts=%d",
+                            "tool=%s executable=%s attempts=%d retry_exhausted=%s",
                             session.session_id,
                             frame.id,
                             tool_name,
                             plan_outcome.executable,
                             attempt_count,
+                            retry_exhausted,
                         )
                 elif (
                     _is_dynamic_map_writer(frame)

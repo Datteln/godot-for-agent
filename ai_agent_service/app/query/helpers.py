@@ -220,6 +220,16 @@ def _append_platform_planning_failure_hint(
         or profile_plan.get("repair_plan")
         or profile_plan.get("issues")
     )
+    if not isinstance(details_value, list) or not details_value:
+        # 压缩后工具结果消息可能已丢失；从 failure_frontier(state) 回读持久化的 repair_plan。
+        frontier = (
+            session.map_task_state.failure_frontier
+            if isinstance(session.map_task_state.failure_frontier, dict)
+            else {}
+        )
+        frontier_repair = frontier.get("repair_plan")
+        if isinstance(frontier_repair, list) and frontier_repair:
+            details_value = frontier_repair
     details = details_value if isinstance(details_value, list) else []
     if reason == "start_not_standable" and outcome.suggested_foothold is not None:
         recovery = (

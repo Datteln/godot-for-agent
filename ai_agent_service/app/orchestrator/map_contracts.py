@@ -155,7 +155,16 @@ def specialized_map_worker_schema(frame: Frame) -> dict[str, Any]:
             not isinstance(value, int) or isinstance(value, bool)
         ):
             continue
-        properties[field_name] = {**properties[field_name], "const": value}
+        # const 是更紧的约束：丢弃基础 schema 的 enum，避免 const 值不在 enum 中时
+        # 产生不可满足字段（如 orchestrator 帧的 stage="orchestrator" 不在 worker enum
+        # ["reader","planner","writer","validator","repairer","reviewer"] 内，导致正确输出被误判）。
+        specialized = {
+            key: prop
+            for key, prop in properties[field_name].items()
+            if key != "enum"
+        }
+        specialized["const"] = value
+        properties[field_name] = specialized
     if frame.allowed_next_stages:
         properties["next_stage"] = {
             **properties["next_stage"],

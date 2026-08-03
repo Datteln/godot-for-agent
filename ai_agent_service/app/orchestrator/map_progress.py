@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from pathlib import Path
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Final, Literal
 
@@ -24,6 +25,7 @@ from app.orchestrator.map_recovery import (
     record_semantic_retry,
     retry_pause_report,
 )
+from app.orchestrator.map_artifacts import MapArtifactStore
 
 if TYPE_CHECKING:
     from app.agents.types import Frame
@@ -758,8 +760,6 @@ def parse_map_plan_outcome(tool_name: str, result: dict[str, Any]) -> MapPlanOut
     )
 
 
-MAP_PLATFORM_PLAN_MAX_ATTEMPTS = 2
-
 _CONTRACT_KEYS = (
     "target_path",
     "map_layer",
@@ -1097,16 +1097,10 @@ def map_platform_plan_call_error(
     tool_name: str,
     tool_args: dict[str, Any],
 ) -> str | None:
-    """在执行前拒绝超限或完全相同的平台规划提交。"""
+    """在执行前拒绝完全相同的平台规划提交（修订计数上限已移除，仅靠语义指纹去重防 thrash）。"""
     if tool_name not in PLATFORM_PLAN_TOOL_NAMES:
         return None
     scope = _platform_plan_scope(tool_args)
-    attempts = session.map_task_state.planning_attempts.get(scope, 0)
-    if attempts >= MAP_PLATFORM_PLAN_MAX_ATTEMPTS:
-        return (
-            f"平台规划已达到 {MAP_PLATFORM_PLAN_MAX_ATTEMPTS} 次修订上限；"
-            "请停止调用工具并返回当前结构化失败原因。"
-        )
     fingerprint = _platform_plan_fingerprint(tool_name, tool_args)
     if fingerprint is None:
         return None
@@ -1117,6 +1111,42 @@ def map_platform_plan_call_error(
             "必须根据 issues/repair_plan 修改具体平台字段。"
         )
     return None
+
+
+def build_map_progress_digest(session: Session, project_root: Path | None = None) -> str:
+    """构建精简 map-progress digest，供每轮注入 agent 上下文。
+
+    从权威 map_task_state 派生当前 revision、stage 与最新失败 error_code + repair_plan，
+    使关键信息跨压缩存活（不依赖 LLM 摘要）。无活动 map 任务或无失败时返回空串，
+    不影响非 map 会话的上下文。
+    """
+    state = session.map_task_state
+    frontier = state.failure_frontier if isinstance(state.failure_frontier, dict) else {}
+    revisions = state.latest_revisions
+    revision = max(revisions.values()) if revisions else None
+    if revision is None and not frontier:
+        return ""
+    parts: list[str] = []
+    if revision is not None:
+        parts.append(f"map_revision={revision}")
+    error_code = str(frontier.get("error_code") or frontier.get("blocked_reason") or "")
+    if error_code:
+        parts.append(f"last_failure={error_code}")
+        repair = frontier.get("repair_plan")
+        if isinstance(repair, list) and repair:
+            parts.append(f"repair_plan={json.dumps(repair[:6], ensure_ascii=False)}")
+    if project_root is not None:
+        # task 3：注入 map_artifacts.json 的 relative_ref，让 LLM 压缩后能定位持久化的地图工具结果。
+        try:
+            store = MapArtifactStore(
+                project_root=project_root, session_id=session.session_id
+            )
+            parts.append(f"map_artifacts_ref={store.relative_ref}")
+        except Exception:  # 路径不可相对化或缺会话信息时跳过（digest 非关键）
+            pass
+    if not parts:
+        return ""
+    return "Map progress (authoritative, survives compaction): " + "; ".join(parts) + "."
 
 
 def map_platform_plan_attempt_count(session: Session, tool_args: dict[str, Any]) -> int:
@@ -1513,8 +1543,12 @@ def remember_map_plan_progress(
     tool_name: str,
     tool_args: dict[str, Any],
     result: dict[str, Any],
-) -> None:
-    """有效规划完成后允许执行阶段写入，但仍要求新 revision 后再 completion。"""
+) -> dict[str, Any] | None:
+    """有效规划完成后允许执行阶段写入，但仍要求新 revision 后再 completion。
+
+    失败的平台规划会记入通用 no-progress 语义重试并返回该重试条目（含 exhausted 标志），
+    供 planner 循环据此触发确定性收尾；成功或非平台规划工具返回 None。
+    """
     if tool_name not in MAP_PLAN_TOOL_NAMES:
         return
     _remember_platform_plan_attempt(session, tool_name, tool_args)
@@ -1547,6 +1581,10 @@ def remember_map_plan_progress(
             target=target,
             revision=current_revision,
         )
+        repair_plan_value = result.get("repair_plan") or result.get("issues")
+        repair_plan_list = (
+            repair_plan_value if isinstance(repair_plan_value, list) else []
+        )
         replace_map_state_field(
             state,
             "failure_frontier",
@@ -1555,6 +1593,7 @@ def remember_map_plan_progress(
                 "blocked_reason": outcome.blocked_reason,
                 "error_code": outcome.error_code,
                 "suggested_foothold": outcome.suggested_foothold,
+                "repair_plan": repair_plan_list[:6],
             },
             target=target,
             revision=current_revision,
@@ -1586,23 +1625,31 @@ def remember_map_plan_progress(
                 target=target,
                 revision=current_revision,
             )
-        return
-
-    if tool_name not in PLATFORM_PLAN_TOOL_NAMES:
-        locked_scope = next(
-            (
-                key
-                for key, value in session.map_task_state.validation_workflows.items()
-                if key.startswith(f"{target}::")
-                and isinstance(value, dict)
-                and value.get("map_revision") == current_revision
-                and value.get("next_stage") == "planner"
+        else:
+            return None
+        # 失败的平台规划记入通用 no-progress 语义重试（替代 plan-specific 计数上限）；
+        # operation 用 scope 身份，使同一 scope 下相同 error_code 反复出现时累积 streak，
+        # 不同 error_code 视为进展（各自独立 streak），与 no-progress 语义一致。
+        retry_entry = record_semantic_retry(
+            session.map_task_state,
+            category="validation_failure",
+            error_category=str(
+                outcome.error_code or outcome.blocked_reason or "platform_plan_failed"
             ),
-            None,
+            root_cause=str(
+                outcome.blocked_reason or outcome.error_code or "platform_plan_failed"
+            ),
+            stage="planner",
+            target=target,
+            revision=current_revision,
+            operation={
+                "tool": tool_name,
+                "target_path": target,
+                "map_layer": scope_args.get("map_layer"),
+            },
+            threshold=SEMANTIC_RETRY_MAX_ATTEMPTS,
         )
-        if locked_scope is not None:
-            session.map_task_state.transition_stage("plan")
-            return
+        return retry_entry
 
     active_workflow = session.map_task_state.validation_workflows.get(scope)
     if isinstance(active_workflow, dict) and active_workflow.get("next_stage") == "planner":

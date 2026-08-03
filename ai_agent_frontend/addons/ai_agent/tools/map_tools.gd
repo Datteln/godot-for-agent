@@ -2857,7 +2857,7 @@ static func _spatial_entry_stale_for_index_hit(
 ) -> Dictionary:
 	if editor_interface == null or dimension != 2:
 		return {"checked": false}
-	if not (entry.get("coords", {}) is Dictionary):
+	if not entry.has("coords") or not (entry.get("coords") is Dictionary):
 		return {"checked": false}
 	map_layer = int(entry.get("map_layer", map_layer))
 	var cache_key := "%s:%d" % [target_path, map_layer]
@@ -2876,7 +2876,7 @@ static func _spatial_entry_stale_for_index_hit(
 
 static func _entry_2d_tile_signature(entry: Dictionary) -> Dictionary:
 	var atlas = entry.get("atlas_coords", {})
-	if not (atlas is Dictionary):
+	if not entry.has("atlas_coords") or not (atlas is Dictionary):
 		return {}
 	return {
 		"source_id": int(entry.get("source_id", -1)),
@@ -2887,6 +2887,8 @@ static func _entry_2d_tile_signature(entry: Dictionary) -> Dictionary:
 
 static func _cell_2d_tile_signature(cell: Dictionary) -> Dictionary:
 	var atlas = cell.get("atlas_coords", {})
+	if not cell.has("atlas_coords"):
+		return {}
 	if atlas is Vector2i:
 		return {
 			"source_id": int(cell.get("source_id", -1)),

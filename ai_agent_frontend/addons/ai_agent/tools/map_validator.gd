@@ -482,12 +482,21 @@ static func build_connectivity_repair_plan(
 ) -> Array:
 	if not in_region(start, region) or not in_region(goal, region):
 		return []
-	var path := manhattan_path(start, goal, dimension)
+	# 仅使用经 A* 校验为可达的真实路径；不再用 manhattan 几何启发式 fabricate 路径
+	#（manhattan 轨迹未经可达性校验，可能建议不可达的桥/走廊）。
+	var path: Array = []
 	var routed := find_path_astar(filled, start, goal, region, dimension, movement)
 	if bool(routed.get("reachable", false)):
-		path = []
 		for point in routed.get("path", []):
 			path.append(coord_from_input(point, dimension))
+	if path.is_empty():
+		return [{
+			"type": "connectivity_unreachable",
+			"action": "replan",
+			"cells": [],
+			"cells_count": 0,
+			"note": "No validated reachable path between start and goal; revise the explicit platforms/segments per the unreachable edges, then validate again.",
+		}]
 	if bool(movement.get("requires_support", false)):
 		# leap 失败的本质是「脚下没有连续支撑」，靠清空空气没用——要在脚下那一行补地面/平台。
 		# 把脚步路径每一格正下方的支撑格收集出来，建议 fill 成地面，搭出一条可走的桥。
@@ -755,23 +764,6 @@ static func _reconstruct_path_from_parents(came_from: Dictionary, start: Vector3
 			break
 		current = coord_from_input(came_from[key], dimension)
 		path.push_front(coord_payload(current, dimension))
-	return path
-
-
-static func manhattan_path(start: Vector3i, goal: Vector3i, dimension: int) -> Array:
-	var path: Array = []
-	var current := start
-	path.append(current)
-	while current.x != goal.x:
-		current.x += 1 if goal.x > current.x else -1
-		path.append(current)
-	while current.y != goal.y:
-		current.y += 1 if goal.y > current.y else -1
-		path.append(current)
-	if dimension == 3:
-		while current.z != goal.z:
-			current.z += 1 if goal.z > current.z else -1
-			path.append(current)
 	return path
 
 

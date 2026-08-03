@@ -4247,7 +4247,7 @@ async def run_turn(
     context_token_limit: int | None = None,
     map_worker_structured_output_enabled: bool = True,
     map_worker_response_contract_mode: MapResponseMode = "prompt_only",
-    map_worker_structured_correction_limit: int = 1,
+    map_worker_structured_correction_limit: int = 2,
     map_worker_structured_thinking_budget: int = 0,
 ) -> StepResult:
     """驱动当前会话的活跃帧完成一轮（或多轮）编排循环。
@@ -4424,6 +4424,11 @@ async def run_turn(
                 frame.force_text_only
                 and _map_output_schema_for_frame(frame) == _MAP_OUTPUT_SCHEMA_V1
             )
+            effective_thinking_budget = (
+                map_worker_structured_thinking_budget
+                if final_structured_turn and map_worker_structured_thinking_budget > 0
+                else resolve_thinking_budget(effort, thinking_budget_selector)
+            )
             response_contract = (
                 ResponseContract(
                     mode=frame.response_contract_mode or map_worker_response_contract_mode,
@@ -4465,11 +4470,7 @@ async def run_turn(
                 visible_tools,
                 model=resolved_model,
                 temperature=0.0 if final_structured_turn else _resolve_temperature(effort),
-                thinking_budget=(
-                    map_worker_structured_thinking_budget
-                    if final_structured_turn
-                    else resolve_thinking_budget(effort, thinking_budget_selector)
-                ),
+                thinking_budget=effective_thinking_budget,
                 on_delta=_delta_callback(
                     event_callback,
                     frame.id,
@@ -4516,7 +4517,7 @@ async def run_turn(
         if final_structured_turn:
             frame.structured_response_model = turn.model or resolved_model
             frame.structured_finish_reason = turn.finish_reason
-            frame.structured_thinking_budget = map_worker_structured_thinking_budget
+            frame.structured_thinking_budget = effective_thinking_budget
             if turn.response_mode is not None:
                 frame.response_contract_mode = turn.response_mode
         _record_cache_metrics(cache_metrics, cache_decision, turn)

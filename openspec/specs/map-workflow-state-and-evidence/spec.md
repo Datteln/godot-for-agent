@@ -3,9 +3,7 @@
 ## Purpose
 
 Define authoritative map-workflow state, scoped evidence, completion gating, contextual continuation, and deterministic support-data recovery.
-
 ## Requirements
-
 ### Requirement: Map workflow state changes only through events
 The system MUST route task-epoch initialization and all stage, blocker, checkpoint, batch, validation, evidence, scope, revision, retry, transaction-reference, and no-progress changes through a single Map Workflow reducer. Every state field MUST declare machine-readable lifecycle metadata containing its task, revision, or session scope, reset/default factory, and resume policy, and epoch initialization MUST be derived from that metadata.
 
@@ -367,3 +365,37 @@ Screenshot and image-review path validation MUST reject malformed lookalikes of 
 #### Scenario: A path list contains a malformed scheme
 - **WHEN** any element of a list-valued capture path argument is non-string or uses a malformed Godot scheme
 - **THEN** the entire path validation fails with a typed invalid-argument result
+
+### Requirement: Specialized result schema is satisfiable
+The runtime SHALL ensure that a specialized map-worker result schema is internally consistent: when a frozen Frame constraint pins a field to a `const`, the specialization SHALL remove or widen any co-existing `enum` so the `const` value is admissible. A worker that outputs the frozen Frame values SHALL pass schema validation regardless of the frame's stage, including the `orchestrator` stage.
+
+#### Scenario: Orchestrator frame completes
+- **WHEN** a map-agent orchestrator frame with `stage = "orchestrator"` produces a final result whose `stage` equals the frozen frame value
+- **THEN** the specialized schema accepts the result and the runtime does not flag `stage` as a contract violation
+
+#### Scenario: Const contradicts the base enum
+- **WHEN** a frozen frame constraint sets a `const` whose value is not in the field's base `enum`
+- **THEN** the specialization drops or widens the `enum` so the `const` is admissible, rather than producing an unsatisfiable field
+
+### Requirement: Failure frontier persists the structured repair plan
+The reducer SHALL store the validator's full `repair_plan`/`issue_details` alongside `error_code` and `blocked_reason` in the scoped failure frontier, and SHALL NOT reduce a validation failure to its error code alone. The persisted repair plan SHALL survive message compaction because it lives in `map_task_state`, not in the conversation history.
+
+#### Scenario: Validation failure is recorded
+- **WHEN** a platform plan validation fails with a per-field `repair_plan`
+- **THEN** the reducer stores the repair plan in the scoped failure frontier and the actionable failure details persist independently of the tool-result message
+
+#### Scenario: Conversation compacts after a failure
+- **WHEN** the tool-result message carrying the repair plan scrolls out of the recent message window and is summarized
+- **THEN** the repair plan remains available in the failure frontier and can be re-surfaced without re-running validation
+
+### Requirement: Map-progress digest is surfaced to the agent context each turn
+The runtime SHALL re-derive a compact map-progress digest from authoritative `map_task_state` — current revision, stage, and the latest scoped failure `error_code` plus its persisted `repair_plan` — and SHALL inject it into the agent's per-turn context. The digest SHALL be re-derived from state on every turn, including the turn immediately following compaction, so it does not depend on the LLM summarizer preserving tool-result history.
+
+#### Scenario: Agent turn begins after compaction
+- **WHEN** a new agent turn begins after conversation compaction removed older tool-result messages
+- **THEN** the agent context still carries the current map revision, stage, and latest failure repair plan, re-derived from state
+
+#### Scenario: No active map task
+- **WHEN** no map task is active in the session
+- **THEN** the runtime injects no map-progress digest and the agent context is unchanged
+

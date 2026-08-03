@@ -64,7 +64,11 @@ static func validate_platform_level_plan(
 	elif not bool(score.get("passed", true)):
 		blocked_reason = "score_issues"
 		var score_details: Array = score.get("issue_details", [])
-		error_code = str((score_details.front() as Dictionary).get("error_code", blocked_reason)) if not score_details.is_empty() else blocked_reason
+		error_code = blocked_reason
+		for score_detail in score_details:
+			if score_detail is Dictionary and not bool((score_detail as Dictionary).get("advisory", false)):
+				error_code = str((score_detail as Dictionary).get("error_code", blocked_reason))
+				break
 	if blocked_reason != "":
 		edit_batches = []
 	## executable 统一结论：所有校验（显式计划、能力参数、入口锚点、跳跃图、评分）都通过才为 true。
@@ -664,6 +668,7 @@ static func _score_level(segments: Array, platforms: Array, jump_graph: Dictiona
 			"actual": segments.size(),
 			"required": 3,
 			"action": "LLM must add explicit gameplay segments and their supporting platforms.",
+			"advisory": true,
 		})
 	var long_platforms: Array = []
 	var repeated_roles := 0
@@ -684,6 +689,7 @@ static func _score_level(segments: Array, platforms: Array, jump_graph: Dictiona
 			"actual": long_platforms,
 			"required": {"max_non_rest_width": int(limits.get("max_platform_width", 8))},
 			"action": "Split or shorten the listed non-rest platforms in the explicit plan.",
+			"advisory": true,
 		})
 	if repeated_roles > int(limits.get("max_repeated_challenge_roles", 2)):
 		issues.append("planned route repeats the same challenge shape too often")
@@ -693,6 +699,7 @@ static func _score_level(segments: Array, platforms: Array, jump_graph: Dictiona
 			"actual": repeated_roles,
 			"required": {"maximum": int(limits.get("max_repeated_challenge_roles", 2))},
 			"action": "LLM must vary the explicit platform roles and route geometry.",
+			"advisory": true,
 		})
 	var finish_buffer := _finish_buffer_width(platforms)
 	if finish_buffer < int(limits.get("min_finish_buffer_width", 6)):
@@ -705,11 +712,16 @@ static func _score_level(segments: Array, platforms: Array, jump_graph: Dictiona
 			"required": int(limits.get("min_finish_buffer_width", 6)),
 			"action": "Widen or replace the final explicit platform; changing seed or region width does not repair the plan.",
 		})
+	var has_blocking := false
+	for detail in issue_details:
+		if detail is Dictionary and not bool((detail as Dictionary).get("advisory", false)):
+			has_blocking = true
+			break
 	var difficulty := 0
 	for segment in segments:
 		difficulty += int(segment.get("difficulty", 1))
 	return {
-		"passed": issues.is_empty(),
+		"passed": not has_blocking,
 		"issues": issues,
 		"issue_details": issue_details,
 		"long_platforms": long_platforms,
@@ -792,7 +804,7 @@ static func _entry_anchor_from_input(input: Dictionary) -> Dictionary:
 	var raw = input.get("entry_anchor", {})
 	if not (raw is Dictionary) or (raw as Dictionary).is_empty():
 		raw = input.get("frontier", {})
-	if raw is Dictionary and (raw as Dictionary).get("cell", {}) is Dictionary:
+	if raw is Dictionary and (raw as Dictionary).has("cell") and (raw as Dictionary).get("cell", {}) is Dictionary:
 		raw = (raw as Dictionary).get("cell", {})
 	if not (raw is Dictionary) or (raw as Dictionary).is_empty():
 		return {}
