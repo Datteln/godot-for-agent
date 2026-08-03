@@ -354,6 +354,17 @@ FAILURE_POLICIES: Final[dict[str, FailurePolicy]] = {
         True,
         "authoritative resource identity is resolved",
     ),
+    "planner_raw_map_resource_rejected": _policy(
+        "plan_step",
+        "refresh_and_replan",
+        True,
+        "none",
+        "backend",
+        "plan_recovery",
+        3,
+        True,
+        "planner returns semantic resources and compiler approval",
+    ),
     "map_resource_ambiguous": _policy(
         "plan_step",
         "pause_for_user",

@@ -8,11 +8,15 @@ from app.tools.registry import REGISTRY
 from app.tools.server_tools.grep_code import register_grep_code_tool
 from app.tools.server_tools.list_files import register_list_files_tool
 from app.tools.server_tools.load_skill import register_load_skill_tool
+
 # 读取子代理产出物的工具，供主代理检查 delegate/delegate_many 子帧写入的中间结果
 from app.tools.server_tools.read_delegate_artifact import (
     register_read_delegate_artifact_tool,
 )
 from app.tools.server_tools.read_map_artifact import register_read_map_artifact_tool
+from app.tools.server_tools.read_planning_snapshot import (
+    register_read_planning_snapshot_tool,
+)
 from app.tools.server_tools.read_file import register_read_file_tool
 from app.tools.server_tools.search_codebase import register_search_codebase_tool
 from app.tools.server_tools.search_tools import register_search_tools_tool
@@ -29,6 +33,7 @@ def register_server_tools() -> None:
     register_load_skill_tool()
     register_read_delegate_artifact_tool()  # 注册 read_delegate_artifact：读取子代理产出物
     register_read_map_artifact_tool()
+    register_read_planning_snapshot_tool()
     register_search_tools_tool()
     register_search_codebase_tool()
     logger.debug("Server tools registered before=%d after=%d", before, len(REGISTRY))

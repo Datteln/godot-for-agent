@@ -1232,6 +1232,42 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		"non_empty_count": non_empty_count,
 		"atlas_summary": _atlas_summary(cells, dimension),
 	}
+	var registry_document := _read_json_resource(RESOURCE_REGISTRY_PATH)
+	result["resource_bindings"] = (
+		(registry_document.get("data", {}) as Dictionary).duplicate(true)
+		if registry_document.get("data", {}) is Dictionary
+		else {}
+	)
+	var used_cells: Array = (
+		target.call("get_used_cells", map_layer)
+		if target.get_class() == "TileMap"
+		else target.call("get_used_cells")
+	)
+	var coverage_complete := cells_format in ["full", "non_empty_only"] \
+		and int(result["cells_omitted"]) == 0
+	result["used_bounds"] = (
+		_used_bounds_3d(used_cells)
+		if dimension == 3
+		else _used_bounds_2d(used_cells)
+	)
+	result["collision_support"] = {
+		"source": "canonical_editor_cells",
+		"complete": coverage_complete,
+		"filled_cells": non_empty_count,
+		"map_layer": map_layer,
+	}
+	result["object_occupancy"] = _live_object_occupancy(
+		target,
+		{
+			"x": origin.x,
+			"y": origin.y,
+			"z": origin.z,
+			"width": width,
+			"height": height,
+			"depth": depth,
+		},
+		dimension
+	)
 	if cells_format != "summary_only":
 		result["cells"] = returned_cells
 	if requested_cells > MAX_DESCRIBED_CELLS:
@@ -1675,6 +1711,8 @@ static func _apply_registry_fallback_to_operation(operation: Dictionary, dimensi
 			operation["item"] = int(resource_entry.get("item", -1))
 		elif not operation.has("item") and resource_entry.has("mesh_library_item"):
 			operation["item"] = int(resource_entry.get("mesh_library_item", -1))
+		if not operation.has("orientation") and resource_entry.has("orientation"):
+			operation["orientation"] = int(resource_entry.get("orientation", 0))
 	else:
 		if not operation.has("source_id") and resource_entry.has("source_id"):
 			operation["source_id"] = int(resource_entry.get("source_id", -1))
@@ -1688,6 +1726,8 @@ static func _apply_registry_fallback_to_operation(operation: Dictionary, dimensi
 				operation["atlas_x"] = int((atlas as Dictionary).get("x", -1))
 			if not operation.has("atlas_y"):
 				operation["atlas_y"] = int((atlas as Dictionary).get("y", -1))
+		if not operation.has("alternative_tile") and resource_entry.has("alternative_tile"):
+			operation["alternative_tile"] = int(resource_entry.get("alternative_tile", 0))
 	return resource_entry
 
 
@@ -1796,35 +1836,7 @@ static func _registry_entry_for_resource_input(input: Dictionary) -> Dictionary:
 	var resource_key := str(input.get("resource", input.get("resource_key", ""))).strip_edges()
 	var fallback_key := str(input.get("fallback_resource", input.get("fallback_resource_key", ""))).strip_edges()
 	var resolved := _registry_entry_with_fallback(registry_data, resource_key, fallback_key)
-	if not resolved.is_empty() or resource_key != "":
-		return resolved
-	return _registry_entry_for_raw_2d_tile(registry_data, input)
-
-
-static func _registry_entry_for_raw_2d_tile(registry_data: Dictionary, input: Dictionary) -> Dictionary:
-	if not input.has("source_id") or not input.has("atlas_x") or not input.has("atlas_y"):
-		return {}
-	var wanted := {
-		"source_id": int(input.get("source_id", -1)),
-		"atlas_x": int(input.get("atlas_x", -1)),
-		"atlas_y": int(input.get("atlas_y", -1)),
-	}
-	if wanted["source_id"] < 0 or wanted["atlas_x"] < 0 or wanted["atlas_y"] < 0:
-		return {}
-	for key in registry_data.keys():
-		var value = registry_data.get(key, {})
-		if not (value is Dictionary):
-			continue
-		var entry: Dictionary = value
-		if not bool(_validate_resource_contract_shape(str(key), entry).get("ok", false)):
-			continue
-		if _registry_2d_tile_signature(entry) != wanted:
-			continue
-		var resolved := entry.duplicate(true)
-		resolved["_resolved_resource"] = str(key)
-		resolved["_fallback_for"] = "raw_atlas"
-		return resolved
-	return {}
+	return resolved
 
 
 static func _registry_entry_with_fallback(registry_data: Dictionary, resource_key: String, fallback_key: String) -> Dictionary:
@@ -2550,6 +2562,46 @@ static func _used_bounds_3d(cells: Array) -> Dictionary:
 		"x": min_x, "y": min_y, "z": min_z,
 		"width": max_x - min_x + 1, "height": max_y - min_y + 1, "depth": max_z - min_z + 1,
 		"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y, "min_z": min_z, "max_z": max_z,
+	}
+
+
+static func _live_object_occupancy(target: Node, region: Dictionary, dimension: int) -> Dictionary:
+	## 从当前 edited scene 的碰撞对象计算实时占用；不依赖可能过期的 spatial index。
+	var tree := target.get_tree()
+	var root: Node = tree.edited_scene_root if tree != null else null
+	if root == null:
+		return {"source": "edited_scene_tree", "freshness": "unavailable", "complete": false, "objects": []}
+	var objects: Array = []
+	var stack: Array[Node] = [root]
+	while not stack.is_empty():
+		var node: Node = stack.pop_back()
+		for child in node.get_children():
+			if child is Node:
+				stack.append(child)
+		if node == target:
+			continue
+		var coords := Vector3i.ZERO
+		if dimension == 2 and node is CollisionObject2D and target is Node2D:
+			var local_position: Vector2 = (target as Node2D).to_local((node as Node2D).global_position)
+			var coords_2d: Vector2i = target.call("local_to_map", local_position)
+			coords = Vector3i(coords_2d.x, coords_2d.y, 0)
+		elif dimension == 3 and node is CollisionObject3D and target is Node3D:
+			var local_position_3d: Vector3 = (target as Node3D).to_local((node as Node3D).global_position)
+			coords = target.call("local_to_map", local_position_3d)
+		else:
+			continue
+		if not MapValidator.in_region(coords, region):
+			continue
+		objects.append({
+			"node_path": str(root.get_path_to(node)),
+			"class": node.get_class(),
+			"cell": MapValidator.coord_payload(coords, dimension),
+		})
+	return {
+		"source": "edited_scene_tree_collision_objects",
+		"freshness": "live",
+		"complete": true,
+		"objects": objects,
 	}
 
 
@@ -4778,6 +4830,222 @@ static func _planning_contract_error(input: Dictionary, current: Dictionary) -> 
 	return {}
 
 
+static func _authoritative_snapshot_error(
+	input: Dictionary,
+	target_path: String,
+	map_layer: int
+) -> Dictionary:
+	## 校验 planner、validator/compiler 使用的是同一个 revision 绑定快照。
+	for field_name in [
+		"authoritative_snapshot_id",
+		"authoritative_snapshot_digest",
+		"authoritative_snapshot_target",
+		"authoritative_snapshot_layer",
+		"authoritative_snapshot_revision",
+	]:
+		if not input.has(field_name):
+			return {
+				"ok": false,
+				"error_code": "authoritative_snapshot_required",
+				"message": "Platform validation requires a runtime-bound authoritative snapshot.",
+				"missing_field": field_name,
+			}
+	if str(input.get("authoritative_snapshot_id", "")).strip_edges() == "" \
+			or str(input.get("authoritative_snapshot_digest", "")).strip_edges() == "":
+		return {
+			"ok": false,
+			"error_code": "authoritative_snapshot_identity_invalid",
+			"message": "Authoritative snapshot id/digest must not be empty.",
+		}
+	if str(input.get("authoritative_snapshot_target", "")) != target_path \
+			or int(input.get("authoritative_snapshot_layer", -1)) != map_layer:
+		return {
+			"ok": false,
+			"error_code": "authoritative_snapshot_scope_mismatch",
+			"message": "Authoritative snapshot target/layer does not match the canonical map target.",
+		}
+	var canonical_revision := int(input.get("_canonical_map_revision", -1))
+	if int(input.get("authoritative_snapshot_revision", -2)) != canonical_revision:
+		return {
+			"ok": false,
+			"error_code": "authoritative_snapshot_revision_stale",
+			"message": "Authoritative snapshot revision no longer matches the canonical map revision.",
+			"snapshot_revision": int(input.get("authoritative_snapshot_revision", -2)),
+			"actual_revision": canonical_revision,
+		}
+	for completeness_field in [
+		"authoritative_snapshot_coverage_complete",
+		"authoritative_snapshot_traversal_complete",
+		"authoritative_snapshot_frontier_complete",
+	]:
+		if input.get(completeness_field, false) != true:
+			return {
+				"ok": false,
+				"error_code": "authoritative_snapshot_incomplete",
+				"message": "Authoritative snapshot coverage/traversal/frontier evidence is incomplete.",
+				"incomplete_field": completeness_field,
+			}
+	return {}
+
+
+static func _platform_reference_cell(input: Dictionary) -> Dictionary:
+	## 从已验证语义事实中选择真实地面参考格，禁止 compiler 猜 atlas。
+	for field_name in ["ground_reference_cell", "entry_support"]:
+		var value = input.get(field_name, {})
+		if _has_coord_dict(value):
+			return {
+				"x": int((value as Dictionary).get("x", 0)),
+				"y": int((value as Dictionary).get("y", 0)),
+			}
+	var anchor = input.get("entry_anchor", {})
+	if _has_coord_dict(anchor):
+		return {
+			"x": int((anchor as Dictionary).get("x", 0)),
+			"y": int((anchor as Dictionary).get("y", 0)) + 1,
+		}
+	return {}
+
+
+static func _snapshot_resource_binding_error(
+	input: Dictionary,
+	operation: Dictionary
+) -> Dictionary:
+	## 比较快照时资源注册表与当前注册表，漂移时要求刷新而不是静默换 atlas。
+	if str(operation.get("action", "fill")) in ["erase", "copy"]:
+		return {"ok": true}
+	if input.get("_authoritative_snapshot_digest_verified", false) != true:
+		return {
+			"ok": false,
+			"error_code": "authoritative_snapshot_digest_unverified",
+			"message": "The service did not verify the full snapshot artifact before compilation.",
+		}
+	var bindings_value = input.get("_authoritative_resource_bindings", {})
+	if not (bindings_value is Dictionary):
+		return {
+			"ok": false,
+			"error_code": "snapshot_resource_bindings_missing",
+			"message": "Authoritative snapshot has no compiler resource bindings.",
+		}
+	var resource_key := str(operation.get("resource", operation.get("resource_key", ""))).strip_edges()
+	var fallback_key := str(operation.get("fallback_resource", operation.get("fallback_resource_key", ""))).strip_edges()
+	var resolved_key := resource_key
+	var bindings: Dictionary = bindings_value
+	if not bindings.has(resolved_key) and fallback_key != "" and bindings.has(fallback_key):
+		resolved_key = fallback_key
+	if resolved_key == "" or not bindings.has(resolved_key):
+		return {
+			"ok": false,
+			"error_code": "snapshot_resource_binding_missing",
+			"message": "Semantic resource is not bound by the authoritative snapshot.",
+			"resource": resource_key,
+		}
+	var snapshot_entry = bindings.get(resolved_key, {})
+	if not (snapshot_entry is Dictionary):
+		return {
+			"ok": false,
+			"error_code": "snapshot_resource_binding_invalid",
+			"message": "Snapshot resource binding is not an object.",
+			"resource": resolved_key,
+		}
+	var live_document := _read_json_resource(RESOURCE_REGISTRY_PATH)
+	var live_bindings: Dictionary = (
+		live_document.get("data", {})
+		if live_document.get("data", {}) is Dictionary
+		else {}
+	)
+	var live_entry = live_bindings.get(resolved_key, {})
+	if not (live_entry is Dictionary) \
+			or _dictionary_sha256(snapshot_entry as Dictionary) != _dictionary_sha256(live_entry as Dictionary):
+		return {
+			"ok": false,
+			"error_code": "resource_registry_drift",
+			"message": "Resource registry changed after the authoritative snapshot was captured.",
+			"resource": resolved_key,
+		}
+	operation["resource"] = resolved_key
+	return {"ok": true}
+
+
+static func _compile_planned_resources(
+	result: Dictionary,
+	input: Dictionary,
+	target: Node,
+	map_layer: int,
+	dimension: int
+) -> Dictionary:
+	## 将 planner 的 semantic batches 确定性解析为 exact TileSet/GridMap 写批次。
+	if not bool(result.get("ok", false)):
+		return result
+	var container: Dictionary = result
+	var profile_value = result.get("profile_plan", null)
+	if profile_value is Dictionary:
+		container = profile_value
+	var batches_value = container.get("edit_map_batches", [])
+	if not (batches_value is Array) or (batches_value as Array).is_empty():
+		return result
+	var candidate_batches: Array = (batches_value as Array).duplicate(true)
+	var compiled_batches: Array = []
+	var reference_cell := _platform_reference_cell(input)
+	for batch_value in candidate_batches:
+		if not (batch_value is Dictionary):
+			continue
+		var batch: Dictionary = (batch_value as Dictionary).duplicate(true)
+		var operations_value = batch.get("operations", [])
+		if not (operations_value is Array):
+			continue
+		var compiled_operations: Array = []
+		for operation_value in operations_value:
+			if not (operation_value is Dictionary):
+				continue
+			var operation: Dictionary = (operation_value as Dictionary).duplicate(true)
+			if str(operation.get("semantic_layer", "")) == "ground" \
+					and not operation.has("reference_cell") \
+					and not reference_cell.is_empty():
+				operation["reference_cell"] = reference_cell.duplicate(true)
+			var snapshot_binding_check := _snapshot_resource_binding_error(input, operation)
+			if not bool(snapshot_binding_check.get("ok", false)):
+				container["candidate_edit_map_batches"] = candidate_batches
+				container["edit_map_batches"] = []
+				result["ok"] = false
+				result["error_code"] = "platform_resource_compilation_failed"
+				result["blocked_reason"] = "resource_compilation_failed"
+				result["resource_compilation_error"] = snapshot_binding_check
+				return result
+			var resource_entry := _apply_registry_fallback_to_operation(operation, dimension)
+			var contract_check := _validate_operation_resource_contract(
+				operation, resource_entry, dimension
+			)
+			if not bool(contract_check.get("ok", true)):
+				container["candidate_edit_map_batches"] = candidate_batches
+				container["edit_map_batches"] = []
+				result["ok"] = false
+				result["error_code"] = "platform_resource_compilation_failed"
+				result["blocked_reason"] = "resource_compilation_failed"
+				result["resource_compilation_error"] = contract_check
+				return result
+			var reference_check := _validate_ground_fill_reference(
+				target, dimension, map_layer, operation, resource_entry
+			)
+			if not bool(reference_check.get("ok", true)):
+				container["candidate_edit_map_batches"] = candidate_batches
+				container["edit_map_batches"] = []
+				result["ok"] = false
+				result["error_code"] = "platform_resource_compilation_failed"
+				result["blocked_reason"] = "resource_compilation_failed"
+				result["resource_compilation_error"] = reference_check
+				return result
+			compiled_operations.append(operation)
+		batch["operations"] = compiled_operations
+		compiled_batches.append(batch)
+	container["edit_map_batches"] = compiled_batches
+	container["resource_compilation"] = {
+		"status": "compiled",
+		"source": "verified_resource_registry_and_reference_cell",
+		"batch_count": compiled_batches.size(),
+	}
+	return result
+
+
 ## Validate and compile an LLM-authored platform route into a jump graph, tile batches, and leap validation plan.
 static func validate_platform_level_plan(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
@@ -4792,6 +5060,12 @@ static func validate_platform_level_plan(input: Dictionary, editor_interface: Ed
 	if not target_error.is_empty():
 		return target_error
 	var region := MapValidator.region_from_input(input, 2)
+	var map_layer := int(input.get("map_layer", 0))
+	var snapshot_error := _authoritative_snapshot_error(
+		input, str(target_result.get("path", "")), map_layer
+	)
+	if not snapshot_error.is_empty():
+		return snapshot_error
 	var limit_error := _region_limit_error(region, 2, "platform plan")
 	if not limit_error.is_empty():
 		return limit_error
@@ -4851,7 +5125,7 @@ static func validate_platform_level_plan(input: Dictionary, editor_interface: Ed
 			"error_code": "missing_entry_anchor",
 			"entry_sample": platform_input.get("entry_sample", {}),
 		}
-	var map_layer := int(platform_input.get("map_layer", 0))
+	map_layer = int(platform_input.get("map_layer", 0))
 	var collision_result := _platform_collision_facts(
 		platform_input,
 		target,
@@ -4872,7 +5146,9 @@ static func validate_platform_level_plan(input: Dictionary, editor_interface: Ed
 		collision_facts
 	)
 	result["planning_contract"] = contract
-	return result
+	result["authoritative_snapshot_id"] = input.get("authoritative_snapshot_id")
+	result["authoritative_snapshot_digest"] = input.get("authoritative_snapshot_digest")
+	return _compile_planned_resources(result, platform_input, target, map_layer, 2)
 
 
 ## Build a profile-based reachable frontier growth plan for platformer/topdown/dungeon/3d maps.
@@ -4888,6 +5164,12 @@ static func plan_reachable_map_growth(input: Dictionary, editor_interface: Edito
 	if not target_error.is_empty():
 		return target_error
 	var region := MapValidator.region_from_input(input, dimension)
+	var snapshot_map_layer := int(input.get("map_layer", 0))
+	var snapshot_error := _authoritative_snapshot_error(
+		input, str(target_result.get("path", "")), snapshot_map_layer
+	)
+	if not snapshot_error.is_empty():
+		return snapshot_error
 	var limit_error := _region_limit_error(region, dimension, "reachable growth")
 	if not limit_error.is_empty():
 		return limit_error
@@ -5001,7 +5283,11 @@ static func plan_reachable_map_growth(input: Dictionary, editor_interface: Edito
 		growth_collision_facts
 	)
 	result["planning_contract"] = contract
-	return result
+	result["authoritative_snapshot_id"] = input.get("authoritative_snapshot_id")
+	result["authoritative_snapshot_digest"] = input.get("authoritative_snapshot_digest")
+	return _compile_planned_resources(
+		result, growth_input, target, map_layer, dimension
+	)
 
 
 static func _ensure_entry_anchor_from_frontier(input: Dictionary) -> void:

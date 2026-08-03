@@ -41,9 +41,7 @@ MAP_AUX_WRITE_TOOL_NAMES = (
 MAP_WRITE_TOOL_NAMES = MAP_CONTENT_WRITE_TOOL_NAMES | MAP_AUX_WRITE_TOOL_NAMES
 # 需要 revision 守卫的工具：从能力声明的 requires_revision 字段派生
 MAP_REVISION_GUARDED_TOOL_NAMES = frozenset(
-    name
-    for name, capability in MAP_TOOL_CAPABILITIES.items()
-    if capability.requires_revision
+    name for name, capability in MAP_TOOL_CAPABILITIES.items() if capability.requires_revision
 )
 # 需要 target_path 的工具：从能力声明的 requires_target 字段派生
 MAP_TARGET_REQUIRED_TOOL_NAMES = frozenset(
@@ -51,9 +49,7 @@ MAP_TARGET_REQUIRED_TOOL_NAMES = frozenset(
 )
 # 验证类与规划类工具集合
 MAP_VALIDATION_TOOL_NAMES = map_tools_in_category("validation")
-MAP_PLAN_TOOL_NAMES = map_tools_in_category("plan") | map_tools_in_category(
-    "platform_plan"
-)
+MAP_PLAN_TOOL_NAMES = map_tools_in_category("plan") | map_tools_in_category("platform_plan")
 PLATFORM_PLAN_TOOL_NAMES = map_tools_in_category("platform_plan")
 MAP_WORKER_MODES = frozenset(
     {
@@ -148,6 +144,7 @@ def build_dynamic_map_worker(
     constraints = _workflow_constraints(spec.get("constraints", []))
     output_schema = spec.get("output_schema")
     approved_batch = spec.get("approved_batch")
+    authoritative_snapshot = spec.get("authoritative_snapshot")
     stage_id = spec.get("stage_id")
     if not isinstance(name, str) or not name.strip():
         return "worker_spec.name 不能为空"
@@ -165,6 +162,22 @@ def build_dynamic_map_worker(
         return "worker_spec.skills 必须是字符串数组"
     if output_schema != MAP_WORKER_RESULT_SCHEMA:
         return f"worker_spec.output_schema 必须是 {MAP_WORKER_RESULT_SCHEMA}"
+    if mode in {"propose_only", "repair_propose"}:
+        if not isinstance(authoritative_snapshot, dict):
+            return "规划 worker 必须提供 authoritative_snapshot artifact"
+        for field_name in (
+            "artifact_ref",
+            "snapshot_id",
+            "digest",
+            "target_path",
+        ):
+            value = authoritative_snapshot.get(field_name)
+            if not isinstance(value, str) or not value.strip():
+                return f"worker_spec.authoritative_snapshot.{field_name} 不能为空"
+        for field_name in ("map_layer", "map_revision"):
+            value = authoritative_snapshot.get(field_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                return f"worker_spec.authoritative_snapshot.{field_name} 必须是整数"
     if mode in MAP_WORKER_WRITE_MODES:
         if not isinstance(approved_batch, dict):
             return "写入 worker 必须提供 planner/validator 的 approved_batch artifact"
@@ -172,6 +185,7 @@ def build_dynamic_map_worker(
         batch_id = approved_batch.get("batch_id")
         target_path = approved_batch.get("target_path")
         map_revision = approved_batch.get("map_revision")
+        map_layer = approved_batch.get("map_layer")
         if not isinstance(artifact_ref, str) or not artifact_ref.strip():
             return "worker_spec.approved_batch.artifact_ref 不能为空"
         if not isinstance(batch_id, str) or not batch_id.strip():
@@ -180,6 +194,12 @@ def build_dynamic_map_worker(
             return "worker_spec.approved_batch.target_path 不能为空"
         if isinstance(map_revision, bool) or not isinstance(map_revision, int):
             return "worker_spec.approved_batch.map_revision 必须是整数"
+        if isinstance(map_layer, bool) or not isinstance(map_layer, int):
+            return "worker_spec.approved_batch.map_layer 必须是整数"
+        for field_name in ("snapshot_id", "snapshot_digest", "batch_fingerprint"):
+            value = approved_batch.get(field_name)
+            if not isinstance(value, str) or not value.strip():
+                return f"worker_spec.approved_batch.{field_name} 不能为空"
     skills = tuple(dict.fromkeys(requested_skills))
     if stage_id is not None and (not isinstance(stage_id, str) or not stage_id.strip()):
         return "worker_spec.stage_id 必须是非空字符串"
@@ -285,7 +305,28 @@ def _dynamic_map_worker_prompt(spec: dict[str, Any]) -> str:
     """只生成 mode 对应的任务指导；执行合同由运行时独立注入和校验。"""
     mode = str(spec.get("mode", ""))
     objective = str(spec.get("objective", "")).strip()
-    return _MAP_WORKER_PROMPT_BUILDERS[mode](objective)
+    prompt = _MAP_WORKER_PROMPT_BUILDERS[mode](objective)
+    snapshot = spec.get("authoritative_snapshot")
+    if mode in {"propose_only", "repair_propose"} and isinstance(snapshot, dict):
+        prompt += (
+            "\n权威地图快照由运行时绑定，禁止自行替换：\n"
+            + str(
+                {
+                    key: snapshot.get(key)
+                    for key in (
+                        "artifact_ref",
+                        "snapshot_id",
+                        "digest",
+                        "target_path",
+                        "map_layer",
+                        "map_revision",
+                        "execution_eligible",
+                    )
+                }
+            )
+            + "\n使用 read_planning_snapshot 读取 planner 投影；不要索取或输出逐格 atlas。"
+        )
+    return prompt
 
 
 def restore_project_agent(data: dict[str, Any], available_tools: set[str]) -> AgentDefinition:

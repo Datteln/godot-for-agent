@@ -24,6 +24,20 @@ def _object_schema(properties: dict[str, Any], required: list[str] | None = None
     }
 
 
+def _authoritative_snapshot_binding_properties() -> dict[str, Any]:
+    """返回仅由运行时注入的平台规划快照身份字段。"""
+    return {
+        "authoritative_snapshot_id": {"type": "string"},
+        "authoritative_snapshot_digest": {"type": "string"},
+        "authoritative_snapshot_target": {"type": "string"},
+        "authoritative_snapshot_layer": {"type": "integer"},
+        "authoritative_snapshot_revision": {"type": "integer"},
+        "authoritative_snapshot_coverage_complete": {"type": "boolean"},
+        "authoritative_snapshot_traversal_complete": {"type": "boolean"},
+        "authoritative_snapshot_frontier_complete": {"type": "boolean"},
+    }
+
+
 def _worker_spec_schema() -> dict[str, Any]:
     """返回动态地图 worker 的参数 schema。"""
     return _object_schema(
@@ -60,6 +74,29 @@ def _worker_spec_schema() -> dict[str, Any]:
                 ),
             },
             "output_schema": {"type": "string", "enum": ["map_worker_result_v1"]},
+            "authoritative_snapshot": {
+                "type": "object",
+                "description": (
+                    "Required for planner modes; runtime-owned authoritative map snapshot identity."
+                ),
+                "properties": {
+                    "artifact_ref": {"type": "string"},
+                    "snapshot_id": {"type": "string"},
+                    "digest": {"type": "string"},
+                    "target_path": {"type": "string"},
+                    "map_layer": {"type": "integer"},
+                    "map_revision": {"type": "integer"},
+                    "execution_eligible": {"type": "boolean"},
+                },
+                "required": [
+                    "artifact_ref",
+                    "snapshot_id",
+                    "digest",
+                    "target_path",
+                    "map_layer",
+                    "map_revision",
+                ],
+            },
             "approved_batch": {
                 "type": "object",
                 "description": (
@@ -70,13 +107,21 @@ def _worker_spec_schema() -> dict[str, Any]:
                     "artifact_ref": {"type": "string"},
                     "batch_id": {"type": "string"},
                     "target_path": {"type": "string"},
+                    "map_layer": {"type": "integer"},
                     "map_revision": {"type": "integer"},
+                    "snapshot_id": {"type": "string"},
+                    "snapshot_digest": {"type": "string"},
+                    "batch_fingerprint": {"type": "string"},
                 },
                 "required": [
                     "artifact_ref",
                     "batch_id",
                     "target_path",
+                    "map_layer",
                     "map_revision",
+                    "snapshot_id",
+                    "snapshot_digest",
+                    "batch_fingerprint",
                 ],
             },
             "stage_id": {"type": "string"},
@@ -2129,6 +2174,7 @@ def register_front_tools() -> None:
                 ),
                 "parameters": _object_schema(
                     {
+                        **_authoritative_snapshot_binding_properties(),
                         "target_path": {
                             "type": "string",
                             "description": "2D TileMapLayer/TileMap used to sample the existing entry boundary.",
@@ -2410,6 +2456,7 @@ def register_front_tools() -> None:
                 ),
                 "parameters": _object_schema(
                     {
+                        **_authoritative_snapshot_binding_properties(),
                         "profile": {
                             "type": "string",
                             "enum": ["platformer", "topdown", "dungeon", "3d_grid"],

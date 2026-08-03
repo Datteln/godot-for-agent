@@ -11,6 +11,25 @@ _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "blocked", "cancelled"})
 _NON_SUCCESS_TERMINAL_STATUSES = frozenset({"failed", "blocked", "cancelled"})
 
 
+def _is_map_writer_step(step: PlanStep) -> bool:
+    """判断计划步骤是否会创建受控地图写入 worker。"""
+    spec = step.worker_spec
+    return isinstance(spec, dict) and str(spec.get("mode", "")) in {
+        "write_one_batch",
+        "repair_write_one_batch",
+    }
+
+
+def _execution_blocked_dependency(step: PlanStep) -> bool:
+    """判断成功结束的 planner 是否只交付了不可执行规划。"""
+    if step.status != "succeeded" or step.result is None:
+        return False
+    return step.result.output.get("execution_status") in {
+        "blocked_by_validation",
+        "blocked_by_missing_facts",
+    }
+
+
 class PlanGraphError(ValueError):
     """表示计划 DAG、输入绑定或状态转换不合法。"""
 
@@ -299,6 +318,43 @@ class PlanGraph:
                 current_attempt_id=None,
             ),
         )
+        if result.output.get("planning_status") == "delivered":
+            publication_id = f"{step_id}__publication"
+            if not any(item.step_id == publication_id for item in graph.steps):
+                publication_output = {
+                    key: result.output.get(key)
+                    for key in (
+                        "planning_status",
+                        "execution_status",
+                        "target_path",
+                        "map_layer",
+                        "map_revision",
+                        "authoritative_snapshot",
+                        "semantic_plan",
+                        "unresolved_issues",
+                        "validation_history",
+                        "approved_batches",
+                    )
+                }
+                publication = PlanStep(
+                    step_id=publication_id,
+                    order=len(graph.steps),
+                    title=f"Publish final plan for {step.title}",
+                    agent="map-plan-publication",
+                    task="Publish the deterministic final planning outcome without executing writes.",
+                    depends_on=(step_id,),
+                    status="succeeded",
+                    result=PlanStepResult(
+                        status="succeeded",
+                        output=publication_output,
+                        artifact_refs=result.artifact_refs,
+                    ),
+                )
+                graph = PlanGraph(
+                    summary=graph.summary,
+                    steps=(*graph.steps, publication),
+                )
+                graph._validate()
         return graph._propagate_blocked()
 
     def defer_attempt(
@@ -513,11 +569,24 @@ class PlanGraph:
                     for dependency in step.depends_on
                     if by_id[dependency].status in _NON_SUCCESS_TERMINAL_STATUSES
                 )
+                if not blocked_by and _is_map_writer_step(step):
+                    blocked_by = tuple(
+                        dependency
+                        for dependency in step.depends_on
+                        if _execution_blocked_dependency(by_id[dependency])
+                    )
                 if not blocked_by:
                     continue
                 result = PlanStepResult(
                     status="blocked",
-                    error_code="predecessor_not_succeeded",
+                    error_code=(
+                        "execution_not_approved"
+                        if any(
+                            _execution_blocked_dependency(by_id[dependency])
+                            for dependency in blocked_by
+                        )
+                        else "predecessor_not_succeeded"
+                    ),
                     blocked_by=blocked_by,
                 )
                 replacements[step.step_id] = replace(

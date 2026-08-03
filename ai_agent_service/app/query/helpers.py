@@ -43,6 +43,7 @@ from app.api.schemas import (
     VerifyStartedHistoryBlock,
 )
 from app.events.store import Event
+
 # history 限流相关常量和工具函数已迁移到 app.history_bounds 共享模块，
 # 避免 helpers 与 history_bounds 之间重复维护同一套阈值/截断逻辑。
 from app.history_bounds import (
@@ -58,6 +59,7 @@ from app.orchestrator.map_progress import (
     map_revision_scope_key,
     parse_map_plan_outcome,
 )
+
 # 子 Frame 创建统一走 frame_factory，保证 history_anchor / parent_id 等字段的一致性
 from app.orchestrator.frame_factory import create_child_frame, typed_child_task_text
 from app.orchestrator.map_workers import (
@@ -749,8 +751,7 @@ def _single_known_map_target(session: Session) -> str:
     # 这里取 "::map_layer=" 前的 target_path 部分，再与 latest_layers 合并，
     # 得到去重后的目标集合。
     targets = {
-        key.split("::map_layer=", 1)[0]
-        for key in session.map_task_state.latest_revisions
+        key.split("::map_layer=", 1)[0] for key in session.map_task_state.latest_revisions
     } | set(session.map_task_state.latest_layers)
     state_targets = session.map_task_state.context_state.get("targets")
     if isinstance(state_targets, dict):
@@ -1340,6 +1341,7 @@ def _invalidate_stale_map_revision_state(
         "validation_workflows",
         "no_progress_streaks",
         "planning_attempts",
+        "authoritative_snapshots",
         "approved_platform_plans",
     ):
         mapping = getattr(state, field_name)
@@ -1358,9 +1360,9 @@ def _invalidate_stale_map_revision_state(
         state,
         "planning_fingerprints",
         {
-        key: value
-        for key, value in state.planning_fingerprints.items()
-        if not key.startswith(scope_prefix)
+            key: value
+            for key, value in state.planning_fingerprints.items()
+            if not key.startswith(scope_prefix)
         },
         target=target,
         revision=current_revision,
@@ -1393,11 +1395,7 @@ def _invalidate_stale_map_revision_state(
     replace_map_state_field(
         state,
         "latest_validations",
-        {
-            key: value
-            for key, value in state.latest_validations.items()
-            if key != target
-        },
+        {key: value for key, value in state.latest_validations.items() if key != target},
         target=target,
         revision=current_revision,
     )
@@ -1449,9 +1447,7 @@ def _map_revision_identity_is_authoritative(
     # revision_key 缺失时，仅在无图层维度时按 target_path 匹配
     explicit_target = tool_args.get("target_path")
     return (
-        isinstance(explicit_target, str)
-        and explicit_target.strip() == target
-        and map_layer is None
+        isinstance(explicit_target, str) and explicit_target.strip() == target and map_layer is None
     )
 
 
@@ -1755,16 +1751,12 @@ def _remember_map_validation(
     raw_structured_issues = result.get("structured_issues")
     normalized_issues = list(raw_issues) if isinstance(raw_issues, list) else []
     normalized_structured_issues = (
-        list(raw_structured_issues)
-        if isinstance(raw_structured_issues, list)
-        else []
+        list(raw_structured_issues) if isinstance(raw_structured_issues, list) else []
     )
     collection_error: str | None = None
     if raw_issues is not None and not isinstance(raw_issues, list):
         collection_error = "validation_issues_malformed"
-    elif raw_structured_issues is not None and not isinstance(
-        raw_structured_issues, list
-    ):
+    elif raw_structured_issues is not None and not isinstance(raw_structured_issues, list):
         collection_error = "validation_structured_issues_malformed"
     scope_error: str | None = None
     if not target:
@@ -1832,9 +1824,7 @@ def _remember_map_validation(
         "fingerprint": fingerprint,
         "repeat_count": count,
         "next_stage": (
-            "reviewer"
-            if _map_validation_is_successful(normalized_result)
-            else "planner"
+            "reviewer" if _map_validation_is_successful(normalized_result) else "planner"
         ),
         "scope_error": scope_error,
         "contract_error": contract_error,
@@ -2454,9 +2444,7 @@ def _resume_pending_map_tool_after_read(session: Session) -> ChatToolCallsRespon
     latest_layer = session.map_task_state.latest_layers.get(target_path)
     input_layer = restored_input.get("map_layer", latest_layer)
     scoped_layer = (
-        input_layer
-        if isinstance(input_layer, int) and not isinstance(input_layer, bool)
-        else None
+        input_layer if isinstance(input_layer, int) and not isinstance(input_layer, bool) else None
     )
     latest_revision = latest_map_revision(session, target_path, scoped_layer)
     if (
@@ -2589,8 +2577,7 @@ def _needs_map_state_read_before_write(session: Session, call: FrontToolCallDTO)
     )
     missing_revision = latest_map_revision(session, target, map_layer) is None
     missing_layer = (
-        "map_layer" not in call.input
-        and target not in session.map_task_state.latest_layers
+        "map_layer" not in call.input and target not in session.map_task_state.latest_layers
     )
     return missing_revision or missing_layer
 
@@ -2685,9 +2672,7 @@ def _resume_pending_map_write_after_read(session: Session) -> ChatToolCallsRespo
     latest_layer = session.map_task_state.latest_layers.get(target)
     input_layer = write_call.input.get("map_layer", latest_layer)
     map_layer = (
-        input_layer
-        if isinstance(input_layer, int) and not isinstance(input_layer, bool)
-        else None
+        input_layer if isinstance(input_layer, int) and not isinstance(input_layer, bool) else None
     )
     latest_revision = latest_map_revision(session, target, map_layer)
     if latest_revision is None or ("map_layer" not in write_call.input and latest_layer is None):
@@ -2937,9 +2922,7 @@ async def _schedule_revision_conflict_reader(
     # ValueError 表示 prompt 构建失败（如缺少必要上下文），此时写入错误消息并中止调度。
     try:
         prompt = (
-            await prompt_factory(reader, task_text)
-            if prompt_factory is not None
-            else reader.prompt
+            await prompt_factory(reader, task_text) if prompt_factory is not None else reader.prompt
         )
     except ValueError as exc:
         frame.messages.append(

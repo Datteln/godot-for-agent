@@ -77,6 +77,31 @@ MAP_WORKER_RESULT_JSON_SCHEMA_V1: Final[dict[str, Any]] = {
         },
         "missing_inputs": {"type": "array"},
         "risks": {"type": "array"},
+        "planning_status": {
+            "type": "string",
+            "enum": ["pending", "delivered"],
+        },
+        "execution_status": {
+            "type": "string",
+            "enum": [
+                "pending",
+                "approved",
+                "blocked_by_validation",
+                "blocked_by_missing_facts",
+            ],
+        },
+        "authoritative_snapshot": {"type": "object"},
+        "semantic_plan": {
+            "type": "object",
+            "properties": {
+                "platforms": {"type": "array"},
+                "segments": {"type": "array"},
+                "semantic_resources": {"type": "array"},
+                "reference_cells": {"type": "array"},
+                "rationale": {"type": "string"},
+            },
+        },
+        "approved_batches": {"type": "array"},
         "next_stage": {
             "type": "string",
             "enum": [
@@ -98,13 +123,9 @@ MAP_RUNTIME_STAGE_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
     "read": frozenset({"read", "plan", "write"}),
     "plan": frozenset({"read", "plan", "write"}),
     "write": frozenset({"read", "plan", "write", "validate"}),
-    "validate": frozenset(
-        {"read", "plan", "write", "validate", "review", "diagnostic"}
-    ),
+    "validate": frozenset({"read", "plan", "write", "validate", "review", "diagnostic"}),
     "review": frozenset({"read", "plan", "review", "diagnostic"}),
-    "diagnostic": frozenset(
-        {"read", "plan", "write", "validate", "review", "diagnostic"}
-    ),
+    "diagnostic": frozenset({"read", "plan", "write", "validate", "review", "diagnostic"}),
 }
 
 MAP_WORKER_TO_RUNTIME_STAGE: Final[dict[str, str]] = {
@@ -122,9 +143,7 @@ MAP_WORKER_NEXT_STAGES: Final[dict[str, frozenset[str]]] = {
     "writer": frozenset({"planner", "validator", "reviewer", "replan"}),
     "validator": frozenset({"planner", "validator", "reviewer", "replan"}),
     "repairer": frozenset({"planner", "validator", "reviewer", "replan"}),
-    "reviewer": frozenset(
-        {"planner", "reviewer", "complete", "completed", "replan"}
-    ),
+    "reviewer": frozenset({"planner", "reviewer", "complete", "completed", "replan"}),
 }
 
 MAP_WORKER_STAGES: Final = frozenset(MAP_WORKER_NEXT_STAGES)
@@ -151,18 +170,12 @@ def specialized_map_worker_schema(frame: Frame) -> dict[str, Any]:
     for field_name, value in constraints:
         if value is None or value == "":
             continue
-        if field_name == "map_revision" and (
-            not isinstance(value, int) or isinstance(value, bool)
-        ):
+        if field_name == "map_revision" and (not isinstance(value, int) or isinstance(value, bool)):
             continue
         # const 是更紧的约束：丢弃基础 schema 的 enum，避免 const 值不在 enum 中时
         # 产生不可满足字段（如 orchestrator 帧的 stage="orchestrator" 不在 worker enum
         # ["reader","planner","writer","validator","repairer","reviewer"] 内，导致正确输出被误判）。
-        specialized = {
-            key: prop
-            for key, prop in properties[field_name].items()
-            if key != "enum"
-        }
+        specialized = {key: prop for key, prop in properties[field_name].items() if key != "enum"}
         specialized["const"] = value
         properties[field_name] = specialized
     if frame.allowed_next_stages:
@@ -212,6 +225,17 @@ def _stage_example(frame: Frame) -> dict[str, Any]:
         },
         "missing_inputs": [],
         "risks": [],
+        "planning_status": "pending",
+        "execution_status": "pending",
+        "authoritative_snapshot": {},
+        "semantic_plan": {
+            "platforms": [],
+            "segments": [],
+            "semantic_resources": [],
+            "reference_cells": [],
+            "rationale": "",
+        },
+        "approved_batches": [],
         "next_stage": next_stage,
     }
 

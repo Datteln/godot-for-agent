@@ -63,20 +63,23 @@ MAP_TOOL_CAPABILITIES: Final[dict[str, MapToolCapability]] = {
         {"read", "plan", "write", "validate", "diagnostic", "review"},
         _READ_MODES | _PLAN_MODES | _WRITE_MODE | _REPAIR_WRITE_MODE | _REVIEW_MODE,
     ),
+    "read_planning_snapshot": _capability(
+        "artifact_read",
+        {"read", "plan", "validate", "diagnostic", "review"},
+        _READ_MODES | _PLAN_MODES | _REVIEW_MODE,
+    ),
     "describe_map_context": _capability("context_read", {"read"}, _READ_MODES),
     "describe_map_region": _capability(
         "context_read",
-        {"read", "plan", "write", "validate", "diagnostic", "review"},
-        _READ_MODES | _PLAN_MODES | _REVIEW_MODE,
+        {"read", "write", "validate", "diagnostic", "review"},
+        _READ_MODES | _REVIEW_MODE,
     ),
     "describe_tilemap_selection": _capability("context_read", {"read"}, _READ_MODES),
-    "read_scene_tree": _capability(
-        "context_read", {"read", "review"}, _READ_MODES | _REVIEW_MODE
-    ),
+    "read_scene_tree": _capability("context_read", {"read", "review"}, _READ_MODES | _REVIEW_MODE),
     "read_file": _capability(
         "context_read",
-        {"read", "plan", "write", "validate", "diagnostic"},
-        _READ_MODES | _PLAN_MODES,
+        {"read", "write", "validate", "diagnostic"},
+        _READ_MODES,
     ),
     "read_class_docs": _capability(
         "context_read", {"read", "plan", "validate", "review"}, _READ_MODES | _PLAN_MODES
@@ -89,13 +92,11 @@ MAP_TOOL_CAPABILITIES: Final[dict[str, MapToolCapability]] = {
     ),
     "query_spatial_index": _capability(
         "context_read",
-        {"read", "plan", "write", "validate", "diagnostic"},
-        _READ_MODES | _PLAN_MODES | _REVIEW_MODE,
+        {"read", "write", "validate", "diagnostic"},
+        _READ_MODES | _REVIEW_MODE,
     ),
     "convert_map_coords": _capability("context_read", {"read"}, _READ_MODES),
-    "find_placement_anchors": _capability(
-        "context_read", {"plan", "write"}, _PLAN_MODES
-    ),
+    "find_placement_anchors": _capability("context_read", {"plan", "write"}, _PLAN_MODES),
     "plan_map_layout": _capability("plan", {"plan"}, _PLAN_MODES),
     "plan_map_algorithms": _capability("plan", {"plan"}, _PLAN_MODES),
     "validate_platform_level_plan": _capability("platform_plan", {"plan"}, _PLAN_MODES),
@@ -107,12 +108,8 @@ MAP_TOOL_CAPABILITIES: Final[dict[str, MapToolCapability]] = {
     "validate_map_region": _capability(
         "validation", {"validate", "diagnostic", "review"}, _REVIEW_MODE
     ),
-    "validate_layer_coverage": _capability(
-        "validation", {"validate", "review"}, _REVIEW_MODE
-    ),
-    "validate_object_placements": _capability(
-        "validation", {"validate", "review"}, _REVIEW_MODE
-    ),
+    "validate_layer_coverage": _capability("validation", {"validate", "review"}, _REVIEW_MODE),
+    "validate_object_placements": _capability("validation", {"validate", "review"}, _REVIEW_MODE),
     "save_scene": _capability("scene_commit", {"review"}),
     "edit_map": _capability(
         "content_write",
@@ -175,9 +172,7 @@ MAP_TOOL_CAPABILITIES: Final[dict[str, MapToolCapability]] = {
     "save_map_blueprint": _capability(
         "template_write", {"write"}, _WRITE_MODE, requires_target=True
     ),
-    "ensure_standard_map_layers": _capability(
-        "structure_write", {"write"}, _WRITE_MODE
-    ),
+    "ensure_standard_map_layers": _capability("structure_write", {"write"}, _WRITE_MODE),
 }
 
 

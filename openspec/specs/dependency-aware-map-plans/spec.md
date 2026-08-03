@@ -14,15 +14,15 @@ The system SHALL preserve stable step ids and `depends_on` edges from plan creat
 - **THEN** the scheduler consumes the same immutable step definitions without dropping or rewriting dependency edges
 
 ### Requirement: Success unlocks dependent steps
-The scheduler MUST start a step only after every declared predecessor has completed successfully and every declared predecessor-result binding has been resolved into the successor contract.
+The scheduler MUST start an execution step only after every declared predecessor has completed successfully and every declared predecessor-result binding has been resolved into the successor contract. A plan-publication step MAY depend on an exhausted deterministic validation outcome, but that outcome MUST NOT satisfy or unlock a writer dependency.
 
 #### Scenario: All predecessors succeed
-- **WHEN** all dependencies of a pending step have typed status `succeeded` and their declared bindings resolve
+- **WHEN** all dependencies of a pending execution step have typed status `succeeded` and their declared bindings resolve
 - **THEN** the scheduler makes that step runnable
 
 #### Scenario: A predecessor reaches terminal failure
 - **WHEN** any dependency reaches an exhausted or proven permanent `failed`, explicit `cancelled`, or terminal `blocked` state
-- **THEN** the scheduler does not start the dependent step and records a typed blocked result that identifies the predecessor
+- **THEN** the scheduler does not start dependent execution steps and records a typed blocked result that identifies the predecessor
 
 #### Scenario: A predecessor attempt is recoverable
 - **WHEN** a dependency attempt requests reader recovery, a new attempt, authoritative refresh, or replan
@@ -32,11 +32,19 @@ The scheduler MUST start a step only after every declared predecessor has comple
 - **WHEN** dependencies succeeded but a required result path or artifact reference is absent or malformed
 - **THEN** the scheduler records a typed binding failure with the step, dependency, and path and creates no child Frame
 
+#### Scenario: Planner validation budget is exhausted
+- **WHEN** the third candidate fails deterministic validation
+- **THEN** the scheduler runs final plan publication with the exhausted result, keeps the writer blocked, and creates no write Frame
+
 ### Requirement: Predecessor results become explicit inputs
-The scheduler MUST bind predecessor typed results or artifact references into the successor input contract inside the scheduler error boundary.
+The scheduler MUST bind predecessor typed results or artifact references into the successor input contract inside the scheduler error boundary. The planner SHALL receive a typed snapshot projection, the validator/compiler SHALL receive the semantic plan plus full snapshot reference, and the writer SHALL receive only compiled approved batch artifacts.
+
+#### Scenario: Planner output feeds validator and compiler
+- **WHEN** a planner step succeeds with a semantic route candidate
+- **THEN** the validator/compiler receives that candidate and the exact authoritative snapshot reference as named contract inputs
 
 #### Scenario: Planner output feeds writer
-- **WHEN** a planner step succeeds with approved batch artifacts
+- **WHEN** validation and compilation succeed with approved batch artifacts
 - **THEN** the writer receives those artifacts as named contract inputs rather than reconstructing a plan from write operations
 
 #### Scenario: A binding path is invalid
@@ -44,11 +52,15 @@ The scheduler MUST bind predecessor typed results or artifact references into th
 - **THEN** the scheduler returns a stable typed `dependency_binding_failed` outcome instead of propagating an exception or HTTP 500
 
 ### Requirement: Writers execute only approved batches
-The service layer MUST reject map writes that are not bound to a planner and validator approval contract.
+The service layer MUST reject map writes that are not bound to a deterministic validator/compiler approval for the same target, layer, revision, snapshot digest, and batch fingerprint. Planner-produced naked atlas operations MUST NOT be treated as an approval contract.
 
 #### Scenario: Unapproved edit batch is requested
 - **WHEN** a writer receives an edit batch without a valid approval contract for the same target and revision
-- **THEN** the system routes the work back to planning and does not synthesize platform parameters
+- **THEN** the system routes the work back to planning or refresh and does not synthesize platform parameters
+
+#### Scenario: Planner supplies raw atlas operations
+- **WHEN** a planner result contains exact atlas operations but no matching compiler approval
+- **THEN** the writer rejects them without starting a transaction or mutating the map
 
 ### Requirement: Worker stage transitions fail as typed plan outcomes
 Worker contract construction and workflow stage transitions MUST execute inside a boundary that converts invalid transitions and payload construction failures into typed plan outcomes.
@@ -120,3 +132,14 @@ The runtime MUST maintain a reducer-owned convergence count scoped to the stable
 #### Scenario: A distinct task epoch begins
 - **WHEN** the runtime starts a distinct task lineage through `task_epoch_started`
 - **THEN** the new task receives a fresh convergence budget without removing the prior task's diagnostic history
+
+### Requirement: Planning publication is independent from writer execution
+The dependency graph MUST represent user-visible plan publication as a separate step from map writing. Publication SHALL accept either an approved plan or a validation-exhausted final candidate and SHALL accurately expose its execution status.
+
+#### Scenario: Approved plan is published
+- **WHEN** validation and compilation succeed
+- **THEN** publication reports `planning_status=delivered` and `execution_status=approved` while the writer follows its approval dependency
+
+#### Scenario: Exhausted plan is published
+- **WHEN** all three planner candidates fail deterministic validation
+- **THEN** publication reports `planning_status=delivered` and `execution_status=blocked_by_validation` while no writer dependency is satisfied

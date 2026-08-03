@@ -26,6 +26,14 @@ from app.orchestrator.map_recovery import (
     retry_pause_report,
 )
 from app.orchestrator.map_artifacts import MapArtifactStore
+from app.orchestrator.map_planning_snapshots import (
+    ApprovedBatchStore,
+    PlanningRepairStore,
+    PlanningSnapshotStore,
+    build_region_snapshot,
+    merge_frontier_snapshot,
+    planning_snapshot_scope,
+)
 
 if TYPE_CHECKING:
     from app.agents.types import Frame
@@ -120,6 +128,9 @@ class MapTaskState:
     validation_failure_counts: dict[str, int] = field(default_factory=dict)
     planning_attempts: dict[str, int] = field(default_factory=dict)
     planning_fingerprints: dict[str, int] = field(default_factory=dict)
+    authoritative_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    planning_attempt_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    planning_publications: dict[str, dict[str, Any]] = field(default_factory=dict)
     tool_failure_fingerprints: dict[str, dict[str, Any]] = field(default_factory=dict)
     approved_platform_plans: dict[str, dict[str, Any]] = field(default_factory=dict)
     latest_revisions: dict[str, int] = field(default_factory=dict)
@@ -156,9 +167,7 @@ class MapTaskState:
         """
         allowed = _MAP_STATUS_TRANSITIONS.get(self.status, frozenset())
         if next_status not in allowed:
-            raise ValueError(
-                f"illegal map task status transition: {self.status} -> {next_status}"
-            )
+            raise ValueError(f"illegal map task status transition: {self.status} -> {next_status}")
         self.status = next_status
 
     def transition_stage(self, next_stage: str) -> None:
@@ -209,6 +218,9 @@ class MapTaskState:
             ("validation_failure_counts", {}),
             ("planning_attempts", {}),
             ("planning_fingerprints", {}),
+            ("authoritative_snapshots", {}),
+            ("planning_attempt_history", {}),
+            ("planning_publications", {}),
             ("tool_failure_fingerprints", {}),
             ("approved_platform_plans", {}),
             ("region_reads", {}),
@@ -308,8 +320,7 @@ class MapTaskState:
             missing = sorted(actual - declared)
             stale = sorted(declared - actual)
             raise RuntimeError(
-                "MapTaskState lifecycle metadata mismatch: "
-                f"missing={missing}, stale={stale}"
+                "MapTaskState lifecycle metadata mismatch: " f"missing={missing}, stale={stale}"
             )
         reset_values: dict[str, Any] = {}
         for item in fields(self):
@@ -321,18 +332,14 @@ class MapTaskState:
             elif item.default is not MISSING:
                 reset_values[item.name] = deepcopy(item.default)
             else:
-                raise RuntimeError(
-                    f"MapTaskState field has no reset default: {item.name}"
-                )
+                raise RuntimeError(f"MapTaskState field has no reset default: {item.name}")
         return reset_values
 
     @classmethod
     def from_dict(cls, value: Any) -> MapTaskState:
         """从持久化字典恢复地图任务状态。"""
         if isinstance(value, cls):
-            raise TypeError(
-                "MapTaskState hydration accepts raw persisted dictionaries only"
-            )
+            raise TypeError("MapTaskState hydration accepts raw persisted dictionaries only")
         if not isinstance(value, dict):
             return cls()
         field_names = set(cls.__dataclass_fields__)
@@ -358,6 +365,9 @@ class MapTaskState:
             "validation_failure_counts",
             "planning_attempts",
             "planning_fingerprints",
+            "authoritative_snapshots",
+            "planning_attempt_history",
+            "planning_publications",
             "tool_failure_fingerprints",
             "approved_platform_plans",
             "latest_revisions",
@@ -459,6 +469,10 @@ class MapTaskState:
             "pending_batches": deepcopy(self.pending_batches),
             "executed_batches": deepcopy(self.executed_batches),
             "latest_revisions": dict(self.latest_revisions),
+            "authoritative_snapshots": deepcopy(self.authoritative_snapshots),
+            "planning_attempt_history": deepcopy(self.planning_attempt_history),
+            "planning_publications": deepcopy(self.planning_publications),
+            "approved_platform_plans": deepcopy(self.approved_platform_plans),
             "known_regions": list(self.region_reads),
         }
         dispatch_map_workflow_event(
@@ -503,10 +517,7 @@ def _migrate_legacy_workflow_scope_data(data: dict[str, Any]) -> None:
             "stage": str(data.get("stage", "read")),
         }
         validation = latest_validations.get(target_value)
-        if (
-            isinstance(validation, dict)
-            and validation.get("map_revision") == revision
-        ):
+        if isinstance(validation, dict) and validation.get("map_revision") == revision:
             scope["validation"] = deepcopy(validation)
         scoped_blockers = [
             deepcopy(item)
@@ -542,6 +553,9 @@ MAP_TASK_FIELD_LIFECYCLE: Final[dict[str, MapTaskFieldLifecycle]] = {
     "validation_failure_counts": MapTaskFieldLifecycle("revision"),
     "planning_attempts": MapTaskFieldLifecycle("task"),
     "planning_fingerprints": MapTaskFieldLifecycle("task"),
+    "authoritative_snapshots": MapTaskFieldLifecycle("revision"),
+    "planning_attempt_history": MapTaskFieldLifecycle("task"),
+    "planning_publications": MapTaskFieldLifecycle("task"),
     "tool_failure_fingerprints": MapTaskFieldLifecycle("task"),
     "approved_platform_plans": MapTaskFieldLifecycle("revision"),
     "latest_revisions": MapTaskFieldLifecycle("revision"),
@@ -688,9 +702,7 @@ def latest_map_revision(
     """
     state: MapTaskState = session.map_task_state
     # 优先查找带图层作用域的 revision
-    scoped = state.latest_revisions.get(
-        map_revision_scope_key(target, map_layer)
-    )
+    scoped = state.latest_revisions.get(map_revision_scope_key(target, map_layer))
     if scoped is not None:
         return scoped
     # 若指定了图层但会话记录的图层不匹配，视为无有效 revision
@@ -974,10 +986,33 @@ def _target(tool_args: dict[str, Any]) -> str:
 
 
 def _platform_plan_scope(tool_args: dict[str, Any]) -> str:
-    """为平台规划修订次数生成目标与图层隔离的作用域。"""
+    """为平台规划事实生成目标与图层隔离的基础作用域。"""
     layer = tool_args.get("map_layer", 0)
     layer_value = layer if isinstance(layer, int) and not isinstance(layer, bool) else 0
     return f"{_target(tool_args)}::map_layer={layer_value}"
+
+
+def _planning_operation(tool_name: str) -> str:
+    """把兼容规划工具名规整为稳定的规划操作。"""
+    if tool_name == "validate_platform_level_plan":
+        return "platform_route_validation"
+    return tool_name
+
+
+def _planning_attempt_scope(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> str:
+    """生成绑定任务 lineage、地图作用域、快照和操作的尝试键。"""
+    lineage = str(
+        session.map_task_lineage.get("lineage_id") or session.map_task_state.task_id or "unbound"
+    )
+    snapshot_id = str(tool_args.get("authoritative_snapshot_id", "legacy"))
+    return (
+        f"lineage={lineage}::{_platform_plan_scope(tool_args)}::"
+        f"snapshot={snapshot_id}::operation={_planning_operation(tool_name)}"
+    )
 
 
 def _platform_plan_fingerprint(tool_name: str, tool_args: dict[str, Any]) -> str | None:
@@ -1002,13 +1037,15 @@ def _platform_plan_fingerprint(tool_name: str, tool_args: dict[str, Any]) -> str
                 "max_horizontal_gap",
                 "max_rise",
                 "max_fall",
-    "gravity_axis",
-    "gravity_sign",
-    "frontier_axis",
-    "frontier_sign",
-)
+                "gravity_axis",
+                "gravity_sign",
+                "frontier_axis",
+                "frontier_sign",
+            )
             if key in tool_args
         },
+        "authoritative_snapshot_id": tool_args.get("authoritative_snapshot_id"),
+        "authoritative_snapshot_digest": tool_args.get("authoritative_snapshot_digest"),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
@@ -1035,9 +1072,7 @@ def map_tool_call_fingerprint(
 ) -> str:
     """生成忽略编排元数据的稳定地图工具调用指纹。"""
     normalized = {
-        key: value
-        for key, value in tool_args.items()
-        if key not in _TOOL_FAILURE_VOLATILE_KEYS
+        key: value for key, value in tool_args.items() if key not in _TOOL_FAILURE_VOLATILE_KEYS
     }
     encoded = json.dumps(
         {"tool": tool_name, "args": normalized},
@@ -1097,20 +1132,188 @@ def map_platform_plan_call_error(
     tool_name: str,
     tool_args: dict[str, Any],
 ) -> str | None:
-    """在执行前拒绝完全相同的平台规划提交（修订计数上限已移除，仅靠语义指纹去重防 thrash）。"""
+    """执行前拒绝缺快照、第四次或未修订的平台规划提交。"""
     if tool_name not in PLATFORM_PLAN_TOOL_NAMES:
         return None
-    scope = _platform_plan_scope(tool_args)
+    snapshot_error = bind_authoritative_snapshot(session, tool_name, tool_args)
+    if snapshot_error is not None:
+        return snapshot_error
+    attempt_scope = _planning_attempt_scope(session, tool_name, tool_args)
+    if session.map_task_state.planning_attempts.get(attempt_scope, 0) >= 3:
+        return (
+            "planning_attempts_exhausted：当前 task lineage、target、layer、snapshot "
+            "和规划操作已完成三次确定性校验。规划结果已经或将被交付；禁止第四次校验，"
+            "writer 必须保持阻断，直到 revision/facts 变化并产生新快照。"
+        )
     fingerprint = _platform_plan_fingerprint(tool_name, tool_args)
     if fingerprint is None:
         return None
-    fingerprint_key = f"{scope}::{fingerprint}"
+    fingerprint_key = f"{attempt_scope}::{fingerprint}"
     if session.map_task_state.planning_fingerprints.get(fingerprint_key, 0) > 0:
         return (
-            "该 platforms/segments 方案已经校验过，确定性结果不会因重复提交改变；"
+            "unchanged_plan_attempt：该 platforms/segments 方案已经校验过，"
+            "确定性结果不会因重复提交改变；"
             "必须根据 issues/repair_plan 修改具体平台字段。"
         )
     return None
+
+
+def active_planning_snapshot(
+    session: Session,
+    target_path: str,
+    map_layer: int,
+) -> dict[str, Any] | None:
+    """返回与当前 canonical revision 一致的权威规划快照定位。"""
+    scope = planning_snapshot_scope(target_path, map_layer)
+    value = session.map_task_state.authoritative_snapshots.get(scope)
+    if not isinstance(value, dict):
+        return None
+    revision = latest_map_revision(session, target_path, map_layer)
+    if value.get("map_revision") != revision:
+        return None
+    if not str(value.get("snapshot_id", "")).strip() or not str(value.get("digest", "")).strip():
+        return None
+    return deepcopy(value)
+
+
+def bind_authoritative_snapshot(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    project_root: Path | None = None,
+) -> str | None:
+    """把当前权威快照身份绑定到规划调用，失败时返回类型化刷新指令。"""
+    if tool_name not in PLATFORM_PLAN_TOOL_NAMES:
+        return None
+    target = _target(tool_args)
+    layer_value = tool_args.get("map_layer", 0)
+    layer = layer_value if isinstance(layer_value, int) and not isinstance(layer_value, bool) else 0
+    snapshot = active_planning_snapshot(session, target, layer)
+    if snapshot is None:
+        return (
+            "authoritative_snapshot_required：当前平台方案没有同 target/layer/revision 的"
+            "权威快照。请由 reader 以 cells_format=non_empty_only/full 读取完整覆盖区域，"
+            "再按显式 traversal profile 运行 compute_reachable_frontier；禁止 planner "
+            "自行读取或猜测第二份事实基线。"
+        )
+    if snapshot.get("execution_eligible") is not True:
+        missing = [
+            key
+            for key, complete in dict(snapshot.get("completeness", {})).items()
+            if complete is not True
+        ]
+        return (
+            "authoritative_snapshot_incomplete：快照不能授权确定性执行；"
+            f"missing_or_stale={missing}。请由 reader 定向刷新或重算 frontier。"
+        )
+    tool_args["authoritative_snapshot_id"] = snapshot["snapshot_id"]
+    tool_args["authoritative_snapshot_digest"] = snapshot["digest"]
+    tool_args["authoritative_snapshot_target"] = snapshot["target_path"]
+    tool_args["authoritative_snapshot_layer"] = snapshot["map_layer"]
+    tool_args["authoritative_snapshot_revision"] = snapshot["map_revision"]
+    tool_args["authoritative_snapshot_coverage_complete"] = bool(
+        dict(snapshot.get("completeness", {})).get("coverage", False)
+    )
+    tool_args["authoritative_snapshot_traversal_complete"] = bool(
+        dict(snapshot.get("completeness", {})).get("traversal_profile", False)
+    )
+    tool_args["authoritative_snapshot_frontier_complete"] = bool(
+        dict(snapshot.get("completeness", {})).get("reachable_frontier", False)
+    )
+    full_snapshot = None
+    if project_root is not None:
+        try:
+            full_snapshot = PlanningSnapshotStore(
+                project_root,
+                session.session_id,
+                session.session_epoch,
+            ).read(str(snapshot["artifact_ref"]))
+        except (OSError, TypeError, ValueError):
+            return (
+                "authoritative_snapshot_digest_mismatch：快照 artifact 无法通过身份或 digest "
+                "校验，请由 reader 重新物化同 revision 快照。"
+            )
+    projection = (
+        full_snapshot.planner_projection()
+        if full_snapshot is not None
+        else snapshot.get("planner_projection")
+    )
+    if isinstance(projection, dict):
+        route_facts = projection.get("route_facts")
+        if isinstance(route_facts, dict):
+            entry = route_facts.get("entry_anchor")
+            frontier = route_facts.get("reachable_frontier")
+            if "entry_anchor" not in tool_args and isinstance(entry, dict) and entry:
+                tool_args["entry_anchor"] = deepcopy(entry)
+            if "frontier" not in tool_args and isinstance(frontier, dict) and frontier:
+                tool_args["frontier"] = deepcopy(frontier)
+    if full_snapshot is not None:
+        tool_args["_authoritative_resource_bindings"] = deepcopy(full_snapshot.resource_bindings)
+        tool_args["_authoritative_snapshot_digest_verified"] = True
+    return None
+
+
+def remember_planning_snapshot_evidence(
+    session: Session,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    result: dict[str, Any],
+    project_root: Path,
+    evidence_ref: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """把 canonical region/frontier 结果物化为可恢复的权威规划快照。"""
+    if tool_name not in {"describe_map_region", "compute_reachable_frontier"}:
+        return None
+    if result.get("ok") is not True:
+        return None
+    store = PlanningSnapshotStore(
+        project_root,
+        session.session_id,
+        session.session_epoch,
+    )
+    try:
+        if tool_name == "describe_map_region":
+            snapshot = build_region_snapshot(
+                tool_args,
+                result,
+                evidence_ref=evidence_ref,
+            )
+        else:
+            target_value = result.get(
+                "target",
+                result.get("target_path", tool_args.get("target_path", "")),
+            )
+            target = target_value if isinstance(target_value, str) else ""
+            layer_value = result.get("map_layer", tool_args.get("map_layer", 0))
+            layer = (
+                layer_value
+                if isinstance(layer_value, int) and not isinstance(layer_value, bool)
+                else 0
+            )
+            current = active_planning_snapshot(session, target, layer)
+            if current is None:
+                return None
+            base = store.read(str(current["artifact_ref"]))
+            snapshot = merge_frontier_snapshot(
+                base,
+                tool_args,
+                result,
+                evidence_ref=evidence_ref,
+            )
+        locator = store.store(snapshot)
+    except (OSError, TypeError, ValueError):
+        return None
+    scope = planning_snapshot_scope(snapshot.target_path, snapshot.map_layer)
+    snapshots = dict(session.map_task_state.authoritative_snapshots)
+    snapshots[scope] = locator
+    replace_map_state_field(
+        session.map_task_state,
+        "authoritative_snapshots",
+        snapshots,
+        target=snapshot.target_path,
+        revision=snapshot.map_revision,
+    )
+    return deepcopy(locator)
 
 
 def build_map_progress_digest(session: Session, project_root: Path | None = None) -> str:
@@ -1135,12 +1338,78 @@ def build_map_progress_digest(session: Session, project_root: Path | None = None
         repair = frontier.get("repair_plan")
         if isinstance(repair, list) and repair:
             parts.append(f"repair_plan={json.dumps(repair[:6], ensure_ascii=False)}")
+    snapshots = [
+        {
+            key: value.get(key)
+            for key in (
+                "artifact_ref",
+                "snapshot_id",
+                "digest",
+                "target_path",
+                "map_layer",
+                "map_revision",
+                "execution_eligible",
+            )
+        }
+        for value in state.authoritative_snapshots.values()
+        if isinstance(value, dict)
+    ]
+    if snapshots:
+        parts.append(
+            "planning_snapshots="
+            + json.dumps(snapshots[-4:], ensure_ascii=False, separators=(",", ":"))
+        )
+    if state.planning_attempt_history:
+        latest_history: list[dict[str, Any]] = next(
+            reversed(state.planning_attempt_history.values()), []
+        )
+        if latest_history:
+            parts.append(
+                "planning_attempts="
+                + json.dumps(latest_history[-3:], ensure_ascii=False, separators=(",", ":"))
+            )
+    if state.planning_publications:
+        latest_publication: dict[str, Any] = next(
+            reversed(state.planning_publications.values()), {}
+        )
+        if latest_publication:
+            semantic_value = latest_publication.get("semantic_plan", {})
+            semantic = semantic_value if isinstance(semantic_value, dict) else {}
+            approved_value = latest_publication.get("approved_batches", [])
+            approved = approved_value if isinstance(approved_value, list) else []
+            publication_digest = {
+                key: latest_publication.get(key)
+                for key in (
+                    "planning_status",
+                    "execution_status",
+                    "target_path",
+                    "map_layer",
+                    "map_revision",
+                    "authoritative_snapshot",
+                )
+            }
+            publication_digest["semantic_plan_counts"] = {
+                "platforms": len(semantic.get("platforms", [])),
+                "segments": len(semantic.get("segments", [])),
+                "reference_cells": len(semantic.get("reference_cells", [])),
+            }
+            publication_digest["approved_batch_refs"] = [
+                {
+                    "artifact_ref": item.get("artifact_ref"),
+                    "batch_id": item.get("batch_id"),
+                    "batch_fingerprint": item.get("batch_fingerprint"),
+                }
+                for item in approved[:12]
+                if isinstance(item, dict)
+            ]
+            parts.append(
+                "planning_publication="
+                + json.dumps(publication_digest, ensure_ascii=False, separators=(",", ":"))
+            )
     if project_root is not None:
         # task 3：注入 map_artifacts.json 的 relative_ref，让 LLM 压缩后能定位持久化的地图工具结果。
         try:
-            store = MapArtifactStore(
-                project_root=project_root, session_id=session.session_id
-            )
+            store = MapArtifactStore(project_root=project_root, session_id=session.session_id)
             parts.append(f"map_artifacts_ref={store.relative_ref}")
         except Exception:  # 路径不可相对化或缺会话信息时跳过（digest 非关键）
             pass
@@ -1149,21 +1418,28 @@ def build_map_progress_digest(session: Session, project_root: Path | None = None
     return "Map progress (authoritative, survives compaction): " + "; ".join(parts) + "."
 
 
-def map_platform_plan_attempt_count(session: Session, tool_args: dict[str, Any]) -> int:
+def map_platform_plan_attempt_count(
+    session: Session,
+    tool_args: dict[str, Any],
+    tool_name: str = "validate_platform_level_plan",
+) -> int:
     """返回当前目标和图层已经执行的平台规划次数。"""
     state: MapTaskState = session.map_task_state
-    return state.planning_attempts.get(_platform_plan_scope(tool_args), 0)
+    return state.planning_attempts.get(
+        _planning_attempt_scope(session, tool_name, tool_args),
+        0,
+    )
 
 
 def _remember_platform_plan_attempt(
     session: Session,
     tool_name: str,
     tool_args: dict[str, Any],
-) -> None:
+) -> tuple[str, int, str | None]:
     """记录一次真实执行的平台规划及其显式方案指纹。"""
     if tool_name not in PLATFORM_PLAN_TOOL_NAMES:
-        return
-    scope = _platform_plan_scope(tool_args)
+        return "", 0, None
+    scope = _planning_attempt_scope(session, tool_name, tool_args)
     state = session.map_task_state
     attempts = dict(state.planning_attempts)
     attempts[scope] = attempts.get(scope, 0) + 1
@@ -1176,12 +1452,10 @@ def _remember_platform_plan_attempt(
     )
     fingerprint = _platform_plan_fingerprint(tool_name, tool_args)
     if fingerprint is None:
-        return
+        return scope, attempts[scope], None
     fingerprint_key = f"{scope}::{fingerprint}"
     fingerprints = dict(state.planning_fingerprints)
-    fingerprints[fingerprint_key] = (
-        fingerprints.get(fingerprint_key, 0) + 1
-    )
+    fingerprints[fingerprint_key] = fingerprints.get(fingerprint_key, 0) + 1
     replace_map_state_field(
         state,
         "planning_fingerprints",
@@ -1189,6 +1463,7 @@ def _remember_platform_plan_attempt(
         target=_target(tool_args),
         revision=_revision(session, tool_args),
     )
+    return scope, attempts[scope], fingerprint
 
 
 def _validation_scope(tool_args: dict[str, Any]) -> str:
@@ -1267,6 +1542,7 @@ def map_write_stage_error(
     session: Session,
     tool_name: str,
     tool_args: dict[str, Any],
+    project_root: Path | None = None,
 ) -> str | None:
     """只允许平台写入执行同作用域内校验通过的编译批次。
 
@@ -1313,6 +1589,36 @@ def map_write_stage_error(
                 "请勿让 writer 自行拼接 fill。"
             )
         return None
+    approval_snapshot_id = str(approval.get("snapshot_id", ""))
+    approval_snapshot_digest = str(approval.get("snapshot_digest", ""))
+    if not approval_snapshot_id or not approval_snapshot_digest:
+        return (
+            "legacy_platform_approval_requires_replan：旧批准记录缺少 snapshot id/digest，"
+            "不能迁移为新的写入授权。请读取权威快照并重新规划、编译。"
+        )
+    active_snapshot = active_planning_snapshot(
+        session,
+        target,
+        map_layer if map_layer is not None else 0,
+    )
+    if (
+        active_snapshot is None
+        or active_snapshot.get("snapshot_id") != approval_snapshot_id
+        or active_snapshot.get("digest") != approval_snapshot_digest
+    ):
+        approvals = dict(session.map_task_state.approved_platform_plans)
+        approvals.pop(scope, None)
+        replace_map_state_field(
+            session.map_task_state,
+            "approved_platform_plans",
+            approvals,
+            target=target,
+            revision=revision,
+        )
+        return (
+            "platform_approval_snapshot_stale：批准批次的快照身份不再是当前权威事实；"
+            "旧批准已失效，必须刷新事实并重新规划。"
+        )
     approval_revision = approval.get(
         "expected_revision",
         approval.get("map_revision"),
@@ -1338,6 +1644,18 @@ def map_write_stage_error(
             index
             for index, record in enumerate(records)
             if record.get("expected_revision") == revision
+            and record.get("snapshot_id") == approval_snapshot_id
+            and record.get("snapshot_digest") == approval_snapshot_digest
+            and record.get("batch_fingerprint")
+            == _platform_batch_fingerprint(
+                str(record.get("batch", {}).get("tool", "edit_map")),
+                record.get("batch", {}),
+                target,
+                revision if isinstance(revision, int) else -1,
+                approval_snapshot_id,
+                approval_snapshot_digest,
+                map_layer if map_layer is not None else 0,
+            )
             and _compiled_batch_matches(
                 tool_name,
                 tool_args,
@@ -1354,6 +1672,39 @@ def map_write_stage_error(
             "fill、修改批次 operations，或执行未获批准的可站立路线。"
         )
     record = records[matched_index]
+    if project_root is not None:
+        artifact_ref = str(record.get("artifact_ref", "")).strip()
+        if not artifact_ref:
+            return (
+                "approved_batch_artifact_required：批准记录缺少不可变 artifact；"
+                "恢复后不能据此创建写事务，请重新编译规划。"
+            )
+        try:
+            persisted_record = ApprovedBatchStore(
+                project_root,
+                session.session_id,
+                session.session_epoch,
+            ).read(artifact_ref)
+        except (OSError, TypeError, ValueError):
+            return (
+                "approved_batch_artifact_invalid：批准 artifact 无法通过会话或完整性校验；"
+                "禁止写入并要求重新编译。"
+            )
+        for identity_field in (
+            "approval_id",
+            "snapshot_id",
+            "snapshot_digest",
+            "target",
+            "map_layer",
+            "expected_revision",
+            "batch_fingerprint",
+            "batch",
+        ):
+            if persisted_record.get(identity_field) != record.get(identity_field):
+                return (
+                    "approved_batch_artifact_mismatch：恢复状态与批准 artifact 不一致；"
+                    "禁止写入并要求重新编译。"
+                )
     approved_batch = record.get("batch", {})
     tool_args["plan_version"] = record.get(
         "plan_version",
@@ -1364,6 +1715,10 @@ def map_write_stage_error(
     tool_args["approval_id"] = record.get("approval_id")
     tool_args["approval_batch_fingerprint"] = record.get("batch_fingerprint")
     tool_args["approval_expected_revision"] = record.get("expected_revision")
+    tool_args["approval_snapshot_id"] = record.get("snapshot_id")
+    tool_args["approval_snapshot_digest"] = record.get("snapshot_digest")
+    tool_args["approval_target_path"] = record.get("target")
+    tool_args["approval_map_layer"] = record.get("map_layer")
     # Preflight is deliberately non-consuming. The matching record is removed
     # only after Godot returns a durable committed transaction result.
     return None
@@ -1390,12 +1745,18 @@ def _platform_batch_fingerprint(
     batch: dict[str, Any],
     target: str,
     expected_revision: int,
+    snapshot_id: str = "",
+    snapshot_digest: str = "",
+    map_layer: int = 0,
 ) -> str:
     """Return the canonical immutable identity of one approved batch."""
     payload = {
         "tool": tool_name,
         "target": target,
+        "map_layer": map_layer,
         "expected_revision": expected_revision,
+        "snapshot_id": snapshot_id,
+        "snapshot_digest": snapshot_digest,
         "operations": batch.get("operations"),
         "expected_cells": batch.get("expected_cells"),
     }
@@ -1419,8 +1780,7 @@ def _platform_approval_records(
         return [
             deepcopy(record)
             for record in records_value
-            if isinstance(record, dict)
-            and isinstance(record.get("batch"), dict)
+            if isinstance(record, dict) and isinstance(record.get("batch"), dict)
         ]
     # Compatibility for schema versions that stored a mutable remaining queue.
     batches_value = approval.get("remaining_batches")
@@ -1512,10 +1872,13 @@ def platform_write_requires_validation(
     layer = tool_args.get("map_layer")
     map_layer = layer if isinstance(layer, int) and not isinstance(layer, bool) else None
     revision = latest_map_revision(session, target, map_layer)
-    if approval.get(
-        "expected_revision",
-        approval.get("map_revision"),
-    ) != revision:
+    if (
+        approval.get(
+            "expected_revision",
+            approval.get("map_revision"),
+        )
+        != revision
+    ):
         return True
 
     records = _platform_approval_records(approval, target)
@@ -1538,11 +1901,57 @@ def _platform_edit_batches(result: dict[str, Any]) -> list[dict[str, Any]]:
     return [deepcopy(batch) for batch in batches_value if isinstance(batch, dict)]
 
 
+def _semantic_plan(tool_args: dict[str, Any]) -> dict[str, Any]:
+    """提取 planner 负责的语义路线，不包含任何裸 atlas 写入。"""
+    return {
+        "platforms": deepcopy(tool_args.get("platforms", [])),
+        "segments": deepcopy(tool_args.get("segments", [])),
+        "semantic_resources": deepcopy(
+            tool_args.get(
+                "semantic_resources",
+                [tool_args.get("ground_resource", "ground")],
+            )
+        ),
+        "reference_cells": deepcopy(
+            tool_args.get(
+                "reference_cells",
+                (
+                    [tool_args["ground_reference_cell"]]
+                    if isinstance(tool_args.get("ground_reference_cell"), dict)
+                    else []
+                ),
+            )
+        ),
+        "rationale": str(tool_args.get("rationale", "")),
+    }
+
+
+def _record_planning_publication(
+    state: MapTaskState,
+    attempt_scope: str,
+    publication: dict[str, Any],
+    *,
+    target: str,
+    revision: int | None,
+) -> None:
+    """保存独立于 writer 的最终规划发布物。"""
+    publications = dict(state.planning_publications)
+    publications[attempt_scope] = deepcopy(publication)
+    replace_map_state_field(
+        state,
+        "planning_publications",
+        publications,
+        target=target,
+        revision=revision,
+    )
+
+
 def remember_map_plan_progress(
     session: Session,
     tool_name: str,
     tool_args: dict[str, Any],
     result: dict[str, Any],
+    project_root: Path | None = None,
 ) -> dict[str, Any] | None:
     """有效规划完成后允许执行阶段写入，但仍要求新 revision 后再 completion。
 
@@ -1550,8 +1959,10 @@ def remember_map_plan_progress(
     供 planner 循环据此触发确定性收尾；成功或非平台规划工具返回 None。
     """
     if tool_name not in MAP_PLAN_TOOL_NAMES:
-        return
-    _remember_platform_plan_attempt(session, tool_name, tool_args)
+        return None
+    attempt_scope, attempt_count, candidate_fingerprint = _remember_platform_plan_attempt(
+        session, tool_name, tool_args
+    )
     outcome = parse_map_plan_outcome(tool_name, result)
     target_value = result.get("target", result.get("target_path", _target(tool_args)))
     target = target_value if isinstance(target_value, str) else ""
@@ -1567,6 +1978,64 @@ def remember_map_plan_progress(
     layer = scope_args.get("map_layer")
     map_layer = layer if isinstance(layer, int) and not isinstance(layer, bool) else None
     current_revision = latest_map_revision(session, target, map_layer)
+    snapshot_revision_value = tool_args.get("authoritative_snapshot_revision", 0)
+    retry_revision = (
+        current_revision
+        if isinstance(current_revision, int) and not isinstance(current_revision, bool)
+        else (
+            snapshot_revision_value
+            if isinstance(snapshot_revision_value, int)
+            and not isinstance(snapshot_revision_value, bool)
+            else 0
+        )
+    )
+    snapshot_id = str(tool_args.get("authoritative_snapshot_id", ""))
+    snapshot_digest = str(tool_args.get("authoritative_snapshot_digest", ""))
+
+    if tool_name in PLATFORM_PLAN_TOOL_NAMES:
+        issues_value = result.get("issues", result.get("repair_plan", []))
+        issues = deepcopy(issues_value)[:12] if isinstance(issues_value, list) else []
+        repair_artifact: dict[str, str] = {}
+        if not outcome.executable and project_root is not None:
+            repair_artifact = PlanningRepairStore(
+                project_root,
+                session.session_id,
+                session.session_epoch,
+            ).store(
+                {
+                    "attempt_scope": attempt_scope,
+                    "attempt": attempt_count,
+                    "candidate_fingerprint": candidate_fingerprint,
+                    "snapshot_id": snapshot_id,
+                    "snapshot_digest": snapshot_digest,
+                    "issues": issues,
+                    "repair_plan": deepcopy(result.get("repair_plan", [])),
+                }
+            )
+        histories = dict(session.map_task_state.planning_attempt_history)
+        history = list(histories.get(attempt_scope, []))
+        history.append(
+            {
+                "attempt": attempt_count,
+                "candidate_fingerprint": candidate_fingerprint,
+                "snapshot_id": snapshot_id,
+                "snapshot_digest": snapshot_digest,
+                "map_revision": current_revision,
+                "passed": outcome.executable,
+                "error_code": outcome.error_code,
+                "blocked_reason": outcome.blocked_reason,
+                "issues": issues,
+                **repair_artifact,
+            }
+        )
+        histories[attempt_scope] = history[-3:]
+        replace_map_state_field(
+            session.map_task_state,
+            "planning_attempt_history",
+            histories,
+            target=target,
+            revision=retry_revision,
+        )
 
     if not outcome.executable:
         # 规划工具可能以成功响应承载诊断结果；任何失败都必须留在规划阶段恢复。
@@ -1582,9 +2051,7 @@ def remember_map_plan_progress(
             revision=current_revision,
         )
         repair_plan_value = result.get("repair_plan") or result.get("issues")
-        repair_plan_list = (
-            repair_plan_value if isinstance(repair_plan_value, list) else []
-        )
+        repair_plan_list = repair_plan_value if isinstance(repair_plan_value, list) else []
         replace_map_state_field(
             state,
             "failure_frontier",
@@ -1601,12 +2068,14 @@ def remember_map_plan_progress(
         replace_map_state_field(
             state,
             "unresolved_issues",
-            [{
-                "kind": "map_plan_not_executable",
-                "tool": tool_name,
-                "blocked_reason": outcome.blocked_reason,
-                "error_code": outcome.error_code,
-            }],
+            [
+                {
+                    "kind": "map_plan_not_executable",
+                    "tool": tool_name,
+                    "blocked_reason": outcome.blocked_reason,
+                    "error_code": outcome.error_code,
+                }
+            ],
             target=target,
             revision=current_revision,
         )
@@ -1630,18 +2099,16 @@ def remember_map_plan_progress(
         # 失败的平台规划记入通用 no-progress 语义重试（替代 plan-specific 计数上限）；
         # operation 用 scope 身份，使同一 scope 下相同 error_code 反复出现时累积 streak，
         # 不同 error_code 视为进展（各自独立 streak），与 no-progress 语义一致。
-        retry_entry = record_semantic_retry(
+        retry_entry: dict[str, Any] = record_semantic_retry(
             session.map_task_state,
             category="validation_failure",
             error_category=str(
                 outcome.error_code or outcome.blocked_reason or "platform_plan_failed"
             ),
-            root_cause=str(
-                outcome.blocked_reason or outcome.error_code or "platform_plan_failed"
-            ),
+            root_cause=str(outcome.blocked_reason or outcome.error_code or "platform_plan_failed"),
             stage="planner",
             target=target,
-            revision=current_revision,
+            revision=retry_revision,
             operation={
                 "tool": tool_name,
                 "target_path": target,
@@ -1649,12 +2116,47 @@ def remember_map_plan_progress(
             },
             threshold=SEMANTIC_RETRY_MAX_ATTEMPTS,
         )
+        retry_entry["attempt_count"] = attempt_count
+        retry_entry["attempt_limit"] = 3
+        retry_entry["exhausted"] = attempt_count >= 3
+        if attempt_count >= 3:
+            publication = {
+                "planning_status": "delivered",
+                "execution_status": "blocked_by_validation",
+                "target_path": target,
+                "map_layer": map_layer,
+                "map_revision": current_revision,
+                "authoritative_snapshot": {
+                    "snapshot_id": snapshot_id,
+                    "digest": snapshot_digest,
+                },
+                "semantic_plan": _semantic_plan(tool_args),
+                "unresolved_issues": repair_plan_list[:12],
+                "validation_history": deepcopy(
+                    session.map_task_state.planning_attempt_history.get(
+                        attempt_scope,
+                        [],
+                    )
+                ),
+                "approved_batches": [],
+            }
+            _record_planning_publication(
+                state,
+                attempt_scope,
+                publication,
+                target=target,
+                revision=current_revision,
+            )
+            result["_planning_publication"] = deepcopy(publication)
+            result["planning_status"] = "delivered"
+            result["execution_status"] = "blocked_by_validation"
+            result["edit_map_batches"] = []
         return retry_entry
 
     active_workflow = session.map_task_state.validation_workflows.get(scope)
     if isinstance(active_workflow, dict) and active_workflow.get("next_stage") == "planner":
         if active_workflow.get("map_revision") != current_revision:
-            return
+            return None
         active_workflow["next_stage"] = "write"
         active_workflow["plan_tool"] = tool_name
         workflows = dict(session.map_task_state.validation_workflows)
@@ -1711,7 +2213,7 @@ def remember_map_plan_progress(
                 revision=None,
             )
             state.transition_stage("plan")
-            return
+            return None
         for index, batch in enumerate(batches):
             batch["batch_index"] = index
             batch_tool = str(batch.get("tool", "edit_map"))
@@ -1721,28 +2223,43 @@ def remember_map_plan_progress(
                 batch,
                 target,
                 expected_revision,
+                snapshot_id,
+                snapshot_digest,
+                map_layer or 0,
             )
             records.append(
                 {
                     "approval_id": hashlib.sha256(
                         (
-                            f"{target}:{next_plan_version}:"
-                            f"{expected_revision}:{fingerprint}"
+                            f"{target}:{next_plan_version}:" f"{expected_revision}:{fingerprint}"
                         ).encode("utf-8")
                     ).hexdigest()[:32],
                     "target": target,
+                    "map_layer": map_layer or 0,
                     "expected_revision": expected_revision,
+                    "snapshot_id": snapshot_id,
+                    "snapshot_digest": snapshot_digest,
                     "batch_fingerprint": fingerprint,
                     "plan_version": next_plan_version,
                     "batch": deepcopy(batch),
                 }
             )
+            if project_root is not None:
+                locator = ApprovedBatchStore(
+                    project_root,
+                    session.session_id,
+                    session.session_epoch,
+                ).store(records[-1])
+                records[-1].update(locator)
         approvals = dict(state.approved_platform_plans)
         approvals[scope] = {
             "tool": tool_name,
             "target": target,
+            "map_layer": map_layer or 0,
             "expected_revision": current_revision,
             "map_revision": current_revision,
+            "snapshot_id": snapshot_id,
+            "snapshot_digest": snapshot_digest,
             "plan_version": next_plan_version,
             "records": records,
         }
@@ -1753,6 +2270,50 @@ def remember_map_plan_progress(
             target=target,
             revision=current_revision,
         )
+        publication = {
+            "planning_status": "delivered",
+            "execution_status": "approved",
+            "target_path": target,
+            "map_layer": map_layer,
+            "map_revision": current_revision,
+            "authoritative_snapshot": {
+                "snapshot_id": snapshot_id,
+                "digest": snapshot_digest,
+            },
+            "semantic_plan": _semantic_plan(tool_args),
+            "unresolved_issues": [],
+            "validation_history": deepcopy(state.planning_attempt_history.get(attempt_scope, [])),
+            "approved_batches": [
+                {
+                    key: record.get(key)
+                    for key in (
+                        "approval_id",
+                        "artifact_ref",
+                        "batch_id",
+                        "snapshot_id",
+                        "snapshot_digest",
+                        "target",
+                        "target_path",
+                        "map_layer",
+                        "expected_revision",
+                        "map_revision",
+                        "batch_fingerprint",
+                    )
+                }
+                for record in records
+            ],
+        }
+        _record_planning_publication(
+            state,
+            attempt_scope,
+            publication,
+            target=target,
+            revision=current_revision,
+        )
+        result["_planning_publication"] = deepcopy(publication)
+        result["planning_status"] = "delivered"
+        result["execution_status"] = "approved"
+    return None
 
 
 def consume_committed_platform_approvals(
@@ -1773,9 +2334,7 @@ def consume_committed_platform_approvals(
     if not isinstance(claimed_value, list) or not claimed_value:
         return False
     claimed = {
-        str(record.get("approval_id", "")): str(
-            record.get("batch_fingerprint", "")
-        )
+        str(record.get("approval_id", "")): str(record.get("batch_fingerprint", ""))
         for record in claimed_value
         if isinstance(record, dict)
         and str(record.get("approval_id", "")).strip()
@@ -1800,18 +2359,14 @@ def consume_committed_platform_approvals(
         ]
         if not matched:
             continue
-        expected_committed_revision = max(
-            int(record.get("expected_revision", -1)) for record in matched
-        ) + 1
+        expected_committed_revision = (
+            max(int(record.get("expected_revision", -1)) for record in matched) + 1
+        )
         if expected_committed_revision != committed_revision:
             continue
-        consumed_ids = {
-            str(record.get("approval_id", "")) for record in matched
-        }
+        consumed_ids = {str(record.get("approval_id", "")) for record in matched}
         remaining = [
-            record
-            for record in records
-            if str(record.get("approval_id", "")) not in consumed_ids
+            record for record in records if str(record.get("approval_id", "")) not in consumed_ids
         ]
         if remaining:
             approval["records"] = remaining
@@ -1894,9 +2449,7 @@ def remember_validation_progress(
         )
         workflow["completion_attempted"] = True
         workflow["next_stage"] = "reviewer" if successful else "diagnostic"
-        session.map_task_state.transition_stage(
-            "review" if successful else "diagnostic"
-        )
+        session.map_task_state.transition_stage("review" if successful else "diagnostic")
         replace_map_state_field(
             session.map_task_state,
             "unresolved_issues",

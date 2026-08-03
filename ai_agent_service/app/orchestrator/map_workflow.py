@@ -34,6 +34,9 @@ REDUCER_OWNED_FIELDS = frozenset(
         "validation_failure_counts",
         "planning_attempts",
         "planning_fingerprints",
+        "authoritative_snapshots",
+        "planning_attempt_history",
+        "planning_publications",
         "tool_failure_fingerprints",
         "approved_platform_plans",
         "latest_revisions",
@@ -64,6 +67,8 @@ _REDUCER_WRITE_DEPTH: ContextVar[int] = ContextVar(
     "map_workflow_reducer_write_depth",
     default=0,
 )
+
+
 def map_workflow_scope_key(target: str, revision: int) -> str:
     """生成所有 blocker、批次、验证、证据和重试共享的规范作用域键。"""
     normalized_target = target.strip()
@@ -76,13 +81,8 @@ def map_workflow_scope_key(target: str, revision: int) -> str:
 
 def assert_map_workflow_write_allowed(field_name: str) -> None:
     """拒绝 reducer 上下文外对 reducer-owned 字段的替换。"""
-    if (
-        field_name in REDUCER_OWNED_FIELDS
-        and _REDUCER_WRITE_DEPTH.get() <= 0
-    ):
-        raise RuntimeError(
-            f"direct write to reducer-owned MapTaskState field: {field_name}"
-        )
+    if field_name in REDUCER_OWNED_FIELDS and _REDUCER_WRITE_DEPTH.get() <= 0:
+        raise RuntimeError(f"direct write to reducer-owned MapTaskState field: {field_name}")
 
 
 @contextmanager
@@ -162,9 +162,7 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
         next_stage = str(payload.get("stage", ""))
         allowed = MAP_RUNTIME_STAGE_TRANSITIONS.get(reduced.stage, frozenset())
         if next_stage not in allowed:
-            raise ValueError(
-                f"illegal map stage transition: {reduced.stage} -> {next_stage}"
-            )
+            raise ValueError(f"illegal map stage transition: {reduced.stage} -> {next_stage}")
         reduced.stage = next_stage
         scope["stage"] = next_stage
     elif event.event_type == "blockers_replaced":
@@ -179,9 +177,7 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
         if not blocker_key or not isinstance(blocker, dict):
             raise ValueError("blocker_upserted requires blocker_key and blocker")
         reduced.completion_blockers = [
-            item
-            for item in reduced.completion_blockers
-            if item.get("blocker_key") != blocker_key
+            item for item in reduced.completion_blockers if item.get("blocker_key") != blocker_key
         ]
         reduced.completion_blockers.append(deepcopy(blocker))
         scope["blockers"] = deepcopy(reduced.completion_blockers)
@@ -205,9 +201,7 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
     elif event.event_type == "resume_authorization_replaced":
         authorization = payload.get("authorization")
         if authorization is not None and not isinstance(authorization, dict):
-            raise ValueError(
-                "resume_authorization_replaced requires object or null"
-            )
+            raise ValueError("resume_authorization_replaced requires object or null")
         reduced.resume_authorization = deepcopy(authorization)
         scope["resume_authorization"] = deepcopy(authorization)
     elif event.event_type == "pending_batches_replaced":
@@ -253,13 +247,9 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
             or not isinstance(exact_attempt, dict)
             or not isinstance(convergence, dict)
         ):
-            raise ValueError(
-                "plan_attempt_recorded requires exact and convergence records"
-            )
+            raise ValueError("plan_attempt_recorded requires exact and convergence records")
         reduced.plan_attempt_registry[exact_key] = deepcopy(exact_attempt)
-        reduced.task_convergence_registry[convergence_key] = deepcopy(
-            convergence
-        )
+        reduced.task_convergence_registry[convergence_key] = deepcopy(convergence)
         scope.setdefault("plan_attempt_keys", []).append(exact_key)
         scope["task_convergence_key"] = convergence_key
     elif event.event_type == "progress_recorded":
@@ -493,16 +483,15 @@ def completion_blocker_key(state: Any, blocker: dict[str, Any]) -> str:
         separators=(",", ":"),
         default=str,
     )
-    issue_identity = str(blocker.get("issue_id", "")).strip() or hashlib.sha256(
-        issue_encoded.encode("utf-8")
-    ).hexdigest()[:24]
+    issue_identity = (
+        str(blocker.get("issue_id", "")).strip()
+        or hashlib.sha256(issue_encoded.encode("utf-8")).hexdigest()[:24]
+    )
     parts = {
         "task": str(getattr(state, "task_id", "")),
         "target": str(blocker.get("target", "")),
         "revision": blocker.get("required_revision"),
-        "source": str(
-            blocker.get("source", blocker.get("tool", blocker.get("reason", "")))
-        ),
+        "source": str(blocker.get("source", blocker.get("tool", blocker.get("reason", "")))),
         "issue": issue_identity,
     }
     encoded = json.dumps(
@@ -583,9 +572,7 @@ def find_direct_map_state_writes(paths: list[Path]) -> list[str]:
                 ):
                     if _direct_write_is_allowlisted(path, node, tree):
                         continue
-                    findings.append(
-                        f"{path}:{getattr(node, 'lineno', 0)}:{target.attr}"
-                    )
+                    findings.append(f"{path}:{getattr(node, 'lineno', 0)}:{target.attr}")
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -611,9 +598,7 @@ def _direct_write_is_allowlisted(
 ) -> bool:
     """Allow only the exact pre-construction hydration method."""
     line = int(getattr(node, "lineno", 0))
-    for class_node in (
-        item for item in tree.body if isinstance(item, ast.ClassDef)
-    ):
+    for class_node in (item for item in tree.body if isinstance(item, ast.ClassDef)):
         for function_node in (
             item
             for item in class_node.body
@@ -623,9 +608,7 @@ def _direct_write_is_allowlisted(
                 path.name,
                 f"{class_node.name}.{function_node.name}",
             )
-            end_line = int(
-                getattr(function_node, "end_lineno", function_node.lineno)
-            )
+            end_line = int(getattr(function_node, "end_lineno", function_node.lineno))
             if (
                 identity in DIRECT_WRITE_HYDRATION_ALLOWLIST
                 and function_node.lineno <= line <= end_line
@@ -644,18 +627,13 @@ def check_repository_map_state_writes() -> int:
     findings = find_direct_map_state_writes(paths)
     if findings:
         raise RuntimeError(
-            "direct reducer-owned MapTaskState writes found:\n"
-            + "\n".join(findings)
+            "direct reducer-owned MapTaskState writes found:\n" + "\n".join(findings)
         )
     return 0
 
 
 def _looks_like_map_state_expression(value: ast.expr) -> bool:
     """判断 AST 表达式是否显式引用 `state` 或 `.map_task_state`。"""
-    return (
-        isinstance(value, ast.Name)
-        and value.id in {"state", "map_task_state"}
-    ) or (
-        isinstance(value, ast.Attribute)
-        and value.attr == "map_task_state"
+    return (isinstance(value, ast.Name) and value.id in {"state", "map_task_state"}) or (
+        isinstance(value, ast.Attribute) and value.attr == "map_task_state"
     )

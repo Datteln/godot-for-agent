@@ -622,6 +622,31 @@ func _validate_map_write_revision(input: Dictionary, key: String) -> Dictionary:
 			"message": "map changed since this plan was made; re-read the affected region before writing",
 			"hint": "Call describe_map_region on the affected region, then retry with expected_revision=actual_revision.",
 		}
+	if input.has("approval_id"):
+		for field_name in [
+			"approval_batch_fingerprint",
+			"approval_snapshot_id",
+			"approval_snapshot_digest",
+			"approval_target_path",
+			"approval_map_layer",
+			"approval_expected_revision",
+		]:
+			if not input.has(field_name) or str(input.get(field_name, "")).strip_edges() == "":
+				return {
+					"ok": false,
+					"error_code": "approval_snapshot_contract_incomplete",
+					"message": "Approved platform writes require snapshot-bound approval metadata.",
+					"missing_field": field_name,
+				}
+		if str(input.get("approval_target_path", "")) != str(input.get("target_path", "")) \
+				or int(input.get("approval_map_layer", -1)) != int(input.get("map_layer", 0)) \
+				or int(input.get("approval_expected_revision", -1)) != actual_revision:
+			return {
+				"ok": false,
+				"error_code": "approval_snapshot_scope_mismatch",
+				"message": "Approved batch target/layer/revision no longer matches the write request.",
+				"actual_revision": actual_revision,
+			}
 	return {}
 
 
@@ -717,6 +742,12 @@ func _finish_map_write_batch(tool_name: String, input: Dictionary, result: Dicti
 			result["approval_expected_revision"] = int(
 				input.get("approval_expected_revision", previous_revision)
 			)
+			result["approval_snapshot_id"] = str(input.get("approval_snapshot_id", ""))
+			result["approval_snapshot_digest"] = str(
+				input.get("approval_snapshot_digest", "")
+			)
+			result["approval_target_path"] = str(input.get("approval_target_path", ""))
+			result["approval_map_layer"] = int(input.get("approval_map_layer", 0))
 		result["plan_version"] = int(input.get("plan_version", 0))
 		result["batch_index"] = int(input.get("batch_index", 0))
 		result["worker"] = str(input.get("worker", ""))

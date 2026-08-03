@@ -25,8 +25,6 @@ from app.orchestrator.map_contracts import (
 )
 from app.orchestrator.map_progress import (
     MapTaskState,
-    _platform_plan_fingerprint,
-    _platform_plan_scope,
     build_map_progress_digest,
     map_platform_plan_call_error,
     remember_map_plan_progress,
@@ -108,9 +106,7 @@ def test_canonical_schema_drives_required_and_specialized_constraints() -> None:
     schema = specialized_map_worker_schema(frame)
 
     assert validate_map_worker_schema(payload, schema) == ()
-    assert map_worker_required_fields() == frozenset(
-        MAP_WORKER_RESULT_JSON_SCHEMA_V1["required"]
-    )
+    assert map_worker_required_fields() == frozenset(MAP_WORKER_RESULT_JSON_SCHEMA_V1["required"])
     for field_name in map_worker_required_fields():
         invalid = dict(payload)
         invalid.pop(field_name)
@@ -145,14 +141,19 @@ def test_local_validator_always_applies_frozen_frame_contract() -> None:
     """即使 provider 声称原生 Schema 成功，本地仍拒绝冻结合同错配。"""
     session = Session(session_id="s1", agent_stack=[_reader_frame()])
     payload = _valid_reader_result(session.agent_stack[0])
-    assert _map_structured_output_error(session, session.agent_stack[0], json.dumps(payload)) is None
+    assert (
+        _map_structured_output_error(session, session.agent_stack[0], json.dumps(payload)) is None
+    )
 
     payload["worker"] = "other-worker"
-    assert _map_structured_output_error(
-        session,
-        session.agent_stack[0],
-        json.dumps(payload),
-    ) is not None
+    assert (
+        _map_structured_output_error(
+            session,
+            session.agent_stack[0],
+            json.dumps(payload),
+        )
+        is not None
+    )
 
 
 class _CaptureCompletions:
@@ -365,9 +366,7 @@ def test_response_contract_and_deterministic_overrides_only_reach_final_turn() -
         mode="json_schema",
         correction_limit=1,
     )
-    final_provider = _CaptureProvider(
-        json.dumps(_valid_reader_result(final), ensure_ascii=False)
-    )
+    final_provider = _CaptureProvider(json.dumps(_valid_reader_result(final), ensure_ascii=False))
     asyncio.run(
         run_turn(
             Session(session_id="s2", agent_stack=[final]),
@@ -409,9 +408,7 @@ def test_parallel_final_turns_keep_response_modes_and_overrides_isolated() -> No
             mode=mode,  # type: ignore[arg-type]
             correction_limit=1,
         )
-        provider = _CaptureProvider(
-            json.dumps(_valid_reader_result(frame), ensure_ascii=False)
-        )
+        provider = _CaptureProvider(json.dumps(_valid_reader_result(frame), ensure_ascii=False))
         providers.append(provider)
         sessions.append(Session(session_id=f"s{index}", agent_stack=[frame]))
 
@@ -818,13 +815,11 @@ def test_orchestrator_result_not_false_rejected_at_schema_level() -> None:
     payload = _valid_orchestrator_result(frame)
     schema = specialized_map_worker_schema(frame)
 
-    assert not any(
-        "stage" in error for error in validate_map_worker_schema(payload, schema)
-    )
+    assert not any("stage" in error for error in validate_map_worker_schema(payload, schema))
 
 
-def test_platform_plan_call_error_no_count_cap_only_fingerprint_dedup() -> None:
-    """修订计数上限已移除：distinct 方案不再因计数被拒；仅相同指纹去重。"""
+def test_platform_plan_call_error_requires_authoritative_snapshot() -> None:
+    """平台规划缺少 revision 绑定快照时必须先返回 typed reader refresh。"""
     session = Session(session_id="s1", agent_stack=[_reader_frame()])
     base_args = {
         "target_path": "TileMap",
@@ -834,33 +829,9 @@ def test_platform_plan_call_error_no_count_cap_only_fingerprint_dedup() -> None:
             {"index": 0, "type": "walk", "start": {"x": 51, "y": -5}, "end": {"x": 52, "y": -5}}
         ],
     }
-    scope = _platform_plan_scope(base_args)
-    fp = _platform_plan_fingerprint("validate_platform_level_plan", base_args)
-    assert fp is not None  # platforms/segments 齐全，应生成指纹
-
-    # 模拟该方案已提交过（指纹已记录）且 attempts 已很高
-    session.map_task_state.planning_attempts[scope] = 5
-    session.map_task_state.planning_fingerprints[f"{scope}::{fp}"] = 1
-
-    # 相同方案再提交 → 被指纹去重拒绝（而非计数上限）
-    duplicate_msg = map_platform_plan_call_error(
-        session, "validate_platform_level_plan", base_args
-    )
-    assert duplicate_msg is not None
-    assert "已经校验过" in duplicate_msg
-
-    # distinct 方案（不同 platforms）→ 即便 attempts=5 也不被拒（计数上限已移除）
-    distinct_args = {
-        **base_args,
-        "platforms": [{"id": "p0", "x": 51, "y": -4, "width": 9, "role": "safe_intro"}],
-        "segments": [
-            {"index": 0, "type": "walk", "start": {"x": 51, "y": -5}, "end": {"x": 53, "y": -5}}
-        ],
-    }
-    distinct_msg = map_platform_plan_call_error(
-        session, "validate_platform_level_plan", distinct_args
-    )
-    assert distinct_msg is None
+    error = map_platform_plan_call_error(session, "validate_platform_level_plan", base_args)
+    assert error is not None
+    assert "authoritative_snapshot_required" in error
 
 
 def test_build_map_progress_digest_empty_without_map_state() -> None:
@@ -920,9 +891,7 @@ def test_final_structured_turn_thinking_budget_falls_back_to_effort_tier() -> No
     final = _reader_frame("f1")
     final.parent_id = None
     arm_map_worker_structured_completion(final, mode="json_schema", correction_limit=1)
-    final_provider = _CaptureProvider(
-        json.dumps(_valid_reader_result(final), ensure_ascii=False)
-    )
+    final_provider = _CaptureProvider(json.dumps(_valid_reader_result(final), ensure_ascii=False))
     security = SecuritySettings(project_root=Path.cwd())
     asyncio.run(
         run_turn(

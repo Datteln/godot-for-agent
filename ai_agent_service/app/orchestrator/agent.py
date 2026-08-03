@@ -81,6 +81,7 @@ from app.orchestrator.map_workers import (
 )
 from app.orchestrator.map_progress import (
     # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
+    bind_authoritative_snapshot,
     latest_map_revision,
     cached_validation_result,
     map_pause_message,
@@ -533,6 +534,21 @@ async def _delegate_child_frame(
             f"{group_id or call_id or parent_id}:{worker_spec.get('mode', 'stage')}",
         )
         worker_spec.setdefault("lifecycle_scope", "delegate_frame")
+        worker_mode_value = str(worker_spec.get("mode", ""))
+        if worker_mode_value in {"propose_only", "repair_propose"} and not isinstance(
+            worker_spec.get("authoritative_snapshot"), dict
+        ):
+            eligible_snapshots = [
+                dict(value)
+                for value in session.map_task_state.authoritative_snapshots.values()
+                if isinstance(value, dict) and value.get("execution_eligible") is True
+            ]
+            if len(eligible_snapshots) != 1:
+                return (
+                    "planner_snapshot_binding_ambiguous：运行时找不到唯一的可执行权威快照。"
+                    "请先让 reader 为明确 target_path/map_layer 完成 region + frontier 快照。"
+                )
+            worker_spec["authoritative_snapshot"] = eligible_snapshots[0]
         requested_worker_name = str(worker_spec.get("name", "")).strip()
         if requested_worker_name:
             try:
@@ -1634,9 +1650,7 @@ def _repair_map_structured_output(
         "mode": str(source.get("mode") or "partial"),
         "objective": str(source.get("objective") or _frame_objective(frame)),
         "target_path": str(
-            frame.map_stage_contract.get("target_path")
-            or source.get("target_path")
-            or ""
+            frame.map_stage_contract.get("target_path") or source.get("target_path") or ""
         ),
         "map_layer": map_layer,
         "map_revision": map_revision,
@@ -1830,8 +1844,10 @@ def _map_frame_exhausted_payload(frame: Frame, limit_label: str, limit: int) -> 
             "需要父 agent 基于已返回的工具结果继续拆分任务，或用更具体的 target_path/map_layer/region 重新委派。"
         ],
         "risks": ["本子阶段未完整收敛，不能作为完成依据。"],
-        "next_stage": "replan" if "replan" in allowed_next else (
-            allowed_next[0] if allowed_next else _map_stage_for_frame(frame)
+        "next_stage": (
+            "replan"
+            if "replan" in allowed_next
+            else (allowed_next[0] if allowed_next else _map_stage_for_frame(frame))
         ),
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -2181,9 +2197,7 @@ async def _finish_frame(
         structured_error = _map_structured_output_error(session, frame, text)
         if structured_error is not None:
             category = structured_error_category(structured_error)
-            raw_digest = hashlib.sha256(
-                text.encode("utf-8", errors="replace")
-            ).hexdigest()[:16]
+            raw_digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
             safe_diagnostic = {
                 **safe_structured_diagnostic(structured_error),
                 "schema_version": _map_output_schema_for_frame(frame),
@@ -4283,11 +4297,7 @@ async def run_turn(
     frame_turns: dict[str, int] = {}  # 非地图帧仍只统计本次 run_turn 的轮数
     # frame_id -> 其中单独计入 edit_map_max_turns 预算的轮数（tool_calls 仅含 edit_map 时）
     frame_edit_map_turns: dict[str, int] = {}
-    driver_turn_limit = (
-        max_turns
-        + max(0, map_worker_structured_correction_limit)
-        + 1
-    )
+    driver_turn_limit = max_turns + max(0, map_worker_structured_correction_limit) + 1
     for loop_index in range(driver_turn_limit):
         frame = session.top_frame()
         if frame is None:
@@ -4366,9 +4376,7 @@ async def run_turn(
             else 0
         )
         total_budget = (
-            frame.agent.max_turns
-            + (frame.agent.edit_map_max_turns or 0)
-            + structured_budget
+            frame.agent.max_turns + (frame.agent.edit_map_max_turns or 0) + structured_budget
         )
         if used >= total_budget:
             result = await _handle_frame_turns_exhausted(
@@ -4920,6 +4928,18 @@ async def run_turn(
                 tool_name=tool.name,
                 args=args,
             )
+            if tool.name in {"validate_platform_level_plan", "plan_reachable_map_growth"}:
+                snapshot_error = bind_authoritative_snapshot(
+                    session,
+                    tool.name,
+                    args,
+                    tool_ctx.security.project_root,
+                )
+                if snapshot_error is not None:
+                    pending_items.append(
+                        _PendingToolMessage(_tool_message(call.id, snapshot_error, is_error=True))
+                    )
+                    continue
             if tool.name == "describe_map_region":
                 cached_region = _cached_map_region_summary(session, args)
                 if cached_region is not None:
@@ -4995,7 +5015,12 @@ async def run_turn(
                     else "当前用户请求未显式授权地图内容编辑，地图写工具已拒绝"
                 )
                 if stage_error is None:
-                    stage_error = map_write_stage_error(session, tool.name, args)
+                    stage_error = map_write_stage_error(
+                        session,
+                        tool.name,
+                        args,
+                        tool_ctx.security.project_root,
+                    )
                 if stage_error is not None:
                     logger.warning(
                         "Map write blocked by progress stage session=%s frame=%s tool=%s error=%s",

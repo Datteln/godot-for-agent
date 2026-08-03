@@ -69,6 +69,7 @@ from app.orchestrator.map_progress import (
     remember_map_tool_failure,
     remember_validation_cache,
     remember_map_plan_progress,
+    remember_planning_snapshot_evidence,
     remember_validation_progress,
     reset_map_task_progress,
     resume_map_task,
@@ -471,7 +472,9 @@ def _planner_completion_text(
     batches_value = result.get("edit_map_batches")
     if batches_value is None:
         batches_value = profile_plan.get("edit_map_batches")
-    proposed_batches = batches_value if isinstance(batches_value, list) else []
+    proposed_batches = (
+        batches_value if outcome.executable and isinstance(batches_value, list) else []
+    )
     issues_value = (
         result.get("issues")
         or result.get("repair_plan")
@@ -492,15 +495,17 @@ def _planner_completion_text(
         for key in ("x", "y", "z", "width", "height", "depth")
         if key in tool_args
     }
+    publication_value = result.get("_planning_publication")
+    publication = publication_value if isinstance(publication_value, dict) else {}
     summary = (
         "LLM 显式平台规划已通过确定性校验，规划阶段由服务端自动结束。"
         if outcome.executable
-        else "平台规划反复未通过校验，已触发无进展停止，规划阶段已停止。"
+        else "第三次确定性校验仍未通过；最新规划已交付，但执行明确阻断且不会调度 writer。"
     )
     payload = {
         "stage": "planner",
         "worker": frame.agent.name,
-        "mode": "propose_only" if outcome.executable else "partial",
+        "mode": "propose_only",
         "objective": frame.agent.description or frame.agent.name,
         "target_path": target_path,
         "map_layer": tool_args.get("map_layer"),
@@ -516,6 +521,29 @@ def _planner_completion_text(
             }
         ],
         "proposed_batches": proposed_batches,
+        "planning_status": publication.get("planning_status", "delivered"),
+        "execution_status": publication.get(
+            "execution_status",
+            "approved" if outcome.executable else "blocked_by_validation",
+        ),
+        "authoritative_snapshot": publication.get(
+            "authoritative_snapshot",
+            {
+                "snapshot_id": tool_args.get("authoritative_snapshot_id"),
+                "digest": tool_args.get("authoritative_snapshot_digest"),
+            },
+        ),
+        "semantic_plan": publication.get(
+            "semantic_plan",
+            {
+                "platforms": tool_args.get("platforms", []),
+                "segments": tool_args.get("segments", []),
+                "semantic_resources": tool_args.get("semantic_resources", []),
+                "reference_cells": tool_args.get("reference_cells", []),
+                "rationale": tool_args.get("rationale", ""),
+            },
+        ),
+        "approved_batches": publication.get("approved_batches", []),
         "write_results": [],
         "validation": {
             "passed": outcome.executable,
@@ -536,7 +564,7 @@ def _planner_completion_text(
         },
         "missing_inputs": [],
         "risks": [] if outcome.executable else ["平台路线尚不可执行，禁止进入写入阶段。"],
-        "next_stage": "writer" if outcome.executable else "planner",
+        "next_stage": "writer" if outcome.executable else "complete",
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -1211,6 +1239,7 @@ class QueryEngine:
         """把大型地图工具结果加入当前事务的会话级聚合 turn。"""
         if tool_name not in {
             "describe_map_region",
+            "compute_reachable_frontier",
             "query_spatial_index",
             "validate_map_region",
             "validate_layer_coverage",
@@ -1352,9 +1381,7 @@ class QueryEngine:
             map_worker_structured_output_enabled=(
                 self._settings.map_worker_structured_output_enabled
             ),
-            map_worker_response_contract_mode=(
-                self._settings.map_worker_response_contract_mode
-            ),
+            map_worker_response_contract_mode=(self._settings.map_worker_response_contract_mode),
             map_worker_structured_correction_limit=(
                 self._settings.map_worker_structured_correction_limit
             ),
@@ -2115,9 +2142,8 @@ class QueryEngine:
                 session.output_style,
             ),
             structure_context=project_context,
-            dynamic_context=(session.rag_context or "") + build_map_progress_digest(
-                session, project_root=security.project_root
-            ),
+            dynamic_context=(session.rag_context or "")
+            + build_map_progress_digest(session, project_root=security.project_root),
             query=request.user_message or "",
         )
         root_snapshot = session.agent_stack[0].compact_snapshot if session.agent_stack else None
@@ -2471,9 +2497,7 @@ class QueryEngine:
             map_worker_structured_output_enabled=(
                 self._settings.map_worker_structured_output_enabled
             ),
-            map_worker_response_contract_mode=(
-                self._settings.map_worker_response_contract_mode
-            ),
+            map_worker_response_contract_mode=(self._settings.map_worker_response_contract_mode),
             map_worker_structured_correction_limit=(
                 self._settings.map_worker_structured_correction_limit
             ),
@@ -2904,6 +2928,42 @@ class QueryEngine:
                 tool_args,
                 result_for_gate,
             )
+            if tool_name in MAP_REVISION_GUARDED_TOOL_NAMES:
+                transaction_status = (
+                    str(result_for_gate.get("map_transaction_status", ""))
+                    if isinstance(result_for_gate, dict)
+                    else ""
+                )
+                if transaction_status == "committed":
+                    self._emit(
+                        session.session_id,
+                        "write_committed",
+                        {
+                            "tool": tool_name,
+                            "target_path": tool_args.get("target_path"),
+                            "map_revision": (
+                                result_for_gate.get("map_revision")
+                                if isinstance(result_for_gate, dict)
+                                else None
+                            ),
+                            "approval_id": tool_args.get("approval_id"),
+                            "snapshot_id": tool_args.get("approval_snapshot_id"),
+                        },
+                    )
+                elif result.status in {"error", "rejected"} or transaction_status in {
+                    "failed",
+                    "rolled_back",
+                }:
+                    self._emit(
+                        session.session_id,
+                        "map_edit_incomplete",
+                        {
+                            "tool": tool_name,
+                            "target_path": tool_args.get("target_path"),
+                            "error_code": result.error_code,
+                            "map_transaction_status": transaction_status,
+                        },
+                    )
             if tool_name in MAP_REVISION_GUARDED_TOOL_NAMES and "plan_version" in tool_args:
                 batch_entry = (
                     session.map_task_state.executed_batches[-1]
@@ -2962,20 +3022,38 @@ class QueryEngine:
                         "completion_candidate": True,
                     }
             if isinstance(result_for_gate, dict):
+                if result.status == "applied":
+                    remember_planning_snapshot_evidence(
+                        session,
+                        tool_name,
+                        tool_args,
+                        result_for_gate,
+                        self._settings.project_root,
+                        (
+                            map_artifact_locator.as_dict()
+                            if map_artifact_locator is not None
+                            else None
+                        ),
+                    )
                 plan_progress = remember_map_plan_progress(
                     session,
                     tool_name,
                     tool_args,
                     result_for_gate,
+                    self._settings.project_root,
                 )
                 if frame.agent.map_stage == "planner" and tool_name in PLATFORM_PLAN_TOOL_NAMES:
                     plan_outcome = parse_map_plan_outcome(tool_name, result_for_gate)
-                    attempt_count = map_platform_plan_attempt_count(session, tool_args)
-                    # plan-specific 计数上限已移除；改由通用 no-progress 语义重试兜底
-                    #（remember_map_plan_progress 失败时记入语义重试，达阈值即 exhausted）。
-                    retry_exhausted = bool(
-                        plan_progress.get("exhausted")
-                    ) if isinstance(plan_progress, dict) else False
+                    attempt_count = map_platform_plan_attempt_count(
+                        session,
+                        tool_args,
+                        tool_name,
+                    )
+                    retry_exhausted = (
+                        bool(plan_progress.get("exhausted"))
+                        if isinstance(plan_progress, dict)
+                        else False
+                    )
                     if plan_outcome.executable or retry_exhausted:
                         frame.forced_completion_text = _planner_completion_text(
                             frame,
@@ -2993,6 +3071,15 @@ class QueryEngine:
                             attempt_count,
                             retry_exhausted,
                         )
+                        publication = result_for_gate.get("_planning_publication", {})
+                        if isinstance(publication, dict):
+                            event_name = (
+                                "execution_approved"
+                                if publication.get("execution_status") == "approved"
+                                else "execution_blocked"
+                            )
+                            self._emit(session.session_id, "planning_delivered", publication)
+                            self._emit(session.session_id, event_name, publication)
                 elif (
                     _is_dynamic_map_writer(frame)
                     and tool_name in PLATFORM_PLAN_TOOL_NAMES
