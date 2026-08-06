@@ -7,10 +7,11 @@ import pytest
 
 from app.agents.types import AgentDefinition, Frame
 from app.orchestrator.completion_gate import evaluate_map_completion
+from app.orchestrator.map_contracts import MAP_WORKER_RESULT_SCHEMA
 from app.orchestrator.map_progress import (
     MAP_TASK_FIELD_LIFECYCLE,
-    MapTaskStatus,
     MapTaskState,
+    MapTaskStatus,
     resume_map_task,
 )
 from app.orchestrator.map_request_scope import MapRequestScope
@@ -87,11 +88,9 @@ def _candidate_session(status: str) -> Session:
 
 def test_lifecycle_metadata_classifies_every_state_field() -> None:
     """保证新增状态字段无法绕过 task epoch 生命周期分类。"""
-    assert set(MAP_TASK_FIELD_LIFECYCLE) == {
-        item.name for item in fields(MapTaskState)
-    }
+    assert set(MAP_TASK_FIELD_LIFECYCLE) == {item.name for item in fields(MapTaskState)}
     assert all(
-        lifecycle.scope in {"task", "revision", "session"}
+        lifecycle.scope in {"task", "revision", "context", "operation", "session"}
         and lifecycle.reset_policy == "dataclass_default"
         and lifecycle.resume_policy == "preserve"
         for lifecycle in MAP_TASK_FIELD_LIFECYCLE.values()
@@ -124,6 +123,96 @@ def test_legacy_schema_migrates_and_round_trips_resume_authorization() -> None:
         set(),
     )
     assert restored.map_task_state.to_dict() == state.to_dict()
+
+
+def _malformed_owner_session(*, side_effect_state: str) -> Session:
+    """构造捕获故障中的 orchestrator + worker schema 持久化形态。"""
+    root = Frame(
+        id="f1",
+        agent=AgentDefinition(
+            name="coordinator",
+            source="bundled",
+            description="",
+            prompt="",
+        ),
+        messages=[],
+    )
+    owner = Frame(
+        id="f2",
+        agent=AgentDefinition(
+            name="map-agent",
+            source="bundled",
+            description="",
+            prompt="",
+            pipeline_kind="map",
+            role="map_orchestrator",
+            map_stage="orchestrator",
+        ),
+        messages=[
+            {
+                "role": "system",
+                "content": "Runtime Map Stage Contract（运行时唯一合同）：{}",
+            }
+        ],
+        parent_id="f1",
+        map_stage_contract={"stage": "orchestrator"},
+        map_request_lineage_id="lineage-1",
+        map_task_id="task-1",
+        contract_id="legacy-contract",
+        worker_instance_id="legacy-worker",
+        result_schema=MAP_WORKER_RESULT_SCHEMA,
+        allowed_next_stages=("planner",),
+    )
+    return Session(
+        session_id="session-legacy-owner",
+        session_epoch="epoch-1",
+        agent_stack=[root, owner],
+        frame_counter=2,
+        map_task_state=MapTaskState(
+            task_id="task-1",
+            task_lineage_id="lineage-1",
+            macro_step_id="map-step",
+            owner_frame_id="f2",
+            domain_task_id="map-step:epoch-1",
+        ),
+        task_run={"side_effect_state": side_effect_state},
+    )
+
+
+def test_hydration_repairs_side_effect_free_malformed_owner() -> None:
+    restored = session_from_dict(
+        session_to_dict(_malformed_owner_session(side_effect_state="none")),
+        set(),
+    )
+    owner = restored.agent_stack[-1]
+    assert owner.domain_owner_contract["contract_kind"] == "domain_owner_v1"
+    assert owner.domain_owner_contract["macro_step_id"] == "map-step"
+    assert owner.map_stage_contract == {}
+    assert owner.worker_instance_id is None
+    assert owner.result_schema is None
+    assert owner.allowed_next_stages == ()
+    assert owner.structured_diagnostics[-1]["outcome"] == "repaired"
+    assert all(
+        not str(message.get("content", "")).startswith("Runtime Map Stage Contract")
+        for message in owner.messages
+    )
+
+
+def test_hydration_blocks_ambiguous_malformed_owner_without_mutation() -> None:
+    restored = session_from_dict(
+        session_to_dict(_malformed_owner_session(side_effect_state="committed")),
+        set(),
+    )
+    owner = restored.agent_stack[-1]
+    assert owner.map_stage_contract == {"stage": "orchestrator"}
+    assert owner.result_schema == MAP_WORKER_RESULT_SCHEMA
+    assert owner.structured_diagnostics[-1] == {
+        "error_code": "map_route_contract_violation",
+        "migration": "legacy_owner_worker_contract_v9",
+        "lineage_intact": True,
+        "side_effect_state": "committed",
+        "outcome": "blocked_no_mutation",
+    }
 
 
 def test_distinct_task_resets_task_and_revision_fields_from_metadata() -> None:
@@ -401,8 +490,7 @@ def test_gate_rejects_missing_revision_and_preserves_unrelated_blockers() -> Non
     decision = evaluate_map_completion(state)
     assert decision.allowed is False
     assert any(
-        blocker.get("reason") == "completion_revision_missing"
-        for blocker in decision.blockers
+        blocker.get("reason") == "completion_revision_missing" for blocker in decision.blockers
     )
 
 

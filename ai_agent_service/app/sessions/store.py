@@ -13,24 +13,27 @@ import json
 import logging
 import re
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, CompactSnapshot, Frame
+from app.orchestrator.frame_contract_types import DomainOwnerContract
+from app.orchestrator.map_contracts import MAP_WORKER_RESULT_SCHEMA
 from app.orchestrator.map_progress import MapTaskState
 from app.orchestrator.map_request_scope import MapRequestScope
 from app.orchestrator.map_workers import restore_project_agent
 from app.permissions.engine import SessionAllowGrant
+from app.sessions.resource_registry import RESET_FAILPOINTS, ResetFailureInjector
 from app.sessions.schema import (
     SESSION_SCHEMA_VERSION,
     migrate_session_payload,
     session_payload_version,
 )
 from app.storage.atomic import atomic_write_json
-from app.sessions.resource_registry import RESET_FAILPOINTS, ResetFailureInjector
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +351,7 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
         "map_reader_detailed_region_ready": frame.map_reader_detailed_region_ready,
         # 地图子 Frame 的可信阶段合同与运行时证据，用于跨轮次恢复时保持流水线状态一致
         "map_stage_contract": frame.map_stage_contract,
+        "domain_owner_contract": frame.domain_owner_contract,
         "map_request_lineage_id": frame.map_request_lineage_id,
         "map_task_id": frame.map_task_id,
         "contract_id": frame.contract_id,
@@ -441,8 +445,7 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
         structured_correction_limit=_as_int(data.get("structured_correction_limit")),
         response_contract_mode=(
             data["response_contract_mode"]
-            if data.get("response_contract_mode")
-            in {"json_schema", "json_object", "prompt_only"}
+            if data.get("response_contract_mode") in {"json_schema", "json_object", "prompt_only"}
             else None
         ),
         response_contract_schema_digest=(
@@ -468,6 +471,7 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
         ],
         map_reader_detailed_region_ready=data.get("map_reader_detailed_region_ready") is True,
         map_stage_contract=_as_dict(data.get("map_stage_contract")),
+        domain_owner_contract=_as_dict(data.get("domain_owner_contract")),
         map_request_lineage_id=(
             str(data["map_request_lineage_id"])
             if data.get("map_request_lineage_id") is not None
@@ -556,6 +560,108 @@ def _as_int(value: Any, default: int = 0) -> int:
     return default
 
 
+def _macro_owner_link(
+    pending_plan: dict[str, Any] | None,
+    owner_frame_id: str,
+) -> tuple[str, str] | None:
+    """从持久化 macro 状态查找 owner 的 step/domain-task 链接。"""
+    if not isinstance(pending_plan, dict):
+        return None
+    raw_state = pending_plan.get("macro_plan_state")
+    raw_steps = raw_state.get("steps") if isinstance(raw_state, dict) else None
+    if not isinstance(raw_steps, dict):
+        return None
+    for step_id, raw_step in raw_steps.items():
+        if not isinstance(raw_step, dict):
+            continue
+        if raw_step.get("owner_frame_id") != owner_frame_id:
+            continue
+        domain_task_id = raw_step.get("domain_task_id")
+        if isinstance(step_id, str) and isinstance(domain_task_id, str):
+            return step_id, domain_task_id
+    return None
+
+
+def _repair_or_mark_malformed_map_owners(session: Session) -> None:
+    """定向迁移旧版被误标成 worker 的 map owner；歧义状态只记录诊断。"""
+    frame_ids = {frame.id for frame in session.agent_stack}
+    for frame in session.agent_stack:
+        if not (frame.agent.role == "map_orchestrator" and frame.agent.map_stage == "orchestrator"):
+            continue
+        malformed = bool(
+            frame.map_stage_contract
+            or frame.worker_instance_id
+            or frame.result_schema == MAP_WORKER_RESULT_SCHEMA
+            or frame.allowed_next_stages
+        )
+        if not malformed:
+            continue
+        macro_link = _macro_owner_link(session.pending_plan, frame.id)
+        state = session.map_task_state
+        state_link_matches = bool(
+            state.owner_frame_id == frame.id and state.macro_step_id and state.domain_task_id
+        )
+        step_id = state.macro_step_id if state_link_matches else ""
+        domain_task_id = state.domain_task_id if state_link_matches else ""
+        if macro_link is not None:
+            step_id, domain_task_id = macro_link
+        run_effect = (
+            session.task_run.get("side_effect_state")
+            if isinstance(session.task_run, dict)
+            else None
+        )
+        lineage_intact = bool(
+            frame.parent_id in frame_ids
+            and frame.map_task_id
+            and frame.map_task_id == state.task_id
+            and frame.map_request_lineage_id
+            and frame.map_request_lineage_id == state.task_lineage_id
+            and step_id
+            and domain_task_id
+        )
+        no_worker_effect = bool(
+            run_effect == "none"
+            and not frame.map_evidence
+            and frame.persistent_edit_map_turn_count == 0
+            and not state.executed_batches
+        )
+        diagnostic = {
+            "error_code": "map_route_contract_violation",
+            "migration": "legacy_owner_worker_contract_v9",
+            "lineage_intact": lineage_intact,
+            "side_effect_state": run_effect or "unknown",
+        }
+        if not (lineage_intact and no_worker_effect):
+            frame.structured_diagnostics.append({**diagnostic, "outcome": "blocked_no_mutation"})
+            continue
+        frame.map_stage_contract = {}
+        frame.contract_id = None
+        frame.worker_instance_id = None
+        frame.result_schema = None
+        frame.allowed_next_stages = ()
+        frame.response_contract_mode = None
+        frame.response_contract_schema_digest = None
+        frame.messages = [
+            message
+            for message in frame.messages
+            if not (
+                message.get("role") == "system"
+                and isinstance(message.get("content"), str)
+                and message["content"].startswith("Runtime Map Stage Contract")
+            )
+        ]
+        frame.domain_owner_contract = DomainOwnerContract(
+            domain="map",
+            owner_frame_id=frame.id,
+            parent_frame_id=frame.parent_id,
+            macro_step_id=step_id,
+            domain_task_id=domain_task_id,
+            durable_task_id=frame.map_task_id,
+            request_lineage_id=frame.map_request_lineage_id,
+        ).to_dict()
+        frame.structured_diagnostics.append({**diagnostic, "outcome": "repaired"})
+
+
 def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Session:
     """从持久化字典恢复 `Session`。
 
@@ -600,7 +706,7 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
     history_event_counter = max(stored_event_counter, restored_event_counter)
     pending_plan = data.get("pending_plan")
     map_task_state = MapTaskState.from_dict(data.get("map_task_state"))
-    return Session(
+    session = Session(
         session_id=str(data["session_id"]),
         session_epoch=str(data.get("session_epoch", "")),
         agent_stack=[
@@ -655,6 +761,8 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         rag_context=str(data.get("rag_context", "")),
         task_run=(dict(data["task_run"]) if isinstance(data.get("task_run"), dict) else None),
     )
+    _repair_or_mark_malformed_map_owners(session)
+    return session
 
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")

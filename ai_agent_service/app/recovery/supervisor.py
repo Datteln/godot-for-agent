@@ -455,6 +455,17 @@ FAILURE_POLICIES: Final[dict[str, FailurePolicy]] = {
         True,
         "client reconnects and observes durable attempt state",
     ),
+    "map_route_contract_violation": _policy(
+        "request",
+        "retry_new_attempt",
+        True,
+        "none",
+        "backend",
+        "map_route_contract",
+        1,
+        True,
+        "backend resumes the recorded owner checkpoint or reconstructs its typed child",
+    ),
     "event_delivery_failed": _policy(
         "transport",
         "retry_new_attempt",

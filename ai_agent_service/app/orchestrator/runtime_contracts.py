@@ -65,7 +65,7 @@ class SkillBindingResult:
 
 @dataclass(frozen=True)
 class MapWorkflowEvent:
-    """表示作用于同一地图目标与 revision 的唯一状态变更事实。"""
+    """表示作用于地图执行范围或 workflow 身份的唯一状态变更事实。"""
 
     event_id: str
     event_type: str
@@ -77,7 +77,7 @@ class MapWorkflowEvent:
 
     @property
     def scope_key(self) -> str:
-        """返回事件所属的规范目标/revision 作用域键。"""
+        """返回事件所属的规范执行范围或 workflow 作用域键。"""
         return f"{self.target.strip()}::revision={self.revision}"
 
     def to_dict(self) -> dict[str, Any]:

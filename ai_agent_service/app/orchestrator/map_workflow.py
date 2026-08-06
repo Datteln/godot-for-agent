@@ -5,11 +5,12 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from app.orchestrator.map_contracts import MAP_RUNTIME_STAGE_TRANSITIONS
 from app.orchestrator.runtime_contracts import MapWorkflowEvent
@@ -35,6 +36,9 @@ REDUCER_OWNED_FIELDS = frozenset(
         "planning_attempts",
         "planning_fingerprints",
         "authoritative_snapshots",
+        "planning_contexts",
+        "planning_context_bundles",
+        "execution_operations",
         "planning_attempt_history",
         "planning_publications",
         "tool_failure_fingerprints",
@@ -55,6 +59,12 @@ REDUCER_OWNED_FIELDS = frozenset(
         "transaction_journals",
         "workflow_scopes",
         "workflow_events",
+        "macro_step_id",
+        "owner_frame_id",
+        "domain_task_id",
+        "child_lineage",
+        "owner_publication",
+        "approval_identity",
     }
 )
 DIRECT_WRITE_HYDRATION_ALLOWLIST = frozenset(
@@ -294,6 +304,90 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
         value = deepcopy(payload.get("value"))
         setattr(reduced, field_name, value)
         scope[field_name] = deepcopy(value)
+    elif event.event_type == "map_owner_linked":
+        macro_step_id = str(payload.get("macro_step_id", ""))
+        owner_frame_id = str(payload.get("owner_frame_id", ""))
+        domain_task_id = str(payload.get("domain_task_id", ""))
+        if macro_step_id:
+            setattr(reduced, "macro_step_id", macro_step_id)
+        if owner_frame_id:
+            setattr(reduced, "owner_frame_id", owner_frame_id)
+        if domain_task_id:
+            setattr(reduced, "domain_task_id", domain_task_id)
+        scope["macro_step_id"] = reduced.macro_step_id
+        scope["owner_frame_id"] = reduced.owner_frame_id
+        scope["domain_task_id"] = reduced.domain_task_id
+    elif event.event_type == "map_child_started":
+        expected_task_stage = str(payload.get("expected_task_stage", reduced.stage))
+        next_task_stage = str(payload.get("task_stage", reduced.stage))
+        if reduced.stage != expected_task_stage:
+            raise ValueError(
+                "stale map child start checkpoint: "
+                f"expected {expected_task_stage}, current {reduced.stage}"
+            )
+        allowed = MAP_RUNTIME_STAGE_TRANSITIONS.get(reduced.stage, frozenset())
+        if next_task_stage not in allowed:
+            raise ValueError(f"illegal map child start stage: {reduced.stage} -> {next_task_stage}")
+        reduced.stage = next_task_stage
+        raw_operations = payload.get("execution_operations", [])
+        if not isinstance(raw_operations, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("operation_id"), str)
+            for item in raw_operations
+        ):
+            raise ValueError("map_child_started execution_operations are invalid")
+        if raw_operations:
+            operations = dict(reduced.execution_operations)
+            for operation in raw_operations:
+                operations[str(operation["operation_id"])] = deepcopy(operation)
+            setattr(reduced, "execution_operations", operations)
+        raw_bundle = payload.get("planning_context_bundle")
+        if raw_bundle is not None:
+            if not isinstance(raw_bundle, dict) or not isinstance(raw_bundle.get("bundle_id"), str):
+                raise ValueError("map_child_started planning_context_bundle is invalid")
+            bundles = dict(reduced.planning_context_bundles)
+            bundles[str(raw_bundle["bundle_id"])] = deepcopy(raw_bundle)
+            setattr(reduced, "planning_context_bundles", bundles)
+        lineage_entry: dict[str, Any] = {
+            "child_frame_id": str(payload.get("child_frame_id", "")),
+            "child_stage": str(payload.get("child_stage", "")),
+        }
+        bundle_id = payload.get("planning_context_bundle_id")
+        if isinstance(bundle_id, str) and bundle_id:
+            lineage_entry["planning_context_bundle_id"] = bundle_id
+        if raw_operations:
+            lineage_entry["execution_operation_ids"] = [
+                str(item["operation_id"]) for item in raw_operations
+            ]
+        setattr(
+            reduced,
+            "child_lineage",
+            [*reduced.child_lineage, lineage_entry],
+        )
+        scope["stage"] = reduced.stage
+        if raw_operations:
+            scope["execution_operation_ids"] = [
+                str(item["operation_id"]) for item in raw_operations
+            ]
+        scope["child_lineage"] = deepcopy(reduced.child_lineage)
+    elif event.event_type == "map_owner_published":
+        setattr(reduced, "owner_publication", deepcopy(payload.get("publication", {})))
+        scope["owner_publication"] = deepcopy(reduced.owner_publication)
+    elif event.event_type == "map_approval_recorded":
+        setattr(reduced, "approval_identity", deepcopy(payload.get("approval_identity", {})))
+        scope["approval_identity"] = deepcopy(reduced.approval_identity)
+    elif event.event_type == "planning_context_refreshed":
+        context_id = str(payload.get("context_id", ""))
+        context_entry = payload.get("context_entry")
+        if not context_id or not isinstance(context_entry, dict):
+            raise ValueError("planning_context_refreshed requires context_id and context_entry")
+        contexts = dict(reduced.planning_contexts)
+        contexts[context_id] = deepcopy(context_entry)
+        setattr(reduced, "planning_contexts", contexts)
+        raw_bundle = payload.get("resulting_bundle")
+        if isinstance(raw_bundle, dict) and isinstance(raw_bundle.get("bundle_id"), str):
+            bundles = dict(reduced.planning_context_bundles)
+            bundles[str(raw_bundle["bundle_id"])] = deepcopy(raw_bundle)
+            setattr(reduced, "planning_context_bundles", bundles)
     else:
         raise ValueError(f"unknown map workflow event type: {event.event_type}")
 

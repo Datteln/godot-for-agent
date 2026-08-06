@@ -220,14 +220,29 @@ static func format_plan_created_event(payload: Dictionary) -> String:
 	for step in steps:
 		if not (step is Dictionary):
 			continue
-		lines.append("  %d. %s (%s)" % [
-			int(step.get("index", 0)),
-			str(step.get("title", "")),
-			str(step.get("agent", ""))
-		])
-		var task := str(step.get("task", ""))
-		if task != "":
-			lines.append("     %s" % task)
+		var owner := str(step.get("owner_agent", step.get("agent", "")))
+		var domain := str(step.get("domain", ""))
+		var objective := str(step.get("objective", step.get("task", "")))
+		var header := "  %d. %s" % [int(step.get("index", 0)), str(step.get("title", objective))]
+		if owner != "":
+			header += " (%s)" % owner
+		if domain != "":
+			header += " [%s]" % domain
+		lines.append(header)
+		if objective != "" and objective != str(step.get("title", "")):
+			lines.append("     %s" % objective)
+		# 展示里程碑仅为 UI 提示，不可执行、不产生 sibling 步骤。
+		var milestones: Array = step.get("display_milestones", []) if step.get("display_milestones", []) is Array else []
+		if not milestones.is_empty():
+			var ms_titles: Array[String] = []
+			for ms in milestones:
+				if not (ms is Dictionary):
+					continue
+				var ms_title := str(ms.get("title", ms.get("id", "")))
+				if ms_title != "":
+					ms_titles.append(ms_title)
+			if not ms_titles.is_empty():
+				lines.append("     milestones: %s" % ", ".join(ms_titles))
 	return _title_with_body("Plan created:", "\n".join(lines))
 
 

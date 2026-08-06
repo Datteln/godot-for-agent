@@ -13,7 +13,8 @@ from typing import Any
 # - MAP_TARGET_REQUIRED_TOOL_NAMES：必须显式传 target_path 的地图写工具集合
 # - requires_map_revision：判断工具是否需要携带 expected_revision 版本号（防并发覆盖）
 from app.orchestrator.map_workers import MAP_TARGET_REQUIRED_TOOL_NAMES, requires_map_revision
-from app.tools.registry import ToolDef, register as _register_tool
+from app.tools.registry import ToolDef
+from app.tools.registry import register as _register_tool
 
 
 def _object_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -59,10 +60,18 @@ def _worker_spec_schema() -> dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Optional map skills; the service adds the skills required by the pipeline."
+                    "Optional additional map skills. For planner modes the service derives and "
+                    "adds required pipeline skills from canonical operation names."
                 ),
             },
-            "operations": {"type": "array", "items": {"type": "string"}},
+            "operations": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Canonical registered tool names for this worker stage; planner operations "
+                    "deterministically select required planning skills."
+                ),
+            },
             "constraints": {
                 "type": "array",
                 "items": _object_schema(
@@ -77,7 +86,8 @@ def _worker_spec_schema() -> dict[str, Any]:
             "authoritative_snapshot": {
                 "type": "object",
                 "description": (
-                    "Required for planner modes; runtime-owned authoritative map snapshot identity."
+                    "Legacy single-context planner input; runtime migrates it into a one-entry "
+                    "planning_context_bundle."
                 ),
                 "properties": {
                     "artifact_ref": {"type": "string"},
@@ -97,6 +107,49 @@ def _worker_spec_schema() -> dict[str, Any]:
                     "map_revision",
                 ],
             },
+            "planning_context_bundle": {
+                "type": "object",
+                "description": (
+                    "Runtime-owned planner reference contexts; entries may use different "
+                    "targets, layers, regions, and source revisions."
+                ),
+                "properties": {
+                    "bundle_id": {"type": "string"},
+                    "required_roles": {"type": "array", "items": {"type": "string"}},
+                    "contexts": {
+                        "type": "array",
+                        "items": _object_schema(
+                            {
+                                "context_id": {"type": "string"},
+                                "semantic_role": {"type": "string"},
+                                "artifact_ref": {"type": "string"},
+                                "digest": {"type": "string"},
+                                "provenance": {"type": "object"},
+                                "target_path": {"type": "string"},
+                                "map_layer": {"type": "integer"},
+                                "region": {"type": "object"},
+                                "source_revision": {"type": "integer"},
+                                "fact_fields": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "fresh": {"type": "boolean"},
+                            },
+                            [
+                                "context_id",
+                                "semantic_role",
+                                "artifact_ref",
+                                "digest",
+                            ],
+                        ),
+                    },
+                },
+                "required": ["contexts"],
+            },
+            "required_context_roles": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
             "approved_batch": {
                 "type": "object",
                 "description": (
@@ -112,6 +165,27 @@ def _worker_spec_schema() -> dict[str, Any]:
                     "snapshot_id": {"type": "string"},
                     "snapshot_digest": {"type": "string"},
                     "batch_fingerprint": {"type": "string"},
+                    "execution_operations": {
+                        "type": "array",
+                        "items": _object_schema(
+                            {
+                                "operation_id": {"type": "string"},
+                                "target_path": {"type": "string"},
+                                "map_layer": {"type": "integer"},
+                                "expected_revision": {"type": "integer"},
+                                "write_payload": {"type": "object"},
+                                "artifact_ref": {"type": "string"},
+                                "batch_id": {"type": "string"},
+                            },
+                            [
+                                "operation_id",
+                                "target_path",
+                                "map_layer",
+                                "expected_revision",
+                                "write_payload",
+                            ],
+                        ),
+                    },
                 },
                 "required": [
                     "artifact_ref",
@@ -375,6 +449,64 @@ def register_front_tools() -> None:
                                         "type": "object",
                                         "description": (
                                             "JSON-schema fragment used to validate the terminal result."
+                                        ),
+                                    },
+                                    "owner_agent": {
+                                        "type": "string",
+                                        "description": (
+                                            "Domain owner agent for this macro outcome (macro_v2). "
+                                            "Aliases `agent`; preferred for domain-owned steps."
+                                        ),
+                                    },
+                                    "domain": {
+                                        "type": "string",
+                                        "enum": ["map", "code", "resource", "scene"],
+                                        "description": (
+                                            "Domain of this macro outcome. Required for macro_v2 steps."
+                                        ),
+                                    },
+                                    "objective": {
+                                        "type": "string",
+                                        "description": (
+                                            "Domain-owned outcome objective (macro_v2). Aliases `task`. "
+                                            "Must not encode specialist-internal stages, tools, or "
+                                            "worker_spec; such fields are rejected."
+                                        ),
+                                    },
+                                    "acceptance_criteria": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Acceptance criteria the owner must satisfy.",
+                                    },
+                                    "predecessor_bindings": {
+                                        "type": "array",
+                                        "description": (
+                                            "Declared predecessor owner-publication fields or artifact "
+                                            "locators bound into this owner's input contract."
+                                        ),
+                                        "items": _object_schema(
+                                            {
+                                                "name": {"type": "string"},
+                                                "source_step_id": {"type": "string"},
+                                                "source_path": {"type": "string"},
+                                                "required": {"type": "boolean"},
+                                            },
+                                            ["name", "source_step_id"],
+                                        ),
+                                    },
+                                    "display_milestones": {
+                                        "type": "array",
+                                        "description": (
+                                            "Display-only milestones for UI; never executable scheduler "
+                                            "nodes and never assigned Frame or tool authority."
+                                        ),
+                                        "items": _object_schema(
+                                            {
+                                                "id": {"type": "string"},
+                                                "title": {"type": "string"},
+                                                "kind": {"type": "string"},
+                                            },
+                                            ["id", "title"],
                                         ),
                                     },
                                 },

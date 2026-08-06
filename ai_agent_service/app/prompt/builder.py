@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.agents.types import AgentDefinition
+from app.orchestrator.map_contracts import MAP_WORKER_TO_RUNTIME_STAGE
 from app.output_styles.catalog import OutputStyleCatalog
 from app.skills.catalog import SkillCatalog
 
@@ -50,7 +51,26 @@ def build_system_prompt(
         if preloaded:
             parts.append("\n\n".join(preloaded))
 
-        summaries = [summary for summary in skill_catalog.summaries() if summary.enabled]
+        binding_stage = (
+            MAP_WORKER_TO_RUNTIME_STAGE.get(str(agent.map_stage))
+            if agent.pipeline_kind == "map"
+            else None
+        )
+        effective_tools = set(agent.effective_tools)
+        summaries = [
+            summary
+            for summary in skill_catalog.summaries()
+            if summary.enabled
+            and skill_catalog.resolve_binding(
+                summary.qualified_name,
+                effective_tools,
+                workflow_stage=binding_stage,
+                worker_mode=agent.worker_mode,
+                agent_role=agent.role,
+                permitted_tools=effective_tools,
+            ).status
+            == "resolved"
+        ]
         if summaries:
             lines = [
                 "可用 Skill（只显示摘要；需要全文时调用 load_skill(name)）：",

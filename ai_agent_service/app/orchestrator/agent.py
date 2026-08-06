@@ -32,6 +32,14 @@ from typing import Any, Literal, cast
 
 from app.agents.bundled import get_agent
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
+
+# ── 本轮整改：将 history 体积控制工具下沉到独立模块，避免 agent.py 膨胀 ──
+from app.history_bounds import (
+    bounded_tool_message_body as _bounded_tool_message_body,
+)
+from app.history_bounds import (
+    summarize_history_text as _summarize_history_text,
+)
 from app.llm.cache_decision_engine import CacheDecision, CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnapshot
 from app.llm.provider import (
@@ -42,26 +50,32 @@ from app.llm.provider import (
     ToolCallRequest,
 )
 
-# ── 本轮整改：将 history 体积控制工具下沉到独立模块，避免 agent.py 膨胀 ──
-from app.history_bounds import (
-    bounded_history_value as _bounded_history_value,
-    bounded_tool_message_body as _bounded_tool_message_body,
-    json_char_size as _json_char_size,
-    summarize_history_text as _summarize_history_text,
-)
-from app.permissions.engine import PermissionContext, SessionAllowGrant, check
-from app.security.settings import SecuritySettings
-from app.sessions.store import Session
-from app.tools.context import ToolContext
-from app.tools.registry import REGISTRY, ToolDef, tools_for
-
 # ── 本轮整改：新增模块导入，支持 capability contract、artifact 存储、stage contract ──
 from app.orchestrator.delegate_artifacts import DelegateArtifactStore
+from app.orchestrator.evidence import scoped_evidence
+from app.orchestrator.frame_contract_types import (
+    MAP_WORKER_STAGE_CONTRACT_KIND,
+    DomainOwnerContract,
+    FrameContractTypeError,
+    MapWorkerStageContract,
+)
+from app.orchestrator.frame_contracts import validate_frame_result
+
+# 本轮整改：子帧创建统一走 frame_factory，确保 history_anchor / stage_contract 等字段一致
+from app.orchestrator.frame_factory import create_child_frame
+from app.orchestrator.macro_contracts import (
+    MACRO_FORBIDDEN_FIELDS,
+    MacroPlan,
+    MacroPlanError,
+    MacroPlanState,
+    derive_macro_step_status_from_child,
+)
 from app.orchestrator.map_capabilities import map_tools_for_stage
 from app.orchestrator.map_contracts import (
-    MAP_WORKER_NEXT_STAGES,
+    MAP_RUNTIME_STAGE_TRANSITIONS,
     MAP_WORKER_RESULT_SCHEMA,
     MAP_WORKER_STAGES,
+    MAP_WORKER_TO_RUNTIME_STAGE,
     MapResponseMode,
     arm_map_worker_structured_completion,
     map_worker_required_fields,
@@ -69,25 +83,22 @@ from app.orchestrator.map_contracts import (
     specialized_map_worker_schema,
     validate_map_worker_schema,
 )
-from app.orchestrator.map_workers import (
-    # 本轮整改：验证工具名与 mode→stage 映射表集中定义，避免硬编码散落
-    MAP_VALIDATION_TOOL_NAMES,
-    MAP_WRITE_TOOL_NAMES,
-    MAP_WORKER_MODE_STAGES,
-    build_dynamic_map_worker,
-    is_map_worker_write_mode,
-    is_map_write_tool,
-    validate_map_write_args,
+from app.orchestrator.map_planning_contexts import (
+    MapPlanningContextBundle,
+    MapPlanningContextEntry,
+    MapPlanningContextError,
 )
 from app.orchestrator.map_progress import (
     # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
     bind_authoritative_snapshot,
-    latest_map_revision,
     cached_validation_result,
+    latest_map_revision,
     map_pause_message,
     map_platform_plan_call_error,
     map_write_stage_error,
     platform_write_requires_validation,
+    record_map_child_lineage,
+    record_map_owner_link,
     remember_map_tool_failure,
     repeated_map_tool_failure_error,
     validation_call_error,
@@ -95,22 +106,33 @@ from app.orchestrator.map_progress import (
 from app.orchestrator.map_recovery import (
     SEMANTIC_RETRY_MAX_ATTEMPTS,
     STRUCTURED_REPAIR_MAX_ATTEMPTS,
-    record_semantic_retry,
     record_plan_attempt,
+    record_semantic_retry,
     retry_pause_report,
     safe_structured_diagnostic,
     structured_error_category,
     structured_repair_actions,
 )
-
-# 本轮整改：子帧创建统一走 frame_factory，确保 history_anchor / stage_contract 等字段一致
-from app.orchestrator.frame_factory import create_child_frame
-from app.orchestrator.frame_contracts import validate_frame_result
-from app.orchestrator.evidence import scoped_evidence
 from app.orchestrator.map_resources import normalize_edit_map_resources
+from app.orchestrator.map_workers import (
+    # 本轮整改：验证工具名与 mode→stage 映射表集中定义，避免硬编码散落
+    MAP_PLANNER_PIPELINE_SKILLS,
+    MAP_VALIDATION_TOOL_NAMES,
+    MAP_WORKER_MODE_STAGES,
+    MAP_WRITE_TOOL_NAMES,
+    build_dynamic_map_worker,
+    is_map_worker_write_mode,
+    is_map_write_tool,
+    validate_map_write_args,
+)
+from app.orchestrator.map_workflow import increment_map_counter, replace_map_state_field
 from app.orchestrator.plan_scheduler import PlanGraph, PlanGraphError
 from app.orchestrator.runtime_contracts import PlanStepResult, UnapprovedWriteRejection
-from app.orchestrator.map_workflow import increment_map_counter, replace_map_state_field
+from app.permissions.engine import PermissionContext, SessionAllowGrant, check
+from app.security.settings import SecuritySettings
+from app.sessions.store import Session
+from app.tools.context import ToolContext
+from app.tools.registry import REGISTRY, ToolDef, tools_for
 
 MAX_AGENT_DEPTH = 4
 EVENT_TEXT_PREVIEW_CHARS = 24_000
@@ -140,7 +162,7 @@ def _map_stage_contract(
     stage = agent.map_stage
     if isinstance(worker_spec, dict):
         stage = MAP_WORKER_MODE_STAGES.get(str(worker_spec.get("mode", "")))
-    if stage is None:
+    if stage not in MAP_WORKER_STAGES:
         return {}
     # 尝试从 task_text 解析 JSON 载荷，提取 target/revision/region 等合同字段
     payload: dict[str, Any] = {}
@@ -155,7 +177,11 @@ def _map_stage_contract(
         if isinstance(worker_spec, dict) and isinstance(worker_spec.get("approved_batch"), dict)
         else {}
     )
-    contract: dict[str, Any] = {"stage": stage}
+    contract: dict[str, Any] = {
+        "contract_kind": MAP_WORKER_STAGE_CONTRACT_KIND,
+        "contract_version": 1,
+        "stage": stage,
+    }
     target = payload.get("target_path", approved_batch.get("target_path"))
     if isinstance(target, str) and target.strip():
         contract["target_path"] = target.strip()
@@ -177,6 +203,29 @@ def _map_stage_contract(
     if approved_batch:
         contract["approved_batch_ref"] = approved_batch.get("artifact_ref")
         contract["approved_batch_id"] = approved_batch.get("batch_id")
+    authoritative_snapshot = (
+        worker_spec.get("authoritative_snapshot")
+        if isinstance(worker_spec, dict)
+        and isinstance(worker_spec.get("authoritative_snapshot"), dict)
+        else None
+    )
+    if authoritative_snapshot is not None:
+        contract["authoritative_snapshot"] = dict(authoritative_snapshot)
+    planning_context_bundle = (
+        worker_spec.get("planning_context_bundle")
+        if isinstance(worker_spec, dict)
+        and isinstance(worker_spec.get("planning_context_bundle"), dict)
+        else None
+    )
+    if planning_context_bundle is not None:
+        contract["planning_context_bundle"] = dict(planning_context_bundle)
+    raw_execution_operations = (
+        approved_batch.get("execution_operations") if approved_batch else None
+    )
+    if isinstance(raw_execution_operations, list):
+        contract["execution_operations"] = [
+            dict(item) for item in raw_execution_operations if isinstance(item, dict)
+        ]
     return contract
 
 
@@ -516,8 +565,6 @@ async def _delegate_child_frame(
         return None
     parent = _find_frame(session, parent_id)
     worker_spec = args.get("worker_spec")
-    # 本轮整改：记录 worker_mode 供后续延迟阶段切换使用
-    worker_mode: str | None = None
     if isinstance(worker_spec, dict):
         if agent_name not in {"map-worker", "map-agent"}:
             return (
@@ -535,20 +582,69 @@ async def _delegate_child_frame(
         )
         worker_spec.setdefault("lifecycle_scope", "delegate_frame")
         worker_mode_value = str(worker_spec.get("mode", ""))
-        if worker_mode_value in {"propose_only", "repair_propose"} and not isinstance(
-            worker_spec.get("authoritative_snapshot"), dict
-        ):
-            eligible_snapshots = [
-                dict(value)
-                for value in session.map_task_state.authoritative_snapshots.values()
-                if isinstance(value, dict) and value.get("execution_eligible") is True
-            ]
-            if len(eligible_snapshots) != 1:
-                return (
-                    "planner_snapshot_binding_ambiguous：运行时找不到唯一的可执行权威快照。"
-                    "请先让 reader 为明确 target_path/map_layer 完成 region + frontier 快照。"
+        if worker_mode_value in {"propose_only", "repair_propose"}:
+            try:
+                raw_bundle = worker_spec.get("planning_context_bundle")
+                if isinstance(raw_bundle, dict):
+                    bundle = MapPlanningContextBundle.from_dict(raw_bundle)
+                else:
+                    entries: list[MapPlanningContextEntry] = []
+                    for value in session.map_task_state.planning_contexts.values():
+                        if not isinstance(value, dict):
+                            continue
+                        entry = MapPlanningContextEntry.from_dict(value)
+                        if not entry.fresh:
+                            continue
+                        if (
+                            entry.target_path is not None
+                            and entry.map_layer is not None
+                            and entry.source_revision is not None
+                            and latest_map_revision(session, entry.target_path, entry.map_layer)
+                            != entry.source_revision
+                        ):
+                            continue
+                        entries.append(entry)
+                    if not entries:
+                        entries = [
+                            MapPlanningContextEntry.from_snapshot(value)
+                            for value in session.map_task_state.authoritative_snapshots.values()
+                            if isinstance(value, dict)
+                            and isinstance(value.get("snapshot_id"), str)
+                            and isinstance(value.get("digest"), str)
+                            and isinstance(value.get("target_path"), str)
+                            and isinstance(value.get("map_layer"), int)
+                            and isinstance(value.get("map_revision"), int)
+                            and latest_map_revision(
+                                session,
+                                str(value["target_path"]),
+                                int(value["map_layer"]),
+                            )
+                            == value.get("map_revision")
+                        ]
+                    required_roles = worker_spec.get("required_context_roles", [])
+                    bundle = MapPlanningContextBundle.from_entries(
+                        entries,
+                        required_roles=(required_roles if isinstance(required_roles, list) else ()),
+                    )
+            except MapPlanningContextError as exc:
+                return f"planner_context_binding_failed：{exc}"
+            worker_spec["planning_context_bundle"] = bundle.to_dict()
+            if len(bundle.contexts) == 1:
+                entry = bundle.contexts[0]
+                legacy_snapshot = next(
+                    (
+                        dict(value)
+                        for value in session.map_task_state.authoritative_snapshots.values()
+                        if isinstance(value, dict)
+                        and value.get("snapshot_id") == entry.context_id
+                        and value.get("digest") == entry.digest
+                    ),
+                    None,
                 )
-            worker_spec["authoritative_snapshot"] = eligible_snapshots[0]
+                if legacy_snapshot is not None:
+                    # 单上下文保持旧合同的只读别名，供滚动升级中的调用方读取；
+                    # planner 的事实源仍是 planning_context_bundle。
+                    worker_spec.setdefault("authoritative_snapshot", legacy_snapshot)
         requested_worker_name = str(worker_spec.get("name", "")).strip()
         if requested_worker_name:
             try:
@@ -569,7 +665,6 @@ async def _delegate_child_frame(
             name=reserved_identity,
             description=(f"{child_or_error.description}; display_name={requested_worker_name}"),
         )
-        worker_mode = str(worker_spec.get("mode", ""))
     else:
         if not isinstance(agent_name, str) or not agent_name:
             return None
@@ -596,6 +691,23 @@ async def _delegate_child_frame(
             "[SCHEDULER_INPUTS]\n"
             f"{json.dumps(scheduler_inputs, ensure_ascii=False, sort_keys=True, default=str)}"
         )
+    child_task_stage = (
+        MAP_WORKER_TO_RUNTIME_STAGE.get(str(child_agent.map_stage))
+        if child_agent.pipeline_kind == "map"
+        else None
+    )
+    expected_task_stage = session.map_task_state.stage
+    if child_task_stage is not None:
+        allowed_task_stages = MAP_RUNTIME_STAGE_TRANSITIONS.get(expected_task_stage, frozenset())
+        if child_task_stage not in allowed_task_stages:
+            return (
+                "map_child_stage_transition_blocked："
+                f"{expected_task_stage} -> {child_task_stage}"
+            )
+    if is_map_worker_write_mode(child_agent.worker_mode) and not _frame_in_active_map_edit(
+        session, parent
+    ):
+        return "当前用户请求未显式授权地图内容编辑，不能创建写入 worker"
     try:
         prompt = (
             await prompt_factory(child_agent, task_text)
@@ -605,18 +717,12 @@ async def _delegate_child_frame(
     except ValueError as exc:
         # 本轮整改：prompt_factory 失败时直接返回错误，不再创建残缺子帧
         return str(exc)
-    if is_map_worker_write_mode(worker_mode):
-        if not _frame_in_active_map_edit(session, parent):
-            return "当前用户请求未显式授权地图内容编辑，不能创建写入 worker"
-        # Skill 与 prompt 完整绑定成功后再进入写阶段，失败创建不得污染状态。
-        # 本轮整改：改用 transition_stage() 受控状态机切换，替代直接赋值 stage
-        session.map_task_state.transition_stage("write")
     child_agent = replace(child_agent, prompt=prompt)
     if parent is None:
         return None
     # 本轮整改：子帧创建统一走 frame_factory，自动继承 history_anchor
     # 并注入 _map_stage_contract 用于后续输出一致性校验
-    return create_child_frame(
+    child = create_child_frame(
         session=session,
         parent=parent,
         agent=child_agent,
@@ -626,6 +732,41 @@ async def _delegate_child_frame(
         pending_delegate_group_id=group_id,
         map_stage_contract=_map_stage_contract(child_agent, task_text, worker_spec),
     )
+    child_stage = child.map_stage_contract.get("stage")
+    if (
+        parent.agent.role == "map_orchestrator"
+        and isinstance(child_stage, str)
+        and child_stage in MAP_WORKER_STAGES
+    ):
+        target = str(child.map_stage_contract.get("target_path") or "")
+        revision = child.map_stage_contract.get("map_revision")
+        child_bundle = child.map_stage_contract.get("planning_context_bundle")
+        child_operations = child.map_stage_contract.get("execution_operations")
+        record_map_child_lineage(
+            session.map_task_state,
+            child_frame_id=child.id,
+            child_stage=child_stage,
+            task_stage=child_task_stage or expected_task_stage,
+            expected_task_stage=expected_task_stage,
+            target=target,
+            revision=(
+                revision if isinstance(revision, int) and not isinstance(revision, bool) else None
+            ),
+            planning_context_bundle_id=(
+                str(child_bundle.get("bundle_id"))
+                if isinstance(child_bundle, dict) and isinstance(child_bundle.get("bundle_id"), str)
+                else None
+            ),
+            planning_context_bundle=(
+                dict(child_bundle) if isinstance(child_bundle, dict) else None
+            ),
+            execution_operations=(
+                [dict(item) for item in child_operations if isinstance(item, dict)]
+                if isinstance(child_operations, list)
+                else []
+            ),
+        )
+    return child
 
 
 def _with_plan_runtime_metadata(
@@ -633,7 +774,14 @@ def _with_plan_runtime_metadata(
     source: dict[str, Any],
 ) -> dict[str, Any]:
     """Preserve request lineage fields omitted by ``PlanGraph.to_dict``."""
-    for key in ("owner_frame_id", "request_lineage_id", "map_task_id"):
+    for key in (
+        "owner_frame_id",
+        "request_lineage_id",
+        "map_task_id",
+        "macro_plan",
+        "macro_plan_state",
+        "semantic_attempt_key",
+    ):
         if key in source:
             payload[key] = source.get(key)
     return payload
@@ -709,6 +857,47 @@ def _plan_step_completed(
     """
     plan = session.pending_plan
     if plan is None:
+        return
+    macro_state_dict = plan.get("macro_plan_state")
+    if isinstance(macro_state_dict, dict):
+        # macro_v2：宏观步骤终态只由 owner 发布驱动，子帧完成不直接完成宏观步骤。
+        # 内部子阶段完成（reader/planner 等）通过 owner 发布上升为宏观状态。
+        try:
+            macro_state = MacroPlanState.from_dict(macro_state_dict)
+        except MacroPlanError as exc:
+            logger.debug(
+                "macro state invalid on child complete session=%s error=%s",
+                session.session_id,
+                exc,
+            )
+            return
+        running = next(
+            (
+                step
+                for step in macro_state.plan.steps
+                if step.owner_frame_id == done.id and step.status == "running"
+            ),
+            None,
+        )
+        if running is None:
+            return
+        output = (
+            dict(result_payload.get("result", {}))
+            if isinstance(result_payload.get("result"), dict)
+            else {"summary": str(result_payload.get("summary", ""))}
+        )
+        updated = derive_macro_step_status_from_child(macro_state, running.step_id, output)
+        if updated.to_dict() != macro_state_dict:
+            plan["macro_plan_state"] = updated.to_dict()
+            _emit_orchestration_event(
+                event_callback,
+                "macro_owner_step_updated",
+                {
+                    "step_id": running.step_id,
+                    "frame_id": done.id,
+                    "status": updated.step(running.step_id).status,
+                },
+            )
         return
     try:
         graph = PlanGraph.from_dict(plan)
@@ -1392,16 +1581,157 @@ def _normalized_map_layer_value(payload: dict[str, Any]) -> int | list[int] | No
 def _map_output_schema_for_frame(frame: Frame) -> str | None:
     """解析当前地图 frame 需要执行的结构化输出 schema。
 
-    本轮整改：不再维护 _MAP_STRUCTURED_OUTPUT_AGENTS 硬编码名称集合，
-    改为两路 capability contract 派生：
-    1. frame.map_stage_contract 非空 → 说明子帧已绑定阶段合同；
-    2. agent.map_stage 属于已知阶段 → 静态声明式元数据兜底。
+    只有通过封闭 ``MapWorkerStageContract`` 构造的 worker Frame 才能获得
+    worker 输出 schema。Agent 元数据或任意非空 dict 均不足以授予该权限。
     """
-    if frame.map_stage_contract:
-        return _MAP_OUTPUT_SCHEMA_V1
-    if frame.agent.map_stage in _MAP_WORKER_STAGES:
-        return _MAP_OUTPUT_SCHEMA_V1
+    try:
+        contract = MapWorkerStageContract.from_dict(frame.map_stage_contract)
+    except FrameContractTypeError:
+        return None
+    return (
+        _MAP_OUTPUT_SCHEMA_V1
+        if contract.result_schema == MAP_WORKER_RESULT_SCHEMA
+        and frame.result_schema == MAP_WORKER_RESULT_SCHEMA
+        and contract.stage in MAP_WORKER_STAGES
+        else None
+    )
+
+
+# 7.5 rollout flag：默认开启 macro_v2 计划与 planner 路由守卫；回滚时可关闭
+# 以恢复 legacy 行为。启动时由配置 `macro_v2_enforced` 注入。
+_MACRO_V2_ENFORCED: bool = True
+
+
+def set_macro_v2_enforced(enabled: bool) -> None:
+    """设置 macro_v2 强制开关，供启动时从配置注入。"""
+    global _MACRO_V2_ENFORCED
+    _MACRO_V2_ENFORCED = bool(enabled)
+
+
+def _planner_route_guard(
+    frame: Frame,
+    session: Session | None = None,
+) -> ErrorResult | None:
+    """验证 owner/worker Frame 合同矩阵，并在 provider 调用前失败关闭。"""
+    if not _MACRO_V2_ENFORCED:
+        return None
+    is_owner = frame.agent.role == "map_orchestrator" and frame.agent.map_stage == "orchestrator"
+    has_worker_fields = any(
+        (
+            frame.map_stage_contract,
+            frame.worker_instance_id,
+            frame.result_schema,
+            frame.allowed_next_stages,
+        )
+    )
+    if is_owner:
+        try:
+            owner_contract = DomainOwnerContract.from_dict(frame.domain_owner_contract)
+        except FrameContractTypeError:
+            owner_contract = None
+        if (
+            owner_contract is not None
+            and owner_contract.owner_frame_id == frame.id
+            and not has_worker_fields
+        ):
+            return None
+        return _map_route_contract_error("地图 owner 的角色、owner 合同或 worker-only 字段不一致")
+
+    is_map_specialist = (
+        frame.agent.pipeline_kind == "map" and frame.agent.map_stage in MAP_WORKER_STAGES
+    )
+    if not is_map_specialist:
+        if has_worker_fields:
+            return _map_route_contract_error("非地图 specialist Frame 携带了 worker 合同或 schema")
+        return None
+    try:
+        worker_contract = MapWorkerStageContract.from_dict(frame.map_stage_contract)
+    except FrameContractTypeError:
+        return _map_route_contract_error("地图 specialist 缺少合法 worker 合同")
+    if (
+        worker_contract.stage != frame.agent.map_stage
+        or worker_contract.contract_id != frame.contract_id
+        or worker_contract.worker_instance_id != frame.worker_instance_id
+        or worker_contract.result_schema != frame.result_schema
+        or worker_contract.allowed_next_stages != frame.allowed_next_stages
+        or frame.result_schema != MAP_WORKER_RESULT_SCHEMA
+    ):
+        return _map_route_contract_error("地图 specialist 的角色、阶段或身份不匹配")
+    if session is not None and any(
+        (
+            session.map_task_state.owner_frame_id,
+            session.map_task_state.task_id,
+            session.map_task_state.task_lineage_id,
+        )
+    ):
+        parent = _find_frame(session, frame.parent_id or "")
+        if (
+            parent is None
+            or parent.id != session.map_task_state.owner_frame_id
+            or frame.map_request_lineage_id != session.map_task_state.task_lineage_id
+            or frame.map_task_id != session.map_task_state.task_id
+        ):
+            return _map_route_contract_error("地图 worker 属于 sibling 或过期 lineage")
+    if worker_contract.stage == "planner":
+        bundle = worker_contract.planning_context_bundle
+        if bundle is None or not bundle.contexts:
+            return _map_route_contract_error("planner 缺少规划上下文集合")
+        if not frame.agent.skills:
+            return _map_route_contract_error("planner 缺少声明的规划 Skill")
+        if frame.agent.worker_mode in {
+            "propose_only",
+            "repair_propose",
+        } and not MAP_PLANNER_PIPELINE_SKILLS.intersection(frame.agent.skills):
+            return _map_route_contract_error("planner 缺少后端解析的规划 Skill")
+        if session is not None:
+            active_contexts = session.map_task_state.planning_contexts
+            for entry in bundle.contexts:
+                active = active_contexts.get(entry.context_id)
+                if not isinstance(active, dict):
+                    active = next(
+                        (
+                            snapshot
+                            for snapshot in session.map_task_state.authoritative_snapshots.values()
+                            if isinstance(snapshot, dict)
+                            and snapshot.get("snapshot_id") == entry.context_id
+                            and snapshot.get("digest") == entry.digest
+                        ),
+                        None,
+                    )
+                if (
+                    not isinstance(active, dict)
+                    or active.get("digest") != entry.digest
+                    or active.get("semantic_role", "map_reference") != entry.semantic_role
+                ):
+                    return _map_route_contract_error(
+                        f"planner 规划上下文缺失或已替换：{entry.context_id}"
+                    )
+                if not entry.fresh:
+                    return _map_route_contract_error(
+                        f"planner 规划上下文已标记过期：{entry.context_id}"
+                    )
+                if (
+                    entry.target_path is not None
+                    and entry.map_layer is not None
+                    and entry.source_revision is not None
+                    and latest_map_revision(session, entry.target_path, entry.map_layer)
+                    != entry.source_revision
+                ):
+                    return _map_route_contract_error(
+                        f"planner 规划上下文 revision 已过期：{entry.context_id}"
+                    )
     return None
+
+
+def _map_route_contract_error(reason: str) -> ErrorResult:
+    """构造不包含用户补救指令的后端路由错误。"""
+    return ErrorResult(
+        text=(
+            "map_route_contract_violation：后端地图 Frame 路由合同不一致；"
+            f"{reason}。运行时将恢复 owner checkpoint 或重建 typed child。"
+        ),
+        error_code="map_route_contract_violation",
+    )
 
 
 def _json_object_from_text(text: str) -> dict[str, Any] | None:
@@ -3216,6 +3546,13 @@ def _normalize_plan_steps(raw_steps: Any) -> list[dict[str, Any]] | str:
     for index, raw in enumerate(raw_steps):
         if not isinstance(raw, dict):
             return "create_plan.steps 的每一项必须是 object"
+        forbidden = MACRO_FORBIDDEN_FIELDS & set(raw.keys())
+        if forbidden:
+            return (
+                "create_plan.steps[] 禁止携带 specialist 内部构造字段（如 worker_spec、"
+                "stage、mode 等），请改为一个领域 owner 步骤加可选展示里程碑："
+                f"{sorted(forbidden)}"
+            )
         title = raw.get("title")
         agent_name = raw.get("agent")
         task = raw.get("task")
@@ -3251,17 +3588,54 @@ def _normalize_plan_steps(raw_steps: Any) -> list[dict[str, Any]] | str:
                     if isinstance(raw.get("expected_result_schema"), dict)
                     else None
                 ),
-                "worker_spec": (
-                    dict(raw["worker_spec"]) if isinstance(raw.get("worker_spec"), dict) else None
+                "owner_agent": (
+                    str(raw["owner_agent"]).strip()
+                    if isinstance(raw.get("owner_agent"), str)
+                    else None
                 ),
+                "domain": (
+                    str(raw["domain"]).strip() if isinstance(raw.get("domain"), str) else None
+                ),
+                "objective": (
+                    str(raw["objective"]).strip() if isinstance(raw.get("objective"), str) else None
+                ),
+                "acceptance_criteria": [
+                    str(item).strip()
+                    for item in raw.get("acceptance_criteria", [])
+                    if isinstance(item, str) and item.strip()
+                ],
+                "predecessor_bindings": [
+                    dict(item)
+                    for item in raw.get("predecessor_bindings", [])
+                    if isinstance(item, dict)
+                ],
+                "display_milestones": [
+                    dict(item)
+                    for item in raw.get("display_milestones", [])
+                    if isinstance(item, dict)
+                ],
                 "estimated_complexity": complexity,
             }
         )
+    map_owner_count = sum(
+        1
+        for step in normalized
+        if str(step.get("owner_agent") or step.get("agent") or "") == "map-agent"
+        or str(step.get("domain") or "") == "map"
+    )
+    if map_owner_count > 1:
+        return (
+            "create_plan 拒绝为同一地图任务创建多个 sibling map-agent owner 步骤；"
+            "请合并为一个领域 owner 成果，内部 read/plan/preview/write/verify 阶段"
+            "用展示里程碑表达。"
+        )
     try:
-        graph = PlanGraph.from_dict({"summary": "", "steps": normalized})
+        PlanGraph.from_dict({"summary": "", "steps": normalized})
     except PlanGraphError as exc:
         return f"create_plan.steps 依赖图不合法：{exc}"
-    normalized = [step.to_dict() for step in graph.steps]
+    # 保留原始规范化字典（含 owner/domain/objective/display_milestones 等
+    # macro 字段），不经过 PlanStep.to_dict 再序列化——后者会丢弃 macro 字段，
+    # 使 MacroPlan 构建拿不到领域信息。PlanGraph 校验仅用于依赖/DAG 校验。
     return normalized
 
 
@@ -3389,6 +3763,18 @@ def _handle_create_plan(
         )
         return
     session.pending_plan = graph.to_dict()
+    try:
+        macro_plan = MacroPlan.from_dict({"summary": summary.strip(), "steps": steps})
+        macro_state = MacroPlanState.from_plan(macro_plan)
+        session.pending_plan["macro_plan"] = macro_plan.to_dict()
+        session.pending_plan["macro_plan_state"] = macro_state.to_dict()
+    except MacroPlanError as macro_exc:
+        logger.debug(
+            "Macro plan not stashable for create_plan session=%s frame=%s error=%s",
+            session.session_id,
+            frame.id,
+            macro_exc,
+        )
     if exact_key:
         session.pending_plan["semantic_attempt_key"] = exact_key
     session.pending_plan["owner_frame_id"] = frame.id
@@ -3400,6 +3786,23 @@ def _handle_create_plan(
         frame.id,
         len(steps),
     )
+    macro_views: dict[str, dict[str, Any]] = {}
+    macro_state_dict = session.pending_plan.get("macro_plan_state")
+    if isinstance(macro_state_dict, dict):
+        try:
+            macro_state = MacroPlanState.from_dict(macro_state_dict)
+        except MacroPlanError:
+            macro_state = None
+        if macro_state is not None:
+            for macro_step in macro_state.plan.steps:
+                macro_views[macro_step.step_id] = {
+                    "owner_agent": macro_step.owner_agent,
+                    "domain": macro_step.domain,
+                    "objective": macro_step.objective,
+                    "display_milestones": [
+                        milestone.to_dict() for milestone in macro_step.display_milestones
+                    ],
+                }
     _emit_orchestration_event(
         event_callback,
         "plan_created",
@@ -3418,6 +3821,7 @@ def _handle_create_plan(
                     "task": step.task,
                     "depends_on": list(step.depends_on),
                     "estimated_complexity": step.estimated_complexity,
+                    **macro_views.get(step.step_id, {}),
                 }
                 for step in graph.steps
             ],
@@ -3538,6 +3942,61 @@ async def _start_delegate_frame(
         child.depth,
     )
     return True
+
+
+def _record_macro_owner(session: Session, step_id: str | None, owner_frame_id: str) -> None:
+    """若存在 macro_v2 调度状态，记录 owner Frame 身份并持久化回 pending_plan。
+
+    持久 owner 身份是 create-or-resume 调度与 planner 路由守卫（task 3.3）的
+    前置：后续重试、审批续接与超时恢复据此 resume 同一 owner 而非新建 sibling。
+    实际帧级 resume 复用引擎既有 map-task 恢复路径（resumed_existing_map_task）。
+    """
+    plan = session.pending_plan
+    if not isinstance(plan, dict) or not step_id:
+        return
+    state_dict = plan.get("macro_plan_state")
+    if not isinstance(state_dict, dict):
+        return
+    try:
+        state = MacroPlanState.from_dict(state_dict)
+        domain_task_id = state.step(step_id).domain_task_id or f"{step_id}:{session.session_epoch}"
+        state = state.set_owner(
+            step_id, owner_frame_id=owner_frame_id, domain_task_id=domain_task_id
+        )
+        plan["macro_plan_state"] = state.to_dict()
+        owner_frame = _find_frame(session, owner_frame_id)
+        if owner_frame is not None and owner_frame.domain_owner_contract:
+            owner_contract = DomainOwnerContract.from_dict(
+                owner_frame.domain_owner_contract
+            ).with_macro_link(
+                macro_step_id=step_id,
+                domain_task_id=domain_task_id,
+            )
+            owner_frame.domain_owner_contract = owner_contract.to_dict()
+        if owner_frame is not None and owner_frame.agent.role == "map_orchestrator":
+            target = next(
+                iter(session.map_task_state.latest_revisions),
+                "__map_owner__",
+            )
+            revision = session.map_task_state.latest_revisions.get(target, 0)
+            record_map_owner_link(
+                session.map_task_state,
+                macro_step_id=step_id,
+                owner_frame_id=owner_frame_id,
+                domain_task_id=domain_task_id,
+                target=target,
+                revision=(
+                    revision if isinstance(revision, int) and not isinstance(revision, bool) else 0
+                ),
+            )
+    except (MacroPlanError, FrameContractTypeError) as macro_exc:
+        logger.debug(
+            "macro owner record skipped session=%s step=%s frame=%s error=%s",
+            session.session_id,
+            step_id,
+            owner_frame_id,
+            macro_exc,
+        )
 
 
 async def _start_delegate_group(
@@ -3879,6 +4338,7 @@ async def _start_delegate_group(
     session.agent_stack.append(child)
     if plan_driven:
         _plan_step_started(session, child, event_callback, plan_step_id)
+        _record_macro_owner(session, plan_step_id, child.id)
     else:
         group = session.delegate_groups[group_id]
         try:
@@ -4303,6 +4763,26 @@ async def run_turn(
         if frame is None:
             logger.error("Agent run_turn failed: empty frame stack session=%s", session.session_id)
             return ErrorResult(text="会话没有活跃的 agent 帧", error_code="missing_agent_frame")
+
+        route_violation = _planner_route_guard(frame, session)
+        if route_violation is not None:
+            logger.warning(
+                "Map route contract violation session=%s frame=%s agent=%s map_stage=%s",
+                session.session_id,
+                frame.id,
+                frame.agent.name,
+                frame.agent.map_stage,
+            )
+            _emit_orchestration_event(
+                event_callback,
+                "map_route_contract_violation",
+                {
+                    "frame_id": frame.id,
+                    "agent": frame.agent.name,
+                    "map_stage": frame.agent.map_stage,
+                },
+            )
+            return route_violation
 
         if (
             frame.force_text_only
@@ -5083,7 +5563,8 @@ async def run_turn(
             effective_tools=frozenset(visible_effective_tools),
             agent_effective_tools=frozenset(frame.agent.effective_tools),
             workflow_stage=(
-                session.map_task_state.stage if _uses_persistent_map_budget(frame) else None
+                MAP_WORKER_TO_RUNTIME_STAGE.get(str(frame.agent.map_stage))
+                or (session.map_task_state.stage if _uses_persistent_map_budget(frame) else None)
             ),
             agent_role=frame.agent.role,
             worker_mode=frame.agent.worker_mode,

@@ -15,7 +15,6 @@ import copy
 import hashlib
 import json
 import logging
-import re
 from collections.abc import Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
@@ -39,7 +38,7 @@ from app.api.schemas import (
     ToolResult,
 )
 from app.config import AppSettings
-from app.events.store import Event, EventStore
+from app.events.store import EventStore
 from app.llm.cache_decision_engine import CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector
 from app.llm.provider import LLMProvider
@@ -50,13 +49,28 @@ from app.orchestrator.agent import (
     StepResult,
     ToolCallsResult,
     run_turn,
+    set_macro_v2_enforced,
 )
-from app.orchestrator.map_workers import (
-    MAP_REVISION_GUARDED_TOOL_NAMES,
-    MAP_VALIDATION_TOOL_NAMES,
-    PLATFORM_PLAN_TOOL_NAMES,
+from app.orchestrator.completion_gate import (
+    completion_gate_text,
+    evaluate_map_completion,
+    has_canonical_map_target_revision,
+)
+from app.orchestrator.evidence import (
+    EvidenceValidationError,
+    register_screenshot_evidence,
+)
+from app.orchestrator.map_artifacts import (
+    CURRENT_MAP_ARTIFACT_TURN,
+    CoordinatedCommitFailureInjector,
+    MapArtifactLocator,
+    MapArtifactStore,
+    MapArtifactTurnConflictError,
+    StagedMapArtifactTurn,
+    clear_session_artifacts,
 )
 from app.orchestrator.map_contracts import (
+    MAP_WORKER_TO_RUNTIME_STAGE,
     MapResponseMode,
     arm_map_worker_structured_completion,
 )
@@ -66,14 +80,32 @@ from app.orchestrator.map_progress import (
     latest_map_revision,
     map_platform_plan_attempt_count,
     parse_map_plan_outcome,
-    remember_map_tool_failure,
-    remember_validation_cache,
     remember_map_plan_progress,
+    remember_map_tool_failure,
     remember_planning_snapshot_evidence,
+    remember_validation_cache,
     remember_validation_progress,
     reset_map_task_progress,
     resume_map_task,
     validation_mode,
+)
+from app.orchestrator.map_request_scope import (
+    MapRequestScope,
+    bind_map_task,
+    invalidate_completion_candidate,
+    is_continuation_intent,
+    mark_completion_candidate,
+    new_request_scope,
+)
+from app.orchestrator.map_workers import (
+    MAP_REVISION_GUARDED_TOOL_NAMES,
+    MAP_VALIDATION_TOOL_NAMES,
+    PLATFORM_PLAN_TOOL_NAMES,
+)
+from app.orchestrator.map_workflow import (
+    consume_map_resume_authorization,
+    increment_map_counter,
+    replace_map_state_field,
 )
 from app.output_styles.catalog import OutputStyleCatalog
 from app.permissions.engine import make_session_allow_grant
@@ -88,37 +120,6 @@ from app.query.tool_result_submission import (
     ValidatedToolResultBatch,
     validate_tool_result_batch,
 )
-from app.orchestrator.map_artifacts import (
-    CURRENT_MAP_ARTIFACT_TURN,
-    CoordinatedCommitFailureInjector,
-    MapArtifactTurnConflictError,
-    MapArtifactLocator,
-    MapArtifactStore,
-    StagedMapArtifactTurn,
-    clear_session_artifacts,
-)
-from app.orchestrator.map_workflow import (
-    consume_map_resume_authorization,
-    increment_map_counter,
-    replace_map_state_field,
-)
-from app.orchestrator.evidence import (
-    EvidenceValidationError,
-    register_screenshot_evidence,
-)
-from app.orchestrator.completion_gate import (
-    completion_gate_text,
-    evaluate_map_completion,
-    has_canonical_map_target_revision,
-)
-from app.orchestrator.map_request_scope import (
-    MapRequestScope,
-    bind_map_task,
-    invalidate_completion_candidate,
-    is_continuation_intent,
-    mark_completion_candidate,
-    new_request_scope,
-)
 from app.rag.asset_llm_client import AssetLLMClient, AssetLLMConfig
 from app.rag.factory import create_codebase_index
 from app.recovery.pointer import RecoveryPointerStore
@@ -128,8 +129,8 @@ from app.recovery.supervisor import (
     RecoveryTokenError,
 )
 from app.security.settings import SecuritySettings, security_settings_from_app
-from app.sessions.store import Session, SessionStore, session_from_dict, session_to_dict
 from app.sessions.resource_registry import BACKEND_RESET_STEPS
+from app.sessions.store import Session, SessionStore, session_from_dict, session_to_dict
 from app.skills.catalog import SkillCatalog
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
@@ -922,11 +923,12 @@ def _resume_map_batch_queue(session: Session) -> ChatToolCallsResponse | None:
 
 
 from app.query.helpers import (
+    _MAP_VALIDATION_REPEAT_LIMIT,
     _PERSISTED_HISTORY_EVENT_TYPES,
     _abort_pending_map_region_read_on_size_error,
     _append_platform_planning_failure_hint,
-    _build_user_content,
     _bind_map_validation_to_pending_write,
+    _build_user_content,
     _clear_validation_blockers,
     _defer_map_tool_for_region_read,
     _defer_map_validation_for_state_read,
@@ -937,26 +939,21 @@ from app.query.helpers import (
     _history_payload_for_front_tool,
     _json_char_size,
     _map_completion_blocker,
-    _map_completion_gate_text,
     _map_region_from_write_args,
-    _MAP_VALIDATION_REPEAT_LIMIT,
     _map_validation_is_successful,
-    _remember_map_validation,
     _persisted_history_events,
-    _region_summary_from_value,
     _remember_latest_map_region_read,
     _remember_latest_map_revision,
+    _remember_map_validation,
     _replace_last_assistant_final,
     _resume_pending_map_tool_after_read,
     _resume_pending_map_validation_after_read,
     _resume_pending_map_write_after_read,
     _review_required_blocker,
-    _safe_artifact_name,
     _schedule_map_completion_continuation,
     _schedule_map_reviewer_if_required,
     _schedule_revision_conflict_reader,
     _structured_session_history,
-    _tool_history_blocks,
     _tool_message,
     _update_map_context_state,
 )
@@ -1999,6 +1996,12 @@ class QueryEngine:
             except asyncio.CancelledError:
                 raise
             except Exception:
+                logger.exception(
+                    "Chat submission attempt failed before backend recovery "
+                    "session=%s request_id=%s",
+                    request.session_id,
+                    request.request_id,
+                )
                 retry_state = copy.deepcopy(snapshot)
                 retry_state.task_run = copy.deepcopy(active.task_run)
                 problem = self._recovery_supervisor.problem(
@@ -2182,11 +2185,20 @@ class QueryEngine:
                 if agent.skills:
                     raise ValueError("Skill 绑定失败：当前 QueryEngine 未配置 SkillCatalog")
             else:
+                worker_binding_stage = (
+                    MAP_WORKER_TO_RUNTIME_STAGE.get(str(agent.map_stage))
+                    if agent.pipeline_kind == "map"
+                    else None
+                )
                 binding = self._skill_catalog.binding_status(
                     agent.skills,
                     set(agent.effective_tools),
                     workflow_stage=(
-                        session.map_task_state.stage if agent.pipeline_kind == "map" else None
+                        worker_binding_stage
+                        if worker_binding_stage is not None
+                        else (
+                            session.map_task_state.stage if agent.pipeline_kind == "map" else None
+                        )
                     ),
                     worker_mode=agent.worker_mode,
                     agent_role=agent.role,
@@ -2473,6 +2485,7 @@ class QueryEngine:
         event_callback: Callable[[str, dict[str, Any]], None],
     ) -> StepResult:
         """用当前 QueryEngine 依赖运行一轮 agent 编排。"""
+        set_macro_v2_enforced(self._settings.macro_v2_enforced)
         return await run_turn(
             session=session,
             llm=self._llm,
@@ -4009,7 +4022,7 @@ class QueryEngine:
                             f"{publication_buffer.request_id or ''}\0"
                             f"{publication_buffer.turn_id}\0"
                             f"{event_index}\0{event_type}"
-                        ).encode("utf-8")
+                        ).encode()
                     ).hexdigest(),
                 )
                 self._recovery_supervisor.hit_failpoint("event_delivery_before_publish")

@@ -5,27 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from pathlib import Path
 from dataclasses import MISSING, asdict, dataclass, field, fields
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal
 
-from app.orchestrator.map_contracts import MAP_RUNTIME_STAGE_TRANSITIONS
-from app.orchestrator.map_workers import MAP_PLAN_TOOL_NAMES, PLATFORM_PLAN_TOOL_NAMES
-from app.orchestrator.map_workflow import (
-    assert_map_workflow_write_allowed,
-    dispatch_map_workflow_event,
-    increment_map_counter,
-    map_workflow_scope_key,
-    make_map_workflow_event,
-    replace_map_state_field,
-    workflow_scope_identity,
-)
-from app.orchestrator.map_recovery import (
-    SEMANTIC_RETRY_MAX_ATTEMPTS,
-    record_semantic_retry,
-    retry_pause_report,
-)
 from app.orchestrator.map_artifacts import MapArtifactStore
+from app.orchestrator.map_contracts import MAP_RUNTIME_STAGE_TRANSITIONS
+from app.orchestrator.map_planning_contexts import (
+    MapExecutionOperation,
+    MapPlanningContextBundle,
+    MapPlanningContextEntry,
+    MapPlanningContextError,
+)
 from app.orchestrator.map_planning_snapshots import (
     ApprovedBatchStore,
     PlanningRepairStore,
@@ -33,6 +24,21 @@ from app.orchestrator.map_planning_snapshots import (
     build_region_snapshot,
     merge_frontier_snapshot,
     planning_snapshot_scope,
+)
+from app.orchestrator.map_recovery import (
+    SEMANTIC_RETRY_MAX_ATTEMPTS,
+    record_semantic_retry,
+    retry_pause_report,
+)
+from app.orchestrator.map_workers import MAP_PLAN_TOOL_NAMES, PLATFORM_PLAN_TOOL_NAMES
+from app.orchestrator.map_workflow import (
+    assert_map_workflow_write_allowed,
+    dispatch_map_workflow_event,
+    increment_map_counter,
+    make_map_workflow_event,
+    map_workflow_scope_key,
+    replace_map_state_field,
+    workflow_scope_identity,
 )
 
 if TYPE_CHECKING:
@@ -90,7 +96,7 @@ class MapTaskCounters:
     pauses: int = 0
 
 
-MapTaskFieldScope = Literal["task", "revision", "session"]
+MapTaskFieldScope = Literal["task", "revision", "context", "operation", "session"]
 
 
 @dataclass(frozen=True)
@@ -129,6 +135,9 @@ class MapTaskState:
     planning_attempts: dict[str, int] = field(default_factory=dict)
     planning_fingerprints: dict[str, int] = field(default_factory=dict)
     authoritative_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    planning_contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    planning_context_bundles: dict[str, dict[str, Any]] = field(default_factory=dict)
+    execution_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     planning_attempt_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     planning_publications: dict[str, dict[str, Any]] = field(default_factory=dict)
     tool_failure_fingerprints: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -153,6 +162,15 @@ class MapTaskState:
     plan_attempt_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
     task_convergence_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
     transaction_journals: list[dict[str, Any]] = field(default_factory=list)
+    # 宏观计划与地图域工作流的类型化链接（task 4.1）：owner 身份、macro 步骤、
+    # 域任务、子帧 lineage、owner 发布与审批身份。独立于 MacroPlanState 持久化，
+    # 两者通过 (macro_step_id, domain_task_id, owner_frame_id) 稳定关联。
+    macro_step_id: str = ""
+    owner_frame_id: str = ""
+    domain_task_id: str = ""
+    child_lineage: list[dict[str, Any]] = field(default_factory=list)
+    owner_publication: dict[str, Any] | None = None
+    approval_identity: dict[str, Any] | None = None
 
     def __setattr__(self, name: str, value: Any) -> None:
         """在功能开关启用时检测 reducer-owned 字段的运行时直写。"""
@@ -219,6 +237,9 @@ class MapTaskState:
             ("planning_attempts", {}),
             ("planning_fingerprints", {}),
             ("authoritative_snapshots", {}),
+            ("planning_contexts", {}),
+            ("planning_context_bundles", {}),
+            ("execution_operations", {}),
             ("planning_attempt_history", {}),
             ("planning_publications", {}),
             ("tool_failure_fingerprints", {}),
@@ -366,6 +387,9 @@ class MapTaskState:
             "planning_attempts",
             "planning_fingerprints",
             "authoritative_snapshots",
+            "planning_contexts",
+            "planning_context_bundles",
+            "execution_operations",
             "planning_attempt_history",
             "planning_publications",
             "tool_failure_fingerprints",
@@ -417,6 +441,7 @@ class MapTaskState:
         if not isinstance(data.get("resume_authorization"), dict):
             data["resume_authorization"] = None
         _migrate_legacy_workflow_scope_data(data)
+        _migrate_legacy_planning_contexts(data)
         return cls(**data)
 
     def make_checkpoint(
@@ -470,6 +495,9 @@ class MapTaskState:
             "executed_batches": deepcopy(self.executed_batches),
             "latest_revisions": dict(self.latest_revisions),
             "authoritative_snapshots": deepcopy(self.authoritative_snapshots),
+            "planning_contexts": deepcopy(self.planning_contexts),
+            "planning_context_bundles": deepcopy(self.planning_context_bundles),
+            "execution_operations": deepcopy(self.execution_operations),
             "planning_attempt_history": deepcopy(self.planning_attempt_history),
             "planning_publications": deepcopy(self.planning_publications),
             "approved_platform_plans": deepcopy(self.approved_platform_plans),
@@ -532,6 +560,29 @@ def _migrate_legacy_workflow_scope_data(data: dict[str, Any]) -> None:
     data["workflow_scopes"] = migrated_scopes
 
 
+def _migrate_legacy_planning_contexts(data: dict[str, Any]) -> None:
+    """把旧单快照注册表迁移为可独立刷新的规划上下文集合。"""
+    contexts = data.get("planning_contexts")
+    bundles = data.get("planning_context_bundles")
+    if isinstance(contexts, dict) and contexts:
+        if not isinstance(bundles, dict):
+            data["planning_context_bundles"] = {}
+        return
+    snapshots = data.get("authoritative_snapshots")
+    migrated: dict[str, dict[str, Any]] = {}
+    if isinstance(snapshots, dict):
+        for snapshot in snapshots.values():
+            if not isinstance(snapshot, dict):
+                continue
+            try:
+                entry = MapPlanningContextEntry.from_snapshot(snapshot)
+            except MapPlanningContextError:
+                continue
+            migrated[entry.context_id] = entry.to_dict()
+    data["planning_contexts"] = migrated
+    data["planning_context_bundles"] = dict(bundles) if isinstance(bundles, dict) else {}
+
+
 MAP_TASK_FIELD_LIFECYCLE: Final[dict[str, MapTaskFieldLifecycle]] = {
     "task_id": MapTaskFieldLifecycle("task"),
     "task_lineage_id": MapTaskFieldLifecycle("task"),
@@ -554,6 +605,9 @@ MAP_TASK_FIELD_LIFECYCLE: Final[dict[str, MapTaskFieldLifecycle]] = {
     "planning_attempts": MapTaskFieldLifecycle("task"),
     "planning_fingerprints": MapTaskFieldLifecycle("task"),
     "authoritative_snapshots": MapTaskFieldLifecycle("revision"),
+    "planning_contexts": MapTaskFieldLifecycle("context"),
+    "planning_context_bundles": MapTaskFieldLifecycle("task"),
+    "execution_operations": MapTaskFieldLifecycle("operation"),
     "planning_attempt_history": MapTaskFieldLifecycle("task"),
     "planning_publications": MapTaskFieldLifecycle("task"),
     "tool_failure_fingerprints": MapTaskFieldLifecycle("task"),
@@ -578,7 +632,181 @@ MAP_TASK_FIELD_LIFECYCLE: Final[dict[str, MapTaskFieldLifecycle]] = {
     "plan_attempt_registry": MapTaskFieldLifecycle("task"),
     "task_convergence_registry": MapTaskFieldLifecycle("task"),
     "transaction_journals": MapTaskFieldLifecycle("task"),
+    "macro_step_id": MapTaskFieldLifecycle("task"),
+    "owner_frame_id": MapTaskFieldLifecycle("task"),
+    "domain_task_id": MapTaskFieldLifecycle("task"),
+    "child_lineage": MapTaskFieldLifecycle("task"),
+    "owner_publication": MapTaskFieldLifecycle("task"),
+    "approval_identity": MapTaskFieldLifecycle("task"),
 }
+
+
+def record_map_owner_link(
+    state: MapTaskState,
+    *,
+    macro_step_id: str,
+    owner_frame_id: str,
+    domain_task_id: str,
+    target: str,
+    revision: int,
+) -> None:
+    """记录地图域工作流与宏观计划的类型化链接（owner/macro/域任务身份）。
+
+    独立于 MacroPlanState 持久化；两者通过 (macro_step_id, domain_task_id,
+    owner_frame_id) 稳定关联，跨重试/审批/恢复 resume 同一 owner。
+    """
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "map_owner_linked",
+            target,
+            revision,
+            {
+                "macro_step_id": macro_step_id,
+                "owner_frame_id": owner_frame_id,
+                "domain_task_id": domain_task_id,
+            },
+        ),
+    )
+
+
+def record_map_child_lineage(
+    state: MapTaskState,
+    *,
+    child_frame_id: str,
+    child_stage: str,
+    task_stage: str | None = None,
+    expected_task_stage: str | None = None,
+    target: str | None = None,
+    revision: int | None = None,
+    planning_context_bundle_id: str | None = None,
+    planning_context_bundle: dict[str, Any] | None = None,
+    execution_operations: list[dict[str, Any]] | None = None,
+) -> None:
+    """原子记录 specialist 子帧 lineage 与对应任务阶段转换。"""
+    workflow_identity = (
+        target.strip()
+        if isinstance(target, str) and target.strip()
+        else f"__workflow__:{state.task_id or state.task_lineage_id or 'map-task'}"
+    )
+    event_revision = (
+        revision
+        if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 0
+        else state.structure_revision
+    )
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "map_child_started",
+            workflow_identity,
+            event_revision,
+            {
+                "child_frame_id": child_frame_id,
+                "child_stage": child_stage,
+                "task_stage": task_stage or state.stage,
+                "expected_task_stage": expected_task_stage or state.stage,
+                "task_id": state.task_id,
+                "owner_frame_id": state.owner_frame_id,
+                "planning_context_bundle_id": planning_context_bundle_id,
+                "planning_context_bundle": deepcopy(planning_context_bundle),
+                "execution_operations": deepcopy(execution_operations or []),
+            },
+        ),
+    )
+
+
+def record_map_owner_publication(
+    state: MapTaskState,
+    *,
+    publication: dict[str, Any],
+    target: str,
+    revision: int,
+) -> None:
+    """记录 owner 发布的类型化结果（preview_ready/awaiting_confirmation 等）。"""
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "map_owner_published",
+            target,
+            revision,
+            {"publication": dict(publication)},
+        ),
+    )
+
+
+def record_map_approval_identity(
+    state: MapTaskState,
+    *,
+    approval_identity: dict[str, Any],
+    target: str,
+    revision: int,
+) -> None:
+    """记录审批身份，供 stale 审批拒绝与 owner resume 复用。"""
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "map_approval_recorded",
+            target,
+            revision,
+            {"approval_identity": dict(approval_identity)},
+        ),
+    )
+
+
+def record_planning_context_refresh(
+    state: MapTaskState,
+    *,
+    context_entry: MapPlanningContextEntry,
+    target: str,
+    revision: int,
+) -> None:
+    """记录单个规划上下文的独立刷新，保证不相关上下文不受影响。
+
+    与 replace_map_state_field 的全量替换不同，本函数通过专用 reducer
+    事件 upsert 指定 context_id 的条目并重新计算 planning_context_bundle，
+    确保刷新一个 gameplay 或 background 条目时，注册表中所有其他已注册
+    上下文保持不变。
+    """
+    dispatch_map_workflow_event(
+        state,
+        make_map_workflow_event(
+            state,
+            "planning_context_refreshed",
+            target,
+            revision,
+            {
+                "context_id": context_entry.context_id,
+                "context_entry": context_entry.to_dict(),
+                "resulting_bundle": (
+                    _build_resulting_bundle(state, context_entry)
+                    if state.planning_contexts
+                    else None
+                ),
+            },
+        ),
+    )
+
+
+def _build_resulting_bundle(
+    state: MapTaskState,
+    refreshed_entry: MapPlanningContextEntry,
+) -> dict[str, Any] | None:
+    """用刷新后的条目替换同 context_id 的旧条目，重建集合。"""
+    entries: list[MapPlanningContextEntry] = [refreshed_entry]
+    for entry_dict in state.planning_contexts.values():
+        if not isinstance(entry_dict, dict):
+            continue
+        entry = MapPlanningContextEntry.from_dict(entry_dict)
+        if entry.context_id != refreshed_entry.context_id:
+            entries.append(entry)
+    try:
+        return MapPlanningContextBundle.from_entries(entries).to_dict()
+    except MapPlanningContextError:
+        return None
 
 
 def _minimal_pause_report(
@@ -1313,6 +1541,47 @@ def remember_planning_snapshot_evidence(
         target=snapshot.target_path,
         revision=snapshot.map_revision,
     )
+    semantic_role_value = result.get(
+        "semantic_role",
+        tool_args.get("semantic_role", f"map_layer:{snapshot.map_layer}"),
+    )
+    semantic_role = (
+        semantic_role_value.strip()
+        if isinstance(semantic_role_value, str) and semantic_role_value.strip()
+        else f"map_layer:{snapshot.map_layer}"
+    )
+    try:
+        context_entry = MapPlanningContextEntry.from_snapshot(
+            locator,
+            semantic_role=semantic_role,
+        )
+        contexts = dict(session.map_task_state.planning_contexts)
+        contexts[context_entry.context_id] = context_entry.to_dict()
+        replace_map_state_field(
+            session.map_task_state,
+            "planning_contexts",
+            contexts,
+            target=snapshot.target_path,
+            revision=snapshot.map_revision,
+        )
+        current_entries = [
+            MapPlanningContextEntry.from_dict(item)
+            for item in contexts.values()
+            if isinstance(item, dict)
+        ]
+        bundle = MapPlanningContextBundle.from_entries(current_entries)
+        bundles = dict(session.map_task_state.planning_context_bundles)
+        bundles[bundle.bundle_id] = bundle.to_dict()
+        replace_map_state_field(
+            session.map_task_state,
+            "planning_context_bundles",
+            bundles,
+            target=snapshot.target_path,
+            revision=snapshot.map_revision,
+        )
+    except MapPlanningContextError:
+        # 旧快照仍保持可恢复；不合法的规划投影不得污染新上下文注册表。
+        pass
     return deepcopy(locator)
 
 
@@ -1327,7 +1596,7 @@ def build_map_progress_digest(session: Session, project_root: Path | None = None
     frontier = state.failure_frontier if isinstance(state.failure_frontier, dict) else {}
     revisions = state.latest_revisions
     revision = max(revisions.values()) if revisions else None
-    if revision is None and not frontier:
+    if revision is None and not frontier and not state.planning_contexts:
         return ""
     parts: list[str] = []
     if revision is not None:
@@ -1358,6 +1627,28 @@ def build_map_progress_digest(session: Session, project_root: Path | None = None
         parts.append(
             "planning_snapshots="
             + json.dumps(snapshots[-4:], ensure_ascii=False, separators=(",", ":"))
+        )
+    contexts = [
+        {
+            key: value.get(key)
+            for key in (
+                "context_id",
+                "semantic_role",
+                "artifact_ref",
+                "digest",
+                "target_path",
+                "map_layer",
+                "source_revision",
+                "fresh",
+            )
+        }
+        for value in state.planning_contexts.values()
+        if isinstance(value, dict)
+    ]
+    if contexts:
+        parts.append(
+            "planning_contexts="
+            + json.dumps(contexts[-8:], ensure_ascii=False, separators=(",", ":"))
         )
     if state.planning_attempt_history:
         latest_history: list[dict[str, Any]] = next(
@@ -1805,7 +2096,7 @@ def _platform_approval_records(
         records.append(
             {
                 "approval_id": hashlib.sha256(
-                    f"{target}:{plan_version}:{fingerprint}".encode("utf-8")
+                    f"{target}:{plan_version}:{fingerprint}".encode()
                 ).hexdigest()[:32],
                 "target": target,
                 "expected_revision": expected_revision,
@@ -2232,7 +2523,7 @@ def remember_map_plan_progress(
                     "approval_id": hashlib.sha256(
                         (
                             f"{target}:{next_plan_version}:" f"{expected_revision}:{fingerprint}"
-                        ).encode("utf-8")
+                        ).encode()
                     ).hexdigest()[:32],
                     "target": target,
                     "map_layer": map_layer or 0,
@@ -2244,6 +2535,14 @@ def remember_map_plan_progress(
                     "batch": deepcopy(batch),
                 }
             )
+            operation = MapExecutionOperation(
+                operation_id=f"map-operation:{records[-1]['approval_id']}",
+                target_path=target,
+                map_layer=map_layer or 0,
+                expected_revision=expected_revision,
+                write_payload={"tool": batch_tool, "args": deepcopy(batch)},
+            )
+            records[-1]["execution_operation"] = operation.to_dict()
             if project_root is not None:
                 locator = ApprovedBatchStore(
                     project_root,
@@ -2251,6 +2550,21 @@ def remember_map_plan_progress(
                     session.session_epoch,
                 ).store(records[-1])
                 records[-1].update(locator)
+        execution_operations = dict(state.execution_operations)
+        for record in records:
+            operation_value = record.get("execution_operation")
+            if not isinstance(operation_value, dict):
+                continue
+            operation_id = str(operation_value.get("operation_id", ""))
+            if operation_id:
+                execution_operations[operation_id] = deepcopy(operation_value)
+        replace_map_state_field(
+            state,
+            "execution_operations",
+            execution_operations,
+            target=target,
+            revision=current_revision,
+        )
         approvals = dict(state.approved_platform_plans)
         approvals[scope] = {
             "tool": tool_name,
@@ -2299,7 +2613,9 @@ def remember_map_plan_progress(
                         "map_revision",
                         "batch_fingerprint",
                     )
+                    if record.get(key) is not None
                 }
+                | {"execution_operations": [deepcopy(record["execution_operation"])]}
                 for record in records
             ],
         }

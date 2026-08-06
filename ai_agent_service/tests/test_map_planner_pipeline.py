@@ -372,6 +372,9 @@ def test_skill_and_runtime_worker_snapshot_contract_remain_aligned() -> None:
     assert "edit_map" not in worker.tools
     assert snapshot.snapshot_id in worker.prompt
     assert "不要索取或输出逐格 atlas" in worker.prompt
+    # change 9.4：单权威快照被迁移为 one-entry planning-context bundle，
+    # planner 的事实源是运行时冻结的 bundle，而非裸快照。
+    assert "map-context-bundle:" in worker.prompt
 
     missing = build_dynamic_map_worker(
         parent,
@@ -386,7 +389,9 @@ def test_skill_and_runtime_worker_snapshot_contract_remain_aligned() -> None:
         },
     )
     assert isinstance(missing, str)
-    assert "authoritative_snapshot" in missing
+    # change 9.2：planner 缺失权威事实源时 fail closed，错误指明新的
+    # planning_context_bundle 合同（单快照兼容路径见上方 worker 构建）。
+    assert "planning_context_bundle" in missing
 
 
 def test_raw_atlas_and_gridmap_items_are_rejected_instead_of_rewritten(tmp_path: Path) -> None:

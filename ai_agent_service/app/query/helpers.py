@@ -35,7 +35,6 @@ from app.api.schemas import (
     StepStartedHistoryBlock,
     SystemTextHistoryBlock,
     ThoughtHistoryBlock,
-    ToolResult,
     UserHistoryBlock,
     VerifyFailedHistoryBlock,
     VerifyPassedHistoryBlock,
@@ -48,20 +47,33 @@ from app.events.store import Event
 # 避免 helpers 与 history_bounds 之间重复维护同一套阈值/截断逻辑。
 from app.history_bounds import (
     HISTORY_MAX_JSON_CHARS as _HISTORY_TOOL_MAX_JSON_CHARS,
+)
+from app.history_bounds import (
     bounded_history_value as _bounded_history_value,
+)
+from app.history_bounds import (
     bounded_tool_message_body as _bounded_tool_message_body,
+)
+from app.history_bounds import (
     json_char_size as _json_char_size,
+)
+from app.history_bounds import (
     summarize_history_text as _summarize_history_text,
 )
 from app.llm.message_transformer import estimate_message_tokens, flatten_message_text
+
+# 子 Frame 创建统一走 frame_factory，保证 history_anchor / parent_id 等字段的一致性
+from app.orchestrator.frame_factory import create_child_frame, typed_child_task_text
+from app.orchestrator.map_contracts import (
+    MAP_RUNTIME_STAGE_TRANSITIONS,
+    MAP_WORKER_TO_RUNTIME_STAGE,
+)
 from app.orchestrator.map_progress import (
     latest_map_revision,
     map_revision_scope_key,
     parse_map_plan_outcome,
+    record_map_child_lineage,
 )
-
-# 子 Frame 创建统一走 frame_factory，保证 history_anchor / parent_id 等字段的一致性
-from app.orchestrator.frame_factory import create_child_frame, typed_child_task_text
 from app.orchestrator.map_workers import (
     MAP_REVISION_GUARDED_TOOL_NAMES,
     # MAP_VALIDATION_TOOL_NAMES 原本定义在本文件（_MAP_VALIDATION_TOOL_NAMES），
@@ -2907,6 +2919,20 @@ async def _schedule_revision_conflict_reader(
             }
         )
         return
+    expected_task_stage = session.map_task_state.stage
+    reader_task_stage = MAP_WORKER_TO_RUNTIME_STAGE["reader"]
+    if reader_task_stage not in MAP_RUNTIME_STAGE_TRANSITIONS.get(expected_task_stage, frozenset()):
+        frame.messages.append(
+            {
+                "role": "system",
+                "internal": True,
+                "content": (
+                    "自动 revision reader 阶段预检失败："
+                    f"{expected_task_stage} -> {reader_task_stage}"
+                ),
+            }
+        )
+        return
     task_text = typed_child_task_text(
         "重新读取 revision 冲突影响的地图区域。",
         {
@@ -2946,6 +2972,20 @@ async def _schedule_revision_conflict_reader(
             "target_path": target,
             "map_revision": result_dict.get("actual_revision"),
         },
+    )
+    actual_revision = result_dict.get("actual_revision")
+    record_map_child_lineage(
+        session.map_task_state,
+        child_frame_id=child.id,
+        child_stage="reader",
+        task_stage=reader_task_stage,
+        expected_task_stage=expected_task_stage,
+        target=target,
+        revision=(
+            actual_revision
+            if isinstance(actual_revision, int) and not isinstance(actual_revision, bool)
+            else None
+        ),
     )
     session.agent_stack.append(child)
 
@@ -2990,6 +3030,12 @@ async def _schedule_map_reviewer_if_required(
         reviewer = get_agent("map-reviewer-agent", set(REGISTRY))
     except KeyError:
         return False
+    expected_task_stage = session.map_task_state.stage
+    reviewer_task_stage = MAP_WORKER_TO_RUNTIME_STAGE["reviewer"]
+    if reviewer_task_stage not in MAP_RUNTIME_STAGE_TRANSITIONS.get(
+        expected_task_stage, frozenset()
+    ):
+        return False
     _pop_last_assistant_final(session)
     # 任务载荷只携带结构化字段（reason/target/revision/region/objective），
     # 具体的 prompt 文本由 prompt_factory 负责拼装，实现调度逻辑与提示词解耦。
@@ -3030,6 +3076,20 @@ async def _schedule_map_reviewer_if_required(
             "map_revision": blocker.get("required_revision"),
             "region": blocker.get("region", {}),
         },
+    )
+    required_revision = blocker.get("required_revision")
+    record_map_child_lineage(
+        session.map_task_state,
+        child_frame_id=child.id,
+        child_stage="reviewer",
+        task_stage=reviewer_task_stage,
+        expected_task_stage=expected_task_stage,
+        target=str(blocker.get("target", "")),
+        revision=(
+            required_revision
+            if isinstance(required_revision, int) and not isinstance(required_revision, bool)
+            else None
+        ),
     )
     session.agent_stack.append(child)
     return True

@@ -7,6 +7,13 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from app.agents.types import AgentDefinition, Frame
+from app.orchestrator.frame_contract_types import (
+    FRAME_CONTRACT_VERSION,
+    MAP_WORKER_STAGE_CONTRACT_KIND,
+    DomainOwnerContract,
+    FrameContractTypeError,
+    MapWorkerStageContract,
+)
 from app.orchestrator.map_contracts import (
     MAP_WORKER_NEXT_STAGES,
     MAP_WORKER_RESULT_SCHEMA,
@@ -51,35 +58,81 @@ def create_child_frame(
         history_anchor_frame_id = parent.history_anchor_frame_id
         history_anchor_message_index = parent.history_anchor_message_index
     frame_id = session.new_frame_id()
-    contract = dict(map_stage_contract or {})
-    worker_instance_id = f"worker-instance:{session.session_id}:{frame_id}"
-    result_schema = MAP_WORKER_RESULT_SCHEMA if contract else None
-    stage = str(contract.get("stage", ""))
-    allowed_next_stages = tuple(sorted(MAP_WORKER_NEXT_STAGES.get(stage, frozenset())))
-    contract_payload = {
-        "worker_instance_id": worker_instance_id,
-        "stage": stage,
-        "target_path": contract.get("target_path"),
-        "map_revision": contract.get("map_revision"),
-        "result_schema": result_schema,
-        "allowed_next_stages": allowed_next_stages,
-    }
-    contract_id = (
-        "frame-contract:"
-        + hashlib.sha256(
-            json.dumps(
-                contract_payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()[:24]
-        if contract
-        else None
+    raw_contract = dict(map_stage_contract or {})
+    worker_contract: MapWorkerStageContract | None = None
+    if raw_contract:
+        try:
+            worker_contract = MapWorkerStageContract.from_dict(raw_contract)
+        except FrameContractTypeError as exc:
+            raise ValueError(f"invalid map worker stage contract: {exc}") from exc
+    worker_instance_id: str | None = None
+    contract_id: str | None = None
+    result_schema: str | None = None
+    allowed_next_stages: tuple[str, ...] = ()
+    if worker_contract is not None:
+        worker_instance_id = f"worker-instance:{session.session_id}:{frame_id}"
+        identity_payload = {
+            "contract_kind": MAP_WORKER_STAGE_CONTRACT_KIND,
+            "contract_version": FRAME_CONTRACT_VERSION,
+            "worker_instance_id": worker_instance_id,
+            "stage": worker_contract.stage,
+            "target_path": worker_contract.target_path,
+            "map_revision": worker_contract.map_revision,
+            "snapshot_id": (
+                worker_contract.authoritative_snapshot.get("snapshot_id")
+                if worker_contract.authoritative_snapshot is not None
+                else None
+            ),
+            "snapshot_digest": (
+                worker_contract.authoritative_snapshot.get("digest")
+                if worker_contract.authoritative_snapshot is not None
+                else None
+            ),
+            "planning_context_bundle_id": (
+                worker_contract.planning_context_bundle.bundle_id
+                if worker_contract.planning_context_bundle is not None
+                else None
+            ),
+            "planning_context_digests": (
+                [entry.digest for entry in worker_contract.planning_context_bundle.contexts]
+                if worker_contract.planning_context_bundle is not None
+                else []
+            ),
+            "execution_operation_ids": [
+                operation.operation_id for operation in worker_contract.execution_operations
+            ],
+            "result_schema": MAP_WORKER_RESULT_SCHEMA,
+            "allowed_next_stages": sorted(MAP_WORKER_NEXT_STAGES[worker_contract.stage]),
+        }
+        contract_id = (
+            "frame-contract:"
+            + hashlib.sha256(
+                json.dumps(
+                    identity_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+        )
+        worker_contract = worker_contract.bind_runtime_identity(
+            contract_id=contract_id,
+            worker_instance_id=worker_instance_id,
+        )
+        result_schema = MAP_WORKER_RESULT_SCHEMA
+        allowed_next_stages = worker_contract.allowed_next_stages
+    contract = worker_contract.to_dict() if worker_contract is not None else {}
+    owner_contract = (
+        DomainOwnerContract(
+            domain="map",
+            owner_frame_id=frame_id,
+            parent_frame_id=parent.id,
+            durable_task_id=parent.map_task_id,
+            request_lineage_id=parent.map_request_lineage_id,
+        ).to_dict()
+        if agent.role == "map_orchestrator" and agent.map_stage == "orchestrator"
+        else {}
     )
-    if contract:
-        contract.update(contract_payload)
-        contract["contract_id"] = contract_id
     messages: list[dict[str, Any]] = [{"role": "system", "content": agent.prompt}]
     if contract:
         messages.append(
@@ -103,10 +156,11 @@ def create_child_frame(
         history_anchor_frame_id=history_anchor_frame_id,
         history_anchor_message_index=history_anchor_message_index,
         map_stage_contract=contract,
+        domain_owner_contract=owner_contract,
         map_request_lineage_id=parent.map_request_lineage_id,
         map_task_id=parent.map_task_id,
         contract_id=contract_id,
-        worker_instance_id=worker_instance_id if contract else None,
+        worker_instance_id=worker_instance_id,
         result_schema=result_schema,
         allowed_next_stages=allowed_next_stages,
     )

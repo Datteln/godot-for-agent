@@ -81,6 +81,14 @@ class AppSettings(BaseSettings):
         le=32768,
         description="地图 worker 最终结构化回合的 bounded thinking token 预算。",
     )
+    macro_v2_enforced: bool = Field(
+        default=True,
+        description=(
+            "是否强制 macro_v2 计划与 planner 路由守卫：拒绝 orchestrator 直接产出 "
+            "map worker 结构化结果、拒绝同一地图任务的 sibling map-agent owner。"
+            "默认开启；回滚时可关闭以恢复 legacy 行为。"
+        ),
+    )
     log_level: str = Field(
         default="DEBUG",
         description="服务日志等级，可选 DEBUG/INFO/WARNING/ERROR/CRITICAL。",

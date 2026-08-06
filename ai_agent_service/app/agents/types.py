@@ -173,6 +173,8 @@ class Frame:
            必要 artifact 读取即可收尾时为 True。
         map_stage_contract: 地图子 Frame 的可信阶段、目标与 revision 合同；为空表示
             该 Frame 不参与结构化地图流水线。
+        domain_owner_contract: 领域 owner 的宏观任务和 lineage 合同；不得包含地图
+            worker schema、worker identity 或 specialist next stages。
         map_request_lineage_id: 创建该 Frame 的当前用户请求 lineage；用于防止
             历史地图任务的 Frame 或工具结果污染无关请求。
         map_task_id: 该 Frame 绑定的地图任务 id；非地图编辑请求为空。
@@ -209,6 +211,7 @@ class Frame:
     # 地图子 Frame 的可信阶段合同：包含阶段、目标路径、revision 等运行时可信信息，
     # 为空 dict 表示该 Frame 不参与结构化地图流水线
     map_stage_contract: dict[str, Any] = field(default_factory=dict)
+    domain_owner_contract: dict[str, Any] = field(default_factory=dict)
     map_request_lineage_id: str | None = None
     map_task_id: str | None = None
     contract_id: str | None = None

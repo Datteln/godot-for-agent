@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Final
 
-SESSION_SCHEMA_VERSION: Final = 8
+SESSION_SCHEMA_VERSION: Final = 9
 
 _LEGACY_MAP_FIELDS: Final[dict[str, str]] = {
     "map_completion_blockers": "completion_blockers",
@@ -143,6 +143,13 @@ def migrate_session_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         # 让旧会话可以在首次加载时安全绑定到已经持久化的当前 epoch。
         migrated.setdefault("session_epoch", "")
         migrated.setdefault("task_run", None)
+
+    if source_version < 9:
+        raw_frames = migrated.get("agent_stack")
+        if isinstance(raw_frames, list):
+            for raw_frame in raw_frames:
+                if isinstance(raw_frame, dict):
+                    raw_frame.setdefault("domain_owner_contract", {})
 
     migrated["map_task_state"] = map_state
     migrated["schema_version"] = SESSION_SCHEMA_VERSION

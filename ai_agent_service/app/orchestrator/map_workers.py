@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from app.agents.types import AgentDefinition, resolve_effective_tools
 from app.orchestrator.map_capabilities import (
@@ -12,6 +12,12 @@ from app.orchestrator.map_capabilities import (
     map_tools_in_category,
 )
 from app.orchestrator.map_contracts import MAP_WORKER_RESULT_SCHEMA
+from app.orchestrator.map_planning_contexts import (
+    MapExecutionOperation,
+    MapPlanningContextBundle,
+    MapPlanningContextEntry,
+    MapPlanningContextError,
+)
 from app.tools.registry import REGISTRY
 
 MapWorkerMode = Literal[
@@ -62,6 +68,30 @@ MAP_WORKER_MODES = frozenset(
     }
 )
 MAP_WORKER_WRITE_MODES = frozenset({"write_one_batch", "repair_write_one_batch"})
+MAP_AREA_EXPANSION_SKILL: Final = "bundled:map-area-expansion"
+MAP_PROCEDURAL_GENERATION_SKILL: Final = "bundled:map-procedural-generation"
+MAP_PLANNER_PIPELINE_SKILLS: Final[frozenset[str]] = frozenset(
+    {
+        MAP_AREA_EXPANSION_SKILL,
+        MAP_PROCEDURAL_GENERATION_SKILL,
+        "map-area-expansion",
+        "map-procedural-generation",
+    }
+)
+_MAP_AREA_EXPANSION_OPERATIONS: Final[frozenset[str]] = PLATFORM_PLAN_TOOL_NAMES | frozenset(
+    {"compute_reachable_frontier"}
+)
+_MAP_PROCEDURAL_OPERATIONS: Final[frozenset[str]] = frozenset(
+    {
+        "plan_map_layout",
+        "plan_map_algorithms",
+        "sample_poisson_points",
+        "sample_noise_grid",
+        "compose_map_blueprint_grammar",
+        "find_placement_anchors",
+        "validate_object_placements",
+    }
+)
 # 动态 Worker mode → 地图流水线阶段的固定映射，
 # 确保编排层按 mode 而非展示名称判断权限与预算。
 MAP_WORKER_MODE_STAGES = {
@@ -87,6 +117,19 @@ def requires_map_revision(name: str) -> bool:
 def is_map_worker_write_mode(mode: Any) -> bool:
     """判断 worker mode 是否属于地图写入 mode。"""
     return mode in MAP_WORKER_WRITE_MODES
+
+
+def required_map_worker_skills(mode: str, operations: list[str]) -> tuple[str, ...]:
+    """根据受控 worker mode 与操作集合推导后端必须注入的地图 Skill。"""
+    if mode not in {"propose_only", "repair_propose"}:
+        return ()
+    operation_set = set(operations)
+    required: list[str] = []
+    if operation_set & _MAP_AREA_EXPANSION_OPERATIONS:
+        required.append(MAP_AREA_EXPANSION_SKILL)
+    if operation_set & _MAP_PROCEDURAL_OPERATIONS:
+        required.append(MAP_PROCEDURAL_GENERATION_SKILL)
+    return tuple(required)
 
 
 def _workflow_strings(value: Any, field_name: str) -> list[str] | str:
@@ -145,6 +188,7 @@ def build_dynamic_map_worker(
     output_schema = spec.get("output_schema")
     approved_batch = spec.get("approved_batch")
     authoritative_snapshot = spec.get("authoritative_snapshot")
+    planning_context_bundle = spec.get("planning_context_bundle")
     stage_id = spec.get("stage_id")
     if not isinstance(name, str) or not name.strip():
         return "worker_spec.name 不能为空"
@@ -157,27 +201,24 @@ def build_dynamic_map_worker(
     if isinstance(constraints, str):
         return constraints
     if not isinstance(requested_skills, list) or not all(
-        isinstance(skill, str) for skill in requested_skills
+        isinstance(skill, str) and skill.strip() for skill in requested_skills
     ):
-        return "worker_spec.skills 必须是字符串数组"
+        return "worker_spec.skills 必须是非空字符串数组"
     if output_schema != MAP_WORKER_RESULT_SCHEMA:
         return f"worker_spec.output_schema 必须是 {MAP_WORKER_RESULT_SCHEMA}"
     if mode in {"propose_only", "repair_propose"}:
-        if not isinstance(authoritative_snapshot, dict):
-            return "规划 worker 必须提供 authoritative_snapshot artifact"
-        for field_name in (
-            "artifact_ref",
-            "snapshot_id",
-            "digest",
-            "target_path",
-        ):
-            value = authoritative_snapshot.get(field_name)
-            if not isinstance(value, str) or not value.strip():
-                return f"worker_spec.authoritative_snapshot.{field_name} 不能为空"
-        for field_name in ("map_layer", "map_revision"):
-            value = authoritative_snapshot.get(field_name)
-            if isinstance(value, bool) or not isinstance(value, int):
-                return f"worker_spec.authoritative_snapshot.{field_name} 必须是整数"
+        try:
+            if isinstance(planning_context_bundle, dict):
+                bundle = MapPlanningContextBundle.from_dict(planning_context_bundle)
+            elif isinstance(authoritative_snapshot, dict):
+                bundle = MapPlanningContextBundle.from_entries(
+                    [MapPlanningContextEntry.from_snapshot(authoritative_snapshot)]
+                )
+            else:
+                return "规划 worker 必须提供 planning_context_bundle"
+        except MapPlanningContextError as exc:
+            return f"worker_spec.planning_context_bundle 不合法：{exc}"
+        spec["planning_context_bundle"] = bundle.to_dict()
     if mode in MAP_WORKER_WRITE_MODES:
         if not isinstance(approved_batch, dict):
             return "写入 worker 必须提供 planner/validator 的 approved_batch artifact"
@@ -186,21 +227,46 @@ def build_dynamic_map_worker(
         target_path = approved_batch.get("target_path")
         map_revision = approved_batch.get("map_revision")
         map_layer = approved_batch.get("map_layer")
+        raw_execution_operations = approved_batch.get("execution_operations", [])
+        if not isinstance(raw_execution_operations, list):
+            return "worker_spec.approved_batch.execution_operations 必须是数组"
+        try:
+            execution_operations = tuple(
+                MapExecutionOperation.from_dict(item)
+                for item in raw_execution_operations
+                if isinstance(item, dict)
+            )
+        except MapPlanningContextError as exc:
+            return f"worker_spec.approved_batch.execution_operations 不合法：{exc}"
+        if len(execution_operations) != len(raw_execution_operations):
+            return "worker_spec.approved_batch.execution_operations 每项必须是对象"
         if not isinstance(artifact_ref, str) or not artifact_ref.strip():
             return "worker_spec.approved_batch.artifact_ref 不能为空"
         if not isinstance(batch_id, str) or not batch_id.strip():
             return "worker_spec.approved_batch.batch_id 不能为空"
-        if not isinstance(target_path, str) or not target_path.strip():
-            return "worker_spec.approved_batch.target_path 不能为空"
-        if isinstance(map_revision, bool) or not isinstance(map_revision, int):
-            return "worker_spec.approved_batch.map_revision 必须是整数"
-        if isinstance(map_layer, bool) or not isinstance(map_layer, int):
-            return "worker_spec.approved_batch.map_layer 必须是整数"
+        if not execution_operations:
+            if not isinstance(target_path, str) or not target_path.strip():
+                return "worker_spec.approved_batch.target_path 不能为空"
+            if isinstance(map_revision, bool) or not isinstance(map_revision, int):
+                return "worker_spec.approved_batch.map_revision 必须是整数"
+            if isinstance(map_layer, bool) or not isinstance(map_layer, int):
+                return "worker_spec.approved_batch.map_layer 必须是整数"
         for field_name in ("snapshot_id", "snapshot_digest", "batch_fingerprint"):
             value = approved_batch.get(field_name)
             if not isinstance(value, str) or not value.strip():
                 return f"worker_spec.approved_batch.{field_name} 不能为空"
-    skills = tuple(dict.fromkeys(requested_skills))
+    normalized_requested_skills = [skill.strip() for skill in requested_skills]
+    required_skills = required_map_worker_skills(str(mode), operations)
+    if (
+        mode in {"propose_only", "repair_propose"}
+        and not required_skills
+        and not MAP_PLANNER_PIPELINE_SKILLS.intersection(normalized_requested_skills)
+    ):
+        return (
+            "planner_skill_selection_failed：worker_spec.operations 未声明可识别的"
+            "地图规划操作，且未显式请求受支持的 planner Skill"
+        )
+    skills = tuple(dict.fromkeys((*required_skills, *normalized_requested_skills)))
     if stage_id is not None and (not isinstance(stage_id, str) or not stage_id.strip()):
         return "worker_spec.stage_id 必须是非空字符串"
 
@@ -306,25 +372,13 @@ def _dynamic_map_worker_prompt(spec: dict[str, Any]) -> str:
     mode = str(spec.get("mode", ""))
     objective = str(spec.get("objective", "")).strip()
     prompt = _MAP_WORKER_PROMPT_BUILDERS[mode](objective)
-    snapshot = spec.get("authoritative_snapshot")
-    if mode in {"propose_only", "repair_propose"} and isinstance(snapshot, dict):
+    bundle = spec.get("planning_context_bundle")
+    if mode in {"propose_only", "repair_propose"} and isinstance(bundle, dict):
         prompt += (
-            "\n权威地图快照由运行时绑定，禁止自行替换：\n"
-            + str(
-                {
-                    key: snapshot.get(key)
-                    for key in (
-                        "artifact_ref",
-                        "snapshot_id",
-                        "digest",
-                        "target_path",
-                        "map_layer",
-                        "map_revision",
-                        "execution_eligible",
-                    )
-                }
-            )
-            + "\n使用 read_planning_snapshot 读取 planner 投影；不要索取或输出逐格 atlas。"
+            "\n地图规划上下文集合由运行时冻结绑定，禁止自行替换：\n"
+            + str(bundle)
+            + "\n逐条使用 artifact_ref 读取 planner 投影；上下文仅供规划参考，"
+            "不要索取或输出逐格 atlas，也不得据此直接写图。"
         )
     return prompt
 
@@ -340,13 +394,20 @@ def restore_project_agent(data: dict[str, Any], available_tools: set[str]) -> Ag
     tools = [str(tool) for tool in data.get("tools", []) if isinstance(tool, str)]
     if workflow_operations and edit_map_max_turns is not None:
         tools = [tool for tool in tools if tool in MAP_WRITE_TOOL_NAMES]
+    worker_mode = str(data["worker_mode"]) if data.get("worker_mode") else None
+    persisted_skills = [
+        str(skill).strip()
+        for skill in data.get("skills", [])
+        if isinstance(skill, str) and skill.strip()
+    ]
+    inferred_skills = required_map_worker_skills(worker_mode or "", workflow_operations)
     agent = AgentDefinition(
         name=str(data.get("name", "dynamic-map-worker")),
         source="project",
         description=str(data.get("description", "")),
         prompt=str(data.get("prompt", "")),
         tools=tools,
-        skills=[str(skill) for skill in data.get("skills", []) if isinstance(skill, str)],
+        skills=list(dict.fromkeys((*inferred_skills, *persisted_skills))),
         workflow_operations=workflow_operations,
         workflow_constraints=[
             dict(constraint)
@@ -357,7 +418,7 @@ def restore_project_agent(data: dict[str, Any], available_tools: set[str]) -> Ag
         pipeline_kind=str(data.get("pipeline_kind", "map")),
         role=str(data.get("role", "map_worker")),
         map_stage=(str(data["map_stage"]) if data.get("map_stage") else None),
-        worker_mode=(str(data["worker_mode"]) if data.get("worker_mode") else None),
+        worker_mode=worker_mode,
         model=str(data.get("model", "inherit")),
         effort=data.get("effort", "standard"),
         max_turns=int(data.get("max_turns", 6)),
