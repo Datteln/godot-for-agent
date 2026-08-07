@@ -37,6 +37,9 @@ const UI_TEXT := {
 		"service_manual": "AI 服务未自动启动。请连接 %s，令牌：%s",
 		"service_failed": "服务启动失败：%s",
 		"service_manual_full": "请手动启动服务。Base URL：%s  Token：%s",
+		"ws_connect_failed": "WebSocket 连接失败（错误码 %s）。",
+		"ws_closed": "WebSocket 已关闭（原因 %s）。",
+		"ws_reconnect_exhausted": "WebSocket 重连次数已耗尽，请检查服务状态后重试。",
 		"event_user": "消息已提交%s。",
 		"event_with_context": "，包含项目上下文",
 		"event_error": "错误：%s",
@@ -66,7 +69,11 @@ const UI_TEXT := {
 		"rejected_turn_ended": "已拒绝本次工具调用，会话已结束，可以继续发送新消息。",
 		"history": "会话历史",
 		"history_empty": "无历史会话",
-		"switch_session_empty": "（无历史记录）"
+		"switch_session_empty": "（无历史记录）",
+		"command_param_error": "命令参数必须是 JSON 对象，例如：/rebuild_index {\"incremental\": true}",
+		"state_resetting": "正在重置",
+		"state_recovering": "正在恢复",
+		"state_paused": "已暂停"
 	},
 	"en": {
 		"send": "Send",
@@ -103,6 +110,9 @@ const UI_TEXT := {
 		"service_manual": "AI service was not auto-started. Connect to %s with token: %s",
 		"service_failed": "Service failed to start: %s",
 		"service_manual_full": "Start the service manually. Base URL: %s  Token: %s",
+		"ws_connect_failed": "WebSocket connection failed (error %s).",
+		"ws_closed": "WebSocket closed (reason: %s).",
+		"ws_reconnect_exhausted": "WebSocket reconnect attempts were exhausted. Check the service and retry.",
 		"event_user": "Message submitted%s.",
 		"event_with_context": " with project context",
 		"event_error": "Error: %s",
@@ -132,7 +142,11 @@ const UI_TEXT := {
 		"rejected_turn_ended": "Rejected this tool call. The turn has ended; you can send a new message.",
 		"history": "Session history",
 		"history_empty": "No session history",
-		"switch_session_empty": "(no history)"
+		"switch_session_empty": "(no history)",
+		"command_param_error": "Command arguments must be a JSON object, e.g.: /rebuild_index {\"incremental\": true}",
+		"state_resetting": "Resetting",
+		"state_recovering": "Recovering",
+		"state_paused": "Paused"
 	}
 }
 

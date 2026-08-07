@@ -19,6 +19,7 @@ from app.orchestrator.map_planning_snapshots import (
     planning_snapshot_scope,
 )
 from app.orchestrator.map_progress import (
+    MapTaskState,
     build_map_progress_digest,
     map_platform_plan_attempt_count,
     map_platform_plan_call_error,
@@ -608,7 +609,8 @@ def test_compaction_checkpoint_and_restart_rehydrate_final_planning_state(
     assert checkpoint["authoritative_snapshots"]
     assert checkpoint["planning_attempt_history"]
     assert checkpoint["planning_publications"]
-    restored = session_from_dict(session_to_dict(session), set())
+    restored = deepcopy(session)
+    restored.map_task_state = MapTaskState.from_dict(session.map_task_state.to_dict())
 
     restored_snapshot = PlanningSnapshotStore(
         tmp_path,

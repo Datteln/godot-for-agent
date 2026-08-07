@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from app.agents.types import AgentDefinition, Frame
-from app.orchestrator.agent import ErrorResult, _planner_route_guard, run_turn
+from app.orchestrator.turn.contracts import ErrorTurnOutcome
+from app.orchestrator.map_turn import MapTurnPolicy, _planner_route_guard
+from app.orchestrator.turn.driver import TurnDriver
 from app.orchestrator.frame_factory import create_child_frame
 from app.orchestrator.map_contracts import MAP_WORKER_RESULT_SCHEMA
 from app.orchestrator.map_progress import MapTaskState, record_map_owner_link
@@ -203,11 +205,11 @@ class TestPlannerRouteGuard:
         provider = _ForbiddenProvider()
         security = SecuritySettings(project_root=Path.cwd())
         result = asyncio.run(
-            run_turn(
-                session,
-                provider,
-                security,
-                ToolContext(
+            TurnDriver(MapTurnPolicy()).run(
+                session=session,
+                llm=provider,
+                security=security,
+                tool_ctx=ToolContext(
                     security=security,
                     session_id=session.session_id,
                     session_epoch=session.session_epoch,
@@ -215,7 +217,7 @@ class TestPlannerRouteGuard:
                 max_turns=1,
             )
         )
-        assert isinstance(result, ErrorResult)
+        assert isinstance(result, ErrorTurnOutcome)
         assert result.error_code == "map_route_contract_violation"
         assert provider.calls == 0
 

@@ -25,7 +25,7 @@ SESSION_RESOURCE_CONTRACTS: Final[tuple[SessionResourceContract, ...]] = (
         "active_requests",
         "backend",
         "reset_owned",
-        "QueryEngine",
+        "AgentApplication",
         "cancel and serialize on the per-session lock",
     ),
     SessionResourceContract(
@@ -81,14 +81,14 @@ SESSION_RESOURCE_CONTRACTS: Final[tuple[SessionResourceContract, ...]] = (
         "history_projection_cache",
         "backend",
         "reset_owned",
-        "QueryEngine",
+        "AgentApplication",
         "drop the exact (session_id, old_epoch) key",
     ),
     SessionResourceContract(
         "turn_progress",
         "backend",
         "reset_owned",
-        "QueryEngine",
+        "AgentApplication",
         "drop the exact session_id key",
     ),
     SessionResourceContract(

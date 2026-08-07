@@ -1,25 +1,31 @@
-﻿@tool
+@tool
 extends VBoxContainer
 
 const AgentDTO = preload("res://addons/ai_agent/dto/agent_dto.gd")
 const AgentHttpClient = preload("res://addons/ai_agent/service/agent_http_client.gd")
+const AgentEventSocket = preload("res://addons/ai_agent/service/agent_event_socket.gd")
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 const ContextCollector = preload("res://addons/ai_agent/context/context_collector.gd")
 const EventFormatter = preload("res://addons/ai_agent/ui/event_formatter.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 const ChatPanelText = preload("res://addons/ai_agent/ui/chat_panel_text.gd")
 const ChatPanelTheme = preload("res://addons/ai_agent/ui/chat_panel_theme.gd")
-const ChatMessageStore = preload("res://addons/ai_agent/ui/chat_message_store.gd")
-const ChatNodeFactory = preload("res://addons/ai_agent/ui/chat_node_factory.gd")
+const ChatTimelineController = preload("res://addons/ai_agent/controllers/chat_timeline_controller.gd")
+const ChatItemRendererRegistry = preload("res://addons/ai_agent/timeline/chat_item_renderer_registry.gd")
+const SessionTurnStateReducer = preload("res://addons/ai_agent/state/session_turn_state_reducer.gd")
 # 报告格式化逻辑已迁出到独立模块 chat_report_formatter.gd，本文件仅保留调用入口
 const ChatReportFormatter = preload("res://addons/ai_agent/ui/chat_report_formatter.gd")
 const ChatVirtualScroller = preload("res://addons/ai_agent/ui/chat_virtual_scroller.gd")
+const ChatStreamingController = preload("res://addons/ai_agent/controllers/chat_streaming_controller.gd")
+const ToolApprovalController = preload("res://addons/ai_agent/controllers/tool_approval_controller.gd")
+const SubmissionController = preload("res://addons/ai_agent/controllers/submission_controller.gd")
+const RecoveryController = preload("res://addons/ai_agent/controllers/recovery_controller.gd")
+const HistoryController = preload("res://addons/ai_agent/controllers/history_controller.gd")
 const InlineToolConfirmation = preload("res://addons/ai_agent/ui/inline_tool_confirmation.gd")
 const LogEntryRenderer = preload("res://addons/ai_agent/ui/log_entry_renderer.gd")
-const MarkdownRenderer = preload("res://addons/ai_agent/ui/markdown_renderer.gd")
 const RecoveryPrompt = preload("res://addons/ai_agent/ui/recovery_prompt.gd")
+const SessionTurnState = preload("res://addons/ai_agent/state/session_turn_state.gd")
 const ToolExecutor = preload("res://addons/ai_agent/tools/tool_executor.gd")
-const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_renderer.gd")
 
 enum AgentState {
 	IDLE,
@@ -33,21 +39,12 @@ enum AgentState {
 }
 
 const PENDING_TOOL_RESULTS_ERROR := "当前会话仍有待回传的工具结果，不能开始新的用户消息"
-const STREAM_RENDER_INTERVAL_MS := 120
-const REASONING_RENDER_INTERVAL_MS := 250
 const EVENT_DRAIN_BATCH_SIZE := 24
 const EVENT_DRAIN_TIME_BUDGET_MS := 6
-const HISTORY_REPLAY_BATCH_SIZE := 12
-const HISTORY_REPLAY_TIME_BUDGET_MS := 4
 const HISTORY_PAGE_SIZE := 40
-const MAX_MESSAGE_LIST_CHILDREN := 50
-const MAX_LIVE_RENDER_CHARS := 60000
 const MAX_MESSAGE_RENDER_CHARS := 90000
-const MAX_REASONING_RENDER_CHARS := 30000
-const MAX_MESSAGE_STORE_MESSAGES := 240
 const INPUT_MIN_HEIGHT := 60
 const INPUT_MAX_HEIGHT := 240
-const FINAL_RESPONSE_EVENT_WAIT_MS := 2500
 ## Plan/Verify 的展示性事件：通常没有活跃 LLM 文本流陪同到达，需要强制滚动一次，
 ## 否则容易在 ScrollContainer 重新计算高度期间被误判为"用户已上滑"而停止跟随。
 const _MILESTONE_EVENT_TYPES := {
@@ -60,25 +57,14 @@ const _MILESTONE_EVENT_TYPES := {
 	"compact_started": true,
 	"compact_boundary": true,
 }
-const _REASONING_BOUNDARY_EVENT_TYPES := {
-	"agent_tool_calls": true,
-	"tool_calls": true,
-	"delegate_start": true,
-	"server_tool_start": true,
-	"server_tool_result": true,
-	"plan_created": true,
-	"plan_step_started": true,
-	"plan_step_completed": true,
-	"verify_started": true,
-	"verify_completed": true,
-}
-
 var editor_interface: EditorInterface
 var service: Node
 var state_store: Node
 var undo_manager: Node
 
 var _http_client: Node
+var _event_socket: Node
+var _session_state := SessionTurnState.new()
 var _collector: Node
 var _tool_executor: Node
 var _recovery_prompt: ConfirmationDialog
@@ -86,6 +72,7 @@ var _log_renderer: LogEntryRenderer
 
 var _scroll: ScrollContainer
 var _message_list: VBoxContainer
+var _confirmation_host: VBoxContainer
 var _input: TextEdit
 var _context_bar: HFlowContainer
 var _file_suggestions_panel: PanelContainer
@@ -98,8 +85,9 @@ var _selection_signature := ""
 var _last_selection_refresh_ms := 0
 var _message_context_popup: PopupMenu
 var _message_context_source: RichTextLabel
-var _message_store: ChatMessageStore
-var _node_factory: ChatNodeFactory
+var _timeline_controller := ChatTimelineController.new()
+var _renderer_registry := ChatItemRendererRegistry.new()
+var _session_state_reducer := SessionTurnStateReducer.new()
 var _virtual_scroller: ChatVirtualScroller
 var _send_btn: Button
 var _stop_btn: Button
@@ -120,12 +108,6 @@ var _history_before := 0
 var _history_has_more := false
 var _history_loading := false
 var _history_refresh_needed := false
-var _history_replaying := false
-var _history_batch_messages: Array = []
-var _history_replay_events: Array = []
-var _history_replay_cursor := 0
-var _history_replay_context: Dictionary = {}
-var _history_replay_started_ms := -1
 var _effort_options: OptionButton
 var _permission_options: OptionButton
 var _style_options: OptionButton
@@ -138,49 +120,18 @@ var _last_context_usage_status := ""
 ## `compact_started` 到达时记录下当时的状态，供 `compact_boundary` 到达时还原；
 ## 压缩前后状态对应"这一轮原本在干什么"（等待模型/执行工具等），不是固定回到 IDLE。
 var _state_before_compact := AgentState.IDLE
-var _state_before_reset := AgentState.IDLE
-var _reset_previous_session_id := ""
-var _pending_new_session_id := ""
 
 var _state := AgentState.IDLE
 var _last_doctor_report: Dictionary = {}
 var _extensions_pending := false
-var _pending_calls: Array = []  # 等待用户确认的调用子集（仅 needs_confirm=true 的项）
-var _pending_silent_results: Array = []  # 暂停点之前已执行的静默调用结果，回传模型时拼在前面
-var _pending_ordered_calls: Array = []  # 从首个确认项开始的原始序列切片，保留 assistant 声明的时序
+var _approval_controller := ToolApprovalController.new()
+var _submission_controller := SubmissionController.new()
+var _recovery_controller := RecoveryController.new()
+var _history_controller := HistoryController.new()
 var _inline_confirm := InlineToolConfirmation.new()
 var _interrupted_locally := false
-var _indent_current_text := false
-var _event_queue: Array = []
-var _draining_events := false
-var _preview_registry: Dictionary = {}
+var _streaming_controller := ChatStreamingController.new()
 var _force_scroll_once := false
-var _pending_final_response := {}
-var _pending_final_event := {}
-var _pending_final_received_ms: int = -1
-
-var _stream_key := ""
-var _stream_message_index := -1
-var _stream_started_ms: int = -1
-var _stream_display_text := ""
-var _stream_text_dirty := false
-var _stream_last_render_ms := 0
-var _stream_continuation_frame := ""
-var _stream_continuation_prefix := ""
-var _reasoning_key := ""
-var _reasoning_toggle: Button
-var _reasoning_detail_rich: RichTextLabel
-var _reasoning_message_index := -1
-var _reasoning_text := ""
-var _reasoning_started_ms: int = -1
-var _reasoning_token_count: int = 0
-var _reasoning_text_dirty := false
-var _reasoning_last_render_ms := 0
-var _rendered_assistant_keys := {}
-var _live_response_keys := {}   # 仅追踪本轮实时响应，避免历史加载的指纹误判为重复
-var _closed_stream_keys := {}
-var _stream_delta_text_by_key := {}
-var _reasoning_delta_text_by_key := {}
 var _theme_colors: Dictionary = {}
 var _auto_scroll := true
 var _suppress_scroll_check := false   # 程序滚动时抑制 value_changed 误判
@@ -196,6 +147,8 @@ var _empty_final_ignored_ms: int = -1   # 空 final 被忽略的时间戳，超�
 
 func _ready() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Initializing chat panel.")
+	_session_state.configure(_current_session_id(), "", 0)
+	_session_state_reducer.state = _session_state
 	_refresh_theme_colors()
 	_build_ui()
 	_build_children()
@@ -206,7 +159,7 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
-	if _draining_events:
+	if _streaming_controller.has_pending():
 		_drain_event_queue()
 	if _virtual_scroller != null:
 		var resync_request := _virtual_scroller.consume_resync_request()
@@ -215,21 +168,10 @@ func _process(_delta: float) -> void:
 				float(_scroll.scroll_vertical) if _scroll != null else 0.0,
 				bool(resync_request.get("stick_to_bottom", false))
 			)
-	if _history_replaying:
-		_drain_history_replay()
 	var selection_now := Time.get_ticks_msec()
 	if selection_now - _last_selection_refresh_ms >= 500:
 		_last_selection_refresh_ms = selection_now
 		_refresh_context_bar()
-	if _stream_text_dirty and _stream_message_index >= 0:
-		var now_ms := Time.get_ticks_msec()
-		if _stream_last_render_ms == 0 or now_ms - _stream_last_render_ms >= STREAM_RENDER_INTERVAL_MS:
-			_render_stream_content()
-	if _post_delta_scroll_frames > 0 and _stream_message_index >= 0:
-		_post_delta_scroll_frames -= 1
-		_sync_virtual_messages()
-		if _auto_scroll and not _user_is_dragging_scrollbar:
-			_do_scroll_to_bottom()
 	if _auto_scroll and not _user_is_dragging_scrollbar and _scroll != null:
 		var stream_bar := _scroll.get_v_scroll_bar()
 		var stream_bottom := maxf(0.0, stream_bar.max_value - stream_bar.page)
@@ -246,21 +188,6 @@ func _process(_delta: float) -> void:
 		_post_final_scroll_frames -= 1
 		if _auto_scroll and not _user_is_dragging_scrollbar:
 			_do_scroll_to_bottom()
-	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
-		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
-	if _reasoning_text_dirty and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
-		var reasoning_now_ms := Time.get_ticks_msec()
-		if _reasoning_last_render_ms == 0 or reasoning_now_ms - _reasoning_last_render_ms >= REASONING_RENDER_INTERVAL_MS:
-			_render_reasoning_entry()
-	if not _pending_final_response.is_empty() and _pending_final_received_ms >= 0:
-		var final_wait_ms := Time.get_ticks_msec() - _pending_final_received_ms
-		if final_wait_ms >= FINAL_RESPONSE_EVENT_WAIT_MS and _event_queue.is_empty() and not _draining_events:
-			var pending_final: Dictionary = _pending_final_response.duplicate(true)
-			_clear_pending_final_pair()
-			FrontendLogger.warn(editor_interface, "ChatPanel", "Rendering pending final without matching event.", {
-				"wait_ms": final_wait_ms
-			})
-			_handle_final(pending_final)
 	# 空 final 超时兜底：收到空 final 后 60 秒内没有真正的 final 到来，强制结束 turn
 	if _empty_final_ignored_ms >= 0 and _state != AgentState.IDLE:
 		var elapsed_ms := Time.get_ticks_msec() - _empty_final_ignored_ms
@@ -269,48 +196,14 @@ func _process(_delta: float) -> void:
 				"elapsed_ms": str(elapsed_ms)
 			})
 			_empty_final_ignored_ms = -1
-			_mark_current_stream_closed()
-			_finish_reasoning_stream()
-			_finish_streaming()
-			_append_message("system", "⚠ 服务端未返回最终回复，已自动结束。")
+			_present_local_text("system", "⚠ 服务端未返回最终回复，已自动结束。")
 			if undo_manager != null:
 				undo_manager.commit_batch()
 			_set_state(AgentState.IDLE)
-			_http_client.current_turn_id = ""
+			_session_state.complete_turn()
 			if state_store != null:
 				state_store.set_value("current_turn_id", "")
 				state_store.set_value("pending_calls", [])
-
-
-func _render_stream_content() -> void:
-	if _stream_message_index < 0 or _message_store == null or _virtual_scroller == null:
-		return
-	var rendered_text := _limit_render_text(_stream_display_text, MAX_LIVE_RENDER_CHARS)
-	_message_store.update_message(_stream_message_index, {
-		"text": rendered_text,
-		"estimated_height": _estimate_text_height(rendered_text),
-	})
-	_virtual_scroller.refresh_message(_stream_message_index, _auto_scroll)
-	_stream_text_dirty = false
-	_stream_last_render_ms = Time.get_ticks_msec()
-	if _auto_scroll:
-		# 内容刚刷新，给 fit_content RichTextLabel 几帧时间稳定布局后再滚动，而不是
-		# 像之前那样不管有没有新内容都每帧滚动一次——长会话里 _message_list 子节点
-		# 一多，每帧都强制重算 ScrollContainer 高度是明显的卡顿来源（§界面卡顿）。
-		_post_delta_scroll_frames = 2
-
-
-func _render_reasoning_entry() -> void:
-	if _reasoning_detail_rich == null or not is_instance_valid(_reasoning_detail_rich):
-		return
-	_reasoning_detail_rich.clear()
-	_reasoning_detail_rich.append_text(MarkdownRenderer.markdown_to_bbcode(
-		_limit_render_text(_reasoning_text, MAX_REASONING_RENDER_CHARS),
-		_theme_colors
-	))
-	_reasoning_text_dirty = false
-	_reasoning_last_render_ms = Time.get_ticks_msec()
-	_scroll_to_bottom()
 
 
 func _limit_render_text(text: String, max_chars: int) -> String:
@@ -405,6 +298,9 @@ func _build_ui() -> void:
 	_message_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_message_list.add_theme_constant_override("separation", 10)
 	_scroll.add_child(_message_list)
+	_confirmation_host = VBoxContainer.new()
+	_confirmation_host.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	add_child(_confirmation_host)
 
 	_file_suggestions_panel = PanelContainer.new()
 	_file_suggestions_panel.visible = false
@@ -473,7 +369,16 @@ func _build_children() -> void:
 	_http_client = AgentHttpClient.new()
 	_http_client.editor_interface = editor_interface
 	_http_client.service = service
+	_http_client.session_state = _session_state
 	add_child(_http_client)
+	_submission_controller.configure(_http_client)
+	_history_controller.configure(_http_client)
+
+	_event_socket = AgentEventSocket.new()
+	_event_socket.editor_interface = editor_interface
+	_event_socket.service = service
+	_event_socket.configure(_session_state)
+	add_child(_event_socket)
 
 	_collector = ContextCollector.new()
 	_collector.editor_interface = editor_interface
@@ -518,16 +423,17 @@ func _ensure_log_renderer() -> void:
 
 
 func _initialize_virtual_messages() -> void:
-	if _message_store == null:
-		_message_store = ChatMessageStore.new()
-	if _node_factory == null:
-		_node_factory = ChatNodeFactory.new()
-		_node_factory.log_renderer = _log_renderer
-		_node_factory.theme_colors = _theme_colors
-		_node_factory.rich_text_setup = _configure_message_rich_text
+	_renderer_registry.log_renderer = _log_renderer
+	_renderer_registry.theme_colors = _theme_colors
+	_renderer_registry.ui_text = _ui_table()
 	if _virtual_scroller == null:
 		_virtual_scroller = ChatVirtualScroller.new()
-		_virtual_scroller.setup(_scroll, _message_list, _message_store, _node_factory)
+		_virtual_scroller.setup(_scroll, _message_list, _timeline_controller.store, _renderer_registry)
+	var timeline_epoch := str(_session_state.snapshot().get("session_epoch", ""))
+	if timeline_epoch.is_empty():
+		timeline_epoch = "pending:%s" % _current_session_id()
+	if _timeline_controller.store.epoch().is_empty():
+		_timeline_controller.reset_epoch(timeline_epoch)
 
 
 func _connect_signals() -> void:
@@ -554,8 +460,12 @@ func _connect_signals() -> void:
 	_file_suggestions.item_activated.connect(_on_file_reference_selected)
 	_message_context_popup.id_pressed.connect(_on_message_context_action)
 	_http_client.response_received.connect(_on_response)
-	_http_client.events_received.connect(_on_events)
 	_http_client.error_occurred.connect(_on_error)
+	_event_socket.events_received.connect(_on_events)
+	_event_socket.error_occurred.connect(_on_error)
+	_event_socket.snapshot_required.connect(_on_socket_snapshot_required)
+	_event_socket.epoch_changed.connect(_on_socket_epoch_changed)
+	_event_socket.application_progress.connect(_on_application_progress)
 	_recovery_prompt.accepted_recovery.connect(_on_recovery_accepted)
 	_recovery_prompt.rejected_recovery.connect(_on_recovery_rejected)
 	_scroll.get_v_scroll_bar().value_changed.connect(_on_scroll_value_changed)
@@ -570,15 +480,11 @@ func _connect_signals() -> void:
 
 func _refresh_theme_colors() -> void:
 	ChatPanelTheme.refresh_theme_colors(self, editor_interface, _theme_colors)
-	if _node_factory != null:
-		_node_factory.theme_colors = _theme_colors
+	_renderer_registry.theme_colors = _theme_colors
 
 
 func _refresh_live_theme_overrides() -> void:
-	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
-		ChatPanelTheme.set_button_text_colors(_reasoning_toggle, _theme_color("muted_text"), _theme_color("hover_text"))
-	if _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
-		_reasoning_detail_rich.add_theme_color_override("default_color", _theme_color("muted_text"))
+	_renderer_registry.theme_colors = _theme_colors
 
 
 func _theme_color(key: String) -> Color:
@@ -595,19 +501,17 @@ func _on_send() -> void:
 		return
 	if _try_run_slash_command(text):
 		return
+	_session_state.set_suppressing(false)
+	if not _session_state.begin_submission():
+		_on_error("当前 Session 正在处理另一轮请求。")
+		return
+	_event_socket.connect_stream()
 	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length()})
 	var requested_model = _request_model()
 	_active_model_name = str(requested_model) if requested_model != null else _model_input.placeholder_text
 	_auto_scroll = true
 	_force_scroll_once = true
 	_interrupted_locally = false
-	_clear_pending_final_pair()
-	_finish_streaming()
-	_finish_reasoning_stream()
-	_closed_stream_keys.clear()
-	_stream_delta_text_by_key.clear()
-	_reasoning_delta_text_by_key.clear()
-	_live_response_keys.clear()
 	_empty_final_ignored_ms = -1   # 重置空 final 超时计时器
 	_input.text = ""
 	_update_input_height()
@@ -615,16 +519,14 @@ func _on_send() -> void:
 	_referenced_files.clear()
 	_selection_signature = ""
 	_refresh_context_bar()
-	# 在用户消息之前追加两条空白消息：强制撑开 ScrollContainer 使滚动到底部，
-	# 同时作为上一轮回复与当前用户消息之间的视觉间距
-	_append_message("system", " ")
-	_append_message("system", " ")
-	_append_message("user", text)
-	_append_message("system", _ui("waiting_model"))
 	_set_state(AgentState.WAITING_LLM)
 	if undo_manager != null:
 		undo_manager.begin_batch("AI: " + text.left(40))
-	_http_client.send_user_message(text, _collector.collect("any", referenced_paths), requested_model)
+	_submission_controller.submit_user(
+		text,
+		_collector.collect("any", referenced_paths),
+		requested_model
+	)
 
 
 func _try_run_slash_command(text: String) -> bool:
@@ -640,7 +542,7 @@ func _try_run_slash_command(text: String) -> bool:
 	if not raw_args.is_empty():
 		var parsed = JSON.parse_string(raw_args)
 		if not (parsed is Dictionary):
-			_append_message("error", "命令参数必须是 JSON 对象，例如：/rebuild_index {\"incremental\": true}")
+			_present_local_text("error", _ui("command_param_error"))
 			FrontendLogger.warn(editor_interface, "ChatPanel", "Slash command rejected: invalid JSON args.", {
 				"command": command_name,
 				"args_chars": raw_args.length()
@@ -651,8 +553,8 @@ func _try_run_slash_command(text: String) -> bool:
 	_update_input_height()
 	_auto_scroll = true
 	_force_scroll_once = true
-	_append_message("user", text)
-	_append_message("system", "正在执行命令 /%s …" % command_name)
+	_present_local_text("user", text)
+	_present_local_text("system", "正在执行命令 /%s …" % command_name)
 	_set_state(AgentState.WAITING_LLM)
 	FrontendLogger.info(editor_interface, "ChatPanel", "Running slash command.", {
 		"command": command_name,
@@ -911,12 +813,12 @@ func _on_response(response: Dictionary) -> void:
 		_last_doctor_report = response
 		if _extensions_pending:
 			_extensions_pending = false
-			_append_message("system", ChatReportFormatter.extensions_report({
+			_present_local_text("system", ChatReportFormatter.extensions_report({
 				"skills": response.get("skills", []),
 				"warnings": response.get("warnings", [])
 			}))
 		else:
-			_append_message("system", ChatReportFormatter.doctor_report(response))
+			_present_local_text("system", ChatReportFormatter.doctor_report(response))
 		if state_store != null:
 			state_store.set_value("doctor_warnings", response.get("warnings", []))
 		return
@@ -925,12 +827,18 @@ func _on_response(response: Dictionary) -> void:
 		_update_output_styles(response.get("output_styles", []))
 		return
 
-	if response.has("session_id") and response.has("pending_turn_id") and response.has("pseudo_events"):
+	if response.has("history") and response.get("history") is Dictionary:
+		var history_response: Dictionary = (response.get("history", {}) as Dictionary).duplicate(true)
+		history_response["_snapshot_recovery"] = bool(response.get("_snapshot_recovery", false))
+		_handle_session_history(history_response)
+		return
+
+	if response.has("session_id") and response.has("pending_turn_id") and response.has("events"):
 		_handle_session_history(response)
 		return
 
 	if response.has("items") and response.has("ok"):
-		_append_message("system", ChatReportFormatter.memory_report(response))
+		_present_local_text("system", ChatReportFormatter.memory_report(response))
 		return
 
 	if response.has("ok") and response.has("session_id") and (
@@ -948,12 +856,12 @@ func _on_response(response: Dictionary) -> void:
 				_commands_btn.disabled = _state != AgentState.IDLE
 				_show_commands_popup()
 		else:
-			_append_message("system", ChatReportFormatter.plain_value("数据", value))
+			_present_local_text("system", ChatReportFormatter.plain_value("数据", value))
 		return
 
 	if response.has("ok") and response.has("text"):
 		var command_text := ChatReportFormatter.command_response(response)
-		_append_message("system" if bool(response.get("ok", false)) else "error", command_text)
+		_present_local_text("system" if bool(response.get("ok", false)) else "error", command_text)
 		if _state == AgentState.WAITING_LLM:
 			_set_state(AgentState.IDLE)
 		return
@@ -968,21 +876,16 @@ func _on_response(response: Dictionary) -> void:
 
 	match str(response.get("type", "")):
 		"tool_calls":
-			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: tool_calls")
-			_handle_tool_calls(response)
+			FrontendLogger.debug(editor_interface, "ChatPanel", "Tool command acknowledged; presentation awaits WebSocket event.")
 		"final":
-			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: final")
-			_on_final_response(response)
+			FrontendLogger.debug(editor_interface, "ChatPanel", "Final command acknowledged; presentation awaits WebSocket event.")
 		"error":
-			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: error", {
-				"text": str(response.get("text", ""))
-			})
-			_on_problem(response)
+			FrontendLogger.debug(editor_interface, "ChatPanel", "Error command acknowledged; presentation awaits WebSocket event.")
 		_:
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: unknown", {
 				"type": str(response.get("type", ""))
 			})
-			_append_message("system", JSON.stringify(response, "\t"))
+			_present_local_text("system", JSON.stringify(response, "\t"))
 
 
 func _on_show_commands() -> void:
@@ -1052,12 +955,12 @@ func _command_default_args(command: Dictionary) -> Dictionary:
 
 func _run_selected_command(command_name: String, args: Dictionary) -> void:
 	if _state not in [AgentState.IDLE, AgentState.PAUSED]:
-		_append_message("error", "当前任务尚未结束，暂时不能运行其他命令。")
+		_present_local_text("error", "当前任务尚未结束，暂时不能运行其他命令。")
 		return
 	_auto_scroll = true
 	_force_scroll_once = true
-	_append_message("user", "/%s %s" % [command_name, JSON.stringify(args)])
-	_append_message("system", "正在执行命令 /%s …" % command_name)
+	_present_local_text("user", "/%s %s" % [command_name, JSON.stringify(args)])
+	_present_local_text("system", "正在执行命令 /%s …" % command_name)
 	_set_state(AgentState.WAITING_LLM)
 	FrontendLogger.info(editor_interface, "ChatPanel", "Running command selected from dropdown.", {
 		"command": command_name,
@@ -1065,45 +968,15 @@ func _run_selected_command(command_name: String, args: Dictionary) -> void:
 	})
 	_http_client.run_command(command_name, args)
 
-
-## 兼容适配器：外部调用方/测试可能仍通过面板接口访问格式化，实际实现已迁出到 ChatReportFormatter。
-func _format_command_response(response: Dictionary) -> String:
-	return ChatReportFormatter.command_response(response)
-
-
-func _format_rebuild_index_result(result: Dictionary) -> String:
-	return ChatReportFormatter.rebuild_index_result(result)
-
-
-func _format_compact_result(result: Dictionary) -> String:
-	return ChatReportFormatter.compact_result(result)
-
-
 func _handle_tool_calls(response: Dictionary) -> void:
-	# 后端理应返回数组；但 HTTP 链路上的版本不匹配/截断/代理篡改都可能让 `calls`
-	# 变成 null 或对象。直接赋给强类型 `Array` 会在运行时崩溃并中断整条工具调用
-	# 回调，所以先判型兜底（§前端外部数据强类型赋值）。
 	var raw_calls: Variant = response.get("calls", [])
 	var calls: Array = raw_calls if raw_calls is Array else []
+	var turn_id := str(response.get("turn_id", ""))
+	if not turn_id.is_empty():
+		_session_state.adopt_turn(turn_id)
 	if _state == AgentState.WAITING_CONFIRM:
 		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring tool_calls while a previous batch is still pending confirmation.", {"count": calls.size()})
 		return
-
-	_append_tool_response_text(response, calls)
-
-	# 工具调用是同一轮 assistant 输出的边界，不是正文流的结束。
-	# 保留当前临时正文块；工具结果单独入队，后续同 frame 的文本继续写入该块。
-	if not calls.is_empty() and _stream_message_index >= 0:
-		var first_call: Variant = calls[0]
-		if first_call is Dictionary:
-			_stream_continuation_frame = str(first_call.get("frame_id", ""))
-			_stream_continuation_prefix = _stream_display_text
-		_mark_current_stream_closed()
-	# `agent_tool_calls` 事件会在同一批 SSE 尾包处理完后结束当前 Thought。
-	# 不在 HTTP 回调中标记 reasoning key 为 closed，否则正文之后才到的 reasoning
-	# 尾包会被丢弃，而不是作为下一条独立 Thought 保留。
-	# 不再用 silent 数组做分组——分组会打乱 assistant 声明的调用顺序。
-	# 改为仅计数 silent_count（用于日志），保留原始 calls 顺序供后续按序执行。
 	var confirm: Array = []
 	var silent_count := 0
 	for call in calls:
@@ -1119,117 +992,49 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		"count": calls.size(), "silent": silent_count, "confirm": confirm.size(), "names": call_names
 	})
 
-	# workflow 工具（Edit/Write）的"宣告"消息直接跳过：确认框本身（confirm 分支）
-	# 或下面紧接着渲染的 diff 预览（silent 分支）已经表达了同样的信息，等结果出来
-	# 后只追加一条合并了 diff 的永久条目，避免一次编辑显示成两个工作流条目。
-	for call in confirm:
-		if call is Dictionary and not EventFormatter.is_workflow_tool(str(call.get("name", ""))):
-			_append_message("system", EventFormatter.format_tool_call_header(call))
-
 	if state_store != null:
-		state_store.set_value("current_turn_id", _http_client.current_turn_id)
+		state_store.set_value("current_turn_id", str(_session_state.snapshot().get("active_turn_id", "")))
 		state_store.set_value("pending_calls", confirm)
 
 	var results: Array = []
 	if confirm.is_empty():
-		# 全部调用均无需确认——按原始顺序依次执行，结果直接回传模型
 		for call in calls:
 			if call is Dictionary:
 				if _interrupted_locally:
 					return
-				var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-				var preview: Control = null
-				var stats := {}
-				if is_workflow:
-					preview = ToolPreviewRenderer.render_call(call, _theme_colors)
-					stats = ToolPreviewRenderer.diff_stats(call)
-				else:
-					_append_message("system", EventFormatter.format_tool_call_header(call))
 				_set_state(AgentState.EXECUTING)
 				var result: Dictionary = await _tool_executor.execute(call)
 				if _interrupted_locally:
 					return
 				result = _ensure_tool_result_for_call(call, result)
 				results.append(result)
-				_append_tool_result(call, result, preview, stats)
-
-	_move_stream_to_end()
 	if not confirm.is_empty():
-		# 原序列中第一项需要确认的调用是暂停点；它之前的静默调用已经满足
-		# 顺序前置条件，可以立即执行。暂停点及其后的所有调用等用户决定后，
-		# 再从原位置继续，避免权限分组改变 assistant 声明的时序。
-		_pending_silent_results.clear()
-		_pending_ordered_calls.clear()
+		var leading_results: Array = []
+		var ordered_calls: Array = []
 		var reached_confirmation := false
 		for call in calls:
 			if not (call is Dictionary):
 				continue
-			# 遇到首个 needs_confirm 调用后切换为"暂存"模式：该项及其后所有调用
-			# （无论是否还需要确认）都按原序压入 _pending_ordered_calls，
-			# 等用户在确认面板操作时再逐个执行或拒绝。
 			if bool(call.get("needs_confirm", false)):
 				reached_confirmation = true
 			if reached_confirmation:
-				_pending_ordered_calls.append(call)
+				ordered_calls.append(call)
 				continue
 			if _interrupted_locally:
 				return
-			var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-			var preview: Control = null
-			var stats := {}
-			if is_workflow:
-				preview = ToolPreviewRenderer.render_call(call, _theme_colors)
-				stats = ToolPreviewRenderer.diff_stats(call)
-			else:
-				_append_message("system", EventFormatter.format_tool_call_header(call))
 			_set_state(AgentState.EXECUTING)
 			var leading_result: Dictionary = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
 			leading_result = _ensure_tool_result_for_call(call, leading_result)
-			_pending_silent_results.append(leading_result)
-			_append_tool_result(call, leading_result, preview, stats)
-		# 暂停点之前的静默调用已立即执行完毕，结果存入 _pending_silent_results，
-		# 后续回传模型时拼在确认调用结果的前面，保证时序正确。
+			leading_results.append(leading_result)
 		FrontendLogger.info(editor_interface, "ChatPanel", "Waiting for inline tool confirmation.", {"count": confirm.size()})
-		_pending_calls = confirm.duplicate(true)
+		_approval_controller.prepare(confirm, leading_results, ordered_calls)
 		_show_inline_confirmation(confirm.duplicate(true))
 		_set_state(AgentState.WAITING_CONFIRM)
 	else:
 		_set_state(AgentState.WAITING_LLM)
-		_http_client.send_tool_results(results, _request_model())
-
-
-func _append_tool_response_text(response: Dictionary, calls: Array) -> void:
-	# tool_calls 响应中的 text 可能包含流式事件未完全显示的正文，补入当前消息并去重。
-	var raw_text: Variant = response.get("text", "")
-	if raw_text == null:
-		return
-	var response_text := _strip_think_xml(str(raw_text)).strip_edges()
-	if response_text == "":
-		return
-	var frame_id := ""
-	if not calls.is_empty() and calls[0] is Dictionary:
-		frame_id = str(calls[0].get("frame_id", ""))
-	if _stream_message_index < 0 and frame_id != "":
-		_ensure_stream_message("%s:tool_response:0" % frame_id, true)
-	if _stream_display_text.strip_edges() == "":
-		_stream_display_text = response_text
-	elif response_text.begins_with(_stream_display_text):
-		_stream_display_text = response_text
-	elif not _stream_display_text.begins_with(response_text):
-		_stream_display_text += "\n\n" + response_text
-	_stream_text_dirty = true
-	_render_stream_content()
-
-
-func _move_stream_to_end() -> void:
-	if _stream_message_index < 0 or _virtual_scroller == null or _message_store == null:
-		return
-	_stream_message_index = _virtual_scroller.move_message(
-		_stream_message_index,
-		_message_store.size() - 1
-	)
+		_submission_controller.submit_tool_results(results, _request_model())
 
 
 func _on_decision(results: Array) -> void:
@@ -1248,15 +1053,15 @@ func _on_decision(results: Array) -> void:
 		if undo_manager != null:
 			undo_manager.abort_batch()
 		if _http_client != null:
-			_http_client.current_turn_id = ""
+			_session_state.complete_turn()
 			_http_client.discard_pending()
 		if state_store != null:
 			state_store.set_value("current_turn_id", "")
 		_set_state(AgentState.IDLE)
-		_append_message("system", _ui("rejected_turn_ended"))
+		_present_local_text("system", _ui("rejected_turn_ended"))
 		return
 	_set_state(AgentState.WAITING_LLM)
-	_http_client.send_tool_results(results, _request_model())
+	_submission_controller.submit_tool_results(results, _request_model())
 
 
 ## 移除文本中的 `<think>…</think>` XML 块及所有残余的 `</think>` 标签。
@@ -1308,16 +1113,8 @@ func _handle_final(response: Dictionary) -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Received final response.", {
 		"chars": str(response.get("text", "")).length()
 	})
-	var text := _strip_think_xml(str(response.get("text", "")))
-	var assistant_key := _message_fingerprint(text)
-	var split := _split_thought_summary(text)
-	var rest := str(split.get("rest", ""))
-	var render_text := rest if rest.strip_edges() != "" else text
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[handle_final]", {
-		"text_len": text.length(),
-		"render_text_len": render_text.strip_edges().length()
-	})
-	if render_text.strip_edges().is_empty():
+	var text := str(response.get("text", ""))
+	if text.strip_edges().is_empty():
 		# 空的 final 只是 agent 中间轮次的心跳/占位，不代表真正回复结束。
 		# 跳过所有关闭和状态切换，继续等下一个非空 final。
 		if _empty_final_ignored_ms < 0:
@@ -1327,56 +1124,33 @@ func _handle_final(response: Dictionary) -> void:
 			"since_ms": _empty_final_ignored_ms
 		})
 		return
-	# 收到非空 final，重置空 final 计时器
 	_empty_final_ignored_ms = -1
-	render_text = render_text + "\n\n"
-	_mark_current_stream_closed()
-	_finish_reasoning_stream()         # 置空 toggle，停止 _process 刷新
-
-	# 用 _live_response_keys（每次 send 清空）判断本轮是否已渲染，避免历史加载的
-	# 指纹污染 _rendered_assistant_keys 导致当前回复被误判为重复而丢弃。
-	if not _live_response_keys.has(assistant_key):
-		_live_response_keys[assistant_key] = true
-		_rendered_assistant_keys[assistant_key] = true
-		_discard_stream_message()
-		_indent_current_text = true
-		_append_log_stream_message(render_text)
-		_indent_current_text = false
-		# 无论走流式还是非流式路径，都在 _process 中连续多帧强制滚动到底部，
-		# 等待 fit_content RichTextLabel 完成复杂 Markdown（表格、代码块）的布局计算。
-		# 但如果用户已主动上滚浏览历史，尊重用户意图，不强制拉回底部。
-		if _auto_scroll:
-			_force_scroll_once = true
-			_do_scroll_to_bottom()
-			_post_final_scroll_frames = 10
-	else:
-		FrontendLogger.debug(editor_interface, "ChatPanel", "Skipped duplicate final response.", {"key_len": assistant_key.length()})
-		_discard_stream_message()
+	if _auto_scroll:
+		_force_scroll_once = true
+		_do_scroll_to_bottom()
+		_post_final_scroll_frames = 10
 	if undo_manager != null:
 		undo_manager.commit_batch()
 	_set_state(AgentState.IDLE)
-	_http_client.current_turn_id = ""
+	_session_state.complete_turn()
 	if state_store != null:
 		state_store.set_value("current_turn_id", "")
 		state_store.set_value("pending_calls", [])
-	# 清理已关闭 stream 的 delta_text 缓存，防止长对话内存泄漏
-	for closed_key in _closed_stream_keys.keys():
-		_stream_delta_text_by_key.erase(closed_key)
 
 
 func _handle_session_history(response: Dictionary) -> void:
 	_ensure_log_renderer()
-	if _history_replaying:
-		FrontendLogger.warn(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] ignored_history_while_replaying")
-		return
-	if _state != AgentState.IDLE:
+	var snapshot_recovery := bool(response.get("_snapshot_recovery", false))
+	if _state != AgentState.IDLE and not (
+		snapshot_recovery and _state == AgentState.RECOVERING
+	):
 		_history_loading = false
 		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored session history while a turn is active.", {
 			"state": _status.text
 		})
 		return
-	var raw_pseudo_events: Variant = response.get("pseudo_events", [])
-	var pseudo_events: Array = raw_pseudo_events if raw_pseudo_events is Array else []
+	var raw_events: Variant = response.get("events", [])
+	var events: Array = raw_events if raw_events is Array else []
 	var session_id := str(response.get("session_id", ""))
 	# 响应 session_id 与当前不符说明是切换会话后迟到的过期响应，直接丢弃。
 	if session_id != "" and session_id != _current_session_id():
@@ -1388,26 +1162,13 @@ func _handle_session_history(response: Dictionary) -> void:
 		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Restoring session history.", {
 		"session_id": session_id,
-		"count": pseudo_events.size(),
+		"count": events.size(),
 		"before": int(response.get("history_before", 0)),
 		"has_more": bool(response.get("history_has_more", false))
 	})
 	var requested_before := _history_before
 	var next_before := int(response.get("history_before", 0))
-	var prepend := _message_store != null and _message_store.size() > 0 and requested_before > 0
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] replay_begin", {
-		"requested_before": requested_before,
-		"next_before": next_before,
-		"pseudo_events": pseudo_events.size(),
-		"prepend": prepend,
-		"store_before": _message_store.size() if _message_store != null else -1,
-		"replaying": _history_replaying,
-	})
-	_history_replaying = true
-	_history_replay_started_ms = Time.get_ticks_msec()
-	_history_batch_messages.clear()
-	if not prepend:
-		_clear_messages(false)
+	var prepend := _timeline_controller.store.size() > 0 and requested_before > 0
 	_update_context_usage_status(
 		int(response.get("context_used_tokens", 0)),
 		int(response.get("context_token_limit", 0))
@@ -1415,100 +1176,35 @@ func _handle_session_history(response: Dictionary) -> void:
 	if state_store != null:
 		state_store.set_value("session_id", session_id)
 	var pending_turn_id = response.get("pending_turn_id")
-	_http_client.sync_event_cursor(int(response.get("last_event_seq", 0)))
+	_session_state.configure(
+		session_id,
+		str(response.get("session_epoch", "")),
+		int(response.get("last_event_seq", 0))
+	)
+	var epoch := str(response.get("session_epoch", ""))
+	if not prepend:
+		_timeline_controller.reset_epoch(epoch)
 	if pending_turn_id != null:
-		_http_client.current_turn_id = str(pending_turn_id)
+		_session_state.adopt_turn(str(pending_turn_id))
 		if state_store != null:
-			state_store.set_value("current_turn_id", _http_client.current_turn_id)
-	_history_replay_events = pseudo_events
-	_history_replay_cursor = 0
-	_history_replay_context = {
-		"prepend": prepend,
-		"requested_before": requested_before,
-		"next_before": next_before,
-		"has_more": bool(response.get("history_has_more", false)),
-		"pending_turn_id": pending_turn_id,
-		"session_id": session_id,
-		"saved_auto_scroll": _auto_scroll,
-	}
-	_auto_scroll = false
-	_drain_history_replay()
-
-
-func _drain_history_replay() -> void:
-	if not _history_replaying:
+			state_store.set_value("current_turn_id", str(pending_turn_id))
+	_event_socket.reconnect_from_state()
+	var restored := _timeline_controller.prepend_history(events)
+	if not restored:
+		_on_error("History contained an invalid canonical Timeline record.")
 		return
-	var started_ms := Time.get_ticks_msec()
-	var cursor_before := _history_replay_cursor
-	var processed := 0
-	while _history_replay_cursor < _history_replay_events.size() and processed < HISTORY_REPLAY_BATCH_SIZE:
-		var event = _history_replay_events[_history_replay_cursor]
-		_history_replay_cursor += 1
-		if event is Dictionary:
-			_handle_event(event)
-		processed += 1
-		if Time.get_ticks_msec() - started_ms >= HISTORY_REPLAY_TIME_BUDGET_MS:
-			break
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] replay_batch", {
-		"cursor_from": cursor_before,
-		"cursor_to": _history_replay_cursor,
-		"total_events": _history_replay_events.size(),
-		"processed": processed,
-		"batch_messages": _history_batch_messages.size(),
-		"elapsed_ms": Time.get_ticks_msec() - started_ms,
-	})
-	if _history_replay_cursor < _history_replay_events.size():
-		return
-	_finish_history_replay()
-
-
-func _finish_history_replay() -> void:
-	_initialize_virtual_messages()
-	var prepend := bool(_history_replay_context.get("prepend", false))
-	var requested_before := int(_history_replay_context.get("requested_before", 0))
-	var next_before := int(_history_replay_context.get("next_before", 0))
-	var pending_turn_id = _history_replay_context.get("pending_turn_id")
-	var session_id := str(_history_replay_context.get("session_id", _current_session_id()))
-	var saved_auto_scroll := bool(_history_replay_context.get("saved_auto_scroll", false))
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] commit_batch", {
-		"prepend": prepend,
-		"batch_messages": _history_batch_messages.size(),
-		"store_before": _message_store.size() if _message_store != null else -1,
-		"virtual": _virtual_scroller.debug_state() if _virtual_scroller != null else {},
-	})
-	_history_replaying = false
-	if prepend:
-		var added_height := _message_store.prepend_messages(_history_batch_messages)
-		_virtual_scroller.prepend_messages(_history_batch_messages.size(), added_height)
-	else:
-		_message_store.append_messages(_history_batch_messages)
-		_virtual_scroller.sync(float(_scroll.scroll_vertical), false)
-	var batch_count := _history_batch_messages.size()
-	_history_batch_messages.clear()
 	_history_loading = false
 	_history_before = next_before
-	_history_has_more = bool(_history_replay_context.get("has_more", false)) and next_before > requested_before
+	_history_has_more = bool(response.get("history_has_more", false)) and next_before > requested_before
 	_history_refresh_needed = false
-	_history_replay_events.clear()
-	_history_replay_cursor = 0
-	_history_replay_context.clear()
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] replay_end", {
-		"batch_messages": batch_count,
-		"store_after": _message_store.size() if _message_store != null else -1,
-		"history_before": _history_before,
-		"history_has_more": _history_has_more,
-		"scroll_vertical": _scroll.scroll_vertical if _scroll != null else -1,
-		"replay_elapsed_ms": Time.get_ticks_msec() - _history_replay_started_ms if _history_replay_started_ms >= 0 else -1,
-		"virtual": _virtual_scroller.debug_state() if _virtual_scroller != null else {},
-	})
-	_history_replay_started_ms = -1
 	if pending_turn_id != null:
-		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
+		_present_local_text("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
 		_show_pending_results_notice()
 		_set_state(AgentState.WAITING_CONFIRM)
-	if batch_count == 0 and _message_store.size() == 0:
-		_append_message("system", _ui("switch_session_empty"))
-	_auto_scroll = saved_auto_scroll
+	elif snapshot_recovery:
+		_set_state(AgentState.IDLE)
+	if events.is_empty() and _timeline_controller.store.size() == 0:
+		_present_local_text("system", _ui("switch_session_empty"))
 	_force_scroll_once = true
 	_post_history_layout_frames = 4
 	_scroll_to_bottom()
@@ -1519,9 +1215,14 @@ func _on_error(message: String) -> void:
 	if _commands_requested:
 		_commands_requested = false
 		_commands_btn.disabled = _state != AgentState.IDLE
-	_append_message("error", message)
-	_finish_streaming()
-	_finish_reasoning_stream()
+	var visible_message := message
+	if message.begins_with("ws_connect_failed:"):
+		visible_message = _ui("ws_connect_failed") % message.get_slice(":", 1)
+	elif message.begins_with("ws_closed:"):
+		visible_message = _ui("ws_closed") % message.get_slice(":", 1)
+	elif message == "ws_reconnect_exhausted":
+		visible_message = _ui("ws_reconnect_exhausted")
+	_present_local_text("error", visible_message)
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	if state_store != null:
@@ -1541,9 +1242,10 @@ func _on_problem(problem: Dictionary) -> void:
 		"attempt_id": str(problem.get("attempt_id", "")),
 	})
 	if disposition == "terminal":
-		_on_error(message)
+		if undo_manager != null:
+			undo_manager.abort_batch()
+		_set_state(AgentState.IDLE)
 		return
-	_append_message("error", message)
 	if side_effect_state == "ambiguous":
 		_set_state(AgentState.PAUSED)
 		return
@@ -1560,41 +1262,13 @@ func _on_problem(problem: Dictionary) -> void:
 
 
 func _show_pending_results_notice() -> void:
-	_ensure_log_renderer()
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
-	var panel := _log_renderer.make_panel(_theme_color("panel_alt_bg"), _theme_color("panel_alt_border"))
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(panel)
-
-	var body := VBoxContainer.new()
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	panel.add_child(body)
-
-	var label := _log_renderer.make_rich_text(_ui("pending_notice"))
-	body.add_child(label)
-
-	var actions := HBoxContainer.new()
-	body.add_child(actions)
-
-	var discard_btn := Button.new()
-	discard_btn.text = _ui("discard_pending")
-	discard_btn.pressed.connect(_discard_pending_results)
-	actions.add_child(discard_btn)
-
-	var reset_btn := Button.new()
-	reset_btn.text = _ui("reset")
-	reset_btn.pressed.connect(_on_reset)
-	actions.add_child(reset_btn)
-
-	_queue_external_message(row, 120.0)
+	_present_local_text("system", _ui("pending_notice"))
 
 
 func _discard_pending_results() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Discarding pending tool results.")
-	_http_client.discard_pending()
-	_append_message("system", _ui("discard_pending"))
+	_submission_controller.discard_pending()
+	_present_local_text("system", _ui("discard_pending"))
 	_set_state(AgentState.WAITING_LLM)
 
 
@@ -1602,11 +1276,10 @@ func _on_reset() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Reset requested.", {"state": _status.text})
 	_auto_scroll = true
 	_interrupted_locally = false
-	_state_before_reset = _state
-	_reset_previous_session_id = _current_session_id()
-	_pending_new_session_id = ""
+	_recovery_controller.begin_reset(_state, _current_session_id())
 	_set_state(AgentState.RESETTING)
-	_http_client.reset_session()
+	_event_socket.close_stream()
+	_submission_controller.reset_session()
 
 
 func _handle_reset_response(response: Dictionary) -> void:
@@ -1614,34 +1287,32 @@ func _handle_reset_response(response: Dictionary) -> void:
 		FrontendLogger.error(editor_interface, "ChatPanel", "Reset failed.", {
 			"error_code": str(response.get("error_code", "")),
 		})
-		_append_message("error", str(response.get("text", "Reset failed.")))
-		if _pending_new_session_id != "" and _reset_previous_session_id != "":
+		_present_local_text("error", str(response.get("text", "Reset failed.")))
+		var recovery := _recovery_controller.failure_recovery()
+		var pending_session_id := str(recovery.get("pending_session_id", ""))
+		var previous_session_id := str(recovery.get("previous_session_id", ""))
+		if pending_session_id != "" and previous_session_id != "":
 			ConfigMigrations.set_value(
 				editor_interface,
 				"ai_agent/session_id",
-				_reset_previous_session_id
+				previous_session_id
 			)
-		_pending_new_session_id = ""
-		_set_state(_state_before_reset)
+		_set_state(int(recovery.get("state", AgentState.IDLE)))
 		return
 	FrontendLogger.info(editor_interface, "ChatPanel", "Reset acknowledged.", {
 		"session_id": str(response.get("session_id", "")),
 		"session_epoch": str(response.get("session_epoch", "")),
 		"last_event_seq": int(response.get("last_event_seq", 0)),
 	})
-	_event_queue.clear()
-	_draining_events = false
+	_streaming_controller.clear()
 	_clear_inline_confirmation()
-	_clear_pending_final_pair()
-	_finish_streaming()
-	_finish_reasoning_stream()
 	if _recovery_prompt != null and is_instance_valid(_recovery_prompt):
 		_recovery_prompt.hide()
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	if _tool_executor != null and _tool_executor.has_method("reset_session_state"):
 		_tool_executor.reset_session_state()
-	_clear_messages()
+	_timeline_controller.reset_epoch(str(response.get("session_epoch", "")))
 	if state_store != null:
 		state_store.reset(
 			str(response.get("session_epoch", "")),
@@ -1650,30 +1321,34 @@ func _handle_reset_response(response: Dictionary) -> void:
 		state_store.set_value("session_id", str(response.get("session_id", "")))
 		state_store.set_value("recovery_pointer", null)
 	_update_context_usage_status(0, _context_token_limit)
+	_session_state.adopt_reset(
+		str(response.get("session_id", "")),
+		str(response.get("session_epoch", "")),
+		int(response.get("last_event_seq", 0))
+	)
+	_event_socket.reconnect_from_state()
 	_set_state(AgentState.IDLE)
-	if _pending_new_session_id != "":
-		_append_message("system", _ui("new_session_started") % _pending_new_session_id)
-	_pending_new_session_id = ""
+	var pending_session_id := _recovery_controller.complete_reset()
+	if pending_session_id != "":
+		_present_local_text("system", _ui("new_session_started") % pending_session_id)
 
 
 func _on_interrupt() -> void:
 	FrontendLogger.warn(editor_interface, "ChatPanel", "Interrupt requested.", {"state": _status.text})
 	_interrupted_locally = true
-	_event_queue.clear()
-	_draining_events = false
+	_streaming_controller.clear()
 	_clear_inline_confirmation()
-	_clear_pending_final_pair()
-	_finish_streaming()
-	_finish_reasoning_stream()
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	if _http_client != null:
-		_http_client.interrupt_current()
+		_submission_controller.interrupt()
+	if _event_socket != null:
+		_event_socket.close_stream()
 	if state_store != null:
 		state_store.set_value("pending_calls", [])
 		state_store.set_value("current_turn_id", "")
 	_set_state(AgentState.PAUSED)
-	_append_message("system", _ui("interrupted"))
+	_present_local_text("system", _ui("interrupted"))
 
 
 func _on_new_session() -> void:
@@ -1683,12 +1358,11 @@ func _on_new_session() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "New session requested.", {"session_id": session_id})
 	_auto_scroll = true
 	_interrupted_locally = false
-	_state_before_reset = _state
-	_reset_previous_session_id = previous_session_id
-	_pending_new_session_id = session_id
+	_recovery_controller.begin_reset(_state, previous_session_id, session_id)
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", session_id)
 	_save_session_to_history(session_id)
 	if _http_client != null:
+		_event_socket.close_stream()
 		_http_client.start_new_session(previous_session_id, session_id)
 	_set_state(AgentState.RESETTING)
 
@@ -1700,16 +1374,23 @@ func _on_recovery_accepted(pointer: Dictionary) -> void:
 	})
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", str(pointer.get("session_id", "default")))
 	_clear_messages()   # 清空当前内容，确保历史加载时消息列表为空
-	_http_client.resume_from_pointer(pointer)
-	_http_client.fetch_session_history()
+	_session_state.configure(
+		str(pointer.get("session_id", "default")),
+		str(pointer.get("session_epoch", "")),
+		int(pointer.get("last_event_seq", 0))
+	)
+	var pending_turn_id = pointer.get("pending_turn_id")
+	if pending_turn_id != null:
+		_session_state.adopt_turn(str(pending_turn_id))
+	_event_socket.reconnect_from_state()
+	_history_controller.fetch_initial()
 	if state_store != null:
 		state_store.merge({
 			"session_id": str(pointer.get("session_id", "default")),
 			"recovery_pointer": pointer,
 			"last_event_seq": int(pointer.get("last_event_seq", 0)),
-			"current_turn_id": _http_client.current_turn_id
+			"current_turn_id": str(_session_state.snapshot().get("active_turn_id", ""))
 		})
-	_http_client.poll_events()
 
 
 func _on_recovery_rejected() -> void:
@@ -1717,21 +1398,21 @@ func _on_recovery_rejected() -> void:
 	_http_client.dismiss_recovery_pointer()
 	if state_store != null:
 		state_store.set_value("recovery_pointer", null)
-	_append_message("system", _ui("recovery_dismissed"))
+	_present_local_text("system", _ui("recovery_dismissed"))
 
 
 func _on_service_started(base_url: String) -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Service started signal received.", {"base_url": base_url})
 	_fetch_initial_service_data()
 	if service != null and not service.is_running():
-		_append_message("system", _ui("service_manual") % [base_url, str(service.token)])
+		_present_local_text("system", _ui("service_manual") % [base_url, str(service.token)])
 
 
 func _on_service_failed(message: String) -> void:
 	FrontendLogger.error(editor_interface, "ChatPanel", "Service failed signal received.", {"message": message})
-	_append_message("error", _ui("service_failed") % message)
+	_present_local_text("error", _ui("service_failed") % message)
 	if service != null and str(service.token) != "":
-		_append_message("system", _ui("service_manual_full") % [str(service.base_url), str(service.token)])
+		_present_local_text("system", _ui("service_manual_full") % [str(service.base_url), str(service.token)])
 
 
 func _fetch_initial_service_data() -> void:
@@ -1747,7 +1428,7 @@ func _fetch_initial_service_data() -> void:
 	if root.strip_edges().is_empty():
 		return
 	FrontendLogger.debug(editor_interface, "ChatPanel", "Fetching initial service data.", {"base_url": root})
-	_http_client.fetch_session_history()
+	_history_controller.fetch_initial()
 	_http_client.fetch_recovery_pointer()
 	_http_client.fetch_output_styles()
 
@@ -1756,7 +1437,10 @@ func _on_events(events: Array) -> void:
 	if _interrupted_locally:
 		FrontendLogger.debug(editor_interface, "ChatPanel", "Suppressed events after interrupt.", {"count": events.size()})
 		return
-	var coalesced := _coalesce_events(events)
+	for event in events:
+		if event is Dictionary and _http_client != null:
+			_http_client.recover_tool_calls_response(event)
+	var coalesced := _streaming_controller.coalesce(events)
 	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling events.", {
 		"count": events.size(),
 		"coalesced_count": coalesced.size()
@@ -1774,263 +1458,90 @@ func _on_events(events: Array) -> void:
 				"text_len": str(payload.get("text", "")).length()
 			})
 			_enqueue_event(event)
-	if not _draining_events:
+	if _streaming_controller.has_pending():
 		_drain_event_queue()
 
 
+func _on_socket_snapshot_required(problem: Dictionary) -> void:
+	FrontendLogger.warn(editor_interface, "WebSocket", "Snapshot recovery required.", {
+		"reason": str(problem.get("reason", "unknown")),
+	})
+	_set_state(AgentState.RECOVERING)
+	_history_controller.fetch_snapshot()
+
+
+func _on_socket_epoch_changed(
+	previous_epoch: String,
+	new_epoch: String,
+	last_event_seq: int
+) -> void:
+	FrontendLogger.info(editor_interface, "WebSocket", "Session epoch changed.", {
+		"previous_epoch": previous_epoch,
+		"new_epoch": new_epoch,
+		"last_event_seq": last_event_seq,
+	})
+
+
+func _on_application_progress(_event: Dictionary) -> void:
+	_http_client.notify_application_progress()
+
+
 func _enqueue_event(event: Dictionary) -> void:
-	_event_queue.append(event)
-	_event_queue.sort_custom(func(a, b):
-		if not (a is Dictionary) or not (b is Dictionary):
-			return false
-		return int(a.get("seq", 0)) < int(b.get("seq", 0))
-	)
-
-
-func _coalesce_events(events: Array) -> Array:
-	var result: Array = []
-	var latest_delta := {}
-	var ordered_delta_keys: Array[String] = []
-	for raw_event in events:
-		if not (raw_event is Dictionary):
-			continue
-		var event: Dictionary = raw_event
-		var event_type := str(event.get("type", ""))
-		if event_type == "agent_reasoning_delta" or event_type == "agent_text_delta":
-			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-			if bool(payload.get("append_delta", false)):
-				_flush_delta_events(result, latest_delta, ordered_delta_keys)
-				result.append(event)
-				continue
-			_remember_delta_event(event, latest_delta, ordered_delta_keys)
-			continue
-		_flush_delta_events(result, latest_delta, ordered_delta_keys)
-		result.append(event)
-	_flush_delta_events(result, latest_delta, ordered_delta_keys)
-	return result
-
-
-func _remember_delta_event(event: Dictionary, latest_delta: Dictionary, ordered_delta_keys: Array[String]) -> void:
-	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-	# 同 `_stream_event_key()`：用 `message_index` 而不是会在每次 round-trip 重新清零
-	# 的 `loop` 去重，否则跨轮次合批时可能把两个不同轮次的增量错误合并成一条。
-	# 与 `_stream_event_key()` 保持一致：同一 message_index 的正文/推理
-	# 分片即使带有旧版 stream_segment，也必须合并。
-	var key := "%s:%s:%s" % [
-		str(event.get("type", "")),
-		str(payload.get("frame_id", "")),
-		str(payload.get("message_index", ""))
-	]
-	if not latest_delta.has(key):
-		ordered_delta_keys.append(key)
-	latest_delta[key] = event
-
-
-func _flush_delta_events(result: Array, latest_delta: Dictionary, ordered_delta_keys: Array[String]) -> void:
-	for key in ordered_delta_keys:
-		if latest_delta.has(key):
-			result.append(latest_delta[key])
-	latest_delta.clear()
-	ordered_delta_keys.clear()
-
-
-func _on_final_response(response: Dictionary) -> void:
-	if not _pending_final_event.is_empty():
-		var event: Dictionary = _pending_final_event.duplicate(true)
-		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-		payload["text"] = str(response.get("text", ""))
-		event["payload"] = payload
-		_clear_pending_final_pair()
-		_enqueue_event(event)
-		if not _draining_events:
-			_drain_event_queue()
-		return
-	_pending_final_response = response.duplicate(true)
-	_pending_final_received_ms = Time.get_ticks_msec()
-	if _http_client != null:
-		_http_client.poll_events()
-
-
-func _clear_pending_final_pair() -> void:
-	_pending_final_response.clear()
-	_pending_final_event.clear()
-	_pending_final_received_ms = -1
+	_streaming_controller.enqueue(event)
 
 
 func _drain_event_queue() -> void:
-	if _event_queue.is_empty():
-		_draining_events = false
+	if not _streaming_controller.has_pending():
 		return
-	_draining_events = true
 	if _interrupted_locally:
-		_event_queue.clear()
-		_draining_events = false
+		_streaming_controller.clear()
 		return
-	var started_ms := Time.get_ticks_msec()
-	var processed := 0
-	while not _event_queue.is_empty() and processed < EVENT_DRAIN_BATCH_SIZE:
-		var event = _event_queue.pop_front()
+	var batch := _streaming_controller.take_batch(
+		EVENT_DRAIN_BATCH_SIZE,
+		EVENT_DRAIN_TIME_BUDGET_MS
+	)
+	for event in batch:
 		if event is Dictionary:
 			_handle_event(event)
-		processed += 1
-		if Time.get_ticks_msec() - started_ms >= EVENT_DRAIN_TIME_BUDGET_MS:
-			break
-	if _event_queue.is_empty():
-		_draining_events = false
 
 
 func _handle_event(event: Dictionary) -> void:
 	var event_type := str(event.get("type", ""))
 	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-	if event_type == "_history_log_text":
-		var history_text := str(payload.get("text", ""))
-		_queue_message({"type": "log", "text": history_text, "mark_text": bool(payload.get("marker", false)), "indent": bool(payload.get("indent", false)), "estimated_height": _estimate_text_height(history_text)})
-		return
-	if event_type == "_history_thought":
-		var thought_header := str(payload.get("header", "Thought"))
-		var thought_detail := str(payload.get("detail", ""))
-		var thought_text := thought_header if thought_detail.strip_edges() == "" else thought_header + "\n" + thought_detail
-		_queue_message({"type": "log", "text": thought_text, "single_entry": true, "estimated_height": _estimate_text_height(thought_detail)})
-		return
-	if event_type == "_history_code":
-		var code := str(payload.get("text", ""))
-		var extension := str(payload.get("path", "")).get_extension().to_lower()
-		var language := "gdscript" if extension == "gd" else ("python" if extension == "py" else "")
-		var fenced_code := "```%s\n%s\n```" % [language, code]
-		_queue_message({"type": "log", "text": fenced_code, "single_entry": true, "indent": true, "estimated_height": _estimate_text_height(code)})
-		return
-	if event_type == "system_message":
-		_render_message_block("system", str(payload.get("text", "")))
-		return
-	if event_type == "user_submitted" and payload.has("text"):
-		_render_message_block("user", str(payload.get("text", "")))
-		return
-	if event_type == "_history_front_tool_result":
-		var history_call: Dictionary = payload.get("call", {}) if payload.get("call", {}) is Dictionary else {}
-		var history_result: Dictionary = payload.get("result", {}) if payload.get("result", {}) is Dictionary else {}
-		if not EventFormatter.is_workflow_tool(str(history_call.get("name", ""))):
-			_append_message("system", EventFormatter.format_tool_call_header(history_call))
-		_append_tool_result(history_call, history_result)
+	_session_state_reducer.reduce(event)
+	if not _timeline_controller.present_event(event):
+		FrontendLogger.error(editor_interface, "ChatPanel", "Canonical Timeline rejected event.", {
+			"type": event_type,
+			"seq": int(event.get("seq", 0)),
+		})
 		return
 	if event_type == "server_tool_result":
 		_remember_server_file_read(event)
-		# 结构化历史中的 Read/Grep/Edit/场景树只会生成 server_tool_result；
-		# 回放时必须走实时事件使用的 formatter/renderer，否则这些消息会整条消失。
-		if _history_replaying:
-			_render_event_description(event)
-		return
-	if event_type == "agent_reasoning_delta":
-		_on_reasoning_delta(event)
-		_register_provisional_preview(payload, "reasoning")
-	elif event_type == "agent_text_delta":
-		_on_text_delta(event)
-		_register_provisional_preview(payload, "text")
-	elif event_type == "submission_preview_committed":
-		_resolve_provisional_previews(payload, true)
-	elif event_type == "submission_preview_discarded":
-		_resolve_provisional_previews(payload, false)
+	if event_type == "tool_calls" or event_type == "agent_tool_calls":
+		_handle_tool_calls(payload)
 	elif event_type == "final":
 		if payload.has("text"):
-			FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (via event stream)", {})
-			_clear_pending_final_pair()
 			_handle_final(payload)
-		elif not _pending_final_response.is_empty():
-			var response: Dictionary = _pending_final_response.duplicate(true)
-			_clear_pending_final_pair()
-			FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (paired response)", {
-				"seq": int(event.get("seq", 0))
-			})
-			_handle_final(response)
 		else:
-			_pending_final_event = event.duplicate(true)
+			_on_error("Final event is missing presentation text.")
+	elif event_type == "error":
+		_on_problem(payload)
 	elif event_type == "agent_model_selected":
 		_active_model_name = str(payload.get("model", "")).strip_edges()
 		_refresh_status_text()
-	else:
-		if event_type == "agent_model_fallback":
-			_active_model_name = str(payload.get("fallback_model", "")).strip_edges()
-			_refresh_status_text()
-		if event_type == "context_usage":
-			var usage_payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-			_update_context_usage_status(
-				int(usage_payload.get("used_tokens", 0)),
-				int(usage_payload.get("token_limit", 0))
-			)
-		# `compact_started`/`compact_boundary` 总是成对到达（见后端 `compact()`），
-		# 中间跨越的才是压缩真正发生的窗口；据此让状态栏在这段时间显示"正在压缩"，
-		# 结束后还原成压缩前原本的状态（等待模型/执行工具等），而不是固定回到 IDLE。
-		if event_type == "compact_started" and _state != AgentState.IDLE:
-			_state_before_compact = _state
-			_set_state(AgentState.COMPACTING)
-		if _REASONING_BOUNDARY_EVENT_TYPES.has(event_type):
-			# 把关闭动作推迟到当前同步批次（_drain_event_queue 的 while 循环）跑完之后再执行。
-			# 否则同一 SSE 批次里排在 boundary 事件后面的 trailing reasoning_delta，会因为 key
-			# 已被同步关闭而在 _on_reasoning_delta 里当成"迟到"丢弃（日志里 55 次 IGNORED 即此）。
-			# call_deferred 在本帧 idle flush 时才运行，那时批内的 reasoning_delta 都已同步应用完。
-			call_deferred("_close_reasoning_for_boundary_event", event)
-		var force_milestone_scroll := _MILESTONE_EVENT_TYPES.has(event_type) and _auto_scroll
-		if force_milestone_scroll:
-			_force_scroll_once = true
-		var rendered_description := _render_event_description(event)
-		if rendered_description != "":
-			FrontendLogger.debug(editor_interface, "ChatPanel", "-> rendered", {
-				"type": event_type,
-				"description_len": rendered_description.length()
-			})
-			if force_milestone_scroll:
-				_force_scroll_once = true
-				_scroll_to_bottom()
-				_post_final_scroll_frames = max(_post_final_scroll_frames, 5)
-		if event_type == "compact_boundary" and _state == AgentState.COMPACTING:
-			_set_state(_state_before_compact)
-
-
-func _register_provisional_preview(payload: Dictionary, kind: String) -> void:
-	if not bool(payload.get("provisional", false)):
-		return
-	var preview_id := str(payload.get("preview_id", "")).strip_edges()
-	if preview_id == "":
-		return
-	_preview_registry[preview_id] = {
-		"request_id": str(payload.get("request_id", "")),
-		"turn_id": str(payload.get("turn_id", "")),
-		"kind": kind,
-		"stream_key": _stream_event_key(payload),
-	}
-
-
-func _resolve_provisional_previews(payload: Dictionary, committed: bool) -> void:
-	var raw_ids: Variant = payload.get("preview_ids", [])
-	if not (raw_ids is Array):
-		return
-	var invalidated := false
-	for raw_id in raw_ids:
-		var preview_id := str(raw_id)
-		if not _preview_registry.has(preview_id):
-			continue
-		var preview: Dictionary = _preview_registry[preview_id]
-		_preview_registry.erase(preview_id)
-		if committed:
-			continue
-		var stream_key := str(preview.get("stream_key", ""))
-		match str(preview.get("kind", "")):
-			"text":
-				if stream_key != "" and stream_key == _stream_key:
-					_discard_stream_message()
-				else:
-					invalidated = true
-			"reasoning":
-				if stream_key != "" and stream_key == _reasoning_key:
-					var reasoning_index := _reasoning_message_index
-					_finish_reasoning_stream()
-					if reasoning_index >= 0:
-						_remove_queued_message(reasoning_index)
-				else:
-					invalidated = true
-	if invalidated:
-		# Selected rollback UX: preserve already-finalized layout but clearly mark
-		# that the matching provisional attempt did not commit.
-		_append_message("error", "未提交的模型预览已丢弃；本次工具结果事务未生效。")
+	elif event_type == "agent_model_fallback":
+		_active_model_name = str(payload.get("fallback_model", "")).strip_edges()
+		_refresh_status_text()
+	elif event_type == "context_usage":
+		_update_context_usage_status(int(payload.get("used_tokens", 0)), int(payload.get("token_limit", 0)))
+	elif event_type == "compact_started" and _state != AgentState.IDLE:
+		_state_before_compact = _state
+		_set_state(AgentState.COMPACTING)
+	elif event_type == "compact_boundary" and _state == AgentState.COMPACTING:
+		_set_state(_state_before_compact)
+	if _MILESTONE_EVENT_TYPES.has(event_type) and _auto_scroll:
+		_force_scroll_once = true
+		_scroll_to_bottom()
 
 
 func _remember_server_file_read(event: Dictionary) -> void:
@@ -2065,7 +1576,7 @@ func _on_extensions() -> void:
 			"skills": _last_doctor_report.get("skills", []),
 			"warnings": _last_doctor_report.get("warnings", [])
 		}
-		_append_message("system", ChatReportFormatter.extensions_report(payload))
+		_present_local_text("system", ChatReportFormatter.extensions_report(payload))
 
 
 func _on_effort_selected(index: int) -> void:
@@ -2169,7 +1680,7 @@ func _update_output_styles(styles: Array) -> void:
 
 
 func _show_inline_confirmation(calls: Array) -> void:
-	_inline_confirm.show(_message_list, calls, _ui_table(), _theme_colors, _on_inline_apply, _on_inline_reject)
+	_inline_confirm.show(_confirmation_host, calls, _ui_table(), _theme_colors, _on_inline_apply, _on_inline_reject)
 	_sync_virtual_messages()
 	# 确保确认面板出现时自动滚动到底部，让用户看到需要操作的内容
 	_auto_scroll = true
@@ -2188,8 +1699,8 @@ func _on_inline_apply() -> void:
 	if _inline_confirm.is_busy():
 		return
 	_inline_confirm.set_busy(true)
-	var results: Array = _pending_silent_results.duplicate(true)
-	for call in _pending_ordered_calls:
+	var results: Array = _approval_controller.leading_results()
+	for call in _approval_controller.ordered_calls():
 		if not (call is Dictionary):
 			continue
 		var confirmation_index := _pending_confirmation_index(str(call.get("id", "")))
@@ -2197,17 +1708,6 @@ func _on_inline_apply() -> void:
 		var should_apply := (
 			_inline_confirm.should_apply(confirmation_index) if needs_confirmation else true
 		)
-		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-		var preview: Control = null
-		var stats := {}
-		if needs_confirmation:
-			preview = _inline_confirm.preview_for(confirmation_index, is_workflow)
-			stats = _inline_confirm.diff_stats_for(confirmation_index, is_workflow)
-		elif is_workflow:
-			preview = ToolPreviewRenderer.render_call(call, _theme_colors)
-			stats = ToolPreviewRenderer.diff_stats(call)
-		else:
-			_append_message("system", EventFormatter.format_tool_call_header(call))
 		if should_apply:
 			if _interrupted_locally:
 				return
@@ -2221,11 +1721,9 @@ func _on_inline_apply() -> void:
 				# 避免夹带的静默调用意外获得会话级权限豁免。
 				result["grant_session_allow"] = _inline_confirm.grant_session_allow()
 			results.append(result)
-			_append_tool_result(call, result, preview, stats)
 		else:
 			var rejected := AgentDTO.rejected_result(call)
 			results.append(rejected)
-			_append_tool_result(call, rejected, preview, stats)
 	_inline_confirm.set_busy(false)
 	_on_decision(results)
 
@@ -2238,27 +1736,16 @@ func _on_inline_reject() -> void:
 	if _inline_confirm.is_busy():
 		return
 	_inline_confirm.set_busy(true)
-	var results: Array = _pending_silent_results.duplicate(true)
-	for call in _pending_ordered_calls:
+	var results: Array = _approval_controller.leading_results()
+	for call in _approval_controller.ordered_calls():
 		if not (call is Dictionary):
 			continue
 		var confirmation_index := _pending_confirmation_index(str(call.get("id", "")))
 		var needs_confirmation := confirmation_index >= 0
-		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-		var preview: Control = null
-		var stats := {}
 		if needs_confirmation:
-			preview = _inline_confirm.preview_for(confirmation_index, is_workflow)
-			stats = _inline_confirm.diff_stats_for(confirmation_index, is_workflow)
 			var rejected := AgentDTO.rejected_result(call)
 			results.append(rejected)
-			_append_tool_result(call, rejected, preview, stats)
 			continue
-		if is_workflow:
-			preview = ToolPreviewRenderer.render_call(call, _theme_colors)
-			stats = ToolPreviewRenderer.diff_stats(call)
-		else:
-			_append_message("system", EventFormatter.format_tool_call_header(call))
 		if _interrupted_locally:
 			return
 		_set_state(AgentState.EXECUTING)
@@ -2267,7 +1754,6 @@ func _on_inline_reject() -> void:
 			return
 		result = _ensure_tool_result_for_call(call, result)
 		results.append(result)
-		_append_tool_result(call, result, preview, stats)
 	_inline_confirm.set_busy(false)
 	_on_decision(results)
 
@@ -2275,11 +1761,7 @@ func _on_inline_reject() -> void:
 ## 在 _pending_calls（仅含 needs_confirm 的调用）中查找指定 tool_use_id 的索引。
 ## 返回 -1 表示该调用不需要确认（是暂停点之后夹带的静默调用）。
 func _pending_confirmation_index(tool_use_id: String) -> int:
-	for index in range(_pending_calls.size()):
-		var call = _pending_calls[index]
-		if call is Dictionary and str(call.get("id", "")) == tool_use_id:
-			return index
-	return -1
+	return _approval_controller.confirmation_index(tool_use_id)
 
 
 ## 仅拆除确认框的 UI（旧的 checkbox/diff 预览/按钮），不触碰 `_pending_calls` /
@@ -2293,9 +1775,7 @@ func _clear_inline_confirmation_ui() -> void:
 
 func _clear_inline_confirmation() -> void:
 	_clear_inline_confirmation_ui()
-	_pending_calls.clear()
-	_pending_silent_results.clear()
-	_pending_ordered_calls.clear()  # 同步清理原始序列切片，防止下一轮残留
+	_approval_controller.clear()
 
 
 func _request_model():
@@ -2357,11 +1837,11 @@ func _status_text_for_state(value: int) -> String:
 		AgentState.COMPACTING:
 			base = _ui("compacting")
 		AgentState.RESETTING:
-			base = "正在重置"
+			base = _ui("state_resetting")
 		AgentState.RECOVERING:
-			base = "正在恢复"
+			base = _ui("state_recovering")
 		AgentState.PAUSED:
-			base = "已暂停"
+			base = _ui("state_paused")
 	var parts: Array[String] = [base]
 	if _active_model_name != "":
 		parts.append(_active_model_name)
@@ -2408,471 +1888,35 @@ func _set_state(value: int) -> void:
 		})
 
 
-func _on_reasoning_delta(event: Dictionary) -> void:
-	var raw_payload: Variant = event.get("payload", {})
-	var payload: Dictionary = raw_payload if raw_payload is Dictionary else {}
-	var key := _stream_event_key(payload)
-	var token_count := int(payload.get("token_count", 0))
-	# 后端只把千问的 reasoning_content 转换为 agent_reasoning_delta。
-	# 因此该事件里的全部文本都必须渲染进 Thought，不能再从中拆正文。
-	var text := _accumulated_stream_text(payload, key, _reasoning_delta_text_by_key)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta]", {
-		"key": key, "text_len": text.length(), "preview": text.left(60).replace("\n", "\\n")
-	})
-	if text != "":
-		_ensure_reasoning_entry(key)
-		_reasoning_text = text
-		if token_count > 0:
-			_reasoning_token_count = token_count
-		_update_reasoning_entry()
-
-
-func _on_text_delta(event: Dictionary) -> void:
-	var raw_payload: Variant = event.get("payload", {})
-	var payload: Dictionary = raw_payload if raw_payload is Dictionary else {}
-	var key := _stream_event_key(payload)
-	var text := _accumulated_stream_text(payload, key, _stream_delta_text_by_key)
-	_render_text_delta_body(key, text)
-
-
-func _render_text_delta_body(key: String, text: String) -> void:
-	if _should_ignore_stream_delta(key, text):
+func _present_local_text(role: String, text: String, color = null) -> void:
+	var style_token := "error" if role == "error" else role
+	var item_id := _timeline_controller.present_local_text(role, _limit_render_text(text, MAX_MESSAGE_RENDER_CHARS), style_token)
+	if item_id.is_empty():
+		FrontendLogger.error(editor_interface, "ChatPanel", "Local Timeline item rejected.", {"role": role})
 		return
-	var stripped := _strip_think_xml(text)
-	var parts := _split_thought_summary(stripped)
-	var rest := str(parts.get("rest", ""))
-	var incoming_frame := key.get_slice(":", 0)
-	if key != _stream_key and _stream_message_index >= 0 and _stream_continuation_frame != "" and incoming_frame == _stream_continuation_frame:
-		# 工具结果返回后，服务端可能给下一轮 LLM 输出新的 message_index。
-		# 该文本仍属于同一 assistant turn，追加到原流式块，不重建节点。
-		_stream_key = key
-		_stream_display_text = _stream_continuation_prefix
-		if rest.strip_edges() != "":
-			if _stream_display_text.strip_edges() != "":
-				_stream_display_text += "\n\n"
-			_stream_display_text += rest
-	elif key != _stream_key:
-		# 流式 key 变了（典型场景：coordinator 在服务端 delegate 给子 agent，
-		# frame_id 从 f1 变成 f2，前端从未收到 tool_calls，_handle_tool_calls()
-		# 不会被调用）。这里必须先把"旧 key"已经显示在屏幕上的文本保留为
-		# 工作流条目，再开始新 key 的流式行——否则下面整段会直接覆盖
-		# _stream_display_text，旧内容就在用户眼前消失得无影无踪。
-		_finalize_stream_as_persistent()
-		_stream_display_text = rest if rest.strip_edges() != "" else stripped
-	elif _stream_continuation_frame != "" and _stream_continuation_prefix != "":
-		# 同一个新 key 的后续 append_delta 是累计文本，保留工具调用前的正文前缀。
-		_stream_display_text = _stream_continuation_prefix
-		if rest.strip_edges() != "":
-			_stream_display_text += "\n\n" + rest
-	else:
-		_stream_display_text = rest if rest.strip_edges() != "" else stripped
-	if _stream_message_index < 0:
-		# _ensure_stream_message() 会清理旧流状态；保住刚收到的新 segment 首包。
-		var pending_text := _stream_display_text
-		_ensure_stream_message(key, true)
-		_stream_display_text = pending_text
-	_stream_text_dirty = true
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta]", {
-		"key": key, "text_len": text.length(), "display_len": _stream_display_text.length(),
-		"preview": text.left(40).replace("\n", "\\n")
-	})
-
-
-## 不能用 `loop` 拼 key：`loop` 是单次 `run_turn()` 调用内部的局部计数器，从 0 开始；
-## map-agent 这类几乎全是前端工具的 agent，每次前端把工具结果 POST 回去都会触发后端
-## 重新调一次 `run_turn()`，同一个 frame 的 `loop` 几乎每轮 round-trip 都会重新变成 1，
-## 导致不同轮次的 reasoning/text 流共享同一个 key，互相误判成"迟到的旧流"而被吞掉。
-## `message_index`（= 这条增量即将写入 `frame.messages` 的下标）在整个 frame 生命周期
-## 内只会单调增长，不会重置，才是真正稳定唯一的"这是哪一次 LLM 调用"标识。
-## provider 可能在同一条 assistant 消息内交错发送正文与 reasoning。它们共享
-## `message_index`，必须渲染为同一个正文块与同一个 Thought，不能按
-## `stream_segment` 拆开；否则会截断正文，且 final 无法替换此前固化的前缀。
-func _stream_event_key(payload: Dictionary) -> String:
-	return "%s:%s" % [
-		str(payload.get("frame_id", "")),
-		str(payload.get("message_index", ""))
-	]
-
-
-func _accumulated_stream_text(payload: Dictionary, key: String, accumulator: Dictionary) -> String:
-	var text := str(payload.get("text", ""))
-	if key == "" or not bool(payload.get("append_delta", false)):
-		if key != "":
-			accumulator[key] = text
-		return text
-	var accumulated := str(accumulator.get(key, "")) + text
-	accumulator[key] = accumulated
-	return accumulated
-
-
-func _should_ignore_stream_delta(key: String, text: String) -> bool:
-	if key != "" and _closed_stream_keys.has(key):
-		return true
-	# 只检查本轮实时响应的指纹，避免历史加载的 _rendered_assistant_keys 误拦截当前回复。
-	var text_key := _message_fingerprint(text)
-	if text_key != "" and _live_response_keys.has(text_key):
-		if _stream_key == key:
-			_discard_stream_message()
-		return true
-	return false
-
-
-func _ensure_reasoning_entry(key: String) -> void:
-	_ensure_log_renderer()
-	if _reasoning_key == key and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
-		return
-	# 新的 reasoning 是正文顺序边界。先固定此前的正文，再把 Thought 入队，
-	# 之后到达的正文增量只能创建在该 Thought 下方的新消息节点中。
-	if _stream_message_index >= 0:
-		if _stream_display_text.strip_edges() != "":
-			_finalize_stream_as_persistent()
-		else:
-			_discard_stream_message()
-	_finish_reasoning_stream()
-	_reasoning_key = key
-	_reasoning_started_ms = Time.get_ticks_msec()
-	if _stream_started_ms < 0:
-		_stream_started_ms = _reasoning_started_ms
-
-	var body := VBoxContainer.new()
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	body.add_theme_constant_override("separation", 2)
-	# 容器默认 mouse_filter=STOP；鼠标悬停在 Thought 区块（即使没有点在 toggle/
-	# 文本上，比如行间空隙）时会拦住滚轮事件，导致流式思考期间无法上滑看历史。
-	body.mouse_filter = Control.MOUSE_FILTER_PASS
-
-	var toggle := _log_renderer.make_workflow_toggle(_format_reasoning_header(), _theme_color("muted_text"))
-	var detail_rich := _log_renderer.append_collapsible(body, toggle, "", "✻")
-
-	_reasoning_message_index = _queue_external_message(body, 72.0, true)
-	_reasoning_toggle = toggle
-	_reasoning_detail_rich = detail_rich
 	_scroll_to_bottom()
-
-
-func _update_reasoning_entry() -> void:
-	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
-		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
-	_reasoning_text_dirty = true
-
-
-func _format_reasoning_header() -> String:
-	var header := _format_reasoning_base_header()
-	if _reasoning_token_count > 0:
-		header += " · %s tokens" % _format_token_count(_reasoning_token_count)
-	return header
-
-
-func _format_reasoning_base_header() -> String:
-	var elapsed := 0.0
-	if _reasoning_started_ms >= 0:
-		elapsed = maxf(0.01, (Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)
-	return "Thought for %.2fs" % elapsed
-
-
-func _format_token_count(count: int) -> String:
-	if count < 1000:
-		return str(count)
-	return "%d,%03d" % [count / 1000, count % 1000]
-
-
-func _ensure_stream_message(key: String, indent := false) -> void:
-	_ensure_log_renderer()
-	if _stream_key == key and _stream_message_index >= 0:
-		return
-	_discard_stream_message()
-	_stream_key = key
-	_stream_started_ms = Time.get_ticks_msec()
-	_stream_message_index = _queue_message({
-		"type": "log",
-		"text": "",
-		"indent": indent,
-		"keep_visible": true,
-		"estimated_height": 64.0,
-	})
-	_scroll_to_bottom()
-
-
-func _finish_streaming() -> void:
-	if _stream_key != "":
-		_stream_delta_text_by_key.erase(_stream_key)
-	_stream_key = ""
-	_stream_message_index = -1
-	_stream_started_ms = -1
-	_stream_display_text = ""
-	_stream_text_dirty = false
-	_stream_last_render_ms = 0
-	_stream_continuation_frame = ""
-	_stream_continuation_prefix = ""
-
-
-func _finish_reasoning_stream() -> void:
-	if _reasoning_text_dirty and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
-		_render_reasoning_entry()
-	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
-		var finished_header := _format_reasoning_header()
-		_reasoning_toggle.text = "✻  " + finished_header + " ✓"
-	if _reasoning_key != "":
-		_reasoning_delta_text_by_key.erase(_reasoning_key)
-	if _reasoning_message_index >= 0:
-		# 保留外部 Thought 节点原位。删除后重新追加持久消息会把 Thought
-		# 移到已经出现的正文之后，破坏 Thought → 正文的显示顺序。
-		if _message_store != null:
-			_message_store.update_message(_reasoning_message_index, {
-				"keep_visible": false,
-				"estimated_height": _estimate_text_height(_reasoning_text)
-			})
-	_reasoning_key = ""
-	_reasoning_toggle = null
-	_reasoning_detail_rich = null
-	_reasoning_message_index = -1
-	_reasoning_text = ""
-	_reasoning_started_ms = -1
-	_reasoning_token_count = 0
-	_reasoning_text_dirty = false
-	_reasoning_last_render_ms = 0
-
-
-func _mark_current_stream_closed() -> void:
-	if _stream_key != "":
-		_closed_stream_keys[_stream_key] = true
-
-
-func _close_reasoning_for_boundary_event(event: Dictionary) -> void:
-	if not _should_close_reasoning_for_boundary_event(event):
-		return
-	# 边界只结束当前块，不封禁这个 key。某些模型会在正文/工具调用后补发
-	# reasoning 尾包；它应当成为新的 Thought。
-	_finish_reasoning_stream()
-
-
-func _should_close_reasoning_for_boundary_event(event: Dictionary) -> bool:
-	if _reasoning_key == "":
-		return true
-	var event_index := _boundary_event_message_index(event)
-	var reasoning_index := _reasoning_stream_message_index()
-	return event_index < 0 or reasoning_index < 0 or event_index >= reasoning_index
-
-
-func _boundary_event_message_index(event: Dictionary) -> int:
-	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-	return _coerce_stream_message_index(payload.get("timeline_message_index", payload.get("message_index", -1)))
-
-
-func _reasoning_stream_message_index() -> int:
-	var parts := _reasoning_key.split(":")
-	if parts.size() < 2:
-		return -1
-	return _coerce_stream_message_index(parts[1])
-
-
-func _coerce_stream_message_index(value: Variant) -> int:
-	if value is int:
-		return int(value)
-	if value is float:
-		return int(value)
-	var text := str(value)
-	if text.is_valid_int():
-		return int(text)
-	if text.is_valid_float():
-		return int(float(text))
-	return -1
-
-
-func _discard_stream_message() -> void:
-	if _stream_message_index >= 0:
-		_remove_queued_message(_stream_message_index)
-	_finish_streaming()
-
-
-## 把 LLM 在决定调用工具之前已经输出的流式文本，从临时流式行转成持久的
-## 工作流条目（带 `●`/`○` 前缀），而不是像 `_discard_stream_message()` 一样
-## 直接丢弃——这样用户能看到模型在工具调用之间的说明/思考文字。
-func _finalize_stream_as_persistent() -> void:
-	var text := _stream_display_text
-	if text.strip_edges() != "":
-		if _stream_text_dirty:
-			_render_stream_content()
-		if _stream_message_index >= 0 and _message_store != null:
-			_message_store.update_message(_stream_message_index, {"keep_visible": false})
-		_rendered_assistant_keys[_message_fingerprint(text)] = true
-	_finish_streaming()
-
-
-func _render_message_block(role: String, text: String, color = null) -> void:
-	_append_message(role, text, color)
-
-
-func _render_event_description(event: Dictionary) -> String:
-	var description := EventFormatter.describe_event(event, _ui_table())
-	if description != "":
-		_render_message_block("system", description)
-	return description
-
-
-func _append_message(role: String, text: String, color = null) -> void:
-	_ensure_log_renderer()
-	if role == "assistant":
-		var assistant_key := _message_fingerprint(text)
-		if _rendered_assistant_keys.has(assistant_key):
-			FrontendLogger.debug(editor_interface, "ChatPanel", "Skipped duplicate assistant message.", {
-				"chars": text.length()
-		})
-			return
-		_rendered_assistant_keys[assistant_key] = true
-
-	if role != "user":
-		_append_log_stream_message(text, _theme_color("error_text") if role == "error" and color == null else color, role != "assistant")
-		return
-
-	_queue_message({"type": "message", "role": role, "text": _limit_render_text(text, MAX_MESSAGE_RENDER_CHARS), "color": color, "estimated_height": _estimate_text_height(text)})
-
-
-func _message_fingerprint(text: String) -> String:
-	return " ".join(text.strip_edges().split())
-
-
-func _append_log_stream_message(text: String, color = null, mark_text: bool = false) -> void:
-	_ensure_log_renderer()
-	_queue_message({
-		"type": "log",
-		"text": _limit_render_text(text, MAX_MESSAGE_RENDER_CHARS),
-		"color": color,
-		"mark_text": mark_text,
-		"indent": _indent_current_text,
-		"estimated_height": _estimate_text_height(text),
-	})
-
-
-## `preview`/`diff_stats` 仅在调用方已经为这个 call 渲染过 diff 预览时传入
-## （即 workflow 类工具：Edit/Write）。传入时渲染一条带彩色 diff 的永久面板，
-## 取代"宣告 + 结果"两条消息——避免同一次编辑在工作流列表里显示成两个条目。
-func _append_tool_result(call: Dictionary, result: Dictionary, preview: Control = null, diff_stats: Dictionary = {}) -> void:
-	var name := str(call.get("name", "unknown"))
-	var status := str(result.get("status", ""))
-	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
-
-	if preview != null and is_instance_valid(preview):
-		_append_tool_result_panel(call, result, preview, diff_stats)
-		return
-
-	var detail := EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
-	if status == "applied":
-		detail = EventFormatter.format_log_tool_result(name, input, result, detail)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_result]", {
-		"name": name, "status": status, "detail_len": detail.length(),
-		"detail": detail.left(120).replace("\n", "\\n")
-	})
-	var color := _theme_color("error_text") if status == "error" else _theme_color("text")
-	_append_message("system", detail, color)
-
-
-## 把已渲染好的 diff/参数预览（在工具执行前从确认框搬出，此时文件内容还是
-## before_text）和执行结果合并成一条永久工作流条目：● 标记 + 标题行 + 缩进的
-## diff 预览 + 状态行。特意不用卡片面板包起来——要和 Read/Grep 等其它工作流
-## 条目保持同样的"⏺ 标记 + 纯文本行"外观，否则会显得是另一种不同的 UI 元素。
-func _append_tool_result_panel(call: Dictionary, result: Dictionary, preview: Control, diff_stats: Dictionary) -> void:
-	_ensure_log_renderer()
-	var status := str(result.get("status", ""))
-	var content := VBoxContainer.new()
-	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	content.add_theme_constant_override("separation", 2)
-
-	var marker := _log_renderer.workflow_marker_text("edit")
-	content.add_child(_log_renderer.make_log_rich_text(EventFormatter.format_tool_call_header(call), null, marker))
-
-	var old_parent := preview.get_parent()
-	if old_parent != null:
-		old_parent.remove_child(preview)
-	var indent := MarginContainer.new()
-	indent.add_theme_constant_override("margin_left", 24)
-	indent.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	indent.add_child(preview)
-	content.add_child(indent)
-
-	var name := str(call.get("name", "unknown"))
-	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
-	var is_diff_kind := ToolPreviewRenderer.infer_render_kind(call) == "diff"
-
-	var status_text := ""
-	var status_color := _theme_color("text")
-	match status:
-		"applied":
-			if is_diff_kind:
-				status_text = "+%d -%d lines" % [int(diff_stats.get("added", 0)), int(diff_stats.get("removed", 0))]
-			else:
-				status_text = EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
-			status_color = _theme_color("success_text")
-		"rejected":
-			status_text = _ui("tool_rejected")
-			status_color = _theme_color("muted_text")
-		"error":
-			status_text = EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
-			status_color = _theme_color("error_text")
-		_:
-			status_text = status
-	if status_text != "":
-		content.add_child(_log_renderer.make_log_rich_text(status_text, status_color))
-
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_result]", {
-		"name": name, "status": status, "status_text": status_text
-	})
-
-	_queue_external_message(content, 120.0)
 
 
 func _clear_messages(reset_history := true) -> void:
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] clear_messages", {
+	FrontendLogger.debug(editor_interface, "ChatPanel", "Timeline cleared.", {
 		"reset_history": reset_history,
-		"store_before": _message_store.size() if _message_store != null else -1,
-		"virtual": _virtual_scroller.debug_state() if _virtual_scroller != null else {},
+		"store_before": _timeline_controller.store.size(),
 	})
-	_clear_pending_final_pair()
-	_rendered_assistant_keys.clear()
-	_live_response_keys.clear()
-	_closed_stream_keys.clear()
-	_stream_delta_text_by_key.clear()
-	_reasoning_delta_text_by_key.clear()
-	_stream_key = ""
-	_stream_message_index = -1
-	_stream_started_ms = -1
-	_stream_display_text = ""
-	_stream_text_dirty = false
-	_stream_last_render_ms = 0
-	_stream_continuation_frame = ""
-	_stream_continuation_prefix = ""
-	_reasoning_key = ""
-	_reasoning_toggle = null
-	_reasoning_detail_rich = null
-	_reasoning_message_index = -1
-	_reasoning_text = ""
-	_reasoning_started_ms = -1
-	_reasoning_token_count = 0
-	_reasoning_text_dirty = false
-	_reasoning_last_render_ms = 0
+	var epoch := str(_session_state.snapshot().get("session_epoch", ""))
+	if epoch.is_empty():
+		epoch = "pending:%s" % _current_session_id()
+	_timeline_controller.reset_epoch(epoch)
 	if reset_history:
 		_history_before = 0
 		_history_has_more = false
 		_history_loading = false
 		_history_refresh_needed = false
-		_history_replaying = false
-		_history_batch_messages.clear()
-		_history_replay_events.clear()
-		_history_replay_cursor = 0
-		_history_replay_context.clear()
-		_history_replay_started_ms = -1
-	_preview_registry.clear()
-	if _virtual_scroller != null:
-		_virtual_scroller.clear()
-	if _message_store != null:
-		_message_store.clear()
 
 
 func _scroll_to_bottom() -> void:
 	_sync_virtual_messages()
 	if not _auto_scroll and not _force_scroll_once:
 		return
-	# 立即清除一次性标记，防止后续同一帧内其他调用再次绕过守卫
 	_force_scroll_once = false
 	if _scroll_request_pending:
 		return
@@ -2886,61 +1930,7 @@ func _sync_virtual_messages() -> void:
 
 
 func _on_collapsible_layout_changed() -> void:
-	# 折叠内容变化后，等待 RichTextLabel 布局稳定再重测虚拟消息高度。
 	_post_history_layout_frames = max(_post_history_layout_frames, 2)
-
-
-func _queue_message(data: Dictionary) -> int:
-	if _history_replaying:
-		var batch_index := _history_batch_messages.size()
-		_history_batch_messages.append(data.duplicate(true))
-		return batch_index
-	_initialize_virtual_messages()
-	var evicted := false
-	while _message_store.size() >= MAX_MESSAGE_STORE_MESSAGES:
-		var removable := -1
-		for index in range(_message_store.size()):
-			if not bool(_message_store.get_message(index).get("keep_visible", false)):
-				removable = index
-				break
-		if removable < 0:
-			break
-		_remove_queued_message(removable)
-		evicted = true
-	if evicted:
-		_history_before = 0
-		_history_has_more = true
-		_history_refresh_needed = true
-	var index := _message_store.add_message(data)
-	_virtual_scroller.notify_message_added(index, _auto_scroll or _force_scroll_once)
-	_scroll_to_bottom()
-	return index
-
-
-func _queue_external_message(node: Control, estimated_height: float, keep_visible := false) -> int:
-	return _queue_message({
-		"type": "external",
-		"external": true,
-		"node": node,
-		"keep_visible": keep_visible,
-		"estimated_height": estimated_height,
-	})
-
-
-func _remove_queued_message(index: int) -> void:
-	if index < 0 or _virtual_scroller == null:
-		return
-	_virtual_scroller.remove_message(index)
-	if _stream_message_index > index:
-		_stream_message_index -= 1
-	if _reasoning_message_index > index:
-		_reasoning_message_index -= 1
-
-
-func _estimate_text_height(text: String) -> float:
-	var line_count := max(1, text.count("\n") + 1)
-	var wrap_lines := int(ceil(float(text.length()) / 90.0))
-	return 30.0 + float(max(line_count, wrap_lines)) * 22.0
 
 
 func _on_scroll_value_changed(value: float) -> void:
@@ -2961,21 +1951,20 @@ func _on_scroll_value_changed(value: float) -> void:
 		_user_scrolled_up_ms = Time.get_ticks_msec()
 	var history_before := _history_request_before(value)
 	if history_before >= 0:
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[DEBUG-HISTORY-7C2A] request_history", {
+		FrontendLogger.debug(editor_interface, "ChatPanel", "History page requested.", {
 			"value": value,
 			"history_before": history_before,
 			"refresh": _history_refresh_needed,
-			"store_size": _message_store.size() if _message_store != null else -1,
-			"replaying": _history_replaying,
+			"store_size": _timeline_controller.store.size(),
 		})
 		_history_loading = true
-		_http_client.fetch_session_history(HISTORY_PAGE_SIZE, history_before)
+		_history_controller.fetch_page(HISTORY_PAGE_SIZE, history_before)
 	if _virtual_scroller != null:
 		_virtual_scroller.on_scroll_changed(value)
 
 
 func _history_request_before(value: float) -> int:
-	if _state != AgentState.IDLE or _history_loading or _history_replaying:
+	if _state != AgentState.IDLE or _history_loading:
 		return -1
 	if _history_refresh_needed:
 		return 0
@@ -3131,8 +2120,7 @@ func _switch_to_session(session_id: String) -> void:
 	_post_delta_scroll_frames = 0
 	_post_history_layout_frames = 0
 	_interrupted_locally = false
-	_event_queue.clear()
-	_draining_events = false
+	_streaming_controller.clear()
 	_clear_inline_confirmation()
 	if undo_manager != null:
 		undo_manager.abort_batch()
@@ -3145,7 +2133,7 @@ func _switch_to_session(session_id: String) -> void:
 	_clear_messages()
 	_update_context_usage_status(0, _context_token_limit)
 	_set_state(AgentState.IDLE)
-	_http_client.fetch_session_history()
+	_history_controller.fetch_initial()
 	_save_session_to_history(session_id)
 
 

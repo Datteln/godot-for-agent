@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,21 +33,6 @@ class EventPage:
 
 _MAX_EVENTS_PER_SESSION = 500
 
-# 旧版流式事件每条都携带"截至当前的完整累积文本"；这种 snapshot 可原地覆盖。
-# 新版 `append_delta` 事件只携带新增片段，必须逐条保留，否则会丢内容。
-# 不去重的话，_MAX_EVENTS_PER_SESSION 的额度会被这些中间态迅速消耗掉，导致
-# 较早几轮的 Thought/正文流被挤出缓冲区，历史回放时只剩最近一两段。
-_COALESCED_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta"}
-
-
-def _coalesce_stream_key(event_type: str, payload: dict[str, Any]) -> tuple[str, str, str] | None:
-    """非流式增量事件返回 None；流式增量返回其 (type, frame_id, loop) 去重键。"""
-    if event_type not in _COALESCED_EVENT_TYPES:
-        return None
-    if bool(payload.get("append_delta", False)):
-        return None
-    return (event_type, str(payload.get("frame_id", "")), str(payload.get("loop", "")))
-
 
 class EventStore:
     """进程内事件存储；每个会话最多保留最近
@@ -59,6 +45,7 @@ class EventStore:
         self._events: dict[str, list[Event]] = {}
         self._seq: dict[str, int] = {}
         self._epochs: dict[str, str] = {}
+        self._signals: dict[str, asyncio.Event] = {}
 
     def append(
         self,
@@ -94,24 +81,6 @@ class EventStore:
         )
         events = self._events.setdefault(session_id, [])
 
-        stream_key = _coalesce_stream_key(event_type, payload)
-        if stream_key is not None and events:
-            last = events[-1]
-            if (
-                last.type,
-                str(last.payload.get("frame_id", "")),
-                str(last.payload.get("loop", "")),
-            ) == stream_key:
-                events[-1] = event
-                logger.debug(
-                    "Event coalesced session=%s seq=%d type=%s replaces_seq=%d",
-                    session_id,
-                    seq,
-                    event_type,
-                    last.seq,
-                )
-                return event
-
         events.append(event)
         if len(events) > _MAX_EVENTS_PER_SESSION:
             del events[: len(events) - _MAX_EVENTS_PER_SESSION]
@@ -120,6 +89,9 @@ class EventStore:
                 session_id,
                 _MAX_EVENTS_PER_SESSION,
             )
+        signal = self._signals.get(session_id)
+        if signal is not None:
+            signal.set()
         logger.debug("Event appended session=%s seq=%d type=%s", session_id, seq, event_type)
         return event
 
@@ -224,3 +196,28 @@ class EventStore:
     def current_epoch(self, session_id: str) -> str:
         """返回进程内事件流当前 epoch。"""
         return self._epochs.get(session_id, "")
+
+    def oldest_seq(self, session_id: str) -> int | None:
+        """返回当前保留窗口最早序号；没有事件时返回 ``None``。"""
+        events = self._events.get(session_id, [])
+        return events[0].seq if events else None
+
+    async def wait_for_change(
+        self,
+        session_id: str,
+        after: int,
+        *,
+        timeout_s: float,
+    ) -> bool:
+        """等待 ``after`` 后出现事件，供 WebSocket 推送而非客户端轮询。"""
+        if self.last_seq(session_id) > after:
+            return True
+        signal = self._signals.setdefault(session_id, asyncio.Event())
+        signal.clear()
+        if self.last_seq(session_id) > after:
+            return True
+        try:
+            await asyncio.wait_for(signal.wait(), timeout=timeout_s)
+        except TimeoutError:
+            return False
+        return self.last_seq(session_id) > after

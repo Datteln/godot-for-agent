@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 import shutil
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -167,12 +166,6 @@ class StagedMapArtifactTurn:
             for entry_id, entry in self.entries.items()
         }
         return _canonical_fingerprint(stable_entries)
-
-
-CURRENT_MAP_ARTIFACT_TURN: ContextVar[StagedMapArtifactTurn | None] = ContextVar(
-    "current_map_artifact_turn",
-    default=None,
-)
 
 
 @dataclass(frozen=True)
@@ -407,24 +400,23 @@ class MapArtifactStore:
         limit: int = 50,
         staged: StagedMapArtifactTurn | None = None,
     ) -> dict[str, Any]:
-        """优先读取当前事务暂存条目，再读取已提交或旧版单文件条目。"""
+        """读取当前事务暂存条目或当前 schema 已提交条目。"""
         path = self._resolve_ref(artifact_ref)
-        if path == self.path.resolve():
-            if not turn_id or not entry_id:
-                raise ValueError(
-                    "aggregated map artifact requires artifact_turn_id and artifact_entry_id"
-                )
-            entry, source = self._resolve_aggregated_entry(
-                turn_id=turn_id,
-                entry_id=entry_id,
-                staged=staged,
+        if path != self.path.resolve():
+            raise ValueError("unsupported map artifact reference")
+        if not turn_id or not entry_id:
+            raise ValueError(
+                "aggregated map artifact requires artifact_turn_id and artifact_entry_id"
             )
-            if not fingerprint:
-                raise ValueError("aggregated map artifact requires artifact_fingerprint")
-            if entry.get("fingerprint") != fingerprint:
-                raise ValueError("map artifact locator fingerprint mismatch")
-        else:
-            entry, source = self._read_legacy_entry(path), "legacy"
+        entry, source = self._resolve_aggregated_entry(
+            turn_id=turn_id,
+            entry_id=entry_id,
+            staged=staged,
+        )
+        if not fingerprint:
+            raise ValueError("aggregated map artifact requires artifact_fingerprint")
+        if entry.get("fingerprint") != fingerprint:
+            raise ValueError("map artifact locator fingerprint mismatch")
         result = entry.get("result")
         if not isinstance(result, dict):
             raise ValueError("map artifact result must be an object")
@@ -521,29 +513,14 @@ class MapArtifactStore:
             raise ValueError(f"map artifact entry was not found: {entry_id}")
         return entries[entry_id], "committed"
 
-    def _read_legacy_entry(self, path: Path) -> dict[str, Any]:
-        """只读兼容整改前的每次调用单独 artifact。"""
-        if path.stat().st_size > MAX_MAP_ARTIFACT_FILE_BYTES:
-            raise ValueError("legacy map artifact file exceeds size limit")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("legacy map artifact payload must be an object")
-        if str(payload.get("schema", "")).startswith("map_delegate_artifact"):
-            raise ValueError("delegate artifact must be read with read_delegate_artifact")
-        if not isinstance(payload.get("result"), dict):
-            raise ValueError("unsupported legacy map artifact schema")
-        return payload
-
     def _resolve_ref(self, artifact_ref: str) -> Path:
-        """限定引用为当前会话目录下的 JSON，拒绝跨会话和 delegate 子目录。"""
+        """限定引用为当前会话唯一 canonical artifact 文档。"""
         if not artifact_ref or Path(artifact_ref).is_absolute():
             raise ValueError("artifact_ref must be a project-relative path")
         session_root = self.session_root.resolve()
         candidate = (self.project_root / artifact_ref).resolve(strict=False)
-        if candidate.parent != session_root or candidate.suffix.lower() != ".json":
+        if candidate.parent != session_root or candidate != self.path.resolve():
             raise ValueError("artifact_ref is outside the current session map artifact directory")
-        if candidate != self.path.resolve() and not candidate.is_file():
-            raise ValueError("legacy map artifact file was not found")
         return candidate
 
 
@@ -564,48 +541,3 @@ def clear_session_artifacts(project_root: Path, session_id: str) -> None:
             raise ValueError("refusing to delete artifact path outside artifact root")
         if resolved.exists():
             shutil.rmtree(resolved)
-
-
-def adopt_legacy_artifact_epoch(
-    project_root: Path,
-    session_id: str,
-    session_epoch: str,
-) -> None:
-    """首次迁移旧 Session 时为既有 map/delegate artifact 补写 epoch。
-
-    该入口只应在 Session 自身尚无 epoch 时调用；reset 后创建的新 Session 从
-    一开始就有 epoch，因此不会把未清理的旧 artifact 误认领到新生命周期。
-    """
-    map_path = (
-        project_root
-        / ".ai_agent_service"
-        / "artifacts"
-        / _safe_session_name(session_id)
-        / "map_artifacts.json"
-    )
-    candidates = [map_path]
-    delegate_root = (
-        project_root
-        / ".ai_agent_service"
-        / "artifacts"
-        / hashlib.sha256(session_id.encode("utf-8")).hexdigest()
-        / "delegates"
-    )
-    if delegate_root.exists():
-        candidates.extend(delegate_root.glob("*.json"))
-    for path in candidates:
-        if not path.exists():
-            continue
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict) or payload.get("session_id") != session_id:
-            raise ValueError("legacy artifact identity mismatch during epoch adoption")
-        stored_epoch = payload.get("session_epoch")
-        if stored_epoch not in {None, "", session_epoch}:
-            raise ValueError("legacy artifact already belongs to another epoch")
-        payload["session_epoch"] = session_epoch
-        commits = payload.get("coordinated_commits")
-        if isinstance(commits, dict):
-            for commit in commits.values():
-                if isinstance(commit, dict):
-                    commit["session_epoch"] = session_epoch
-        atomic_write_json(path, payload)

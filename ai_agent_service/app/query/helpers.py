@@ -1,4 +1,4 @@
-"""QueryEngine helper functions split out of the HTTP/session facade."""
+"""AgentApplication helper functions split out of the HTTP/session facade."""
 
 from __future__ import annotations
 
@@ -30,18 +30,20 @@ from app.api.schemas import (
     PlanCreatedHistoryBlock,
     PlanStepDTO,
     SessionHistoryBlock,
-    SessionHistoryItemDTO,
     StepCompletedHistoryBlock,
     StepStartedHistoryBlock,
     SystemTextHistoryBlock,
     ThoughtHistoryBlock,
     UserHistoryBlock,
-    VerifyFailedHistoryBlock,
-    VerifyPassedHistoryBlock,
-    VerifyResultDTO,
+    VerifyOutcomeHistoryBlock,
     VerifyStartedHistoryBlock,
 )
 from app.events.store import Event
+from app.verify.contracts import (
+    UnsupportedVerifySchemaError,
+    VerifyOutcome,
+    VerifyRecoveryAction,
+)
 
 # history 限流相关常量和工具函数已迁移到 app.history_bounds 共享模块，
 # 避免 helpers 与 history_bounds 之间重复维护同一套阈值/截断逻辑。
@@ -307,25 +309,38 @@ _VERIFY_SYSTEM_PROMPT = (
     "3) 是否引入了明显的逻辑错误；\n"
     "4) 信号连接是否完整（GDScript 场景相关改动）；\n"
     "5) 依赖关系是否正确（import/preload 引用）。\n"
-    "只返回 JSON，不要任何额外文字、不要 markdown 代码块标记，格式为："
-    '{"passed": bool, "issues": [{"severity": "error"|"warning"|"info", '
-    '"file_path": str, "line": int|null, "message": str}], "summary": str}'
+    "只返回当前 VerifyOutcome JSON，不要任何额外文字、不要 markdown 代码块标记。"
+    "字段必须且只能包含 schema_version=1、status(passed|failed|unavailable)、"
+    "phase=semantic、reason_code、summary、issues、attempt、max_attempts、retryable、"
+    "recovery_actions。禁止返回 passed 布尔字段。成功使用 reason_code=verified；"
+    "发现问题使用 reason_code=semantic_issue；校验器自身不可用时使用对应的"
+    " unavailable reason，绝不能伪装成功。"
 )
 
 
-def _parse_verify_response(text: str) -> VerifyResultDTO:
-    """把 Phase 2 LLM 校验返回的文本解析为 `VerifyResultDTO`。
-
-    解析失败（非 JSON/字段不合法）时保守返回 `passed=True`，避免校验自身的
-    解析问题阻塞用户的正常工作流；失败原因记录在 `summary` 与日志中。
+def _parse_verify_response(
+    text: str,
+    *,
+    attempt: int = 1,
+    max_attempts: int = 1,
+) -> VerifyOutcome:
+    """严格解析唯一 VerifyOutcome；失败时返回 unavailable，绝不伪造通过。
 
     Args:
         text: LLM 返回的原始文本。
 
     Returns:
-        解析得到的 `VerifyResultDTO`，或解析失败时的保守兜底结果。
+        解析得到的 canonical `VerifyOutcome`，或带确切原因的 unavailable outcome。
     """
     cleaned = text.strip()
+    malformed_actions = (
+        (
+            VerifyRecoveryAction(action="retry_verifier", target="semantic"),
+            VerifyRecoveryAction(action="pause_unverified", target="semantic"),
+        )
+        if attempt < max_attempts
+        else (VerifyRecoveryAction(action="pause_unverified", target="semantic"),)
+    )
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
         if cleaned.lower().startswith("json"):
@@ -335,14 +350,40 @@ def _parse_verify_response(text: str) -> VerifyResultDTO:
         data = json.loads(cleaned)
     except (TypeError, json.JSONDecodeError):
         logger.warning("Verify response is not valid JSON: %s", cleaned[:200])
-        return VerifyResultDTO(passed=True, issues=[], summary="校验响应解析失败，已跳过")
+        return VerifyOutcome.unavailable(
+            phase="semantic",
+            reason_code="response_malformed",
+            summary="语义校验器返回了无法解析的响应。",
+            attempt=attempt,
+            max_attempts=max_attempts,
+            recovery_actions=malformed_actions,
+        )
     if not isinstance(data, dict):
-        return VerifyResultDTO(passed=True, issues=[], summary="校验响应格式不合法，已跳过")
+        return VerifyOutcome.unavailable(
+            phase="semantic",
+            reason_code="response_malformed",
+            summary="语义校验器响应不是对象。",
+            attempt=attempt,
+            max_attempts=max_attempts,
+            recovery_actions=malformed_actions,
+        )
     try:
-        return VerifyResultDTO.model_validate(data)
-    except Exception as exc:  # pydantic ValidationError 及其他兜底
+        return VerifyOutcome.from_payload(data)
+    except UnsupportedVerifySchemaError as exc:
         logger.warning("Verify response failed validation: %s", exc)
-        return VerifyResultDTO(passed=True, issues=[], summary="校验响应字段不合法，已跳过")
+        reason = (
+            "unsupported_verify_schema"
+            if "passed" in data
+            else "response_malformed"
+        )
+        return VerifyOutcome.unavailable(
+            phase="semantic",
+            reason_code=reason,
+            summary=f"语义校验响应不符合当前协议：{reason}",
+            attempt=attempt,
+            max_attempts=max_attempts,
+            recovery_actions=malformed_actions,
+        )
 
 
 def _build_user_content(request: ChatRequest) -> str:
@@ -3955,236 +3996,6 @@ def _is_internal_history_message(message: dict[str, Any]) -> bool:
     )
 
 
-def _history_items_for_frame(
-    frame: Frame, *, include_system_prompt: bool = False
-) -> list[SessionHistoryItemDTO]:
-    """Convert stored LLM messages into chat-panel friendly history items."""
-    items: list[SessionHistoryItemDTO] = []
-    if not include_system_prompt and frame.compact_snapshot is not None:
-        items.append(
-            SessionHistoryItemDTO(
-                role="system",
-                text=frame.compact_snapshot.summary,
-                frame_id=frame.id,
-                agent=frame.agent.name,
-            )
-        )
-    tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
-    for index, message in enumerate(frame.messages):
-        if _is_internal_history_message(message):
-            continue
-        role = str(message.get("role", "system"))
-        content = message.get("content", "")
-        text = (
-            ""
-            if content is None
-            else flatten_message_text(content) if isinstance(content, list) else str(content)
-        )
-
-        if role == "system":
-            if index == 0 and not include_system_prompt:
-                continue
-            if not text.strip():
-                continue
-            items.append(
-                SessionHistoryItemDTO(
-                    role="system", text=text, frame_id=frame.id, agent=frame.agent.name
-                )
-            )
-            continue
-
-        if role == "user":
-            text = _display_user_content(text)
-            if text.strip():
-                items.append(
-                    SessionHistoryItemDTO(
-                        role="user", text=text, frame_id=frame.id, agent=frame.agent.name
-                    )
-                )
-            continue
-
-        if role == "assistant":
-            if text.strip():
-                items.append(
-                    SessionHistoryItemDTO(
-                        role="assistant", text=text, frame_id=frame.id, agent=frame.agent.name
-                    )
-                )
-            tool_calls = message.get("tool_calls", [])
-            if isinstance(tool_calls, list) and tool_calls:
-                lines = ["Tool calls"]
-                for call in tool_calls:
-                    if not isinstance(call, dict):
-                        continue
-                    function = call.get("function", {})
-                    name = "unknown"
-                    arguments: dict[str, Any] = {}
-                    if isinstance(function, dict):
-                        name = str(function.get("name", "unknown"))
-                        arguments = _parse_tool_call_arguments(function.get("arguments"))
-                    call_id = str(call.get("id", ""))
-                    if call_id:
-                        tool_calls_by_id[call_id] = (name, arguments)
-                    lines.append(f"- `{name}`")
-                items.append(
-                    SessionHistoryItemDTO(
-                        role="system",
-                        text="\n".join(lines),
-                        frame_id=frame.id,
-                        agent=frame.agent.name,
-                    )
-                )
-            continue
-
-        if role == "tool":
-            tool_call_id = str(message.get("tool_call_id", ""))
-            tool_name, tool_args = tool_calls_by_id.get(tool_call_id, ("", {}))
-            items.append(
-                SessionHistoryItemDTO(
-                    role="system",
-                    text=_format_tool_result_summary(tool_name, tool_args, text),
-                    frame_id=frame.id,
-                    agent=frame.agent.name,
-                )
-            )
-            continue
-
-        if text.strip():
-            items.append(
-                SessionHistoryItemDTO(
-                    role="system", text=text, frame_id=frame.id, agent=frame.agent.name
-                )
-            )
-    return items
-
-
-def _history_text_fingerprint(text: str) -> str:
-    """生成用于历史条目去重的稳定文本指纹。"""
-    return " ".join(text.split())
-
-
-def _append_history_item_if_new(
-    items: list[SessionHistoryItemDTO],
-    seen: set[str],
-    item: SessionHistoryItemDTO | None,
-) -> None:
-    """将非空且未重复的历史条目追加到目标列表。"""
-    if item is None:
-        return
-    fingerprint = _history_text_fingerprint(item.text)
-    if not fingerprint or fingerprint in seen:
-        return
-    seen.add(fingerprint)
-    items.append(item)
-
-
-def _history_title_with_body(title: str, body: str) -> str:
-    """组合 workflow 历史条目的标题行与 Markdown 正文。"""
-    stripped = body.strip()
-    if not stripped:
-        return title
-    return f"{title}\n{stripped}"
-
-
-def _format_plan_created_history_event(payload: dict[str, Any]) -> str:
-    """把 `plan_created` 事件转换成前端可渲染的 Markdown 历史文本。"""
-    summary = str(payload.get("summary", "")).strip()
-    steps = payload.get("steps", [])
-    body_lines: list[str] = []
-    if summary:
-        body_lines.append(summary)
-    if isinstance(steps, list) and steps:
-        if body_lines:
-            body_lines.append("")
-        for raw_step in steps:
-            if not isinstance(raw_step, dict):
-                continue
-            index = int(raw_step.get("index", 0))
-            title = str(raw_step.get("title", "")).strip()
-            agent = str(raw_step.get("agent", "")).strip()
-            task = str(raw_step.get("task", "")).strip()
-            label = title or task or "Untitled step"
-            suffix = f" ({agent})" if agent else ""
-            body_lines.append(f"{index}. {label}{suffix}")
-            if task and task != title:
-                body_lines.append(f"   - {task}")
-    return _history_title_with_body("Plan created:", "\n".join(body_lines))
-
-
-def _format_plan_step_started_history_event(payload: dict[str, Any]) -> str:
-    """把 `plan_step_started` 事件转换成前端可渲染的历史文本。"""
-    index = int(payload.get("step_index", 0))
-    total = int(payload.get("total_steps", 0))
-    title = str(payload.get("title", "")).strip()
-    agent = str(payload.get("agent", "")).strip()
-    suffix = f" ({agent})" if agent else ""
-    return _history_title_with_body(f"Step {index}/{total} started:", f"{title}{suffix}".strip())
-
-
-def _format_plan_step_completed_history_event(payload: dict[str, Any]) -> str:
-    """把 `plan_step_completed` 事件转换成前端可渲染的历史文本。"""
-    index = int(payload.get("step_index", 0))
-    total = int(payload.get("total_steps", 0))
-    summary = str(payload.get("summary", "")).strip()
-    return _history_title_with_body(f"Step {index}/{total} completed:", summary)
-
-
-def _format_verify_started_history_event(payload: dict[str, Any]) -> str:
-    """把 `verify_started` 事件转换成前端可渲染的历史文本。"""
-    file_path = str(payload.get("file_path", "")).strip()
-    phase = str(payload.get("phase", "")).strip()
-    suffix = f" ({phase})" if phase else ""
-    return _history_title_with_body("Verify started:", f"{file_path}{suffix}".strip())
-
-
-def _format_verify_completed_history_event(payload: dict[str, Any]) -> str:
-    """把 `verify_completed` 事件转换成前端可渲染的历史文本。"""
-    summary = str(payload.get("summary", "")).strip()
-    if bool(payload.get("passed", False)):
-        return _history_title_with_body("Verify passed:", summary)
-    issues_count = int(payload.get("issues_count", 0))
-    return _history_title_with_body(f"Verify found {issues_count} issue(s):", summary)
-
-
-def _history_item_for_event(event: Event) -> SessionHistoryItemDTO | None:
-    """把可回放的 workflow 事件转换成单条历史条目。"""
-    payload = event.payload
-    match event.type:
-        case "plan_created":
-            return SessionHistoryItemDTO(
-                role="system", text=_format_plan_created_history_event(payload)
-            )
-        case "plan_step_started":
-            return SessionHistoryItemDTO(
-                role="system", text=_format_plan_step_started_history_event(payload)
-            )
-        case "plan_step_completed":
-            return SessionHistoryItemDTO(
-                role="system", text=_format_plan_step_completed_history_event(payload)
-            )
-        case "verify_started":
-            return SessionHistoryItemDTO(
-                role="system", text=_format_verify_started_history_event(payload)
-            )
-        case "verify_completed":
-            return SessionHistoryItemDTO(
-                role="system", text=_format_verify_completed_history_event(payload)
-            )
-        case _:
-            return None
-
-
-def _history_item_for_stream_event(event: Event) -> SessionHistoryItemDTO | None:
-    """把最后一次流式增量转换成历史条目，保留中间 Thought/子 agent 输出。"""
-    text = str(event.payload.get("text", "")).strip()
-    if not text:
-        return None
-    frame_id = str(event.payload.get("frame_id", "")) or None
-    if event.type == "agent_reasoning_delta":
-        text = f"Thought for 0.00s\n{text}"
-    return SessionHistoryItemDTO(role="assistant", text=text, frame_id=frame_id)
-
-
 def _merged_stream_event(events: list[Event]) -> Event | None:
     """把同一段流式事件合并为一个可回放的完整文本事件。"""
     if not events:
@@ -4199,41 +4010,6 @@ def _merged_stream_event(events: list[Event]) -> Event | None:
         else:
             text_parts = [text]
     return replace(selected, payload={**selected.payload, "text": "".join(text_parts)})
-
-
-def _history_items_for_events(events: list[Event], seen: set[str]) -> list[SessionHistoryItemDTO]:
-    """从事件日志中恢复不在 frame messages 里的 workflow 历史条目。"""
-    items: list[SessionHistoryItemDTO] = []
-    current_stream_events: list[Event] = []
-    current_stream_key: tuple[str, str, str] | None = None
-
-    def flush_stream() -> None:
-        nonlocal current_stream_events, current_stream_key
-        current_stream = _merged_stream_event(current_stream_events)
-        stream_item = _history_item_for_stream_event(current_stream) if current_stream else None
-        _append_history_item_if_new(items, seen, stream_item)
-        current_stream_events = []
-        current_stream_key = None
-
-    for event in events:
-        if event.type in {"agent_text_delta", "agent_reasoning_delta"}:
-            payload = event.payload
-            stream_key = (
-                event.type,
-                str(payload.get("frame_id", "")),
-                str(payload.get("message_index", payload.get("loop", ""))),
-            )
-            if current_stream_key is not None and stream_key != current_stream_key:
-                flush_stream()
-            current_stream_events.append(event)
-            current_stream_key = stream_key
-            continue
-
-        flush_stream()
-        _append_history_item_if_new(items, seen, _history_item_for_event(event))
-
-    flush_stream()
-    return items
 
 
 def _json_object(raw: str) -> dict[str, Any]:
@@ -4477,7 +4253,7 @@ def _tool_history_blocks(
     input_args: dict[str, Any],
     content: str,
 ) -> list[SessionHistoryBlock]:
-    """重建工具历史块，并让前端工具结果复用实时回放事件。"""
+    """重建工具历史块，且不生成前端私有回放事件。"""
     blocks = _tool_history_blocks_without_replay(frame, name, input_args, content)
     if name not in _HISTORY_FRONT_TOOLS:
         return blocks
@@ -4486,33 +4262,31 @@ def _tool_history_blocks(
     if status == "":
         status = "error" if result.get("error") or result.get("ok") is False else "applied"
         result = {"status": status, "result": result}
-    replay_event = {
-        "type": "_history_front_tool_result",
-        "payload": {
-            "call": {"name": name, "input": input_args, "agent": frame.agent.name},
-            "result": result,
-        },
+    render_descriptor = {
+        "type": "tool_result",
+        "call": {"name": name, "input": input_args, "agent": frame.agent.name},
+        "result": result,
     }
-    return [block.model_copy(update={"replay_event": replay_event}) for block in blocks]
+    return [
+        block.model_copy(
+            update={
+                "render_descriptor": render_descriptor,
+            }
+        )
+        for block in blocks
+    ]
 
 
 def _system_history_blocks(frame: Frame, text: str) -> list[SessionHistoryBlock]:
     inner = _json_object(text)
-    verify = inner.get("verify")
+    verify = inner.get("verify_outcome")
     if not isinstance(verify, dict):
         return []
     origin = _history_origin(frame)
-    file_path = str(verify.get("file_path", ""))
-    summary = str(verify.get("summary", ""))
-    if bool(verify.get("passed", False)):
-        return [VerifyPassedHistoryBlock(file_path=file_path, summary=summary, **origin)]
-    issues = verify.get("issues", [])
-    issues_count = len(issues) if isinstance(issues, list) else 0
     return [
-        VerifyFailedHistoryBlock(
-            file_path=file_path,
-            issues_count=issues_count,
-            summary=summary,
+        VerifyOutcomeHistoryBlock(
+            file_path=str(inner.get("verify_target", "")),
+            outcome=dict(verify),
             **origin,
         )
     ]
@@ -4535,12 +4309,20 @@ def _message_history_blocks(
         return []
     if str(message.get("history_role", "")) == "error":
         displayed = text.strip()
-        return [ErrorHistoryBlock(text=displayed, **origin)] if displayed else []
+        return (
+            [ErrorHistoryBlock(text=displayed, message_index=message_index, **origin)]
+            if displayed
+            else []
+        )
     if role == "user":
         if frame.parent_id is not None and message_index == 1:
             return []
         displayed = _display_user_content(text).strip()
-        return [UserHistoryBlock(text=displayed, **origin)] if displayed else []
+        return (
+            [UserHistoryBlock(text=displayed, message_index=message_index, **origin)]
+            if displayed
+            else []
+        )
     if role == "assistant":
         calls = message.get("tool_calls", [])
         if isinstance(calls, list):
@@ -4556,28 +4338,49 @@ def _message_history_blocks(
                         str(function.get("name", "unknown")),
                         _parse_tool_call_arguments(function.get("arguments")),
                     )
-        return _assistant_history_blocks(
-            frame,
-            text,
-            has_tool_calls=bool(calls),
-            include_thought_summary=include_thought_summary,
-        )
+        return [
+            block.model_copy(update={"message_index": message_index})
+            for block in _assistant_history_blocks(
+                frame,
+                text,
+                has_tool_calls=bool(calls),
+                include_thought_summary=include_thought_summary,
+            )
+        ]
     if role == "tool":
         call_id = str(message.get("tool_call_id", ""))
         name, input_args = tool_calls_by_id.get(call_id, ("", {}))
-        return _tool_history_blocks(frame, name, input_args, text)
+        return [
+            block.model_copy(
+                update={"message_index": message_index, "tool_use_id": call_id or None}
+            )
+            for block in _tool_history_blocks(frame, name, input_args, text)
+        ]
     if role == "system":
         if is_initial_system or not text.strip():
             return []
-        return _system_history_blocks(frame, text)
-    return [SystemTextHistoryBlock(text=text, **origin)] if text.strip() else []
+        return [
+            block.model_copy(update={"message_index": message_index})
+            for block in _system_history_blocks(frame, text)
+        ]
+    return (
+        [SystemTextHistoryBlock(text=text, message_index=message_index, **origin)]
+        if text.strip()
+        else []
+    )
 
 
 def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
     payload = event.payload
     frame_id = str(payload.get("frame_id", "")) or None
     agent = str(payload.get("agent", "")) or None
-    origin = {"frame_id": frame_id, "agent": agent}
+    raw_message_index = payload.get("message_index", payload.get("timeline_message_index"))
+    message_index = (
+        int(raw_message_index)
+        if isinstance(raw_message_index, int) and not isinstance(raw_message_index, bool)
+        else None
+    )
+    origin = {"frame_id": frame_id, "agent": agent, "message_index": message_index}
     if event.type in _GENERIC_HISTORY_EVENT_TYPES:
         return [EventHistoryBlock(event_type=event.type, payload=payload, **origin)]
     if event.type == "agent_reasoning_delta":
@@ -4645,19 +4448,12 @@ def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
             )
         ]
     if event.type == "verify_completed":
-        if bool(payload.get("passed", False)):
-            return [
-                VerifyPassedHistoryBlock(
-                    file_path=str(payload.get("file_path", "")),
-                    summary=str(payload.get("summary", "")),
-                    **origin,
-                )
-            ]
+        raw_outcome = payload.get("outcome", {})
+        outcome = raw_outcome if isinstance(raw_outcome, dict) else {}
         return [
-            VerifyFailedHistoryBlock(
+            VerifyOutcomeHistoryBlock(
                 file_path=str(payload.get("file_path", "")),
-                issues_count=int(payload.get("issues_count", 0)),
-                summary=str(payload.get("summary", "")),
+                outcome=dict(outcome),
                 **origin,
             )
         ]
@@ -4710,22 +4506,10 @@ def _event_history_blocks(event: Event) -> list[SessionHistoryBlock]:
     return []
 
 
-def _block_fingerprint(block: SessionHistoryBlock) -> str:
-    data = block.model_dump(exclude={"frame_id", "agent"})
-    return json.dumps(data, ensure_ascii=False, sort_keys=True)
-
-
 def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[SessionHistoryBlock]:
     """Interleave frame messages with events anchored to their upcoming message index."""
-    assistant_indexes = [
-        index
-        for index, message in enumerate(frame.messages)
-        if str(message.get("role", "")) == "assistant"
-    ]
     anchored: dict[int, list[SessionHistoryBlock]] = {}
     trailing: list[SessionHistoryBlock] = []
-    legacy_stream_anchor = 0
-    legacy_stream_key: tuple[str, str] | None = None
     stream_groups: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     normalized_events: list[tuple[Event, int, int]] = []
     for event in events:
@@ -4813,12 +4597,6 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
         message_index: int | None = None
         if isinstance(raw_index, int):
             message_index = raw_index
-        elif event.type in {"agent_reasoning_delta", "agent_text_delta"} and assistant_indexes:
-            key = (str(event.payload.get("loop", "")), str(event.payload.get("frame_id", "")))
-            if legacy_stream_key is not None and key != legacy_stream_key:
-                legacy_stream_anchor += 1
-            legacy_stream_key = key
-            message_index = assistant_indexes[min(legacy_stream_anchor, len(assistant_indexes) - 1)]
         # agent_text_delta events are streaming snapshots; when anchored to an
         # assistant message that already contains the final text, skip them to
         # avoid rendering the same content twice with mismatched indentation.
@@ -4836,22 +4614,13 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
             anchored.setdefault(message_index, []).extend(blocks)
 
     result: list[SessionHistoryBlock] = []
-    last_fingerprint = ""
-
-    def append_unique(block: SessionHistoryBlock) -> None:
-        nonlocal last_fingerprint
-        fingerprint = _block_fingerprint(block)
-        if fingerprint == last_fingerprint:
-            return
-        last_fingerprint = fingerprint
-        result.append(block)
 
     tool_calls_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
     for index, message in enumerate(frame.messages):
         event_blocks = anchored.get(index, [])
         has_reasoning_event = any(isinstance(block, ThoughtHistoryBlock) for block in event_blocks)
         for block in event_blocks:
-            append_unique(block)
+            result.append(block)
         message_blocks = _message_history_blocks(
             frame,
             message,
@@ -4863,12 +4632,12 @@ def _structured_history_for_frame(frame: Frame, events: list[Event]) -> list[Ses
         for block in message_blocks:
             if has_reasoning_event and isinstance(block, ThoughtHistoryBlock) and not block.detail:
                 continue
-            append_unique(block)
+            result.append(block)
     for message_index in sorted(index for index in anchored if index >= len(frame.messages)):
         for block in anchored[message_index]:
-            append_unique(block)
+            result.append(block)
     for block in trailing:
-        append_unique(block)
+        result.append(block)
     return result
 
 

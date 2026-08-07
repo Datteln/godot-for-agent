@@ -25,6 +25,11 @@ dependencies = [
     "tree-sitter-c-sharp",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
 [project.scripts]
 check-map-state-writes = "app.orchestrator.map_workflow:check_repository_map_state_writes"
 

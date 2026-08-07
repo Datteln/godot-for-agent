@@ -81,36 +81,6 @@ class ToolResult(BaseModel):
     grant_session_allow: bool = False
 
 
-class VerifyIssue(BaseModel):
-    """代码编辑后自动校验发现的一个问题（内部模型，不出现在 HTTP 协议里）。
-
-    Attributes:
-        severity: 严重程度。
-        file_path: 问题所在文件（相对工程根目录）。
-        line: 行号；无法定位时为 None。
-        message: 问题描述。
-    """
-
-    severity: Literal["error", "warning", "info"]
-    file_path: str
-    line: int | None = None
-    message: str
-
-
-class VerifyResultDTO(BaseModel):
-    """一次校验（Phase 1 语法快检或 Phase 2 语义校验）的结构化结果（内部模型）。
-
-    Attributes:
-        passed: 是否通过校验。
-        issues: 发现的问题列表；通过时为空。
-        summary: 一句话总结，供事件 payload 与 system 消息展示。
-    """
-
-    passed: bool
-    issues: list[VerifyIssue] = Field(default_factory=list)
-    summary: str
-
-
 class ChatRequest(BaseModel):
     """`POST /chat` 请求体（§14）。
 
@@ -261,61 +231,8 @@ class DoctorResponse(BaseModel):
     llm_base_url_configured: bool
     llm_model: str
     session_store_dir: str
+    operational_policy: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
-
-
-class ChatEventDTO(BaseModel):
-    """`GET /chat/events` 返回的一条事件。"""
-
-    seq: int
-    session_id: str
-    session_epoch: str = ""
-    type: str
-    payload: dict[str, Any] = Field(default_factory=dict)
-    delivery: (
-        Literal[
-            "provisional_preview",
-            "transactional",
-            "out_of_band_liveness",
-        ]
-        | None
-    ) = None
-    provisional: bool = False
-    preview_id: str | None = None
-    request_id: str | None = None
-    turn_id: str | None = None
-    frame_id: str | None = None
-    message_id: str | None = None
-
-
-class ChatProgressDTO(BaseModel):
-    """活跃 `/chat` 请求的事务外、非持久化存活快照。"""
-
-    type: Literal["turn_progress"] = "turn_progress"
-    session_id: str
-    request_id: str | None = None
-    turn_id: str | None = None
-    phase: str
-    heartbeat_seq: int
-
-
-class ChatEventsResponse(BaseModel):
-    """`GET /chat/events` 响应。"""
-
-    events: list[ChatEventDTO]
-    session_epoch: str = ""
-    progress: ChatProgressDTO | None = None
-    cursor: int = 0
-    has_more: bool = False
-
-
-class SessionHistoryItemDTO(BaseModel):
-    """A frontend-renderable session history item."""
-
-    role: Literal["user", "assistant", "system", "error"]
-    text: str
-    frame_id: str | None = None
-    agent: str | None = None
 
 
 class HistoryBlockBase(BaseModel):
@@ -323,7 +240,9 @@ class HistoryBlockBase(BaseModel):
 
     frame_id: str | None = None
     agent: str | None = None
-    replay_event: dict[str, Any] | None = Field(default=None, exclude=True)
+    message_index: int | None = None
+    tool_use_id: str | None = None
+    render_descriptor: dict[str, Any] | None = None
 
 
 class UserHistoryBlock(HistoryBlockBase):
@@ -418,17 +337,10 @@ class VerifyStartedHistoryBlock(HistoryBlockBase):
     phase: str = ""
 
 
-class VerifyPassedHistoryBlock(HistoryBlockBase):
-    type: Literal["verify_passed"] = "verify_passed"
+class VerifyOutcomeHistoryBlock(HistoryBlockBase):
+    type: Literal["verify_outcome"] = "verify_outcome"
     file_path: str
-    summary: str = ""
-
-
-class VerifyFailedHistoryBlock(HistoryBlockBase):
-    type: Literal["verify_failed"] = "verify_failed"
-    file_path: str
-    issues_count: int = 0
-    summary: str = ""
+    outcome: dict[str, Any]
 
 
 class DelegateResultDTO(BaseModel):
@@ -470,8 +382,7 @@ SessionHistoryBlock = Annotated[
     | StepStartedHistoryBlock
     | StepCompletedHistoryBlock
     | VerifyStartedHistoryBlock
-    | VerifyPassedHistoryBlock
-    | VerifyFailedHistoryBlock
+    | VerifyOutcomeHistoryBlock
     | DelegateResultsHistoryBlock
     | DelegateResultHistoryBlock
     | EventHistoryBlock
@@ -492,7 +403,7 @@ class SessionHistoryResponse(BaseModel):
     context_token_limit: int = 0
     history_before: int = 0
     history_has_more: bool = False
-    pseudo_events: list[dict[str, Any]] = Field(default_factory=list)
+    events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class RecoveryPointerDTO(BaseModel):

@@ -96,6 +96,7 @@ def run_doctor(
         llm_base_url_configured=settings.llm_base_url != "https://api.openai.com/v1",
         llm_model=settings.llm_model,
         session_store_dir=str(store_dir),
+        operational_policy=settings.effective_operational_policy(),
         warnings=warnings,
     )
     logger.info(

@@ -6,13 +6,22 @@ FR-18/NFR-4：端点、API key、模型名由用户本地配置，不硬编码�
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Literal
+from typing import Any, Final, Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.permissions.types import PermRule
+
+
+REMOVED_POLLING_ENV_VARS: Final = frozenset(
+    {
+        "AI_AGENT_ENABLE_EVENT_STREAM",
+        "AI_AGENT_EVENT_POLL_INTERVAL_SEC",
+    }
+)
 
 
 class AppSettings(BaseSettings):
@@ -57,8 +66,39 @@ class AppSettings(BaseSettings):
     )
     llm_request_timeout_s: float = Field(
         default=60.0,
+        ge=1.0,
+        le=600.0,
         description="单次 LLM 请求超时时间（秒）。",
     )
+    provider_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=6,
+        description="主模型与 fallback 共享的最大真实 wire attempt 数。",
+    )
+    workflow_snapshot_event_threshold: int = Field(default=256, ge=16, le=100_000)
+    workflow_snapshot_byte_threshold: int = Field(
+        default=1_048_576,
+        ge=65_536,
+        le=67_108_864,
+    )
+    completion_continuation_limit: int = Field(default=4, ge=1, le=16)
+    map_compaction_token_threshold: int = Field(default=120_000, ge=1_000, le=2_000_000)
+    completed_response_hot_cache_size: int = Field(default=128, ge=1, le=4_096)
+    websocket_batch_event_limit: int = Field(default=64, ge=1, le=512)
+    websocket_batch_byte_limit: int = Field(default=262_144, ge=1_024, le=4_194_304)
+    websocket_unacked_event_limit: int = Field(default=256, ge=1, le=4_096)
+    websocket_unacked_byte_limit: int = Field(
+        default=1_048_576,
+        ge=1_024,
+        le=16_777_216,
+    )
+    websocket_ack_timeout_s: float = Field(default=15.0, ge=1.0, le=120.0)
+    websocket_stall_timeout_s: float = Field(default=45.0, ge=2.0, le=600.0)
+    websocket_heartbeat_interval_s: float = Field(default=15.0, ge=1.0, le=120.0)
+    websocket_reconnect_initial_s: float = Field(default=0.25, ge=0.05, le=10.0)
+    websocket_reconnect_max_s: float = Field(default=10.0, ge=0.1, le=120.0)
+    websocket_reconnect_max_attempts: int = Field(default=8, ge=1, le=100)
     map_worker_structured_output_enabled: bool = Field(
         default=True,
         description="是否启用地图 worker 的同 Frame 结构化纠错。",
@@ -80,14 +120,6 @@ class AppSettings(BaseSettings):
         ge=0,
         le=32768,
         description="地图 worker 最终结构化回合的 bounded thinking token 预算。",
-    )
-    macro_v2_enforced: bool = Field(
-        default=True,
-        description=(
-            "是否强制 macro_v2 计划与 planner 路由守卫：拒绝 orchestrator 直接产出 "
-            "map worker 结构化结果、拒绝同一地图任务的 sibling map-agent owner。"
-            "默认开启；回滚时可关闭以恢复 legacy 行为。"
-        ),
     )
     log_level: str = Field(
         default="DEBUG",
@@ -262,6 +294,8 @@ class AppSettings(BaseSettings):
     )
     verify_syntax_timeout: int = Field(
         default=10,
+        ge=1,
+        le=120,
         description="Phase 1 语法快检命令的超时秒数，超时视为该阶段跳过。",
     )
     verify_godot_path: str = Field(
@@ -274,8 +308,57 @@ class AppSettings(BaseSettings):
     )
     verify_max_retries: int = Field(
         default=2,
+        ge=1,
+        le=8,
         description="单次编辑（按文件路径计）允许的最大校验-修复重试次数，超过后跳过后续校验。",
     )
+
+    @model_validator(mode="after")
+    def validate_operational_policy(self) -> "AppSettings":
+        """拒绝不安全的跨字段阈值和已删除的轮询配置。"""
+        removed = sorted(key for key in REMOVED_POLLING_ENV_VARS if key in os.environ)
+        if removed:
+            raise ValueError(
+                "removed polling settings are unsupported: " + ", ".join(removed)
+            )
+        if self.websocket_unacked_event_limit < self.websocket_batch_event_limit:
+            raise ValueError(
+                "websocket_unacked_event_limit must be >= websocket_batch_event_limit"
+            )
+        if self.websocket_unacked_byte_limit < self.websocket_batch_byte_limit:
+            raise ValueError(
+                "websocket_unacked_byte_limit must be >= websocket_batch_byte_limit"
+            )
+        if self.websocket_stall_timeout_s <= self.websocket_ack_timeout_s:
+            raise ValueError(
+                "websocket_stall_timeout_s must be greater than websocket_ack_timeout_s"
+            )
+        if self.websocket_reconnect_max_s < self.websocket_reconnect_initial_s:
+            raise ValueError(
+                "websocket_reconnect_max_s must be >= websocket_reconnect_initial_s"
+            )
+        return self
+
+    def effective_operational_policy(self) -> dict[str, Any]:
+        """返回可安全记录和通过 doctor 暴露的有效运行策略。"""
+        return {
+            "provider_max_attempts": self.provider_max_attempts,
+            "workflow_snapshot_event_threshold": self.workflow_snapshot_event_threshold,
+            "workflow_snapshot_byte_threshold": self.workflow_snapshot_byte_threshold,
+            "completion_continuation_limit": self.completion_continuation_limit,
+            "map_compaction_token_threshold": self.map_compaction_token_threshold,
+            "completed_response_hot_cache_size": self.completed_response_hot_cache_size,
+            "websocket_batch_event_limit": self.websocket_batch_event_limit,
+            "websocket_batch_byte_limit": self.websocket_batch_byte_limit,
+            "websocket_unacked_event_limit": self.websocket_unacked_event_limit,
+            "websocket_unacked_byte_limit": self.websocket_unacked_byte_limit,
+            "websocket_ack_timeout_s": self.websocket_ack_timeout_s,
+            "websocket_stall_timeout_s": self.websocket_stall_timeout_s,
+            "websocket_heartbeat_interval_s": self.websocket_heartbeat_interval_s,
+            "websocket_reconnect_initial_s": self.websocket_reconnect_initial_s,
+            "websocket_reconnect_max_s": self.websocket_reconnect_max_s,
+            "websocket_reconnect_max_attempts": self.websocket_reconnect_max_attempts,
+        }
 
     def resolved_log_dir(self) -> Path:
         """返回日志文件存储目录的绝对路径。

@@ -107,17 +107,6 @@ The system MUST expose non-mutating request-liveness progress and provisional mo
 - **WHEN** either a progress heartbeat, a provisional preview, or a committed event arrives for the active request
 - **THEN** the client refreshes its idle watchdog without resubmitting the chat request or selecting a model
 
-### Requirement: Legacy per-call artifacts are read-only migration inputs
-The system MAY read an existing referenced `describe_map_region-*.json` during migration but MUST write all new map-tool artifacts to the Session `map_artifacts.json`.
-
-#### Scenario: Persisted history references an existing legacy artifact
-- **WHEN** a legacy per-call artifact still exists and passes path and schema validation
-- **THEN** the compatibility reader may return it without creating another per-call artifact
-
-#### Scenario: Persisted history references a deleted legacy artifact
-- **WHEN** a referenced legacy artifact no longer exists
-- **THEN** the system returns a structured missing-artifact result instead of guessing content or recreating it from an unrelated turn
-
 ### Requirement: Artifact publication never leaves a dangling locator
 Every committed map-artifact locator MUST resolve to the exact committed artifact entry identified by Session, turn, entry, and canonical content fingerprint.
 
@@ -130,19 +119,19 @@ Every committed map-artifact locator MUST resolve to the exact committed artifac
 - **THEN** normal readers cannot observe it and recovery either reuses it for the identical retry or removes it after reconciliation
 
 ### Requirement: Coordinated publication is idempotent
-The coordinated Session/artifact commit MUST preserve the existing completed-turn identity and canonical submission-fingerprint semantics, extending that path to prepared coordinated commits rather than replacing its identity algorithm.
+The coordinated Session/artifact/workflow commit MUST use the canonical completed-turn identity and submission fingerprint stored in the durable identity ledger. Prepared coordinated commits and completed retries MUST resolve through that one identity algorithm; a bounded response hot cache is only an optimization and never an authority.
 
 #### Scenario: Client retries an interrupted identical submission
 - **WHEN** a retry has the same turn identity and canonical fingerprint as a prepared coordinated commit
-- **THEN** the runtime resumes or returns that commit without duplicating artifact entries, messages, grants, or workflow mutations
+- **THEN** the runtime resumes or returns that commit without duplicating artifact entries, messages, grants, workflow events, approvals, or mutations
 
 #### Scenario: Retry conflicts with prepared content
 - **WHEN** a retry reuses a known turn identity with a different canonical fingerprint
 - **THEN** the runtime rejects the conflict and preserves the original prepared or committed data for recovery
 
-#### Scenario: Retry matches an existing completed turn
-- **WHEN** a retry has the same turn identity and canonical fingerprint as a result already held by the existing completed-turn cache
-- **THEN** the runtime returns that cached result through the existing identity path without starting a new coordinated commit
+#### Scenario: Retry matches a completed turn after hot-cache eviction
+- **WHEN** a retry has the same identity and fingerprint as a durable completed-turn ledger entry whose response left the hot cache
+- **THEN** the runtime loads or reconstructs its canonical outcome without starting another coordinated commit
 
 ### Requirement: Coordinated commit boundaries are deterministically testable
 The coordinated Session/artifact implementation MUST expose test-only named failpoints at each durable preparation, resource-publication, commit-marker, and cleanup boundary, and the production composition MUST keep them disabled and unreachable from submission payloads.
@@ -204,26 +193,26 @@ All turn allocation, completed-turn lookup, canonical-fingerprint idempotency, m
 - **THEN** the runtime rejects it with a typed stale-epoch failure and performs no dependent mutation
 
 ### Requirement: Reset creates an event-stream synchronization boundary
-Event sequence numbers for a reused `session_id` SHALL remain monotonic across reset. The service MUST discard prior-epoch event content, emit a new-epoch reset boundary, and return the authoritative `session_epoch` and `last_event_seq` in the reset acknowledgement. Event and history readers MUST reject or omit old-epoch content even when an earlier poll completes late.
+Event sequence numbers for a reused `session_id` SHALL remain monotonic across reset. The service MUST discard prior-epoch event content, emit a new-epoch WebSocket reset boundary, and return the authoritative `session_epoch` and `last_event_seq` in the reset acknowledgement. WebSocket, snapshot, and history readers MUST reject or omit old-epoch content.
 
-#### Scenario: An event request is in flight during reset
-- **WHEN** a prior-epoch event poll completes after reset acknowledgement
-- **THEN** the client ignores that response, adopts the acknowledged epoch and cursor, and cannot append prior-conversation events to the reset conversation
+#### Scenario: An old WebSocket frame arrives after reset
+- **WHEN** a prior-epoch event or control frame arrives after reset acknowledgement
+- **THEN** the event acceptor rejects it, adopts no cursor from it, and cannot append prior-conversation content
 
 #### Scenario: A client reconnects after reset
-- **WHEN** a client resumes event polling using the acknowledged epoch and `last_event_seq`
-- **THEN** it receives only new-epoch events with sequence numbers above the acknowledged high-water and cannot replay prior-epoch history
+- **WHEN** the client resumes WebSocket delivery using the acknowledged epoch and `last_event_seq`
+- **THEN** it receives only new-epoch events above the acknowledged high-water sequence
 
 ### Requirement: Reset acknowledgement controls the frontend transition
-The frontend SHALL enter a non-sendable `resetting` state before requesting reset and SHALL clear session-owned presentation and safety state only as part of adopting a successful reset acknowledgement. It MUST cancel or replace old event polling, clear pending tool batches, undo presentation state, recovery UI, and per-session caches, and resume input only after adopting the returned epoch and cursor.
+The frontend SHALL enter a non-sendable `resetting` state before requesting reset and SHALL clear Session-owned presentation and safety state only while atomically adopting a successful reset acknowledgement. It MUST close the old WebSocket, clear pending tool batches, undo presentation state, recovery UI, and per-Session caches, and reconnect under the returned epoch before resuming input.
 
 #### Scenario: Reset succeeds
 - **WHEN** the server acknowledges a durable new epoch
-- **THEN** the frontend clears the prior conversation, closes recovery UI, switches its event cursor and epoch, and then enables new input
+- **THEN** the state owner clears the prior conversation, closes recovery UI, adopts epoch and cursor, reconnects the event socket, and then enables new input
 
 #### Scenario: Reset fails
 - **WHEN** the server returns a typed reset failure or the request is interrupted
-- **THEN** the frontend does not present an empty successful conversation, keeps input blocked until the prior state is retained or reloaded, and shows the reset error
+- **THEN** the frontend does not present an empty successful conversation, keeps input blocked until prior state is retained or reloaded, and shows the reset error
 
 ### Requirement: File safety and derived caches do not cross reset
 Per-session file-read authorization and derived Session caches, including history-block and recovery caches, MUST be keyed by epoch or explicitly invalidated during reset. A read, cache signature, or recovery pointer from an older epoch SHALL NOT authorize or satisfy an operation in the new epoch.
@@ -316,3 +305,37 @@ The runtime MUST upsert each planning-context entry by its stable context identi
 #### Scenario: Planner child starts successfully
 - **WHEN** all planner child preflight checks succeed against the expected workflow checkpoint
 - **THEN** its task-stage transition and child lineage become visible in one durable commit before the provider call begins
+
+### Requirement: Completed tool-result identity outlives the response hot cache
+For the lifetime of a new-schema Session epoch, every committed tool-result batch MUST retain a compact durable identity containing turn id, canonical fingerprint, outcome kind, commit digest, and a durable response or checkpoint locator. Evicting a full response from a bounded hot cache MUST NOT remove that identity or permit the batch to be applied again.
+
+#### Scenario: Identical retry arrives after hot-cache eviction
+- **WHEN** a client resubmits the same committed turn id and canonical fingerprint after its full response body was evicted
+- **THEN** the runtime reconstructs or loads the original outcome and applies no messages, grants, artifacts, reducer events, approvals, or mutations again
+
+#### Scenario: Conflicting retry arrives after hot-cache eviction
+- **WHEN** an old committed turn id is submitted with a different canonical fingerprint after hot-cache eviction
+- **THEN** the durable identity ledger rejects it as a typed conflict and preserves the original commit
+
+#### Scenario: Session is reset
+- **WHEN** reset establishes a new Session epoch
+- **THEN** old-epoch completed identities are unreachable from the new epoch even if cleanup files still exist
+
+### Requirement: Submission publication scope is explicit and singular
+User and tool-result submission MUST carry one typed per-submission scope containing the working Session, request and turn identities, staged artifact turn, preview lifecycle, and buffered event publisher. This scope MUST be passed explicitly to subordinate services and MUST NOT be discovered through a module-global `ContextVar`, singleton application facade, or ambient mutable global. Only the owning use case may commit or resolve the scope.
+
+#### Scenario: Turn execution emits provisional and transactional events
+- **WHEN** a submission invokes TurnDriver and subordinate Map handlers emit events
+- **THEN** the bound buffered publisher records them in that submission scope and exposes only permitted provisional events before durable commit
+
+#### Scenario: Coordinated commit succeeds
+- **WHEN** Session, workflow, artifacts, completed identity, and response locator commit successfully
+- **THEN** the owning submission use case flushes the one scope exactly once and resolves matching previews as committed
+
+#### Scenario: Submission fails or is cancelled
+- **WHEN** validation, provider execution, reducer application, persistence, or coordinated publication fails
+- **THEN** the owning use case discards or recovers the same scope without leaking buffered business events or resolving another submission's previews
+
+#### Scenario: Publication ownership is inspected
+- **WHEN** architecture tests inspect application publication state
+- **THEN** no global publication `ContextVar`, `AgentApplication` event indirection, or second commit owner exists

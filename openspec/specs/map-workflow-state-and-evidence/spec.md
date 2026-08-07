@@ -5,26 +5,26 @@
 Define authoritative map-workflow state, scoped evidence, completion gating, contextual continuation, and deterministic support-data recovery.
 ## Requirements
 ### Requirement: Map workflow state changes only through events
-The system MUST route task-epoch initialization and all owner identity, macro-step link, planning-context registry, child lineage, stage, blocker, checkpoint, operation, batch, validation, evidence, execution scope, revision, retry, transaction-reference, publication, approval, and no-progress changes through a single Map Workflow reducer. Every state field MUST declare machine-readable lifecycle metadata containing its task, context, operation, revision, or session scope, reset/default factory, and resume policy, and epoch initialization MUST be derived from that metadata.
+The system MUST route task-epoch initialization and all owner identity, macro-step link, planning-context registry, child lineage, stage, blocker, checkpoint, operation, batch, validation, evidence, execution scope, revision, retry, transaction-reference, publication, approval, and no-progress changes through one Map Workflow reducer. Every field MUST declare machine-readable lifecycle metadata, and no application use case, TurnDriver component, domain policy, or transport may directly assign reducer-owned state.
 
-#### Scenario: Agent requests a stage transition
-- **WHEN** Agent orchestration submits a valid map workflow event
-- **THEN** the reducer applies the transition and records the event without direct state-field assignment by the Agent
+#### Scenario: Map policy requests a stage transition
+- **WHEN** MapTurnPolicy submits a valid workflow event
+- **THEN** the reducer applies the transition and records the event without direct state assignment by orchestration
 
-#### Scenario: QueryEngine requests a state update
-- **WHEN** QueryEngine receives a map tool result
-- **THEN** it submits an event instead of directly modifying MapTaskState fields or reducer-owned nested containers
+#### Scenario: Tool-result use case requests a state update
+- **WHEN** the tool-result submission use case receives a Map result
+- **THEN** it submits an event instead of modifying MapTaskState or reducer-owned nested containers
 
-#### Scenario: A distinct map task begins
-- **WHEN** the runtime creates a new map task rather than resuming the current task lineage
-- **THEN** one `task_epoch_started` event atomically resets every task-scoped field, including owner and macro links, planning-context entries and bundles, child lineage, automatic iterations, blockers, validations, evidence, execution scopes, revisions, layers, region reads, pending operations and batches, retries, transaction references, publications, approvals, and contextual task data
+#### Scenario: A distinct Map task begins
+- **WHEN** the runtime creates a new Map task rather than resuming current lineage
+- **THEN** one `task_epoch_started` event atomically resets every task-scoped field according to lifecycle metadata
 
 #### Scenario: A workflow field is added
-- **WHEN** a new field is introduced without complete lifecycle metadata or its reset/resume behavior differs from that metadata
-- **THEN** the exhaustive workflow-state check fails before the field can silently leak across task epochs
+- **WHEN** a field lacks complete lifecycle metadata or runtime behavior differs from it
+- **THEN** the exhaustive workflow-state check fails
 
 #### Scenario: Code bypasses reducer ownership
-- **WHEN** a repository check finds a direct write to a reducer-owned scalar or nested container outside the reducer or the exact audited pre-construction hydration boundary
+- **WHEN** a repository check finds a direct write outside the reducer
 - **THEN** the check fails and identifies the bypassing location
 
 ### Requirement: Workflow state is scoped by target and revision
@@ -247,19 +247,19 @@ The runtime SHALL model direct support-data rebuild as `writes_internal_cache`, 
 - **THEN** the context read returns a structured corruption diagnostic and does not silently replace potentially recoverable user-maintained data
 
 ### Requirement: Persisted workflow state hydrates through a closed construction boundary
-The runtime MUST migrate raw persisted data, validate and normalize the complete value, construct `MapTaskState` once, and publish it as live reducer-owned state. The hydration boundary MUST NOT accept or mutate an already-live `MapTaskState`.
+The runtime MUST accept only the current manifest-selected workflow schema, validate and normalize the complete snapshot-plus-events result, construct `MapTaskState` once, and publish it as live reducer-owned state. Hydration MUST NOT migrate an older schema or accept an already-live `MapTaskState`.
 
-#### Scenario: Persisted state requires schema migration
-- **WHEN** an older persisted workflow document is loaded
-- **THEN** migration operates on raw data before construction and the complete migrated value passes schema and lifecycle validation before publication
+#### Scenario: Current state hydrates successfully
+- **WHEN** manifest, snapshot, segments, schema epoch, lineage, sequence, and digests all validate
+- **THEN** the complete state is constructed once and every later change is represented by a reducer event
 
-#### Scenario: Hydration completes
-- **WHEN** a validated `MapTaskState` has been constructed and published
-- **THEN** every later state change, including a migration correction, is represented by a reducer event rather than a hydration allowlist write
+#### Scenario: Unsupported persisted schema is loaded
+- **WHEN** workflow data lacks the current manifest schema or uses the removed embedded representation
+- **THEN** hydration returns `unsupported_session_schema`, performs no migration, and requires a new Session
 
-#### Scenario: Persisted state round-trips
-- **WHEN** a supported workflow state is serialized and hydrated
-- **THEN** its task, revision, and session fields preserve the declared resume policies and no field is omitted from classification
+#### Scenario: Current state round-trips
+- **WHEN** a current workflow state is serialized and hydrated
+- **THEN** its task, revision, Session, and lifecycle fields round-trip without omission
 
 ### Requirement: Validation inputs are normalized defensively
 The runtime MUST normalize validator and reviewer payloads into typed internal values before they reach workflow state or the Completion Gate.
@@ -470,19 +470,19 @@ An approval or rejection MUST reference the persisted session epoch, durable map
 - **THEN** the reducer rejects it with a typed stale-approval result and performs no write
 
 ### Requirement: Planning contexts are independently reducer owned
-The map workflow SHALL store planning-context entries under stable context identities and store planner bundles as ordered references to those entries. Each entry MUST declare its semantic role, provenance, digest, canonical target when applicable, layer or region, source revision, fact fields, freshness, and lifecycle metadata. Updating one entry MUST NOT replace unrelated contexts or make context equality a workflow invariant.
+The Map workflow SHALL store planning-context entries under stable identities and planner bundles as ordered references. Each entry MUST declare semantic role, provenance, digest, canonical target when applicable, layer or region, source revision, facts, freshness, and lifecycle metadata. Updating one entry MUST NOT replace unrelated contexts.
 
 #### Scenario: Mid and Background contexts are recorded
 - **WHEN** reader results publish gameplay and multiple background facts for one durable task
-- **THEN** the reducer preserves each entry independently and can bind one planner bundle containing all required roles
+- **THEN** the reducer preserves each entry independently and binds a planner bundle containing required roles
 
 #### Scenario: One context becomes stale
-- **WHEN** only one entry's source scope advances to a newer revision
+- **WHEN** only one entry's source scope advances
 - **THEN** the reducer marks or replaces that entry without invalidating unrelated current contexts
 
-#### Scenario: Compound storage key is hydrated
-- **WHEN** a legacy record uses a key containing layer or revision decorations
-- **THEN** hydration keeps the key as an index detail and requires a separately validated canonical target field rather than copying the decorated key into `target_path`
+#### Scenario: Current context key is loaded
+- **WHEN** a current-schema entry is hydrated
+- **THEN** its storage key remains an index detail and its separately validated canonical target supplies target identity
 
 ### Requirement: Specialist child start is one workflow event
 Starting a specialist child MUST use the requested child's frozen worker stage to derive its Skill-binding stage. After side-effect-free preflight, one reducer event SHALL validate the expected workflow checkpoint, transition the persisted task stage, and append child lineage atomically. Lifecycle identity MUST be based on workflow, task, owner lineage, and child identity rather than a mandatory map target.
@@ -499,18 +499,52 @@ Starting a specialist child MUST use the requested child's frozen worker stage t
 - **WHEN** one planner child binds contexts from different map targets or layers
 - **THEN** its lifecycle event remains valid under the owner lineage without inventing one target to identify the child
 
-### Requirement: Hydration repairs or blocks malformed owner contracts
-Session hydration MUST detect a persisted map owner carrying a specialist worker result schema, worker identity, or worker-stage transitions. It SHALL repair the Frame only when the durable owner/task lineage is intact and recorded side-effect state proves that no specialist mutation occurred; otherwise it MUST record a backend-owned typed recovery problem and perform no provider call or map mutation.
+### Requirement: Workflow events are durably sequenced independently of memory retention
+Every committed Map Workflow event MUST have a strictly increasing sequence within its Session epoch and lineage. Sequence allocation MUST use a persisted high-water mark and MUST NOT derive identity from an in-memory collection length.
 
-#### Scenario: Recoverable malformed owner is loaded
-- **WHEN** hydration finds `role=map_orchestrator`, `map_stage=orchestrator`, and `result_schema=map_worker_result_v1` with intact owner lineage and side-effect state `none`
-- **THEN** migration removes worker-only fields, reconstructs the versioned owner contract, and resumes the same owner checkpoint
+#### Scenario: More than 512 events commit
+- **WHEN** a workflow commits beyond the previous in-memory limit
+- **THEN** every event remains durably addressable and no slicing removes replay history
 
-#### Scenario: Malformed owner has ambiguous state
-- **WHEN** hydration cannot prove the owner lineage or whether a worker side effect occurred
-- **THEN** the runtime preserves diagnostic evidence, blocks automatic mutation, and emits a backend routing recovery problem rather than silently deleting or replaying the task
+#### Scenario: Process restarts
+- **WHEN** the workflow is restored
+- **THEN** the next sequence exceeds every committed sequence selected by the manifest
 
-#### Scenario: Valid worker child is loaded
-- **WHEN** hydration finds a specialist child with a matching worker-stage contract, owner lineage, and result schema
-- **THEN** it preserves that contract without converting the child into an owner Frame
+### Requirement: Workflow restart replays snapshot plus committed increments
+Authoritative state MUST be reconstructable from one manifest-selected current-schema snapshot and every committed later event. Digests, lineage, schema, and sequence continuity MUST validate before publication.
+
+#### Scenario: Restart follows several event segments
+- **WHEN** a process loads snapshot N and committed segments N+1 through M
+- **THEN** it replays them through the reducer and publishes only after validating the resulting digest
+
+#### Scenario: A sequence gap or digest mismatch exists
+- **WHEN** selected content is missing, duplicated, reordered, corrupt, or fails chaining
+- **THEN** the runtime emits a typed recovery problem, preserves files, and prohibits mutation
+
+#### Scenario: A segment was prepared but not committed
+- **WHEN** restart finds a segment not referenced by the manifest
+- **THEN** normal replay ignores it and coordinated recovery finishes or removes it
+
+### Requirement: Workflow compaction is snapshot gated and crash safe
+Compaction MUST create and verify a complete snapshot at the high-water mark, atomically switch the manifest, and only then remove covered segments. Event count and byte thresholds MUST be validated configuration.
+
+#### Scenario: Compaction crashes before manifest switch
+- **WHEN** a new snapshot is written but not selected
+- **THEN** restart uses the previous snapshot and segments without losing events
+
+#### Scenario: Compaction completes
+- **WHEN** the new snapshot and manifest are durable and verified
+- **THEN** covered segments may be garbage-collected without changing replayed state
+
+### Requirement: Legacy workflow Sessions are unsupported
+The runtime MUST recognize only the new persistent schema epoch and MUST NOT contain an embedded-state reader, baseline converter, dual-read comparison, dual writer, legacy diagnostic-tail projection, or rollback exporter.
+
+#### Scenario: Legacy Session is loaded
+- **WHEN** a Session contains the bounded embedded MapTaskState representation and no current manifest
+- **THEN** the runtime returns `unsupported_session_schema`, performs no provider or mutation action, and offers creation of a new Session
+
+#### Scenario: Release artifact is inspected
+- **WHEN** persistence architecture checks scan the runtime
+- **THEN** no legacy workflow reader, converter, dual-write branch, or old-format exporter exists
+
 

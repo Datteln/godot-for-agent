@@ -17,7 +17,6 @@ from app.events.store import EventStore
 from app.llm.provider import AssistantTurn, LLMProvider
 from app.orchestrator.delegate_artifacts import DelegateArtifactStore
 from app.orchestrator.map_artifacts import MapArtifactStore, StagedMapArtifactTurn
-from app.query.engine import QueryEngine, _PUBLICATION_BUFFER
 from app.recovery.pointer import RecoveryPointerStore
 from app.recovery.supervisor import (
     FAILURE_POLICIES,
@@ -31,6 +30,7 @@ from app.sessions.resource_registry import (
 )
 from app.sessions.store import SessionStore
 from app.tools.front_tools import register_front_tools
+from tests.application_test_support import build_test_application
 
 
 class _UnusedProvider(LLMProvider):
@@ -76,7 +76,7 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
             sessions = SessionStore(root / "sessions", project_root=root)
             events = EventStore()
             recovery = RecoveryPointerStore(root / "recovery.json", root)
-            engine = QueryEngine(
+            engine = build_test_application(
                 settings=AppSettings(
                     llm_base_url="http://localhost",
                     project_root=root,
@@ -91,7 +91,11 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
             old_epoch = session.session_epoch
             session.turn_counter = 4
             session.request_id_cache["old"] = {"type": "final", "text": "old"}
-            session.completed_tool_turn_cache["t4"] = {"fingerprint": "old"}
+            session.completed_turn_ledger["t4"] = {"fingerprint": "old"}
+            session.completed_response_hot_cache["t4"] = {
+                "type": "final",
+                "text": "old",
+            }
             session.history_event_counter = 7
             sessions.save(session)
             events.ensure_sequence("s1", 7, session_epoch=old_epoch)
@@ -120,13 +124,13 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
                 result_schema="test",
                 result={"summary": "old"},
             )
-            engine._history_blocks_cache[("s1", old_epoch)] = (
+            engine.lifecycle._history_blocks_cache[("s1", old_epoch)] = (
                 (1, 1, 1),
                 ["old projection"],
             )
             old_copy = copy.deepcopy(session)
 
-            response = await engine.reset("s1")
+            response = await engine.use_cases.reset.execute("s1")
 
             self.assertTrue(response.ok)
             self.assertNotEqual(response.session_epoch, old_epoch)
@@ -134,7 +138,7 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(map_store.session_root.exists())
             self.assertFalse(delegate_store.session_root.exists())
             self.assertIsNone(recovery.read("s1"))
-            self.assertNotIn(("s1", old_epoch), engine._history_blocks_cache)
+            self.assertNotIn(("s1", old_epoch), engine.lifecycle._history_blocks_cache)
             with self.assertRaises(ValueError):
                 MapArtifactStore(
                     root,
@@ -165,7 +169,8 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fresh.session_epoch, response.session_epoch)
             self.assertEqual(fresh.turn_counter, 0)
             self.assertEqual(fresh.request_id_cache, {})
-            self.assertEqual(fresh.completed_tool_turn_cache, {})
+            self.assertEqual(fresh.completed_turn_ledger, {})
+            self.assertEqual(fresh.completed_response_hot_cache, {})
             self.assertIsNone(fresh.task_run)
             with self.assertRaises(ValueError):
                 sessions.save(old_copy)
@@ -174,7 +179,7 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             events = EventStore()
-            engine = QueryEngine(
+            engine = build_test_application(
                 settings=AppSettings(
                     llm_base_url="http://localhost",
                     project_root=root,
@@ -184,8 +189,8 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
                 llm=_UnusedProvider(),
                 event_store=events,
             )
-            first = await engine.reset("s1")
-            second = await engine.reset("s1")
+            first = await engine.use_cases.reset.execute("s1")
+            second = await engine.use_cases.reset.execute("s1")
             self.assertTrue(first.ok and second.ok)
             self.assertNotEqual(first.session_epoch, second.session_epoch)
             self.assertGreater(second.last_event_seq, first.last_event_seq)
@@ -199,12 +204,18 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
             store = SessionStore(root / "sessions", project_root=root)
             old = store.get_or_create("s1", set())
             old.turn_counter = 4
-            old.completed_tool_turn_cache["t4"] = {
+            old.completed_turn_ledger["t4"] = {
                 "fingerprint": "old",
-                "response": {"type": "final", "text": "old"},
+                "outcome_kind": "final",
+                "commit_digest": "old",
+                "response_locator": "old.json",
+            }
+            old.completed_response_hot_cache["t4"] = {
+                "type": "final",
+                "text": "old",
             }
             store.save(old)
-            engine = QueryEngine(
+            engine = build_test_application(
                 settings=AppSettings(
                     llm_base_url="http://localhost",
                     project_root=root,
@@ -214,8 +225,8 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
                 llm=_FinalProvider(),
                 event_store=EventStore(),
             )
-            reset = await engine.reset("s1")
-            response = await engine.submit_user_turn(
+            reset = await engine.use_cases.reset.execute("s1")
+            response = await engine.execute(
                 ChatRequest(
                     session_id="s1",
                     session_epoch=reset.session_epoch,
@@ -227,7 +238,8 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.text, "fresh")
             fresh = store.get_or_create("s1", engine.available_tools)
             self.assertEqual(fresh.session_epoch, reset.session_epoch)
-            self.assertNotIn("t4", fresh.completed_tool_turn_cache)
+            self.assertNotIn("t4", fresh.completed_turn_ledger)
+            self.assertNotIn("t4", fresh.completed_response_hot_cache)
 
     async def test_committed_turn_conflict_recovers_inside_backend(self) -> None:
         """原 t4 冲突不结束任务；后端在 t5 重新发布并返回原成功响应。"""
@@ -235,7 +247,7 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
             root = Path(tmp)
             register_front_tools()
             sessions = SessionStore(root / "sessions", project_root=root)
-            engine = QueryEngine(
+            engine = build_test_application(
                 settings=AppSettings(
                     llm_base_url="http://localhost",
                     project_root=root,
@@ -289,9 +301,8 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
                 working: Any,
                 _request: Any,
                 _batch: Any,
+                publication: Any,
             ) -> ChatFinalResponse:
-                publication = _PUBLICATION_BUFFER.get()
-                assert publication is not None
                 publication.map_artifact_turn.add_entry(
                     tool_use_id="artifact-entry",
                     tool_name="describe_map_region",
@@ -301,8 +312,8 @@ class SessionEpochResetTests(unittest.IsolatedAsyncioTestCase):
                 working.clear_pending()
                 return ChatFinalResponse(text="continued")
 
-            engine._submit_locked = successful_submission  # type: ignore[method-assign]
-            response = await engine.submit_user_turn(
+            engine.coordinator._backend_recovery._turn_service.execute = successful_submission  # type: ignore[method-assign]
+            response = await engine.execute(
                 ChatRequest(
                     session_id="s1",
                     session_epoch=session.session_epoch,

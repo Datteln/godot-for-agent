@@ -19,15 +19,15 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from app.api.routes import create_router
+from app.application.composition import build_application_use_cases
 from app.config import AppSettings
 from app.events.store import EventStore
-from app.llm.provider import OpenAICompatibleProvider
+from app.llm.provider import LLMProvider, OpenAICompatibleProvider
 from app.logging_config import configure_logging
 from app.mcp.server import run_mcp_stdio
 from app.memory.store import MemoryStore
-from app.output_styles.catalog import OutputStyleCatalog
 from app.orchestrator.map_capabilities import validate_map_capability_contract
-from app.query.engine import QueryEngine
+from app.output_styles.catalog import OutputStyleCatalog
 from app.rag.build_manager import RagIndexBuildManager
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import security_settings_from_app
@@ -68,7 +68,12 @@ def _token_from_env() -> str | None:
     return value if value else None
 
 
-def create_app(settings: AppSettings | None = None, token: str | None = None) -> FastAPI:
+def create_app(
+    settings: AppSettings | None = None,
+    token: str | None = None,
+    *,
+    llm_provider: LLMProvider | None = None,
+) -> FastAPI:
     """创建 FastAPI 应用实例。"""
     resolved_settings = settings or AppSettings()
     configure_logging(
@@ -85,6 +90,10 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         resolved_settings.trusted_project,
         resolved_token is not None,
     )
+    logger.info(
+        "Effective operational policy %s",
+        resolved_settings.effective_operational_policy(),
+    )
 
     register_server_tools()
     register_front_tools()
@@ -96,16 +105,23 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
     if capability_issues:
         raise RuntimeError("地图工具能力合同无效：" + "；".join(capability_issues))
     security = security_settings_from_app(resolved_settings)
-    llm = OpenAICompatibleProvider(
+    llm = llm_provider or OpenAICompatibleProvider(
         base_url=resolved_settings.llm_base_url,
         api_key=resolved_settings.llm_api_key.get_secret_value(),
         default_model=resolved_settings.llm_model,
         timeout_s=resolved_settings.llm_request_timeout_s,
         fallback_model=resolved_settings.llm_fallback_model,
+        max_attempts=resolved_settings.provider_max_attempts,
     )
     store = SessionStore(
         resolved_settings.resolved_session_store_dir(),
         project_root=resolved_settings.project_root,
+        workflow_snapshot_event_threshold=(
+            resolved_settings.workflow_snapshot_event_threshold
+        ),
+        workflow_snapshot_byte_threshold=(
+            resolved_settings.workflow_snapshot_byte_threshold
+        ),
     )
     event_store = EventStore()
     recovery_store = RecoveryPointerStore(
@@ -115,7 +131,7 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
     skill_catalog = SkillCatalog(resolved_settings, security, set(REGISTRY))
     output_style_catalog = OutputStyleCatalog(resolved_settings)
     memory_store = MemoryStore(resolved_settings.resolved_memory_store_path())
-    query_engine = QueryEngine(
+    use_cases = build_application_use_cases(
         settings=resolved_settings,
         session_store=store,
         llm=llm,
@@ -147,7 +163,7 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         nonlocal auto_build_task
-        resumed_recoveries = await query_engine.resume_pending_recoveries()
+        resumed_recoveries = await use_cases.recovery.resume_pending()
         if resumed_recoveries:
             logger.info(
                 "Resumed durable task recovery journals count=%d",
@@ -188,7 +204,7 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
             settings=resolved_settings,
             security=security,
             llm=llm,
-            query_engine=query_engine,
+            use_cases=use_cases,
             auth_enabled=resolved_token is not None,
             event_store=event_store,
             recovery_store=recovery_store,
@@ -196,20 +212,20 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
             output_style_catalog=output_style_catalog,
             memory_store=memory_store,
             rag_build_manager=rag_build_manager,
+            session_store=store,
+            expected_token=resolved_token,
         )
     )
     app.state.rag_build_manager = rag_build_manager
     app.state.event_store = event_store
-    app.state.query_engine = query_engine
+    app.state.session_store = store
+    app.state.use_cases = use_cases
     logger.info(
         "AI agent service app ready tools=%d session_store=%s",
         len(REGISTRY),
         resolved_settings.resolved_session_store_dir(),
     )
     return app
-
-
-app = create_app()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

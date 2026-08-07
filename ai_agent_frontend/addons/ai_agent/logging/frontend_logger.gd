@@ -15,7 +15,8 @@ const REDACTED_KEYS := {
 	"api_key": true,
 	"authorization": true,
 	"llm_api_key": true,
-	"token": true
+	"token": true,
+	"session_epoch": true
 }
 const MAX_DATA_CHARS := 4000
 const MAX_LOG_FILE_BYTES := 10 * 1024 * 1024
@@ -141,7 +142,14 @@ static func _redact_dictionary(data: Dictionary) -> Dictionary:
 	for key in data.keys():
 		var key_text := str(key)
 		var lower_key := key_text.to_lower()
-		if REDACTED_KEYS.has(lower_key) or lower_key.contains("api_key") or lower_key.contains("token"):
+		if (
+			REDACTED_KEYS.has(lower_key)
+			or lower_key.contains("api_key")
+			or lower_key.contains("token")
+			or lower_key.ends_with("_id")
+			or lower_key.ends_with("_ids")
+			or lower_key.contains("epoch")
+		):
 			result[key_text] = "<redacted>"
 			continue
 		var value = data[key]

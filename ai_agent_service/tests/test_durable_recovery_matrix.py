@@ -15,9 +15,9 @@ from app.api.schemas import ChatRequest
 from app.config import AppSettings
 from app.events.store import EventStore
 from app.llm.provider import AssistantTurn, LLMError, LLMProvider, OpenAICompatibleProvider
-from app.orchestrator.agent import _invoke_server_tool, _tool_message
+from app.orchestrator.map_turn import _invoke_server_tool, _tool_message
 from app.orchestrator.map_artifacts import StagedMapArtifactTurn
-from app.query.engine import QueryEngine, _SubmissionPublicationBuffer
+from app.application.publication import SubmissionScope
 from app.recovery.supervisor import (
     RECOVERY_FAILPOINTS,
     RecoverySupervisor,
@@ -27,6 +27,7 @@ from app.sessions.resource_registry import RESET_FAILPOINTS
 from app.sessions.store import SessionStore
 from app.tools.context import ToolContext
 from app.tools.registry import ToolDef
+from tests.application_test_support import build_test_application
 
 
 class _UnusedProvider(LLMProvider):
@@ -152,14 +153,14 @@ class ResetFailureMatrixTests(unittest.IsolatedAsyncioTestCase):
                 old_epoch = session.session_epoch
                 session.turn_counter = 4
                 store.save(session)
-                engine = QueryEngine(
-                    _settings(root),
-                    store,
-                    _UnusedProvider(),
+                engine = build_test_application(
+                    settings=_settings(root),
+                    session_store=store,
+                    llm=_UnusedProvider(),
                     event_store=EventStore(),
                 )
 
-                response = await engine.reset("s1")
+                response = await engine.use_cases.reset.execute("s1")
 
                 self.assertFalse(response.ok)
                 self.assertEqual(store.current_epoch("s1"), old_epoch)
@@ -168,10 +169,10 @@ class ResetFailureMatrixTests(unittest.IsolatedAsyncioTestCase):
                     4,
                 )
                 restarted = SessionStore(root / "sessions", project_root=root)
-                QueryEngine(
-                    _settings(root),
-                    restarted,
-                    _UnusedProvider(),
+                build_test_application(
+                    settings=_settings(root),
+                    session_store=restarted,
+                    llm=_UnusedProvider(),
                     event_store=EventStore(),
                 )
                 self.assertEqual(restarted.current_epoch("s1"), old_epoch)
@@ -194,10 +195,10 @@ class ResetFailureMatrixTests(unittest.IsolatedAsyncioTestCase):
                 store.begin_reset("s1")
 
             restarted = SessionStore(root / "sessions", project_root=root)
-            QueryEngine(
-                _settings(root),
-                restarted,
-                _UnusedProvider(),
+            build_test_application(
+                settings=_settings(root),
+                session_store=restarted,
+                llm=_UnusedProvider(),
                 event_store=EventStore(),
             )
 
@@ -227,23 +228,23 @@ class ResetFailureMatrixTests(unittest.IsolatedAsyncioTestCase):
                 store.save(session)
                 events = EventStore()
                 events.append("s1", "old", {}, session_epoch=old_epoch)
-                engine = QueryEngine(
-                    _settings(root),
-                    store,
-                    _UnusedProvider(),
+                engine = build_test_application(
+                    settings=_settings(root),
+                    session_store=store,
+                    llm=_UnusedProvider(),
                     event_store=events,
                 )
 
-                response = await engine.reset("s1")
+                response = await engine.use_cases.reset.execute("s1")
 
                 self.assertTrue(response.ok)
                 self.assertNotEqual(response.session_epoch, old_epoch)
                 restarted = SessionStore(root / "sessions", project_root=root)
                 restarted_events = EventStore()
-                QueryEngine(
-                    _settings(root),
-                    restarted,
-                    _UnusedProvider(),
+                build_test_application(
+                    settings=_settings(root),
+                    session_store=restarted,
+                    llm=_UnusedProvider(),
                     event_store=restarted_events,
                 )
                 self.assertEqual(restarted.pending_reset_records(), [])
@@ -568,13 +569,13 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 root / "sessions",
                 project_root=root,
             )
-            restarted_engine = QueryEngine(
-                _settings(root),
-                restarted_store,
-                _UnusedProvider(),
+            restarted_engine = build_test_application(
+                settings=_settings(root),
+                session_store=restarted_store,
+                llm=_UnusedProvider(),
                 event_store=events,
             )
-            resumed = await restarted_engine.resume_pending_recoveries()
+            resumed = await restarted_engine.use_cases.recovery.resume_pending()
 
             self.assertEqual(resumed, 1)
             restored = restarted_store.get_or_create(
@@ -628,6 +629,7 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
         provider = object.__new__(OpenAICompatibleProvider)
         provider._default_model = "primary"  # type: ignore[attr-defined]
         provider._fallback_model = "fallback"  # type: ignore[attr-defined]
+        provider._max_attempts = 5  # type: ignore[attr-defined]
         calls: list[str] = []
         fallbacks: list[tuple[str, str]] = []
 
@@ -635,9 +637,14 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
             _messages: list[dict[str, Any]],
             _tools: list[dict[str, Any]],
             model: str,
-            *_args: Any,
+            _temperature: float | None,
+            _thinking_budget: int = -1,
+            _on_delta: Any = None,
+            _cache_breakpoints: Any = None,
+            response_contract: Any = None,
         ) -> AssistantTurn:
             """primary 失败，fallback 成功。"""
+            del response_contract
             calls.append(model)
             if model == "primary":
                 raise LLMError("primary failed")
@@ -666,15 +673,21 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
         provider = object.__new__(OpenAICompatibleProvider)
         provider._default_model = "primary"  # type: ignore[attr-defined]
         provider._fallback_model = "fallback"  # type: ignore[attr-defined]
+        provider._max_attempts = 5  # type: ignore[attr-defined]
         calls: list[str] = []
 
         async def failing_chat_once(
             _messages: list[dict[str, Any]],
             _tools: list[dict[str, Any]],
             model: str,
-            *_args: Any,
+            _temperature: float | None,
+            _thinking_budget: int = -1,
+            _on_delta: Any = None,
+            _cache_breakpoints: Any = None,
+            response_contract: Any = None,
         ) -> AssistantTurn:
             """记录并拒绝每个 provider attempt。"""
+            del response_contract
             calls.append(model)
             raise LLMError(f"{model} failed")
 
@@ -697,19 +710,19 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 root = Path(tmp)
                 events = EventStore()
                 store = SessionStore(root / "sessions", project_root=root)
-                engine = QueryEngine(
-                    _settings(root),
-                    store,
-                    _UnusedProvider(),
+                engine = build_test_application(
+                    settings=_settings(root),
+                    session_store=store,
+                    llm=_UnusedProvider(),
                     event_store=events,
                     recovery_failure_injector=_NamedFailureInjector(failpoint),
                 )
                 session = store.get_or_create("s1", engine.available_tools)
-                engine._recovery_supervisor.begin_attempt(
+                engine.coordinator._recovery_supervisor.begin_attempt(
                     session,
                     ChatRequest(session_id="s1", user_message="edit"),
                 )
-                buffer = _SubmissionPublicationBuffer(
+                buffer = SubmissionScope(
                     session=session,
                     request_id="r1",
                     turn_id="t1",
@@ -722,8 +735,8 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 )
                 buffer.events.append(("s1", "grant_created", {"grant_id": "g1"}))
 
-                engine._flush_submission_publications(buffer)
-                engine._flush_submission_publications(buffer)
+                engine.publisher.flush(buffer)
+                engine.publisher.flush(buffer)
 
                 delivered = [
                     event for event in events.list_after("s1", 0) if event.type == "grant_created"
@@ -741,14 +754,14 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
             root = Path(tmp)
             store = SessionStore(root / "sessions", project_root=root)
             provider = _BlockingProvider()
-            engine = QueryEngine(
-                _settings(root),
-                store,
-                provider,
+            engine = build_test_application(
+                settings=_settings(root),
+                session_store=store,
+                llm=provider,
                 event_store=EventStore(),
             )
             task = asyncio.create_task(
-                engine.submit_user_turn(
+                engine.execute(
                     ChatRequest(
                         session_id="s1",
                         request_id="r1",
@@ -774,10 +787,10 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = SessionStore(root / "sessions", project_root=root)
-            engine = QueryEngine(
-                _settings(root),
-                store,
-                _UnusedProvider(),
+            engine = build_test_application(
+                settings=_settings(root),
+                session_store=store,
+                llm=_UnusedProvider(),
                 event_store=EventStore(),
             )
             session = store.get_or_create("s1", engine.available_tools)
@@ -801,13 +814,13 @@ class RecoveryBoundaryEndToEndTests(unittest.IsolatedAsyncioTestCase):
             store.save_task_run(session)
             store.save(session)
 
-            resumed = await engine.resume_paused_map_task("s1")
+            resumed = await engine.use_cases.resume.execute("s1")
             self.assertTrue(resumed["resumed"])
             self.assertEqual(session.map_task_state.status, "running")
             assert session.task_run is not None
             self.assertEqual(session.task_run["status"], "recovering")
 
-            cancelled = await engine.cancel_map_task("s1")
+            cancelled = await engine.use_cases.map_tasks.cancel("s1")
             self.assertTrue(cancelled["cancelled"])
             self.assertEqual(session.map_task_state.status, "cancelled")
             self.assertEqual(session.task_run["status"], "cancelled")

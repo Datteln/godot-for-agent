@@ -8,7 +8,7 @@ from app.orchestrator.map_progress import MapTaskState
 from app.orchestrator.map_recovery import record_plan_attempt
 from app.orchestrator.plan_scheduler import PlanGraph, PlanGraphError
 from app.orchestrator.runtime_contracts import PlanStepResult
-from app.sessions.schema import migrate_session_payload
+from app.sessions.schema import UnsupportedSessionSchemaError, validate_session_payload
 
 
 def _two_step_graph(*, source_path: str = "output.batch") -> PlanGraph:
@@ -134,27 +134,25 @@ def test_invalid_review_to_write_transition_leaves_state_unchanged() -> None:
 
 
 @pytest.mark.parametrize("has_scheduler_graph", [False, True])
-def test_legacy_remaining_queue_is_removed_during_migration(
+def test_legacy_remaining_queue_is_rejected_without_migration(
     has_scheduler_graph: bool,
 ) -> None:
-    """验证旧 remaining 永不成为第二个 pending-step 来源。"""
+    """旧 remaining 队列不转换为当前 scheduler 数据。"""
     group: dict[str, object] = {
         "remaining": [{"agent": "map-agent", "task": "legacy child"}],
     }
     if has_scheduler_graph:
         group["scheduler_plan"] = _two_step_graph().to_dict()
-    migrated, changed = migrate_session_payload(
-        {
-            "schema_version": 6,
-            "session_id": "session-1",
-            "delegate_groups": {"group-1": group},
-        }
-    )
+    legacy = {
+        "schema_version": 6,
+        "session_id": "session-1",
+        "delegate_groups": {"group-1": group},
+    }
 
-    assert changed is True
-    restored = migrated["delegate_groups"]["group-1"]
-    assert "remaining" not in restored
-    assert ("migration_error" in restored) is (not has_scheduler_graph)
+    with pytest.raises(UnsupportedSessionSchemaError):
+        validate_session_payload(legacy)
+
+    assert "remaining" in group
 
 
 def test_graph_is_the_only_runnable_child_source() -> None:

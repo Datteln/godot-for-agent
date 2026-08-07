@@ -29,8 +29,8 @@ class AgentDefinition:
         disallowed_tools: 额外 denylist，优先级高于 `tools`。
         skills: agent 启动时预加载的 Skill 名称（M1+ 生效）。
         model: 模型档位；`"inherit"` 表示沿用会话默认模型。
-        effort: 任务档位（§6.5），决定 `run_turn` 传给 `LLMProvider.chat()`
-            的 `temperature`（见 `orchestrator/agent.py::EFFORT_TEMPERATURE`）。
+        effort: 任务档位（§6.5），决定 `TurnDriver.run` 传给 `LLMProvider.chat()`
+            的 `temperature`（见 `orchestrator/turn/model_policy.py::EFFORT_TEMPERATURE`）。
             根帧可被 `Session.effort` 覆盖，委派子帧始终使用各自的声明值。
         max_turns: 单次循环允许的最大轮数；不属于 `edit_map_max_turns` 覆盖范围的
             轮次（即本轮 tool_calls 不是单一 `edit_map` 调用）都计入这个预算。
@@ -157,13 +157,13 @@ class Frame:
             只在本帧内生效，不提升权限、不跨 agent 继承。
         search_tools_noop_count: 本帧连续未激活新工具的 `search_tools` 次数。
         persistent_turn_count: 地图帧在当前 map revision 内累计的 LLM 轮数；
-            前端工具回传造成的新 `run_turn` 调用不会清零。
+            前端工具回传造成的新 `TurnDriver.run` 调用不会清零。
         persistent_edit_map_turn_count: 当前 map revision 内累计的纯 `edit_map`
             轮数，与常规轮次预算分开计算。
         map_progress_revision: 上述预算对应的 map revision；真实写入推进 revision
             后预算自动进入新进展周期。
         forced_completion_text: 编排器已经确定当前子阶段应结束时保存的结构化
-            收尾文本；`run_turn` 会在下一次调用 LLM 前消费它。
+            收尾文本；`TurnDriver.run` 会在下一次调用 LLM 前消费它。
         force_text_only: 当前阶段事实已经齐全、下一轮只能输出最终文本时为 True。
         structured_attempt_count: 当前 Frame 已消费的结构化纠错次数。
         structured_correction_limit: 当前 Frame 允许的同 Frame 纠错上限。

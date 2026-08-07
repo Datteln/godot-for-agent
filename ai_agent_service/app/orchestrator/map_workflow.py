@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from app.orchestrator.map_contracts import MAP_RUNTIME_STAGE_TRANSITIONS
-from app.orchestrator.runtime_contracts import MapWorkflowEvent
+from app.workflow.contracts import WorkflowEvent
 
 REDUCER_OWNED_FIELDS = frozenset(
     {
@@ -58,7 +58,8 @@ REDUCER_OWNED_FIELDS = frozenset(
         "task_convergence_registry",
         "transaction_journals",
         "workflow_scopes",
-        "workflow_events",
+        "workflow_high_water_seq",
+        "pending_workflow_events",
         "macro_step_id",
         "owner_frame_id",
         "domain_task_id",
@@ -114,22 +115,13 @@ def make_map_workflow_event(
     *,
     request_id: str | None = None,
     turn_id: str | None = None,
-) -> MapWorkflowEvent:
-    """基于当前事件序号和内容生成可重放的稳定事件 id。"""
-    body = {
-        "index": len(getattr(state, "workflow_events", [])),
-        "type": event_type,
-        "target": target,
-        "revision": revision,
-        "payload": payload or {},
-        "request_id": request_id,
-        "turn_id": turn_id,
-    }
-    digest = hashlib.sha256(
-        json.dumps(body, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()[:20]
-    return MapWorkflowEvent(
-        event_id=f"mwe-{digest}",
+) -> WorkflowEvent:
+    """从持久 high-water 分配下一个严格递增事件序号。"""
+    high_water = getattr(state, "workflow_high_water_seq", 0)
+    if isinstance(high_water, bool) or not isinstance(high_water, int) or high_water < 0:
+        raise ValueError("workflow high-water is invalid")
+    return WorkflowEvent(
+        event_seq=high_water + 1,
         event_type=event_type,
         target=target,
         revision=revision,
@@ -139,8 +131,19 @@ def make_map_workflow_event(
     )
 
 
-def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
-    """纯归约单个事件并返回深拷贝的新状态。"""
+def reduce_map_workflow(
+    state: Any,
+    event: WorkflowEvent,
+    *,
+    stage_event: bool = True,
+) -> Any:
+    """纯归约连续事件，并按需把事件加入当前事务的待发布集合。"""
+    expected_seq = int(getattr(state, "workflow_high_water_seq", 0)) + 1
+    if event.event_seq != expected_seq:
+        raise ValueError(
+            f"non-contiguous workflow event sequence: expected={expected_seq} "
+            f"actual={event.event_seq}"
+        )
     reduced = deepcopy(state)
     scope_key = map_workflow_scope_key(event.target, event.revision)
     scopes = reduced.workflow_scopes
@@ -297,7 +300,8 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
     elif event.event_type == "owned_field_replaced":
         field_name = str(payload.get("field", ""))
         if field_name not in REDUCER_OWNED_FIELDS or field_name in {
-            "workflow_events",
+            "workflow_high_water_seq",
+            "pending_workflow_events",
             "workflow_scopes",
         }:
             raise ValueError(f"field is not replaceable by workflow reducer: {field_name}")
@@ -392,18 +396,20 @@ def reduce_map_workflow(state: Any, event: MapWorkflowEvent) -> Any:
         raise ValueError(f"unknown map workflow event type: {event.event_type}")
 
     reduced.workflow_scopes[scope_key] = scope
-    reduced.workflow_events.append(event.to_dict())
-    if len(reduced.workflow_events) > 512:
-        reduced.workflow_events = reduced.workflow_events[-512:]
+    reduced.workflow_high_water_seq = event.event_seq
+    if stage_event:
+        reduced.pending_workflow_events.append(event.to_payload())
     return reduced
 
 
-def dispatch_map_workflow_event(state: Any, event: MapWorkflowEvent) -> None:
+def dispatch_map_workflow_event(state: Any, event: WorkflowEvent) -> None:
     """归约事件后原子替换现有 MapTaskState 的字段集合。"""
     with reducer_write_scope():
         reduced = reduce_map_workflow(state, event)
+        # ``reduce_map_workflow`` 已经从输入生成完全独立的状态；这里转移其字段所有权，
+        # 避免热路径再次深拷贝整个 MapTaskState。
         state.__dict__.clear()
-        state.__dict__.update(deepcopy(reduced.__dict__))
+        state.__dict__.update(reduced.__dict__)
 
 
 def replace_map_blockers(

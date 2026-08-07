@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Query, Response, status
+from fastapi import APIRouter, Response, WebSocket, status
 
 from app.api.schemas import (
-    ChatEventDTO,
-    ChatEventsResponse,
-    ChatProgressDTO,
     ChatRequest,
     ChatResponse,
     CommandInfo,
@@ -30,22 +27,21 @@ from app.api.schemas import (
     SessionHistoryResponse,
     SkillsResponse,
 )
+from app.application.use_cases import ApplicationUseCases
 from app.config import AppSettings
 from app.doctor.checks import run_doctor
 from app.events.store import EventStore
+from app.events.websocket import serve_event_websocket
 from app.llm.provider import LLMProvider
 from app.memory.store import MemoryStore
 from app.output_styles.catalog import OutputStyleCatalog
-from app.query.engine import QueryEngine
 from app.rag.build_manager import RagIndexBuildManager
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import SecuritySettings
+from app.sessions.store import SessionStore
 from app.skills.catalog import SkillCatalog
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_EVENT_PAGE_LIMIT = 50
-_MAX_EVENT_PAGE_LIMIT = 200
 
 COMMANDS: list[CommandInfo] = [
     CommandInfo(
@@ -81,7 +77,7 @@ COMMANDS: list[CommandInfo] = [
         },
     ),
     # 显式恢复已暂停的地图任务：前端在用户主动恢复时调用，
-    # 底层通过 QueryEngine.resume_paused_map_task 从检查点继续
+    # 底层通过 AgentApplication.resume_paused_map_task 从检查点继续
     CommandInfo(
         name="resume_map_task",
         description="显式恢复指定 session 中已暂停的地图任务。",
@@ -130,7 +126,7 @@ def create_router(
     settings: AppSettings,
     security: SecuritySettings,
     llm: LLMProvider,
-    query_engine: QueryEngine,
+    use_cases: ApplicationUseCases,
     auth_enabled: bool,
     event_store: EventStore,
     recovery_store: RecoveryPointerStore,
@@ -138,6 +134,8 @@ def create_router(
     output_style_catalog: OutputStyleCatalog,
     memory_store: MemoryStore,
     rag_build_manager: RagIndexBuildManager,
+    session_store: SessionStore,
+    expected_token: str | None,
 ) -> APIRouter:
     """创建 HTTP 路由表。"""
     router = APIRouter()
@@ -150,7 +148,9 @@ def create_router(
             request.user_message is not None,
             len(request.tool_results or []),
         )
-        return await query_engine.submit_user_turn(request)
+        if request.user_message is not None:
+            return await use_cases.user_submission.execute(request)
+        return await use_cases.tool_result_submission.execute(request)
 
     @router.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -165,12 +165,12 @@ def create_router(
     @router.post("/reset", response_model=ResetResponse)
     async def reset(request: ResetRequest) -> ResetResponse:
         logger.info("HTTP /reset session=%s", request.session_id)
-        return await query_engine.reset(request.session_id)
+        return await use_cases.reset.execute(request.session_id)
 
     @router.post("/chat/discard-pending", response_model=ChatResponse)
     async def discard_pending(request: ResetRequest) -> ChatResponse:
         logger.info("HTTP /chat/discard-pending session=%s", request.session_id)
-        return await query_engine.discard_pending(request.session_id)
+        return await use_cases.tool_result_submission.discard_pending(request.session_id)
 
     @router.post("/chat/interrupt", response_model=InterruptResponse)
     async def interrupt(request: InterruptRequest) -> InterruptResponse:
@@ -179,7 +179,7 @@ def create_router(
             request.session_id,
             request.cause,
         )
-        return await query_engine.interrupt(request.session_id, cause=request.cause)
+        return await use_cases.interruption.execute(request.session_id, request.cause)
 
     @router.get("/doctor", response_model=DoctorResponse)
     async def doctor() -> DoctorResponse:
@@ -211,63 +211,34 @@ def create_router(
         logger.info("HTTP /output-styles count=%d", len(summaries))
         return OutputStylesResponse(output_styles=[summary.__dict__ for summary in summaries])
 
-    @router.get("/chat/events", response_model=ChatEventsResponse)
-    async def chat_events(
-        session_id: str,
-        session_epoch: str | None = None,
-        after: int = Query(default=0, ge=0),
-        limit: int = Query(
-            default=_DEFAULT_EVENT_PAGE_LIMIT,
-            ge=1,
-            le=_MAX_EVENT_PAGE_LIMIT,
-        ),
-    ) -> ChatEventsResponse:
-        page = event_store.page_after(
-            session_id,
-            after,
-            limit=limit,
-            session_epoch=session_epoch,
+    @router.websocket("/chat/socket")
+    async def chat_socket(websocket: WebSocket) -> None:
+        """建立鉴权、单 epoch、带累计确认的事件推送通道。"""
+        await serve_event_websocket(
+            websocket,
+            expected_token=expected_token,
+            settings=settings,
+            event_store=event_store,
+            session_store=session_store,
         )
-        raw_progress = query_engine.turn_progress(session_id)
-        logger.debug(
-            "HTTP /chat/events session=%s after=%d limit=%d count=%d " "cursor=%d has_more=%s",
-            session_id,
-            after,
-            limit,
-            len(page.events),
-            page.cursor,
-            page.has_more,
-        )
-        return ChatEventsResponse(
-            events=[
-                ChatEventDTO(
-                    seq=event.seq,
-                    session_id=event.session_id,
-                    session_epoch=event.session_epoch,
-                    type=event.type,
-                    payload=event.payload,
-                    delivery=event.payload.get("delivery"),
-                    provisional=bool(event.payload.get("provisional", False)),
-                    preview_id=event.payload.get("preview_id"),
-                    request_id=event.payload.get("request_id"),
-                    turn_id=event.payload.get("turn_id"),
-                    frame_id=event.payload.get("frame_id"),
-                    message_id=event.payload.get("message_id"),
-                )
-                for event in page.events
-            ],
-            session_epoch=page.session_epoch,
-            progress=(ChatProgressDTO(**raw_progress) if raw_progress is not None else None),
-            cursor=page.cursor,
-            has_more=page.has_more,
-        )
+
+    @router.get("/chat/snapshot")
+    async def chat_snapshot(session_id: str) -> dict[str, object]:
+        """返回一次性有界恢复快照，不能作为连续事件轮询使用。"""
+        history = use_cases.history.execute(session_id, limit=200, before=0)
+        return {
+            "session_id": session_id,
+            "session_epoch": session_store.current_epoch(session_id, create=False),
+            "last_event_seq": event_store.last_seq(session_id),
+            "history": history.model_dump(mode="json"),
+        }
 
     @router.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)
     async def session_history(
         session_id: str, limit: int = 200, before: int = 0
     ) -> SessionHistoryResponse:
         logger.info("HTTP /sessions/%s/history limit=%d before=%d", session_id, limit, before)
-        return query_engine.session_history(session_id, limit=limit, before=before)
+        return use_cases.history.execute(session_id, limit=limit, before=before)
 
     @router.get("/recovery-pointer", response_model=RecoveryPointerResponse)
     async def recovery_pointer() -> RecoveryPointerResponse:
@@ -371,17 +342,17 @@ def create_router(
                 logger.warning("Command compact rejected: invalid keep_recent")
                 return _err("keep_recent 必须是正整数")
             use_llm = _bool_argument(request.args.get("use_llm"))
-            result = await query_engine.compact(
+            result = await use_cases.compaction.execute(
                 request.session_id, keep_recent=keep_recent, use_llm=use_llm
             )
             return CommandResponse(ok=True, text="compact 已完成", result=result)
         # resume_map_task：显式恢复已暂停的地图任务
-        # 需要 session_id；调用 QueryEngine.resume_paused_map_task 从检查点继续
+        # 需要 session_id；调用 AgentApplication.resume_paused_map_task 从检查点继续
         if name == "resume_map_task":
             if request.session_id is None:
                 logger.warning("Command resume_map_task rejected: missing session_id")
                 return _err("resume_map_task 需要 session_id")
-            result = await query_engine.resume_paused_map_task(request.session_id)
+            result = await use_cases.resume.execute(request.session_id)
             if result.get("resumed") is not True:
                 return _err(f"地图任务未恢复：{result.get('reason', 'unknown')}")
             return CommandResponse(
@@ -395,7 +366,7 @@ def create_router(
             if request.session_id is None:
                 logger.warning("Command cancel_map_task rejected: missing session_id")
                 return _err("cancel_map_task 需要 session_id")
-            result = await query_engine.cancel_map_task(request.session_id)
+            result = await use_cases.map_tasks.cancel(request.session_id)
             if result.get("cancelled") is not True:
                 return _err(f"地图任务未取消：{result.get('reason', 'unknown')}")
             return CommandResponse(
@@ -411,7 +382,7 @@ def create_router(
             if effort not in {"quick", "standard", "deep", "verify", "advisor"}:
                 logger.warning("Command set_effort rejected: unknown effort=%s", effort)
                 return _err(f"未知 effort：{effort}")
-            await query_engine.set_effort(request.session_id, effort)
+            await use_cases.settings.set_effort(request.session_id, effort)
             return CommandResponse(ok=True, text=f"effort 已设置为 {effort}")
         if name == "set_output_style":
             if request.session_id is None:
@@ -423,7 +394,7 @@ def create_router(
                     "Command set_output_style rejected: unknown output_style=%s", output_style
                 )
                 return _err(f"未知 OutputStyle：{output_style}")
-            await query_engine.set_output_style(request.session_id, output_style)
+            await use_cases.settings.set_output_style(request.session_id, output_style)
             return CommandResponse(ok=True, text=f"OutputStyle 已设置为 {output_style}")
         if name == "refresh_extensions":
             skill_catalog.refresh()

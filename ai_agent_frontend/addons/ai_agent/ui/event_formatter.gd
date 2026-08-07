@@ -1,4 +1,4 @@
-## 把 SSE 事件和工具调用/结果格式化为用户可见字符串。
+## 把已接受的 WebSocket 事件和工具调用/结果格式化为用户可见字符串。
 ## 所有方法均为静态；需要 i18n 的方法通过 ui_text 字典（已按当前语言解析好）传入。
 @tool
 extends Object
@@ -144,11 +144,22 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 				str(payload.get("phase", ""))
 			])
 		"verify_completed":
-			if bool(payload.get("passed", false)):
-				return _title_with_body("Verify passed:", str(payload.get("summary", "")))
+			var raw_outcome: Variant = payload.get("outcome", {})
+			var outcome: Dictionary = raw_outcome if raw_outcome is Dictionary else {}
+			var status := str(outcome.get("status", "unavailable"))
+			var summary := str(outcome.get("summary", ""))
+			if status == "passed":
+				return _title_with_body("Verify passed:", summary)
+			if status == "failed":
+				var raw_issues: Variant = outcome.get("issues", [])
+				var issues_count: int = raw_issues.size() if raw_issues is Array else 0
+				return _title_with_body(
+					"Verify found %d issue(s):" % issues_count,
+					summary
+				)
 			return _title_with_body(
-				"Verify found %d issue(s):" % int(payload.get("issues_count", 0)),
-				str(payload.get("summary", ""))
+				"Verify unavailable (%s):" % str(outcome.get("reason_code", "unknown")),
+				summary
 			)
 		_:
 			var key_names: Array[String] = []

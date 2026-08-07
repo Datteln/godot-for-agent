@@ -64,7 +64,7 @@ class TestMapOwnerStateRoundTrip:
     def test_link_fields_emit_events(self) -> None:
         """记录链接字段时派发 reducer 事件。"""
         state = _fresh()
-        before = len(state.workflow_events)
+        before = len(state.pending_workflow_events)
         record_map_owner_link(
             state,
             macro_step_id="expand",
@@ -76,10 +76,10 @@ class TestMapOwnerStateRoundTrip:
         record_map_child_lineage(
             state, child_frame_id="fc", child_stage="planner", target="Map/Main", revision=3
         )
-        after = len(state.workflow_events)
+        after = len(state.pending_workflow_events)
         assert after - before == 2
-        assert state.workflow_events[-2]["event_type"] == "map_owner_linked"
-        assert state.workflow_events[-1]["event_type"] == "map_child_started"
+        assert state.pending_workflow_events[-2]["event_type"] == "map_owner_linked"
+        assert state.pending_workflow_events[-1]["event_type"] == "map_child_started"
 
     def test_task_epoch_reset_clears_link_fields(self) -> None:
         """新任务 epoch 按 lifecycle 元数据重置链接字段。"""
@@ -147,17 +147,17 @@ class TestPlanningContextRefresh:
 
     def test_refresh_emits_event(self) -> None:
         state = self._fresh()
-        before = len(state.workflow_events)
+        before = len(state.pending_workflow_events)
         record_planning_context_refresh(
             state,
             context_entry=self._mid_entry(),
             target="Map/Main",
             revision=7,
         )
-        after = len(state.workflow_events)
+        after = len(state.pending_workflow_events)
         assert after - before == 1
-        assert state.workflow_events[-1]["event_type"] == "planning_context_refreshed"
-        assert state.workflow_events[-1]["payload"]["context_id"] == "mid-ctx"
+        assert state.pending_workflow_events[-1]["event_type"] == "planning_context_refreshed"
+        assert state.pending_workflow_events[-1]["payload"]["context_id"] == "mid-ctx"
 
     def test_refresh_upserts_context_entry(self) -> None:
         state = self._fresh()
@@ -286,21 +286,19 @@ class TestPlanningContextRefresh:
             reduce_map_workflow,
             reducer_write_scope,
         )
-        from app.orchestrator.runtime_contracts import MapWorkflowEvent
+        from app.workflow.contracts import WorkflowEvent
 
         clean = MapTaskState()
-        with reducer_write_scope():
-            replace_map_state_field(clean, "structure_revision", 3)
-        for event_dict in state.workflow_events:
-            event = MapWorkflowEvent(
-                event_id=event_dict["event_id"],
+        for event_dict in state.pending_workflow_events:
+            event = WorkflowEvent(
+                event_seq=event_dict["event_seq"],
                 event_type=event_dict["event_type"],
                 target=event_dict["target"],
                 revision=event_dict["revision"],
                 payload=event_dict.get("payload", {}),
             )
             with reducer_write_scope():
-                clean = reduce_map_workflow(clean, event)
+                clean = reduce_map_workflow(clean, event, stage_event=False)
         assert "mid-ctx" in clean.planning_contexts
         assert "bg-ctx" in clean.planning_contexts
         assert clean.planning_contexts["mid-ctx"]["source_revision"] == 7

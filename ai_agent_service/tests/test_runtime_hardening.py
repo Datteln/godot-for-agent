@@ -18,15 +18,17 @@ from pathlib import Path
 from typing import Any
 
 from app.config import AppSettings
+from app.application.composition import build_application_use_cases
 from app.agents.types import AgentDefinition, Frame
 from app.events.store import EventStore
 from app.llm.provider import AssistantTurn, LLMProvider
 from app.memory.store import MemoryStore
-from app.orchestrator.agent import _requires_create_plan_before_map_delegate
+from app.orchestrator.map_turn import _requires_create_plan_before_map_delegate
 from app.orchestrator.map_progress import MapTaskState
-from app.query.engine import QueryEngine, _schedule_map_completion_continuation
+from app.query.helpers import _schedule_map_completion_continuation
 from app.recovery.pointer import RecoveryPointerStore
-from app.sessions.store import Session, SessionStore, _safe_filename, session_from_dict
+from app.security.settings import security_settings_from_app
+from app.sessions.store import Session, SessionStore, _safe_filename, session_from_dict, session_to_dict
 from app.storage.atomic import atomic_write_json
 
 
@@ -62,21 +64,31 @@ class PersistenceValidationTests(unittest.TestCase):
             self.assertEqual([m.id for m in store.list()], [item.id])
 
     def test_session_null_fields_do_not_crash(self) -> None:
-        broken = {
-            "session_id": "broken",
-            "agent_stack": None,
-            "pending_tool_call_ids": None,
-            "pending_verify_candidates": None,
-            "request_id_cache": None,
-            "turn_counter": None,
-        }
-        session = session_from_dict(broken, set())
-        self.assertEqual(session.session_id, "broken")
-        self.assertEqual(session.agent_stack, [])
-        self.assertEqual(session.pending_tool_call_ids, set())
-        self.assertEqual(session.pending_verify_candidates, [])
-        self.assertEqual(session.request_id_cache, {})
-        self.assertEqual(session.turn_counter, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root / "sessions", project_root=root)
+            current = store.get_or_create("broken", set())
+            broken = session_to_dict(current)
+            broken.update(
+                {
+                    "agent_stack": None,
+                    "pending_tool_call_ids": None,
+                    "pending_verify_candidates": None,
+                    "request_id_cache": None,
+                    "turn_counter": None,
+                }
+            )
+            session = session_from_dict(
+                broken,
+                set(),
+                map_task_state=MapTaskState(),
+            )
+            self.assertEqual(session.session_id, "broken")
+            self.assertEqual(session.agent_stack, [])
+            self.assertEqual(session.pending_tool_call_ids, set())
+            self.assertEqual(session.pending_verify_candidates, [])
+            self.assertEqual(session.request_id_cache, {})
+            self.assertEqual(session.turn_counter, 0)
 
     def test_session_non_object_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -96,7 +108,7 @@ class SessionFilenameTests(unittest.TestCase):
     def test_store_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
-            store.save(Session(session_id="abc-123"))
+            store.save(store.get_or_create("abc-123", set()))
             restored = SessionStore(Path(tmp)).get_or_create("abc-123", set())
             self.assertEqual(restored.session_id, "abc-123")
 
@@ -216,23 +228,27 @@ class ResetRaceTests(unittest.IsolatedAsyncioTestCase):
             settings = AppSettings(llm_base_url="http://localhost", project_root=Path(tmp))
             store = SessionStore(Path(tmp) / "sessions")
             llm = _BlockingLLMProvider()
-            engine = QueryEngine(
+            use_cases = build_application_use_cases(
                 settings=settings,
                 session_store=store,
                 llm=llm,
+                base_security=security_settings_from_app(settings),
+                skill_catalog=None,
+                output_style_catalog=None,
                 event_store=EventStore(),
+                recovery_store=None,
             )
             from app.api.schemas import ChatRequest
 
             chat_task = asyncio.create_task(
-                engine.submit_user_turn(
+                use_cases.user_submission.execute(
                     ChatRequest(session_id="s1", user_message="hi", request_id="r1")
                 )
             )
             await asyncio.wait_for(llm.entered.wait(), timeout=5)
 
             # reset 必须取消正在 await LLM 的 turn，并在持锁状态下清空会话。
-            await engine.reset("s1")
+            await use_cases.reset.execute("s1")
 
             with self.assertRaises(asyncio.CancelledError):
                 await chat_task

@@ -15,7 +15,6 @@ from app.orchestrator.macro_contracts import (
     DomainOwnerStatus,
     MacroPlan,
     MacroPlanError,
-    MacroPlanMigration,
     MacroPlanState,
     MacroPlanStep,
     OwnerDispatchDecision,
@@ -24,7 +23,6 @@ from app.orchestrator.macro_contracts import (
     MacroApprovalRequest,
     PredecessorBinding,
     StageCheckpoint,
-    classify_legacy_plan_migration,
     bind_macro_inputs,
     derive_macro_step_status_from_child,
     required_stage_for_map_operation,
@@ -343,66 +341,6 @@ class TestMacroPlanSiblingInvariant:
             }
         )
         assert len(plan.steps) == 2
-
-
-class TestLegacyPlanMigration:
-    """遗留多 sibling 地图计划的类型化迁移结论。"""
-
-    def test_multi_sibling_legacy_plan_requires_migration(self) -> None:
-        """含多个 map-agent owner 的遗留计划应被分类为需迁移。"""
-        legacy = {
-            "summary": "s",
-            "steps": [
-                {"id": "read", "agent": "map-agent", "task": "读取地图"},
-                {"id": "plan", "agent": "map-agent", "task": "规划路线"},
-                {"id": "write", "agent": "map-agent", "task": "写入批次"},
-            ],
-        }
-        migration = classify_legacy_plan_migration(legacy)
-        assert migration is not None
-        assert migration.disposition == "regenerate_as_macro_v2"
-        assert migration.map_owner_count == 3
-        assert set(migration.map_owner_step_ids) == {"read", "plan", "write"}
-        assert migration.suggested_owner_agent == "map-agent"
-        assert migration.legacy_step_count == 3
-
-    def test_macro_v2_plan_not_migrated(self) -> None:
-        """macro_v2 计划不需要迁移。"""
-        plan = MacroPlan.from_dict(_map_plan([_map_step()]))
-        assert classify_legacy_plan_migration(plan.to_dict()) is None
-
-    def test_stashed_macro_plan_not_migrated(self) -> None:
-        """已 stash macro_plan 子结构的计划不需要迁移。"""
-        legacy_with_macro = {
-            "summary": "s",
-            "plan_kind": "legacy",
-            "steps": [{"id": "a", "agent": "map-agent", "task": "t"}],
-            "macro_plan": MacroPlan.from_dict(_map_plan([_map_step()])).to_dict(),
-        }
-        assert classify_legacy_plan_migration(legacy_with_macro) is None
-
-    def test_single_map_owner_not_migrated(self) -> None:
-        """只有一个 map owner 的遗留计划不需要迁移。"""
-        legacy = {
-            "summary": "s",
-            "steps": [
-                {"id": "code", "agent": "programming-agent", "task": "code"},
-                {"id": "map", "agent": "map-agent", "task": "expand"},
-            ],
-        }
-        assert classify_legacy_plan_migration(legacy) is None
-
-    def test_classifier_uses_no_natural_language(self) -> None:
-        """分类器只按 owner/domain 计数，不解析 task 文本推断阶段。"""
-        single_owner_with_plan_keyword = {
-            "summary": "s",
-            "steps": [
-                {"id": "a", "agent": "map-agent", "task": "规划路线并写入"},
-            ],
-        }
-        assert (
-            classify_legacy_plan_migration(single_owner_with_plan_keyword) is None
-        )
 
 
 class TestMacroPlanState:

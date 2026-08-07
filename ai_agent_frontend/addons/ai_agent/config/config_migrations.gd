@@ -51,8 +51,14 @@ const DEFAULTS := {
 	"ai_agent/log_level": "info",
 	"ai_agent/log_to_file": true,
 	"ai_agent/log_file_path": "res://logs/ai_agent_frontend.log",
-	"ai_agent/enable_event_stream": true,
-	"ai_agent/event_poll_interval_sec": 1.0,
+	"ai_agent/ws_ack_timeout_sec": 15.0,
+	"ai_agent/ws_reconnect_initial_sec": 0.25,
+	"ai_agent/ws_reconnect_max_sec": 10.0,
+	"ai_agent/ws_reconnect_max_attempts": 8,
+	"ai_agent/ws_heartbeat_interval_sec": 15.0,
+	"ai_agent/ws_heartbeat_timeout_sec": 45.0,
+	"ai_agent/render_events_per_frame": 32,
+	"ai_agent/render_budget_ms": 4.0,
 	"ai_agent/enable_lsp_diagnostics": true,
 	"ai_agent/show_recovery_prompt": true,
 	"ai_agent/trusted_project_extensions": false,
@@ -162,9 +168,37 @@ const PROPERTY_HINTS := {
 		"hint": PROPERTY_HINT_GLOBAL_FILE,
 		"hint_string": "*.log,*.txt"
 	},
-	"ai_agent/event_poll_interval_sec": {
+	"ai_agent/ws_ack_timeout_sec": {
 		"hint": PROPERTY_HINT_RANGE,
-		"hint_string": "0.2,10,0.1,suffix:s"
+		"hint_string": "1,120,1,suffix:s"
+	},
+	"ai_agent/ws_reconnect_initial_sec": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "0.05,10,0.05,suffix:s"
+	},
+	"ai_agent/ws_reconnect_max_sec": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "0.1,120,0.1,suffix:s"
+	},
+	"ai_agent/ws_reconnect_max_attempts": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,100,1"
+	},
+	"ai_agent/ws_heartbeat_interval_sec": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,120,1,suffix:s"
+	},
+	"ai_agent/ws_heartbeat_timeout_sec": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "2,600,1,suffix:s"
+	},
+	"ai_agent/render_events_per_frame": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,512,1"
+	},
+	"ai_agent/render_budget_ms": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "0.25,16,0.25,suffix:ms"
 	},
 	"ai_agent/python_executable": {
 		"hint": PROPERTY_HINT_GLOBAL_FILE,
@@ -215,6 +249,47 @@ static func apply_defaults(editor_interface: EditorInterface) -> void:
 		if not settings.has_setting(key):
 			settings.set_setting(key, DEFAULTS[key])
 		_add_property_info(settings, key, DEFAULTS[key])
+
+
+static func validate_operational_settings(editor_interface: EditorInterface) -> PackedStringArray:
+	var settings := editor_interface.get_editor_settings()
+	var errors := PackedStringArray()
+	for removed_key in ["ai_agent/enable_event_stream", "ai_agent/event_poll_interval_sec"]:
+		if settings.has_setting(removed_key):
+			errors.append("Removed polling setting is unsupported: " + removed_key)
+	_validate_number_range(settings, errors, "ai_agent/ws_ack_timeout_sec", 1.0, 120.0)
+	_validate_number_range(settings, errors, "ai_agent/ws_reconnect_initial_sec", 0.05, 10.0)
+	_validate_number_range(settings, errors, "ai_agent/ws_reconnect_max_sec", 0.1, 120.0)
+	_validate_number_range(settings, errors, "ai_agent/ws_reconnect_max_attempts", 1.0, 100.0)
+	_validate_number_range(settings, errors, "ai_agent/ws_heartbeat_interval_sec", 1.0, 120.0)
+	_validate_number_range(settings, errors, "ai_agent/ws_heartbeat_timeout_sec", 2.0, 600.0)
+	_validate_number_range(settings, errors, "ai_agent/render_events_per_frame", 1.0, 512.0)
+	_validate_number_range(settings, errors, "ai_agent/render_budget_ms", 0.25, 16.0)
+	var reconnect_initial := float(settings.get_setting("ai_agent/ws_reconnect_initial_sec"))
+	var reconnect_max := float(settings.get_setting("ai_agent/ws_reconnect_max_sec"))
+	if reconnect_max < reconnect_initial:
+		errors.append("ai_agent/ws_reconnect_max_sec must be >= ws_reconnect_initial_sec")
+	var heartbeat_interval := float(settings.get_setting("ai_agent/ws_heartbeat_interval_sec"))
+	var heartbeat_timeout := float(settings.get_setting("ai_agent/ws_heartbeat_timeout_sec"))
+	if heartbeat_timeout <= heartbeat_interval:
+		errors.append("ai_agent/ws_heartbeat_timeout_sec must be greater than ws_heartbeat_interval_sec")
+	return errors
+
+
+static func _validate_number_range(
+	settings: EditorSettings,
+	errors: PackedStringArray,
+	key: String,
+	minimum: float,
+	maximum: float
+) -> void:
+	var value: Variant = settings.get_setting(key)
+	if not (value is int or value is float):
+		errors.append(key + " must be numeric")
+		return
+	var number := float(value)
+	if number < minimum or number > maximum:
+		errors.append("%s must be in [%s, %s]" % [key, minimum, maximum])
 
 
 static func get_value(editor_interface: EditorInterface, key: String) -> Variant:

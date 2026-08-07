@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.orchestrator.map_artifacts import (
-    CURRENT_MAP_ARTIFACT_TURN,
-    MapArtifactStore,
-)
+from app.orchestrator.map_artifacts import MapArtifactStore
 from app.tools.context import ToolContext
 from app.tools.registry import ToolDef, register
 from app.tools.server_tools.artifact_errors import (
@@ -115,7 +112,7 @@ async def read_map_artifact_handler(
             field=field,
             offset=offset,
             limit=limit,
-            staged=CURRENT_MAP_ARTIFACT_TURN.get(),
+            staged=ctx.staged_map_artifact_turn,
         )
     except (OSError, TypeError, ValueError) as error:
         return artifact_read_error(artifact_ref, "map_tool_result", error)

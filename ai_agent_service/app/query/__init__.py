@@ -1,2 +1,2 @@
-"""QueryEngine facade package."""
+"""AgentApplication facade package."""
 

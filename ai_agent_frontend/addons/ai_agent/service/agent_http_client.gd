@@ -2,7 +2,6 @@
 extends Node
 
 signal response_received(response: Dictionary)
-signal events_received(events: Array)
 signal error_occurred(message: String)
 
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
@@ -20,13 +19,12 @@ const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd
 const DEFAULT_REQUEST_TIMEOUT_S := 30.0
 const DEFAULT_CHAT_REQUEST_TIMEOUT_S := 300.0
 const LLM_FALLBACK_GRACE_S := 15.0
-## 上面那个超时现在按"空闲"语义续期（见 `_on_events_completed`）：只要
-## `/chat/events` 轮询还能拿到新事件（流式文本、delegate、工具调用……），
+## 上面那个超时按"空闲"语义续期：只要独立 WebSocket 事件通道还能拿到
+## 应用进度事件（流式文本、delegate、工具调用……），
 ## 就说明后端没卡死，超时计时器会被重置而不是任由它在固定总时长后到期。
 ## 这个硬上限是兜底：哪怕事件一直在零星地来、后端实际已经死循环/卡死，
 ## 单条 `/chat` 请求也不会无限续期下去。
 const DEFAULT_CHAT_REQUEST_HARD_CAP_S := 1800.0
-const EVENT_PAGE_LIMIT := 50
 const RECOVERY_FRONTEND_FAILPOINTS := {
 	"frontend_ack_before_adopt": true,
 	"frontend_ack_after_adopt": true,
@@ -34,22 +32,17 @@ const RECOVERY_FRONTEND_FAILPOINTS := {
 
 var editor_interface: EditorInterface
 var service: Node
-var current_turn_id: String = ""
+var session_state: RefCounted
 var _handled_tool_turn_ids: Dictionary = {}
-var _session_epoch := ""
 var _resetting := false
 
 var _http: HTTPRequest
-var _event_http: HTTPRequest
 var _queue: Array[Dictionary] = []
 var _busy := false
 var _inflight_generation := -1
 var _inflight_path := ""
 var _inflight_session_id := ""
 var _request_generation := 0
-var _last_event_seq := 0
-var _suppress_events := false
-var _event_timer: Timer
 var _request_timeout_timer: Timer
 var _timeout_generation := -1
 var _inflight_started_at_msec := 0
@@ -74,14 +67,6 @@ func _hit_test_failpoint(name: String) -> bool:
 func _ready() -> void:
 	_create_chat_http()
 
-	_create_event_http()
-
-	_event_timer = Timer.new()
-	_event_timer.one_shot = false
-	add_child(_event_timer)
-	_event_timer.timeout.connect(poll_events)
-	_event_timer.stop()
-
 	_request_timeout_timer = Timer.new()
 	_request_timeout_timer.one_shot = true
 	add_child(_request_timeout_timer)
@@ -95,13 +80,6 @@ func _create_chat_http() -> void:
 	_http.request_completed.connect(_on_request_completed)
 
 
-func _create_event_http() -> void:
-	_event_http = HTTPRequest.new()
-	_event_http.name = "EventHttp"
-	add_child(_event_http)
-	_event_http.request_completed.connect(_on_events_completed)
-
-
 func _replace_chat_http() -> void:
 	# A cancelled HTTPRequest may emit completion later. Destroying the node also
 	# destroys that signal source, so it cannot mutate a newer request's state.
@@ -112,16 +90,6 @@ func _replace_chat_http() -> void:
 			_http.cancel_request()
 		_http.queue_free()
 	_create_chat_http()
-
-
-func _replace_event_http() -> void:
-	if is_instance_valid(_event_http):
-		if _event_http.request_completed.is_connected(_on_events_completed):
-			_event_http.request_completed.disconnect(_on_events_completed)
-		if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-			_event_http.cancel_request()
-		_event_http.queue_free()
-	_create_event_http()
 
 
 func _abandon_inflight_request() -> void:
@@ -140,15 +108,15 @@ func send_user_message(text: String, context: Dictionary, model = null) -> void:
 	if _resetting:
 		error_occurred.emit("Session reset is still in progress.")
 		return
-	_suppress_events = false
-	_configure_event_timer()
+	if session_state != null:
+		session_state.set_suppressing(false)
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing user message.", {
 		"chars": text.length(),
 		"has_context": not context.is_empty()
 	})
 	var payload := {
 		"session_id": _session_id(),
-		"session_epoch": _session_epoch if _session_epoch != "" else null,
+		"session_epoch": _session_epoch_value() if _session_epoch_value() != "" else null,
 		"request_id": _new_request_id(),
 		"user_message": text,
 		"context": context,
@@ -187,7 +155,7 @@ func send_tool_results(results: Array, model = null) -> void:
 				"turn_id": str(result.get("turn_id", "")),
 			})
 			continue
-		result["turn_id"] = current_turn_id
+		result["turn_id"] = _active_turn_id()
 		valid_results.append(result)
 	if dropped > 0:
 		FrontendLogger.warn(editor_interface, "HTTP", "Dropped invalid tool results.", {"dropped": dropped, "kept": valid_results.size()})
@@ -215,7 +183,7 @@ func send_tool_results(results: Array, model = null) -> void:
 		return
 	var payload := {
 		"session_id": _session_id(),
-		"session_epoch": _session_epoch if _session_epoch != "" else null,
+		"session_epoch": _session_epoch_value() if _session_epoch_value() != "" else null,
 		"request_id": _new_request_id(),
 		"model": model,
 		"permission_mode": _setting("ai_agent/permission_mode"),
@@ -244,10 +212,8 @@ func reset_session() -> void:
 	_request_generation += 1
 	_queue.clear()
 	_abandon_inflight_request()
-	_replace_event_http()
-	if _event_timer != null:
-		_event_timer.stop()
-	_suppress_events = false
+	if session_state != null:
+		session_state.begin_reset()
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing session reset.", {"session_id": _session_id()})
 	if abandoned_path == "/chat":
 		_enqueue("POST", "/chat/interrupt", {
@@ -267,14 +233,9 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 	_request_generation += 1
 	_queue.clear()
 	_abandon_inflight_request()
-	_replace_event_http()
-	if _event_timer != null:
-		_event_timer.stop()
-	current_turn_id = ""
+	if session_state != null:
+		session_state.complete_turn()
 	_handled_tool_turn_ids.clear()
-	_session_epoch = ""
-	_last_event_seq = 0
-	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != new_session_id:
 		_enqueue("POST", "/chat/interrupt", {
 			"session_id": previous_session_id,
@@ -286,17 +247,16 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 func interrupt_current() -> void:
 	FrontendLogger.warn(editor_interface, "HTTP", "Interrupting current request.", {"queue_size": _queue.size()})
 	_request_generation += 1
-	_suppress_events = true
+	if session_state != null:
+		session_state.set_suppressing(true)
 	_queue.clear()
 	_abandon_inflight_request()
 	# `cancel_request()` 不保证触发 `request_completed`（曾导致 `_busy` 卡死为
 	# true，后续所有请求——包括下面要发的 `/chat/interrupt` 和用户的下一条
 	# 消息——永远排在队列里发不出去）。这里不再等待那个信号，直接复位，
 	# 迟到的信号会被 `_on_request_completed` 的生成号检查丢弃。
-	_replace_event_http()
-	if _event_timer != null:
-		_event_timer.stop()
-	current_turn_id = ""
+	if session_state != null:
+		session_state.complete_turn()
 	_handled_tool_turn_ids.clear()
 	# 仅断开本地连接还不够：后端的 agent 循环（自动执行的静默工具）会继续跑完
 	# 整轮并持续写入新事件，等下一条用户消息发出后这些旧事件会被一起拉取、
@@ -317,22 +277,19 @@ func switch_to_session(previous_session_id: String) -> void:
 	_replace_chat_http()
 	_busy = false
 	_request_timeout_timer.stop()
-	_replace_event_http()
-	current_turn_id = ""
+	if session_state != null:
+		session_state.complete_turn()
 	_handled_tool_turn_ids.clear()
-	_session_epoch = ""
-	_last_event_seq = 0
-	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != _session_id():
 		_enqueue("POST", "/chat/interrupt", {
 			"session_id": previous_session_id,
 			"cause": "user_interrupted"
 		})
-	_configure_event_timer()
 
 
 func discard_pending() -> void:
-	current_turn_id = ""
+	if session_state != null:
+		session_state.complete_turn()
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing pending tool result discard.", {"session_id": _session_id()})
 	_enqueue("POST", "/chat/discard-pending", {"session_id": _session_id()})
 
@@ -384,7 +341,7 @@ func dismiss_recovery_pointer() -> void:
 
 func fetch_session_history(limit: int = 40, before: int = 0) -> void:
 	var path := "/sessions/%s/history?limit=%d&before=%d" % [_session_id().uri_encode(), limit, before]
-	FrontendLogger.debug(editor_interface, "AgentHttpClient", "[DEBUG-HISTORY-7C2A] enqueue_history", {
+	FrontendLogger.debug(editor_interface, "AgentHttpClient", "History request queued.", {
 		"limit": limit,
 		"before": before,
 		"session_id": _session_id(),
@@ -393,34 +350,14 @@ func fetch_session_history(limit: int = 40, before: int = 0) -> void:
 	_enqueue("GET", path, {})
 
 
-func sync_event_cursor(last_event_seq: int) -> void:
-	_last_event_seq = max(_last_event_seq, last_event_seq)
+func fetch_chat_snapshot() -> void:
+	var path := "/chat/snapshot?session_id=%s" % _session_id().uri_encode()
+	_enqueue("GET", path, {})
 
 
-## 从恢复指针同步本地事件序号与挂起的 turn_id，供恢复提示"接受"分支调用。
-func resume_from_pointer(pointer: Dictionary) -> void:
-	_session_epoch = str(pointer.get("session_epoch", ""))
-	_last_event_seq = max(_last_event_seq, int(pointer.get("last_event_seq", 0)))
-	var pending_turn_id = pointer.get("pending_turn_id")
-	current_turn_id = str(pending_turn_id) if pending_turn_id != null else ""
-	_configure_event_timer()
-
-
-func poll_events() -> void:
-	if _resetting:
-		return
-	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		return
-	var path := "/chat/events?session_id=%s&session_epoch=%s&after=%d&limit=%d" % [
-		_session_id().uri_encode(),
-		_session_epoch.uri_encode(),
-		_last_event_seq,
-		EVENT_PAGE_LIMIT,
-	]
-	var err := _event_http.request(_url(path), _headers(), HTTPClient.METHOD_GET)
-	if err != OK:
-		FrontendLogger.warn(editor_interface, "HTTP", "Failed to start event poll.", {"error": err})
-		error_occurred.emit("Failed to poll events: " + str(err))
+func notify_application_progress() -> void:
+	## WebSocket 应用进度可续期 HTTP command watchdog；socket ping/pong 不调用此入口。
+	_maybe_extend_request_timeout()
 
 
 func _enqueue(method: String, path: String, payload: Dictionary) -> void:
@@ -557,12 +494,13 @@ func _on_request_timeout() -> void:
 	var interrupt_enqueued := false
 	if timed_out_path == "/chat":
 		# 前端单方面放弃等待并不会让后端的 agent 循环停下来——它会继续跑完
-		# 这一轮工具调用，并持续通过独立的事件轮询通道往外推流，造成"状态栏
+		# 这一轮工具调用，并持续通过独立的 WebSocket 通道往外推流，造成"状态栏
 		# 已经显示空闲，但某条 Thought 计时还在不停增长"的诡异现象。这里和
 		# 用户主动点"停止"一样，显式通知后端取消这个 session 仍在运行的请求，
 		# 并临时丢弃它后续迟到的事件，直到下一条用户消息重新开始一轮。
-		current_turn_id = ""
-		_suppress_events = true
+		if session_state != null:
+			session_state.complete_turn()
+			session_state.set_suppressing(true)
 		_enqueue("POST", "/chat/interrupt", {
 			"session_id": timed_out_session_id if timed_out_session_id != "" else _session_id(),
 			"cause": "client_timeout"
@@ -601,7 +539,7 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 	_inflight_item = {}
 	var text := body.get_string_from_utf8()
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
-		if _suppress_events:
+		if _responses_suppressed():
 			FrontendLogger.info(editor_interface, "HTTP", "Suppressed HTTP failure after interrupt.", {
 				"code": code,
 				"result": result
@@ -632,7 +570,6 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 				_pump()
 				return
 			_resetting = false
-			_configure_event_timer()
 			response_received.emit({
 				"ok": false,
 				"session_id": _session_id(),
@@ -669,6 +606,8 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 
 	if parsed is Dictionary:
 		var response: Dictionary = parsed
+		if str(completed_item.get("path", "")).begins_with("/chat/snapshot?"):
+			response["_snapshot_recovery"] = true
 		FrontendLogger.debug(editor_interface, "HTTP", "Received response.", {
 			"type": str(response.get("type", "data")),
 			"keys": response.keys()
@@ -676,13 +615,7 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 		if str(completed_item.get("path", "")) == "/reset":
 			_resetting = false
 			if bool(response.get("ok", false)):
-				_session_epoch = str(response.get("session_epoch", ""))
-				_last_event_seq = int(response.get("last_event_seq", 0))
-				current_turn_id = ""
 				_handled_tool_turn_ids.clear()
-				_replace_event_http()
-				_suppress_events = false
-			_configure_event_timer()
 			if _hit_test_failpoint("frontend_ack_after_adopt"):
 				_pump()
 				return
@@ -692,11 +625,17 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 		if response.has("cancelled") and response.has("last_event_seq"):
 			# `/chat/interrupt` 的确认：跳过中断前后后端可能残留写入的旧事件，
 			# 不把这条纯内部 ack 转发给 ChatPanel。
-			if _inflight_session_id == _session_id():
-				_last_event_seq = max(_last_event_seq, int(response.get("last_event_seq", 0)))
+			var accepted_seq := int(response.get("last_event_seq", 0))
+			if _inflight_session_id == _session_id() and session_state != null:
+				var snapshot: Dictionary = session_state.snapshot()
+				session_state.configure(
+					str(snapshot.get("session_id", "")),
+					str(snapshot.get("session_epoch", "")),
+					accepted_seq
+				)
 			FrontendLogger.info(editor_interface, "HTTP", "Interrupt acknowledged by backend.", {
 				"cancelled": response.get("cancelled", false),
-				"last_event_seq": _last_event_seq,
+				"last_event_seq": accepted_seq,
 				"path": _inflight_path,
 				"session_id": _inflight_session_id
 			})
@@ -706,9 +645,11 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			_pump()
 			return
 		if response.get("type", "") == "tool_calls":
-			current_turn_id = str(response.get("turn_id", ""))
-			if current_turn_id != "":
-				_handled_tool_turn_ids[current_turn_id] = true
+			var turn_id := str(response.get("turn_id", ""))
+			if turn_id != "":
+				if session_state != null:
+					session_state.adopt_turn(turn_id)
+				_handled_tool_turn_ids[turn_id] = true
 		elif (
 			response.get("type", "") == "error"
 			and str(response.get("disposition", "")) == "retry_new_turn"
@@ -718,17 +659,8 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 				raw_next_action if raw_next_action is Dictionary else {}
 			)
 			var fresh_turn_id := str(next_action.get("turn_id", ""))
-			if fresh_turn_id != "":
-				current_turn_id = fresh_turn_id
-		if (
-			response.has("pseudo_events")
-			and str(response.get("session_id", "")) == _session_id()
-		):
-			_session_epoch = str(response.get("session_epoch", _session_epoch))
-			_last_event_seq = max(
-				_last_event_seq,
-				int(response.get("last_event_seq", 0))
-			)
+			if fresh_turn_id != "" and session_state != null:
+				session_state.adopt_turn(fresh_turn_id)
 		if _hit_test_failpoint("frontend_ack_after_adopt"):
 			_pump()
 			return
@@ -738,83 +670,7 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 	_pump()
 
 
-func _on_events_completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
-	if _resetting:
-		return
-	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
-		return
-	var parsed := JSON.parse_string(body.get_string_from_utf8())
-	var page := _parse_event_page(parsed, _last_event_seq)
-	if bool(page.get("valid", false)):
-		var response_epoch := str(page.get("session_epoch", ""))
-		if _session_epoch != "" and response_epoch != "" and response_epoch != _session_epoch:
-			FrontendLogger.info(editor_interface, "HTTP", "Ignoring stale event epoch.", {
-				"expected_epoch": _session_epoch,
-				"response_epoch": response_epoch,
-			})
-			return
-		if _session_epoch == "" and response_epoch != "":
-			_session_epoch = response_epoch
-		var events: Array = page.get("events", [])
-		var raw_progress: Variant = page.get("progress")
-		var has_live_progress: bool = raw_progress is Dictionary
-		if not events.is_empty() or has_live_progress:
-			FrontendLogger.debug(editor_interface, "HTTP", "Received events.", {
-				"count": events.size(),
-				"has_more": bool(page.get("has_more", false)),
-				"response_cursor": int(page.get("cursor", _last_event_seq)),
-			})
-			_maybe_extend_request_timeout()
-		for event in events:
-			_try_recover_tool_calls_response(event)
-		_last_event_seq = int(page.get("cursor", _last_event_seq))
-		if _suppress_events:
-			if not events.is_empty():
-				FrontendLogger.debug(editor_interface, "HTTP", "Suppressed events after interrupt.", {"count": events.size()})
-			return
-		if not events.is_empty():
-			events_received.emit(events)
-		if bool(page.get("has_more", false)):
-			# request_completed runs after this HTTPRequest becomes reusable. Defer one
-			# turn and retain poll_events' disconnected guard to prevent overlap.
-			call_deferred("_poll_event_backlog")
-
-
-func _parse_event_page(parsed: Variant, current_cursor: int) -> Dictionary:
-	# Keep compatibility with older backends: cursor/has_more and preview fields
-	# are optional, while accepted event sequence remains the source of truth.
-	if not (parsed is Dictionary):
-		return {"valid": false, "events": [], "cursor": current_cursor, "has_more": false}
-	var raw_events: Variant = parsed.get("events", [])
-	if not (raw_events is Array):
-		return {"valid": false, "events": [], "cursor": current_cursor, "has_more": false}
-	var accepted: Array = []
-	var accepted_cursor := current_cursor
-	for raw_event in raw_events:
-		if not (raw_event is Dictionary):
-			continue
-		var seq := int(raw_event.get("seq", 0))
-		if seq <= accepted_cursor:
-			continue
-		accepted.append(raw_event)
-		accepted_cursor = seq
-	return {
-		"valid": true,
-		"events": accepted,
-		"cursor": accepted_cursor,
-		"has_more": bool(parsed.get("has_more", false)),
-		"progress": parsed.get("progress"),
-		"session_epoch": str(parsed.get("session_epoch", "")),
-	}
-
-
-func _poll_event_backlog() -> void:
-	if _suppress_events:
-		return
-	poll_events()
-
-
-func _try_recover_tool_calls_response(event: Dictionary) -> void:
+func recover_tool_calls_response(event: Dictionary) -> void:
 	var event_type := str(event.get("type", ""))
 	if event_type != "tool_calls" or not _busy or _inflight_path != "/chat":
 		return
@@ -844,13 +700,8 @@ func _try_recover_tool_calls_response(event: Dictionary) -> void:
 	_inflight_started_at_msec = 0
 	_inflight_item = {}
 	_request_timeout_timer.stop()
-	current_turn_id = turn_id
-	response_received.emit({
-		"type": "tool_calls",
-		"turn_id": turn_id,
-		"text": payload.get("text", null),
-		"calls": raw_calls,
-	})
+	if session_state != null:
+		session_state.adopt_turn(turn_id)
 	_pump()
 
 
@@ -882,6 +733,22 @@ func _session_id() -> String:
 	return str(_setting("ai_agent/session_id"))
 
 
+func _session_epoch_value() -> String:
+	if session_state == null:
+		return ""
+	return str(session_state.snapshot().get("session_epoch", ""))
+
+
+func _active_turn_id() -> String:
+	if session_state == null:
+		return ""
+	return str(session_state.snapshot().get("active_turn_id", ""))
+
+
+func _responses_suppressed() -> bool:
+	return session_state != null and bool(session_state.snapshot().get("suppressing", false))
+
+
 func _language_hint() -> String:
 	var root := ProjectSettings.globalize_path("res://")
 	if FileAccess.file_exists(root.path_join(".csproj")):
@@ -891,13 +758,3 @@ func _language_hint() -> String:
 
 func _new_request_id() -> String:
 	return "%d-%d" % [Time.get_ticks_usec(), randi()]
-
-
-func _configure_event_timer() -> void:
-	if editor_interface == null:
-		return
-	if bool(_setting("ai_agent/enable_event_stream")):
-		_event_timer.wait_time = max(0.2, float(_setting("ai_agent/event_poll_interval_sec")))
-		_event_timer.start()
-	else:
-		_event_timer.stop()

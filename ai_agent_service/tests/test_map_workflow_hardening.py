@@ -20,10 +20,10 @@ from app.orchestrator.map_workflow import (
     replace_map_state_field,
     upsert_completion_blocker,
 )
-from app.query.engine import _map_completion_candidate_is_current
+from app.application.request_scope import _map_completion_candidate_is_current
 from app.query.helpers import _remember_map_validation
-from app.sessions.schema import SESSION_SCHEMA_VERSION, migrate_session_payload
-from app.sessions.store import Session, session_from_dict, session_to_dict
+from app.sessions.schema import UnsupportedSessionSchemaError, validate_session_payload
+from app.sessions.store import Session
 
 
 def _completion_ready_state(*, status: str = "running") -> MapTaskState:
@@ -97,122 +97,21 @@ def test_lifecycle_metadata_classifies_every_state_field() -> None:
     )
 
 
-def test_legacy_schema_migrates_and_round_trips_resume_authorization() -> None:
-    """验证旧版专用恢复标记迁移为绑定 lineage 的一次性授权。"""
-    migrated, changed = migrate_session_payload(
-        {
-            "session_id": "session-1",
-            "map_task_state": {
-                "task_id": "task-1",
-                "status": "running",
-                "resumed_from_checkpoint": True,
-            },
-            "map_task_lineage": {"lineage_id": "lineage-1"},
-        }
-    )
-
-    assert changed is True
-    assert migrated["schema_version"] == SESSION_SCHEMA_VERSION
-    state = session_from_dict(migrated, set()).map_task_state
-    assert state.resume_authorization == {
-        "task_id": "task-1",
-        "lineage_id": "lineage-1",
+def test_legacy_schema_is_rejected_without_migration() -> None:
+    """旧嵌入状态及旧恢复标记只能得到 unsupported schema。"""
+    legacy = {
+        "session_id": "session-1",
+        "map_task_state": {
+            "task_id": "task-1",
+            "status": "running",
+            "resumed_from_checkpoint": True,
+        },
     }
-    restored = session_from_dict(
-        session_to_dict(Session(session_id="session-1", map_task_state=state)),
-        set(),
-    )
-    assert restored.map_task_state.to_dict() == state.to_dict()
 
+    with pytest.raises(UnsupportedSessionSchemaError):
+        validate_session_payload(legacy)
 
-def _malformed_owner_session(*, side_effect_state: str) -> Session:
-    """构造捕获故障中的 orchestrator + worker schema 持久化形态。"""
-    root = Frame(
-        id="f1",
-        agent=AgentDefinition(
-            name="coordinator",
-            source="bundled",
-            description="",
-            prompt="",
-        ),
-        messages=[],
-    )
-    owner = Frame(
-        id="f2",
-        agent=AgentDefinition(
-            name="map-agent",
-            source="bundled",
-            description="",
-            prompt="",
-            pipeline_kind="map",
-            role="map_orchestrator",
-            map_stage="orchestrator",
-        ),
-        messages=[
-            {
-                "role": "system",
-                "content": "Runtime Map Stage Contract（运行时唯一合同）：{}",
-            }
-        ],
-        parent_id="f1",
-        map_stage_contract={"stage": "orchestrator"},
-        map_request_lineage_id="lineage-1",
-        map_task_id="task-1",
-        contract_id="legacy-contract",
-        worker_instance_id="legacy-worker",
-        result_schema=MAP_WORKER_RESULT_SCHEMA,
-        allowed_next_stages=("planner",),
-    )
-    return Session(
-        session_id="session-legacy-owner",
-        session_epoch="epoch-1",
-        agent_stack=[root, owner],
-        frame_counter=2,
-        map_task_state=MapTaskState(
-            task_id="task-1",
-            task_lineage_id="lineage-1",
-            macro_step_id="map-step",
-            owner_frame_id="f2",
-            domain_task_id="map-step:epoch-1",
-        ),
-        task_run={"side_effect_state": side_effect_state},
-    )
-
-
-def test_hydration_repairs_side_effect_free_malformed_owner() -> None:
-    restored = session_from_dict(
-        session_to_dict(_malformed_owner_session(side_effect_state="none")),
-        set(),
-    )
-    owner = restored.agent_stack[-1]
-    assert owner.domain_owner_contract["contract_kind"] == "domain_owner_v1"
-    assert owner.domain_owner_contract["macro_step_id"] == "map-step"
-    assert owner.map_stage_contract == {}
-    assert owner.worker_instance_id is None
-    assert owner.result_schema is None
-    assert owner.allowed_next_stages == ()
-    assert owner.structured_diagnostics[-1]["outcome"] == "repaired"
-    assert all(
-        not str(message.get("content", "")).startswith("Runtime Map Stage Contract")
-        for message in owner.messages
-    )
-
-
-def test_hydration_blocks_ambiguous_malformed_owner_without_mutation() -> None:
-    restored = session_from_dict(
-        session_to_dict(_malformed_owner_session(side_effect_state="committed")),
-        set(),
-    )
-    owner = restored.agent_stack[-1]
-    assert owner.map_stage_contract == {"stage": "orchestrator"}
-    assert owner.result_schema == MAP_WORKER_RESULT_SCHEMA
-    assert owner.structured_diagnostics[-1] == {
-        "error_code": "map_route_contract_violation",
-        "migration": "legacy_owner_worker_contract_v9",
-        "lineage_intact": True,
-        "side_effect_state": "committed",
-        "outcome": "blocked_no_mutation",
-    }
+    assert legacy["map_task_state"]["resumed_from_checkpoint"] is True
 
 
 def test_distinct_task_resets_task_and_revision_fields_from_metadata() -> None:
@@ -227,7 +126,7 @@ def test_distinct_task_resets_task_and_revision_fields_from_metadata() -> None:
         latest_revisions={"Map/Main": 8},
         completion_blockers=[{"reason": "old"}],
         task_convergence_registry={"old": {"count": 2}},
-        workflow_events=[{"event_type": "old_event"}],
+        workflow_high_water_seq=7,
         workflow_schema_version=3,
     )
 
@@ -243,8 +142,8 @@ def test_distinct_task_resets_task_and_revision_fields_from_metadata() -> None:
     assert state.completion_blockers == []
     assert state.task_convergence_registry == {}
     assert state.workflow_schema_version == 3
-    assert state.workflow_events[0] == {"event_type": "old_event"}
-    assert state.workflow_events[-1]["event_type"] == "task_epoch_started"
+    assert state.workflow_high_water_seq == 8
+    assert state.pending_workflow_events[-1]["event_type"] == "task_epoch_started"
 
 
 def test_same_task_resume_preserves_checkpoint_state_and_consumes_once() -> None:
@@ -288,10 +187,7 @@ def test_resume_authorization_survives_restart_until_next_request() -> None:
             "lineage_id": "lineage-1",
         },
     )
-    restored = session_from_dict(
-        session_to_dict(Session(session_id="session-1", map_task_state=state)),
-        set(),
-    ).map_task_state
+    restored = MapTaskState.from_dict(state.to_dict())
 
     assert consume_map_resume_authorization(
         restored,
@@ -521,8 +417,8 @@ def test_completed_gate_replay_has_no_duplicate_transition_effect() -> None:
     state = _completion_ready_state(status="running")
     assert evaluate_map_completion(state).allowed is True
     state.complete()
-    event_count = len(state.workflow_events)
+    event_count = len(state.pending_workflow_events)
 
     assert evaluate_map_completion(state).allowed is True
     assert state.status == "completed"
-    assert len(state.workflow_events) == event_count
+    assert len(state.pending_workflow_events) == event_count

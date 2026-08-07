@@ -32,9 +32,6 @@ FallbackCallback = Callable[[str, str], None]
 # 流式增量事件的最小推送间隔（秒），避免逐 token 产生事件淹没事件队列。
 _DELTA_MIN_INTERVAL_S = 0.5
 
-# 单次 chat() 内模型级重试上限（含主模型与降级模型的组合尝试）；与 _chat_once
-# 内的流式重连（max_stream_attempts，针对单次请求的连接抖动）是两个层次。
-_MAX_CHAT_ATTEMPTS = 5
 # 指数退避基数与上限（秒）；仅对可重试错误在重试之间等待。
 _RETRY_BACKOFF_BASE_S = 0.5
 _RETRY_BACKOFF_CAP_S = 8.0
@@ -94,6 +91,7 @@ class AssistantTurn:
     total_input_tokens: int | None = None
     model: str = ""
     response_mode: Literal["json_schema", "json_object", "prompt_only"] | None = None
+    wire_attempt_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -172,7 +170,15 @@ def _cache_tokens_from_usage(usage: Any) -> tuple[int | None, int | None, int | 
 class LLMError(Exception):
     """LLM 调用失败的统一异常，供上层转换为 `{"type":"error"}` 响应（§17）。"""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str = "llm_error",
+        wire_attempt_count: int = 0,
+        model: str = "",
+    ) -> None:
         """记录失败信息与可选的 HTTP 状态码。
 
         Args:
@@ -181,6 +187,46 @@ class LLMError(Exception):
         """
         super().__init__(message)
         self.status_code = status_code
+        self.error_code = error_code
+        self.wire_attempt_count = wire_attempt_count
+        self.model = model
+
+
+class PartialStreamInterrupted(LLMError):
+    """A stream failed after semantic output crossed the no-retry boundary."""
+
+    def __init__(
+        self,
+        *,
+        accepted_kinds: frozenset[str],
+        wire_attempt_count: int,
+        model: str,
+    ) -> None:
+        super().__init__(
+            "大模型流式响应在部分输出后中断；为避免拼接不同补全，本轮不会自动重试。",
+            error_code="partial_stream_interrupted",
+            wire_attempt_count=wire_attempt_count,
+            model=model,
+        )
+        self.accepted_kinds = accepted_kinds
+
+
+@dataclass(slots=True)
+class WireAttemptBudget:
+    """One counter shared by primary, format downgrade, and fallback requests."""
+
+    maximum: int
+    used: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return self.maximum - self.used
+
+    def consume(self) -> int:
+        if self.remaining <= 0:
+            raise RuntimeError("wire attempt budget exhausted")
+        self.used += 1
+        return self.used
 
 
 class LLMProvider(Protocol):
@@ -248,6 +294,7 @@ class OpenAICompatibleProvider:
         default_model: str,
         timeout_s: float,
         fallback_model: str | None = None,
+        max_attempts: int = 3,
     ) -> None:
         """构造 OpenAI 兼容客户端。
 
@@ -263,14 +310,20 @@ class OpenAICompatibleProvider:
             base_url=base_url,
             api_key=api_key or "sk-local-placeholder",
             timeout=timeout_s,
+            max_retries=0,
         )
         self._default_model = default_model
         self._fallback_model = fallback_model
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        self._max_attempts = max_attempts
         logger.info(
-            "Initialized OpenAI-compatible provider base_url=%s timeout_s=%s fallback_configured=%s",
+            "Initialized OpenAI-compatible provider base_url=%s timeout_s=%s "
+            "fallback_configured=%s max_attempts=%d sdk_retries=0",
             base_url,
             timeout_s,
             fallback_model is not None,
+            max_attempts,
         )
 
     @property
@@ -324,15 +377,16 @@ class OpenAICompatibleProvider:
             LLMError: 主模型与降级模型均连接失败、超时或返回错误状态码时抛出。
         """
         resolved_model = model or self._default_model
-        max_attempts = _MAX_CHAT_ATTEMPTS
+        budget = WireAttemptBudget(self._max_attempts)
         fallback_emitted = False
         last_exc: LLMError | None = None
-        for attempt in range(1, max_attempts + 1):
-            # 前 2 次（含首次）用主模型；之后转降级模型（若配置且与主模型不同）。
+        has_fallback = (
+            self._fallback_model is not None and self._fallback_model != resolved_model
+        )
+        primary_attempt_limit = min(2, self._max_attempts) if has_fallback else self._max_attempts
+        while budget.remaining > 0:
             use_fallback = (
-                attempt > 2
-                and self._fallback_model is not None
-                and self._fallback_model != resolved_model
+                has_fallback and budget.used >= primary_attempt_limit
             )
             current_model = self._fallback_model if use_fallback else resolved_model
             if use_fallback and not fallback_emitted and on_fallback is not None:
@@ -348,9 +402,16 @@ class OpenAICompatibleProvider:
                     on_delta,
                     cache_breakpoints,
                     response_contract,
+                    budget,
                 )
+            except PartialStreamInterrupted as exc:
+                exc.wire_attempt_count = budget.used
+                exc.model = str(current_model)
+                raise
             except LLMError as exc:
                 last_exc = exc
+                exc.wire_attempt_count = budget.used
+                exc.model = str(current_model)
                 if not _is_retryable_llm_error(exc):
                     logger.warning(
                         "LLM chat non-retryable failure model=%s status_code=%s",
@@ -358,19 +419,22 @@ class OpenAICompatibleProvider:
                         exc.status_code,
                     )
                     raise
-                if attempt >= max_attempts:
+                if budget.remaining <= 0:
                     logger.warning(
                         "LLM chat exhausted retries attempts=%d model=%s status_code=%s",
-                        attempt,
+                        budget.used,
                         current_model,
                         exc.status_code,
                     )
                     raise
-                delay = min(_RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP_S)
+                delay = min(
+                    _RETRY_BACKOFF_BASE_S * (2 ** max(budget.used - 1, 0)),
+                    _RETRY_BACKOFF_CAP_S,
+                )
                 logger.warning(
                     "LLM chat retryable failure; retrying attempt=%d/%d model=%s status_code=%s delay=%.2f",
-                    attempt,
-                    max_attempts,
+                    budget.used,
+                    budget.maximum,
                     current_model,
                     exc.status_code,
                     delay,
@@ -390,6 +454,7 @@ class OpenAICompatibleProvider:
         on_delta: DeltaCallback | None,
         cache_breakpoints: list[CacheBreakpoint] | None,
         response_contract: ResponseContract | None,
+        budget: WireAttemptBudget,
     ) -> AssistantTurn:
         """执行单模型请求，并仅对响应格式能力拒绝做一次窄降级。"""
         try:
@@ -402,6 +467,7 @@ class OpenAICompatibleProvider:
                 on_delta,
                 cache_breakpoints,
                 response_contract,
+                budget,
             )
         except LLMError as exc:
             if (
@@ -429,6 +495,8 @@ class OpenAICompatibleProvider:
                 next_mode,
                 exc.status_code,
             )
+            if budget.remaining <= 0:
+                raise
             return await self._invoke_chat_once(
                 messages,
                 tools,
@@ -438,6 +506,7 @@ class OpenAICompatibleProvider:
                 on_delta,
                 cache_breakpoints,
                 downgraded,
+                budget,
             )
 
     async def _invoke_chat_once(
@@ -450,19 +519,11 @@ class OpenAICompatibleProvider:
         on_delta: DeltaCallback | None,
         cache_breakpoints: list[CacheBreakpoint] | None,
         response_contract: ResponseContract | None,
+        budget: WireAttemptBudget,
     ) -> AssistantTurn:
-        """兼容旧 provider test double，并在存在合同时传递新关键字。"""
-        if response_contract is None:
-            return await self._chat_once(
-                messages,
-                tools,
-                model,
-                temperature,
-                thinking_budget,
-                on_delta,
-                cache_breakpoints,
-            )
-        return await self._chat_once(
+        """Consume one shared wire attempt and invoke the canonical request surface."""
+        wire_attempt = budget.consume()
+        result = await self._chat_once(
             messages,
             tools,
             model,
@@ -471,6 +532,20 @@ class OpenAICompatibleProvider:
             on_delta,
             cache_breakpoints,
             response_contract=response_contract,
+        )
+        return AssistantTurn(
+            raw_message=result.raw_message,
+            content=result.content,
+            tool_calls=result.tool_calls,
+            finish_reason=result.finish_reason,
+            reasoning=result.reasoning,
+            reasoning_tokens=result.reasoning_tokens,
+            cached_tokens=result.cached_tokens,
+            cache_creation_tokens=result.cache_creation_tokens,
+            total_input_tokens=result.total_input_tokens,
+            model=result.model,
+            response_mode=result.response_mode,
+            wire_attempt_count=wire_attempt,
         )
 
     async def _chat_once(
@@ -559,8 +634,10 @@ class OpenAICompatibleProvider:
         )
         emitted_content_len = 0
         emitted_reasoning_len = 0
-        max_stream_attempts = 5
-        for stream_attempt in range(1, max_stream_attempts + 1):
+        accepted_kinds: set[str] = set()
+        # One `_chat_once` call owns exactly one wire request. Retry decisions are
+        # made only by `chat()` using the shared WireAttemptBudget.
+        for _single_wire_attempt in range(1):
             role = "assistant"
             content_parts: list[str] = []
             reasoning_parts: list[str] = []
@@ -588,6 +665,8 @@ class OpenAICompatibleProvider:
                 )
                 async for chunk in stream:
                     chunk_usage = getattr(chunk, "usage", None)
+                    if chunk_usage is not None:
+                        accepted_kinds.add("usage")
                     chunk_reasoning_tokens = _reasoning_tokens_from_usage(chunk_usage)
                     if chunk_reasoning_tokens is not None:
                         reasoning_tokens = chunk_reasoning_tokens
@@ -610,6 +689,7 @@ class OpenAICompatibleProvider:
                         role = delta.role
                     reasoning_piece = getattr(delta, "reasoning_content", None)
                     if reasoning_piece:
+                        accepted_kinds.add("reasoning")
                         reasoning_parts.append(reasoning_piece)
                         now = time.monotonic()
                         if on_delta is not None and now - last_reasoning_emit >= _DELTA_MIN_INTERVAL_S:
@@ -620,6 +700,7 @@ class OpenAICompatibleProvider:
                             if delta_text:
                                 on_delta("reasoning", delta_text, None)
                     if delta.content:
+                        accepted_kinds.add("content")
                         content_parts.append(delta.content)
                         now = time.monotonic()
                         if on_delta is not None and now - last_content_emit >= _DELTA_MIN_INTERVAL_S:
@@ -629,7 +710,10 @@ class OpenAICompatibleProvider:
                             last_content_emit = now
                             if delta_text:
                                 on_delta("content", delta_text, None)
-                    for tool_call_delta in delta.tool_calls or []:
+                    tool_call_deltas = delta.tool_calls or []
+                    if tool_call_deltas:
+                        accepted_kinds.add("tool_call")
+                    for tool_call_delta in tool_call_deltas:
                         entry = tool_calls_acc.setdefault(
                             tool_call_delta.index,
                             {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
@@ -644,22 +728,58 @@ class OpenAICompatibleProvider:
                             if tool_call_delta.function.arguments:
                                 entry["function"]["arguments"] += tool_call_delta.function.arguments
                 break
-            except (APIConnectionError, APITimeoutError, httpx.TransportError) as exc:
-                if stream_attempt < max_stream_attempts:
+            except APITimeoutError as exc:
+                if accepted_kinds:
                     logger.warning(
-                        "LLM stream connection error; reconnecting attempt=%d/%d error_type=%s",
-                        stream_attempt + 1,
-                        max_stream_attempts,
-                        type(exc).__name__,
+                        "LLM partial stream timeout model=%s accepted_kinds=%s",
+                        model,
+                        sorted(accepted_kinds),
                     )
-                    continue
+                    raise PartialStreamInterrupted(
+                        accepted_kinds=frozenset(accepted_kinds),
+                        wire_attempt_count=0,
+                        model=model,
+                    ) from exc
+                raise LLMError(
+                    "大模型请求超时。",
+                    error_code="provider_timeout",
+                ) from exc
+            except (APIConnectionError, httpx.TransportError) as exc:
+                if accepted_kinds:
+                    logger.warning(
+                        "LLM partial stream interrupted model=%s accepted_kinds=%s",
+                        model,
+                        sorted(accepted_kinds),
+                    )
+                    raise PartialStreamInterrupted(
+                        accepted_kinds=frozenset(accepted_kinds),
+                        wire_attempt_count=0,
+                        model=model,
+                    ) from exc
                 logger.warning("LLM stream connection error error_type=%s", type(exc).__name__)
-                raise LLMError(f"大模型流式响应中断：{exc}") from exc
+                raise LLMError(
+                    f"大模型流式响应中断：{exc}",
+                    error_code="provider_error",
+                ) from exc
             except APIStatusError as exc:
+                if accepted_kinds:
+                    logger.warning(
+                        "LLM partial stream status interruption model=%s status_code=%s "
+                        "accepted_kinds=%s",
+                        model,
+                        exc.status_code,
+                        sorted(accepted_kinds),
+                    )
+                    raise PartialStreamInterrupted(
+                        accepted_kinds=frozenset(accepted_kinds),
+                        wire_attempt_count=0,
+                        model=model,
+                    ) from exc
                 logger.warning("LLM stream status error status_code=%s", exc.status_code)
                 raise LLMError(
                     f"大模型端点返回错误（{exc.status_code}）：{exc.message}",
                     status_code=exc.status_code,
+                    error_code="provider_error",
                 ) from exc
 
         content = "".join(content_parts) or None

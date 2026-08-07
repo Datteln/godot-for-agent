@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from app.agents.bundled import get_agent
 from app.agents.types import Frame
 from app.events.store import Event
-from app.query.engine import (
+from app.query.helpers import (
     _persisted_history_events,
     _structured_history_for_frame,
     _structured_session_history,
 )
-from app.sessions.store import Session, session_from_dict, session_to_dict
+from app.sessions.store import Session, SessionStore
 
 
 def _frame() -> Frame:
@@ -148,9 +150,19 @@ class StructuredHistoryTests(unittest.TestCase):
             },
         )
 
-        restored = session_from_dict(session_to_dict(session), set())
-        events = _persisted_history_events(restored)
-        blocks = _structured_history_for_frame(restored.agent_stack[0], events)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root / "sessions", project_root=root)
+            persisted = store.get_or_create("s1", set())
+            persisted.agent_stack = session.agent_stack
+            persisted.history_events = session.history_events
+            persisted.history_event_counter = session.history_event_counter
+            store.save(persisted)
+            restored = SessionStore(root / "sessions", project_root=root).get_or_create(
+                "s1", set()
+            )
+            events = _persisted_history_events(restored)
+            blocks = _structured_history_for_frame(restored.agent_stack[0], events)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["text"], "complete reasoning")

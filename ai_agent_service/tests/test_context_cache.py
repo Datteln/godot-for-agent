@@ -32,13 +32,13 @@ from app.llm.message_transformer import (
     inject_cache_breakpoints,
 )
 from app.llm.provider import _cache_tokens_from_usage, _max_token_count
-from app.orchestrator.agent import _emit_cache_hit_event, _emit_context_usage_event, _record_cache_metrics
+from app.orchestrator.map_turn import _emit_cache_hit_event, _emit_context_usage_event, _record_cache_metrics
 from app.prompt.builder import LayeredPrompt, build_layered_system_prompt
 from app.prompt.project_context import build_project_context
 from app.prompt.rag_context import build_rag_context
 from app.rag.index import CodebaseIndex
 from app.security.settings import SecuritySettings
-from app.sessions.store import Session, session_from_dict, session_to_dict
+from app.sessions.store import Session, SessionStore
 
 _LONG = "x" * (EXPLICIT_CACHE_FALLBACK_TOKENS * 4 + 16)
 
@@ -490,13 +490,19 @@ class RagContextTests(unittest.TestCase):
 
 class SessionRagContextRoundTripTests(unittest.TestCase):
     def test_rag_context_survives_serialization(self) -> None:
-        session = Session(session_id="s1", rag_context="相关代码片段……\n--- a.gd:1-2 ---\ncode")
-        restored = session_from_dict(session_to_dict(session), set())
-        self.assertEqual(restored.rag_context, session.rag_context)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root / "sessions", project_root=root)
+            session = store.get_or_create("s1", set())
+            session.rag_context = "相关代码片段……\n--- a.gd:1-2 ---\ncode"
+            store.save(session)
+            restored = SessionStore(root / "sessions", project_root=root).get_or_create(
+                "s1", set()
+            )
+            self.assertEqual(restored.rag_context, session.rag_context)
 
     def test_rag_context_defaults_empty(self) -> None:
-        restored = session_from_dict({"session_id": "s1"}, set())
-        self.assertEqual(restored.rag_context, "")
+        self.assertEqual(Session(session_id="s1").rag_context, "")
 
 
 class EmitCacheHitEventTests(unittest.TestCase):

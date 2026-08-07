@@ -1,4 +1,4 @@
-"""Session compact implementation split out of QueryEngine."""
+"""Session compact implementation split out of AgentApplication."""
 
 from __future__ import annotations
 

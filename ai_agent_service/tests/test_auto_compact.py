@@ -1,22 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from app.agents.bundled import get_agent
 from app.agents.types import Frame
+from app.application.context_service import SessionContextService
 from app.config import AppSettings
 from app.events.store import EventStore
+from app.llm.cache_decision_engine import CacheDecisionEngine
 from app.llm.message_transformer import estimate_message_tokens
 from app.llm.provider import AssistantTurn, LLMProvider
-from app.query.engine import QueryEngine
 from app.sessions.store import Session, SessionStore
 
 
 class _StubLLMProvider(LLMProvider):
-    """`run_turn` 不会被这些测试触发，仅满足构造函数类型要求。"""
+    """`TurnDriver.run` 不会被这些测试触发，仅满足构造函数类型要求。"""
 
     @property
     def supports_tool_calling(self) -> bool:
@@ -30,7 +33,16 @@ class _StubLLMProvider(LLMProvider):
         raise AssertionError("not expected to be called in these tests")
 
 
-def _make_engine(tmp_dir: str, *, threshold: int = 60_000, keep_recent: int = 12) -> QueryEngine:
+@dataclass(frozen=True)
+class _ContextRig:
+    service: SessionContextService
+    settings: AppSettings
+    store: SessionStore
+    events: EventStore
+    available_tools: set[str]
+
+
+def _make_engine(tmp_dir: str, *, threshold: int = 60_000, keep_recent: int = 12) -> _ContextRig:
     settings = AppSettings(
         llm_base_url="http://localhost",
         project_root=Path(tmp_dir),
@@ -38,11 +50,38 @@ def _make_engine(tmp_dir: str, *, threshold: int = 60_000, keep_recent: int = 12
         auto_compact_keep_recent=keep_recent,
     )
     store = SessionStore(Path(tmp_dir) / "sessions")
-    return QueryEngine(
+    events = EventStore()
+    available_tools: set[str] = set()
+    service = SessionContextService(
         settings=settings,
-        session_store=store,
+        store=store,
         llm=_StubLLMProvider(),
-        event_store=EventStore(),
+        cache_engine=CacheDecisionEngine(),
+        emit=lambda session_id, event_type, payload: events.append(
+            session_id,
+            event_type,
+            payload,
+            session_epoch=store.current_epoch(session_id, create=False),
+        ).seq,
+        available_tools=lambda: available_tools,
+    )
+    return _ContextRig(service, settings, store, events, available_tools)
+
+
+def _compact(
+    engine: _ContextRig,
+    session_id: str,
+    *,
+    triggered_by: str = "manual",
+) -> dict[str, Any]:
+    """Drive the canonical async compaction boundary from synchronous tests."""
+    return asyncio.run(
+        engine.service.compact(
+            session_id,
+            keep_recent=engine.settings.auto_compact_keep_recent,
+            triggered_by=triggered_by,
+            use_llm=False,
+        )
     )
 
 
@@ -60,13 +99,13 @@ class NeedsAutoCompactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             engine = _make_engine(tmp, threshold=60_000)
             session = Session(session_id="s1", agent_stack=[_frame_with_messages(4)])
-            self.assertFalse(engine._needs_auto_compact(session))
+            self.assertFalse(engine.service.needs_auto_compact(session))
 
     def test_true_when_any_frame_exceeds_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             engine = _make_engine(tmp, threshold=1000)
             session = Session(session_id="s1", agent_stack=[_frame_with_messages(20, big=True)])
-            self.assertTrue(engine._needs_auto_compact(session))
+            self.assertTrue(engine.service.needs_auto_compact(session))
 
     def test_false_when_disabled_threshold_not_checked_by_caller(self) -> None:
         # `_needs_auto_compact` itself doesn't read `auto_compact_enabled` — that
@@ -75,8 +114,8 @@ class NeedsAutoCompactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             engine = _make_engine(tmp, threshold=1000)
             session = Session(session_id="s1", agent_stack=[_frame_with_messages(20, big=True)])
-            engine._settings.auto_compact_enabled = False
-            self.assertTrue(engine._needs_auto_compact(session))
+            engine.settings.auto_compact_enabled = False
+            self.assertTrue(engine.service.needs_auto_compact(session))
 
     def test_checks_all_frames_not_just_top(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,28 +123,28 @@ class NeedsAutoCompactTests(unittest.TestCase):
             small = _frame_with_messages(2)
             big = _frame_with_messages(20, big=True)
             session = Session(session_id="s1", agent_stack=[big, small])
-            self.assertTrue(engine._needs_auto_compact(session))
+            self.assertTrue(engine.service.needs_auto_compact(session))
 
 
 class CompactTriggeredByTests(unittest.TestCase):
     def test_manual_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             engine = _make_engine(tmp)
-            session = engine._store.get_or_create("s1", engine.available_tools)
+            session = engine.store.get_or_create("s1", engine.available_tools)
             session.agent_stack = [_frame_with_messages(20)]
-            result = engine._compact_locked("s1")
+            result = _compact(engine, "s1")
             self.assertIsInstance(result, dict)
-            events = engine._events.list_after("s1", 0) if engine._events else []
+            events = engine.events.list_after("s1", 0)
             payload = next(e.payload for e in events if e.type == "compact_boundary")
             self.assertEqual(payload["triggered_by"], "manual")
 
     def test_auto_label_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             engine = _make_engine(tmp)
-            session = engine._store.get_or_create("s1", engine.available_tools)
+            session = engine.store.get_or_create("s1", engine.available_tools)
             session.agent_stack = [_frame_with_messages(20)]
-            engine._compact_locked("s1", triggered_by="auto")
-            events = engine._events.list_after("s1", 0) if engine._events else []
+            _compact(engine, "s1", triggered_by="auto")
+            events = engine.events.list_after("s1", 0)
             payload = next(e.payload for e in events if e.type == "compact_boundary")
             self.assertEqual(payload["triggered_by"], "auto")
 
@@ -114,10 +153,10 @@ class CompactTriggeredByTests(unittest.TestCase):
         # "正在压缩"显示在压缩完成之后，体验上是反的。
         with tempfile.TemporaryDirectory() as tmp:
             engine = _make_engine(tmp)
-            session = engine._store.get_or_create("s1", engine.available_tools)
+            session = engine.store.get_or_create("s1", engine.available_tools)
             session.agent_stack = [_frame_with_messages(20)]
-            engine._compact_locked("s1", triggered_by="auto")
-            events = engine._events.list_after("s1", 0)
+            _compact(engine, "s1", triggered_by="auto")
+            events = engine.events.list_after("s1", 0)
             types = [e.type for e in events if e.type in ("compact_started", "compact_boundary")]
             self.assertEqual(types, ["compact_started", "compact_boundary"])
             started_payload = next(e.payload for e in events if e.type == "compact_started")
@@ -128,8 +167,8 @@ class CompactTriggeredByTests(unittest.TestCase):
 class OversizedSingleMessageCompactionTests(unittest.TestCase):
     """复现并验证修复：消息数 < keep_recent+2 但单条消息超大时不再是空压缩。"""
 
-    def _session_with_oversized_message(self, engine: QueryEngine, *, oversized_at: int, total: int) -> Session:
-        session = engine._store.get_or_create("s1", engine.available_tools)
+    def _session_with_oversized_message(self, engine: _ContextRig, *, oversized_at: int, total: int) -> Session:
+        session = engine.store.get_or_create("s1", engine.available_tools)
         messages: list[dict[str, Any]] = [{"role": "system", "content": "system prompt"}]
         for i in range(total):
             role = "user" if i % 2 == 0 else "assistant"
@@ -144,9 +183,9 @@ class OversizedSingleMessageCompactionTests(unittest.TestCase):
             # 总共 6 条消息（远低于 keep_recent=12 的 14 条门槛），中间一条 20000 字符。
             session = self._session_with_oversized_message(engine, oversized_at=2, total=6)
             before = estimate_message_tokens(session.agent_stack[0].messages)
-            self.assertTrue(engine._needs_auto_compact(session))
+            self.assertTrue(engine.service.needs_auto_compact(session))
 
-            result = engine._compact_locked("s1", triggered_by="auto")
+            result = _compact(engine, "s1", triggered_by="auto")
 
             self.assertEqual(result["compacted_frames"], 0)  # too few messages for history-summary path
             self.assertGreater(result["truncated_messages"], 0)
@@ -157,8 +196,8 @@ class OversizedSingleMessageCompactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             engine = _make_engine(tmp)
             self._session_with_oversized_message(engine, oversized_at=2, total=6)
-            first = engine._compact_locked("s1", triggered_by="auto")
-            second = engine._compact_locked("s1", triggered_by="auto")
+            first = _compact(engine, "s1", triggered_by="auto")
+            second = _compact(engine, "s1", triggered_by="auto")
             self.assertGreater(first["truncated_messages"], 0)
             self.assertEqual(second["truncated_messages"], 0)  # already shrunk, idempotent
 
@@ -168,7 +207,7 @@ class OversizedSingleMessageCompactionTests(unittest.TestCase):
             session = self._session_with_oversized_message(engine, oversized_at=5, total=6)
             frame = session.agent_stack[0]
             original_last = frame.messages[-1]["content"]
-            engine._compact_locked("s1", triggered_by="auto")
+            _compact(engine, "s1", triggered_by="auto")
             self.assertEqual(frame.messages[-1]["content"], original_last)
 
 

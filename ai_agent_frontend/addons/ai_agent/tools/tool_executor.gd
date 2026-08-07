@@ -146,7 +146,7 @@ func execute(tool_call: Dictionary) -> Dictionary:
 	# ── 排查日志：记录原始 tool_call 结构 ──
 	var _raw_id := tool_call.get("id", "")
 	var _raw_frame_id := tool_call.get("frame_id", "")
-	FrontendLogger.info(editor_interface, "ToolExecutor", "execute() entry — raw tool_call inspection.", {
+	FrontendLogger.debug(editor_interface, "ToolExecutor", "execute() entry — raw tool_call inspection.", {
 		"tool": name,
 		"call_keys": tool_call.keys(),
 		"id_present": tool_call.has("id"),
@@ -472,7 +472,7 @@ func execute(tool_call: Dictionary) -> Dictionary:
 	# ── 排查日志：记录即将传给 AgentDTO 的元数据 ──
 	var _dto_tool_use_id := str(tool_call.get("id", ""))
 	var _dto_frame_id := str(tool_call.get("frame_id", ""))
-	FrontendLogger.info(editor_interface, "ToolExecutor", "execute() exit — DTO metadata check.", {
+	FrontendLogger.debug(editor_interface, "ToolExecutor", "execute() exit — DTO metadata check.", {
 		"tool": name,
 		"ok": result.get("ok", true),
 		"dto_tool_use_id": _dto_tool_use_id,

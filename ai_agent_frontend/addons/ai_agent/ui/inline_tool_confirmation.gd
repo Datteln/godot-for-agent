@@ -1,14 +1,10 @@
 @tool
 extends RefCounted
 
-const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_renderer.gd")
-
 const HIGH_RISK_TOOLS := ["run_tests", "run_headless_self_test", "set_project_setting", "batch_rename", "open_scene", "add_autoload", "remove_autoload", "add_input_action", "remove_input_action"]
 
 var confirm_box: Control
 var _checkboxes: Array[CheckBox] = []
-var _previews: Array[Control] = []
-var _diff_stats: Array[Dictionary] = []
 var _always_allow: CheckBox
 var _apply_btn: Button
 var _reject_btn: Button
@@ -47,18 +43,10 @@ func show(
 		var item := HBoxContainer.new()
 		item.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		var checkbox := CheckBox.new()
-		checkbox.text = str(ui_text.get("apply", "Apply"))
+		checkbox.text = "%s: %s" % [str(ui_text.get("apply", "Apply")), str(call.get("name", "tool"))]
 		checkbox.button_pressed = true
 		_checkboxes.append(checkbox)
 		item.add_child(checkbox)
-		var preview := ToolPreviewRenderer.render_call(call, theme_colors)
-		preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		item.add_child(preview)
-		_previews.append(preview)
-		if ToolPreviewRenderer.infer_render_kind(call) == "diff":
-			_diff_stats.append(ToolPreviewRenderer.diff_stats(call))
-		else:
-			_diff_stats.append({})
 		body.add_child(item)
 		body.add_child(HSeparator.new())
 
@@ -90,8 +78,6 @@ func clear_ui() -> void:
 		confirm_box.queue_free()
 	confirm_box = null
 	_checkboxes.clear()
-	_previews.clear()
-	_diff_stats.clear()
 	_busy = false
 
 
@@ -109,18 +95,6 @@ func is_busy() -> bool:
 
 func should_apply(index: int) -> bool:
 	return index < _checkboxes.size() and _checkboxes[index].button_pressed
-
-
-func preview_for(index: int, is_workflow: bool) -> Control:
-	if not is_workflow or index >= _previews.size():
-		return null
-	return _previews[index]
-
-
-func diff_stats_for(index: int, is_workflow: bool) -> Dictionary:
-	if not is_workflow or index >= _diff_stats.size():
-		return {}
-	return _diff_stats[index]
 
 
 func grant_session_allow() -> bool:

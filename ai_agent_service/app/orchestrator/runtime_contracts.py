@@ -64,28 +64,6 @@ class SkillBindingResult:
 
 
 @dataclass(frozen=True)
-class MapWorkflowEvent:
-    """表示作用于地图执行范围或 workflow 身份的唯一状态变更事实。"""
-
-    event_id: str
-    event_type: str
-    target: str
-    revision: int
-    payload: dict[str, Any] = field(default_factory=dict)
-    request_id: str | None = None
-    turn_id: str | None = None
-
-    @property
-    def scope_key(self) -> str:
-        """返回事件所属的规范执行范围或 workflow 作用域键。"""
-        return f"{self.target.strip()}::revision={self.revision}"
-
-    def to_dict(self) -> dict[str, Any]:
-        """转换为可追加到 Session 的事件记录。"""
-        return asdict(self)
-
-
-@dataclass(frozen=True)
 class FrameContractViolation:
     """记录子 Frame 偏离创建时冻结接口合同的原因。"""
 

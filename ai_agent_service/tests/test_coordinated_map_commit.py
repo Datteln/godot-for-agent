@@ -19,7 +19,7 @@ from app.orchestrator.map_progress import (
     MapTaskState,
     consume_committed_platform_approvals,
 )
-from app.query.engine import QueryEngine
+from app.application.composition import build_application_use_cases
 from app.sessions.store import Session, SessionStore, session_to_dict
 from app.tools.front_tools import register_front_tools
 from app.tools.registry import REGISTRY
@@ -67,6 +67,7 @@ def _staged_turn(
 def _session_with_locator(
     artifact_store: MapArtifactStore,
     staged: StagedMapArtifactTurn,
+    session: Session,
 ) -> Session:
     """构造只引用 staged turn 精确指纹的待发布 Session。"""
     entry = staged.entries["tool-1"]
@@ -75,20 +76,18 @@ def _session_with_locator(
         "tool-1",
         str(entry["fingerprint"]),
     ).as_dict()
-    return Session(
-        session_id=staged.session_id,
-        turn_counter=int(staged.turn_id.removeprefix("t")),
-        pending_tool_calls={"tool-1": {"map_artifact": locator}},
-        history_events=[
-            {
-                "seq": 1,
-                "event_type": "tool_result",
-                "payload": {"tool_use_id": "tool-1"},
-            }
-        ],
-        history_event_counter=1,
-        session_allow={("describe_map_region", "map", "fingerprint", "")},
-    )
+    session.turn_counter = int(staged.turn_id.removeprefix("t"))
+    session.pending_tool_calls = {"tool-1": {"map_artifact": locator}}
+    session.history_events = [
+        {
+            "seq": 1,
+            "event_type": "tool_result",
+            "payload": {"tool_use_id": "tool-1"},
+        }
+    ]
+    session.history_event_counter = 1
+    session.session_allow = {("describe_map_region", "map", "fingerprint", "")}
+    return session
 
 
 def _execute_until_exit(
@@ -99,13 +98,20 @@ def _execute_until_exit(
     """按 artifact-first 顺序执行，直到命名边界模拟进程退出。"""
     injector = _NamedExitInjector(failpoint)
     staged = _staged_turn()
+    session_store = SessionStore(sessions_root, project_root=project_root)
+    current_session = session_store.get_or_create(staged.session_id, set())
+    staged.session_epoch = current_session.session_epoch
     artifact_store = MapArtifactStore(
         project_root,
         staged.session_id,
         injector,
+        current_session.session_epoch,
     )
-    session = _session_with_locator(artifact_store, staged)
-    session_store = SessionStore(sessions_root, project_root=project_root)
+    session = _session_with_locator(
+        artifact_store,
+        staged,
+        current_session,
+    )
     try:
         artifact_store.prepare_turn(staged)
         injector.hit("session_publish_before_write")
@@ -129,7 +135,11 @@ def test_every_coordinated_commit_boundary_reconciles_without_dangling_locator(
 
     restarted_store = SessionStore(sessions_root, project_root=tmp_path)
     restored = restarted_store.get_or_create(staged.session_id, set())
-    artifact_store = MapArtifactStore(tmp_path, staged.session_id)
+    artifact_store = MapArtifactStore(
+        tmp_path,
+        staged.session_id,
+        session_epoch=restored.session_epoch,
+    )
     artifact_store.reconcile_with_session(session_to_dict(restored))
 
     locator_value = restored.pending_tool_calls.get("tool-1", {}).get(
@@ -162,7 +172,7 @@ def test_every_coordinated_commit_boundary_reconciles_without_dangling_locator(
 def test_production_composition_has_no_enabled_failpoint() -> None:
     """验证 production 默认构造不携带任何 failpoint 实现。"""
     store = MapArtifactStore(Path.cwd(), "session-1")
-    parameter = inspect.signature(QueryEngine.__init__).parameters[
+    parameter = inspect.signature(build_application_use_cases).parameters[
         "coordinated_commit_failure_injector"
     ]
 
@@ -223,12 +233,23 @@ def test_restart_advances_counter_past_every_reserved_artifact_turn(
 ) -> None:
     """验证重启会把 Session 计数器提升到 artifact 已占用 turn 之后。"""
     sessions_root = tmp_path / ".ai_agent_service" / "sessions"
-    artifact_store = MapArtifactStore(tmp_path, "session-1")
     staged = _staged_turn(turn_id="t5")
+    store = SessionStore(sessions_root, project_root=tmp_path)
+    current_session = store.get_or_create(staged.session_id, set())
+    staged.session_epoch = current_session.session_epoch
+    artifact_store = MapArtifactStore(
+        tmp_path,
+        "session-1",
+        session_epoch=current_session.session_epoch,
+    )
     artifact_store.prepare_turn(staged)
-    low_session = _session_with_locator(artifact_store, staged)
+    low_session = _session_with_locator(
+        artifact_store,
+        staged,
+        current_session,
+    )
     low_session.turn_counter = 2
-    SessionStore(sessions_root, project_root=tmp_path).save(low_session)
+    store.save(low_session)
     artifact_store.commit_prepared_turn(staged)
 
     restarted = SessionStore(
@@ -245,13 +266,25 @@ def test_conflicting_turn_returns_typed_failure_and_retry_uses_fresh_turn(
 ) -> None:
     """验证异指纹冲突保留原提交，并允许更大 turn id 的干净重试。"""
     sessions_root = tmp_path / ".ai_agent_service" / "sessions"
-    artifact_store = MapArtifactStore(tmp_path, "session-1")
     committed = _staged_turn(turn_id="t3", value=3)
+    store = SessionStore(sessions_root, project_root=tmp_path)
+    current_session = store.get_or_create(committed.session_id, set())
+    committed.session_epoch = current_session.session_epoch
+    artifact_store = MapArtifactStore(
+        tmp_path,
+        "session-1",
+        session_epoch=current_session.session_epoch,
+    )
     artifact_store.prepare_turn(committed)
-    session = _session_with_locator(artifact_store, committed)
-    SessionStore(sessions_root, project_root=tmp_path).save(session)
+    session = _session_with_locator(
+        artifact_store,
+        committed,
+        current_session,
+    )
+    store.save(session)
     artifact_store.commit_prepared_turn(committed)
     conflicting = _staged_turn(turn_id="t3", value=99)
+    conflicting.session_epoch = current_session.session_epoch
 
     with pytest.raises(MapArtifactTurnConflictError) as captured:
         artifact_store.prepare_turn(conflicting)

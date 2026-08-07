@@ -3,7 +3,7 @@
 把"用哪种缓存策略"、"标记哪些断点"、"这次前缀相对上一轮是否稳定"集中到这里：
 `provider.py` 只负责按给定断点改写消息，`message_transformer.py` 只负责断点定位
 算法，`cache_manager.py` 只负责指纹计算，本模块组合三者产出单一决策，供
-`orchestrator/agent.py::run_turn` 直接消费。
+`orchestrator/turn/driver.py::TurnDriver.run` 直接消费。
 
 策略采用三级降级（文档 3.10），把 token 阈值从"核心判断"降级为"兜底保护"：
 - 前缀稳定（本帧上一轮见过同一缓存键）→ 显式缓存（注入 `cache_control` 断点），

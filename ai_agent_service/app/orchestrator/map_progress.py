@@ -155,7 +155,8 @@ class MapTaskState:
     pause_reason: str = ""
     pause_report: dict[str, Any] = field(default_factory=dict)
     workflow_schema_version: int = 1
-    workflow_events: list[dict[str, Any]] = field(default_factory=list)
+    workflow_high_water_seq: int = 0
+    pending_workflow_events: list[dict[str, Any]] = field(default_factory=list, repr=False)
     workflow_scopes: dict[str, dict[str, Any]] = field(default_factory=dict)
     evidence_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
     retry_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -331,7 +332,9 @@ class MapTaskState:
 
     def to_dict(self) -> dict[str, Any]:
         """将任务状态转换为 JSON 可序列化字典。"""
-        return asdict(self)
+        payload = asdict(self)
+        payload.pop("pending_workflow_events", None)
+        return payload
 
     def task_epoch_reset_values(self) -> dict[str, Any]:
         """按字段生命周期元数据生成新任务 epoch 的完整默认值。"""
@@ -414,7 +417,7 @@ class MapTaskState:
             "pending_batches",
             "executed_batches",
             "completion_blockers",
-            "workflow_events",
+            "pending_workflow_events",
             "transaction_journals",
         ):
             if not isinstance(data.get(key), list):
@@ -427,21 +430,12 @@ class MapTaskState:
             data["stage"] = "read"
         if data.get("pause_kind") not in _MAP_PAUSE_KINDS:
             data["pause_kind"] = ""
-        legacy_resume = value.get("resumed_from_checkpoint")
-        if (
-            "resume_authorization" not in data
-            and legacy_resume is True
-            and isinstance(data.get("task_id"), str)
-            and data["task_id"]
-        ):
-            data["resume_authorization"] = {
-                "task_id": data["task_id"],
-                "lineage_id": data["task_id"],
-            }
         if not isinstance(data.get("resume_authorization"), dict):
             data["resume_authorization"] = None
-        _migrate_legacy_workflow_scope_data(data)
-        _migrate_legacy_planning_contexts(data)
+        high_water = data.get("workflow_high_water_seq", 0)
+        if isinstance(high_water, bool) or not isinstance(high_water, int) or high_water < 0:
+            raise ValueError("workflow_high_water_seq must be a non-negative integer")
+        data["pending_workflow_events"] = []
         return cls(**data)
 
     def make_checkpoint(
@@ -516,73 +510,6 @@ class MapTaskState:
         return checkpoint
 
 
-def _migrate_legacy_workflow_scope_data(data: dict[str, Any]) -> None:
-    """在构造 live state 前把旧投影迁移为 revision scope。"""
-    scopes = data.get("workflow_scopes")
-    if isinstance(scopes, dict) and scopes:
-        return
-    latest_revisions = data.get("latest_revisions")
-    latest_validations = data.get("latest_validations")
-    blockers = data.get("completion_blockers")
-    if not isinstance(latest_revisions, dict):
-        latest_revisions = {}
-    if not isinstance(latest_validations, dict):
-        latest_validations = {}
-    if not isinstance(blockers, list):
-        blockers = []
-    migrated_scopes: dict[str, dict[str, Any]] = {}
-    targets = set(latest_revisions) | set(latest_validations)
-    for target_value in sorted(targets, key=str):
-        target = str(target_value)
-        if "::" in target:
-            continue
-        revision = latest_revisions.get(target_value)
-        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-            continue
-        scope: dict[str, Any] = {
-            "target": target,
-            "revision": revision,
-            "stage": str(data.get("stage", "read")),
-        }
-        validation = latest_validations.get(target_value)
-        if isinstance(validation, dict) and validation.get("map_revision") == revision:
-            scope["validation"] = deepcopy(validation)
-        scoped_blockers = [
-            deepcopy(item)
-            for item in blockers
-            if isinstance(item, dict)
-            and str(item.get("target", target)) == target
-            and item.get("required_revision") in {None, revision}
-        ]
-        if scoped_blockers:
-            scope["blockers"] = scoped_blockers
-        migrated_scopes[map_workflow_scope_key(target, revision)] = scope
-    data["workflow_scopes"] = migrated_scopes
-
-
-def _migrate_legacy_planning_contexts(data: dict[str, Any]) -> None:
-    """把旧单快照注册表迁移为可独立刷新的规划上下文集合。"""
-    contexts = data.get("planning_contexts")
-    bundles = data.get("planning_context_bundles")
-    if isinstance(contexts, dict) and contexts:
-        if not isinstance(bundles, dict):
-            data["planning_context_bundles"] = {}
-        return
-    snapshots = data.get("authoritative_snapshots")
-    migrated: dict[str, dict[str, Any]] = {}
-    if isinstance(snapshots, dict):
-        for snapshot in snapshots.values():
-            if not isinstance(snapshot, dict):
-                continue
-            try:
-                entry = MapPlanningContextEntry.from_snapshot(snapshot)
-            except MapPlanningContextError:
-                continue
-            migrated[entry.context_id] = entry.to_dict()
-    data["planning_contexts"] = migrated
-    data["planning_context_bundles"] = dict(bundles) if isinstance(bundles, dict) else {}
-
-
 MAP_TASK_FIELD_LIFECYCLE: Final[dict[str, MapTaskFieldLifecycle]] = {
     "task_id": MapTaskFieldLifecycle("task"),
     "task_lineage_id": MapTaskFieldLifecycle("task"),
@@ -625,7 +552,8 @@ MAP_TASK_FIELD_LIFECYCLE: Final[dict[str, MapTaskFieldLifecycle]] = {
     "pause_reason": MapTaskFieldLifecycle("task"),
     "pause_report": MapTaskFieldLifecycle("task"),
     "workflow_schema_version": MapTaskFieldLifecycle("session"),
-    "workflow_events": MapTaskFieldLifecycle("session"),
+    "workflow_high_water_seq": MapTaskFieldLifecycle("session"),
+    "pending_workflow_events": MapTaskFieldLifecycle("session"),
     "workflow_scopes": MapTaskFieldLifecycle("revision"),
     "evidence_registry": MapTaskFieldLifecycle("revision"),
     "retry_registry": MapTaskFieldLifecycle("task"),

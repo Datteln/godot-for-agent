@@ -11,6 +11,12 @@ const MAX_REFERENCED_FILES := 8
 const MAX_REFERENCED_FILE_CHARS := 40000
 
 var editor_interface: EditorInterface
+var _project_files_cache: Array = []
+var _project_files_dirty := true
+
+
+func _ready() -> void:
+	_connect_editor_filesystem_signals()
 
 
 func collect(domain_hint: String = "any", referenced_paths: Array = []) -> Dictionary:
@@ -25,7 +31,7 @@ func collect(domain_hint: String = "any", referenced_paths: Array = []) -> Dicti
 		"referenced_files": _collect_referenced_files(referenced_paths),
 		"scene_tree": _collect_scene_tree(),
 		"tile_catalog": _collect_tile_catalog(),
-		"project_files": _collect_project_files(),
+		"project_files": project_files(),
 		"debugger_errors": _collect_debugger_errors(diagnostics),
 		"diagnostics": diagnostics,
 		"dotnet_enabled": _dotnet_enabled(),
@@ -34,13 +40,59 @@ func collect(domain_hint: String = "any", referenced_paths: Array = []) -> Dicti
 
 
 func _collect_project_files() -> Array:
+	if editor_interface != null:
+		var filesystem := editor_interface.get_resource_filesystem()
+		if filesystem != null:
+			var files: Array = []
+			_scan_editor_filesystem(filesystem.get_filesystem(), files)
+			return files
 	var files: Array = []
 	_scan_project_dir("res://", files, 0)
 	return files
 
 
 func project_files() -> Array:
-	return _collect_project_files()
+	if _project_files_dirty:
+		_project_files_cache = _collect_project_files()
+		_project_files_dirty = false
+	return _project_files_cache.duplicate()
+
+
+func _connect_editor_filesystem_signals() -> void:
+	if editor_interface == null:
+		return
+	var filesystem := editor_interface.get_resource_filesystem()
+	if filesystem == null:
+		return
+	for signal_name in ["filesystem_changed", "resources_reimported", "sources_changed"]:
+		if filesystem.has_signal(signal_name) and not filesystem.is_connected(
+			signal_name,
+			_mark_project_files_dirty
+		):
+			filesystem.connect(signal_name, _mark_project_files_dirty)
+
+
+func _mark_project_files_dirty(_arg1: Variant = null, _arg2: Variant = null) -> void:
+	_project_files_dirty = true
+
+
+func _scan_editor_filesystem(directory: EditorFileSystemDirectory, out: Array) -> void:
+	if directory == null or out.size() >= MAX_PROJECT_FILES:
+		return
+	for file_index in range(directory.get_file_count()):
+		var path := directory.get_file_path(file_index)
+		if _is_project_file(path):
+			out.append(path)
+			if out.size() >= MAX_PROJECT_FILES:
+				return
+	for directory_index in range(directory.get_subdir_count()):
+		var child := directory.get_subdir(directory_index)
+		var child_path := child.get_path()
+		if child_path.begins_with("res://addons/"):
+			continue
+		_scan_editor_filesystem(child, out)
+		if out.size() >= MAX_PROJECT_FILES:
+			return
 
 
 func _collect_referenced_files(paths: Array) -> Array:

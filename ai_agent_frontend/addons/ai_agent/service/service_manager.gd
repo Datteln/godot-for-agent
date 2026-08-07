@@ -53,6 +53,12 @@ func start() -> void:
 		return
 
 	ConfigMigrations.apply_defaults(editor_interface)
+	var policy_errors := ConfigMigrations.validate_operational_settings(editor_interface)
+	if not policy_errors.is_empty():
+		var message := "Invalid AI Agent operational settings: " + "; ".join(policy_errors)
+		FrontendLogger.error(editor_interface, "Service", message)
+		service_failed.emit(message)
+		return
 	base_url = str(ConfigMigrations.get_value(editor_interface, "ai_agent/service_url"))
 	token = _generate_token()
 

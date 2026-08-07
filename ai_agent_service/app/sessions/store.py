@@ -21,19 +21,20 @@ from typing import Any, Literal
 
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, CompactSnapshot, Frame
-from app.orchestrator.frame_contract_types import DomainOwnerContract
-from app.orchestrator.map_contracts import MAP_WORKER_RESULT_SCHEMA
 from app.orchestrator.map_progress import MapTaskState
 from app.orchestrator.map_request_scope import MapRequestScope
 from app.orchestrator.map_workers import restore_project_agent
 from app.permissions.engine import SessionAllowGrant
 from app.sessions.resource_registry import RESET_FAILPOINTS, ResetFailureInjector
 from app.sessions.schema import (
+    SESSION_SCHEMA_EPOCH,
     SESSION_SCHEMA_VERSION,
-    migrate_session_payload,
-    session_payload_version,
+    UnsupportedSessionSchemaError,
+    validate_session_payload,
 )
 from app.storage.atomic import atomic_write_json
+from app.workflow.contracts import WorkflowIntegrityError
+from app.workflow.store import WorkflowStore
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +57,8 @@ class Session:
         turn_counter: `turn_id` 生成计数器。
         frame_counter: `frame_id` 生成计数器。
         request_id_cache: `request_id` → 上次响应体，用于请求级幂等（§14.1）。
-        completed_tool_turn_cache: 已处理工具结果的 turn id → 结果指纹与响应体；
-            客户端更换 request_id 重试同一批结果时仍返回第一次响应。
+        completed_turn_ledger: 当前 epoch 已提交工具结果的紧凑权威身份。
+        completed_response_hot_cache: 可淘汰的完整响应热缓存；账本身份不随之淘汰。
         pending_tool_calls: pending tool_call_id → tool metadata，用于工具结果回填、
             enrich 与会话级 allow 授权。
         session_allow: 本会话内"总是允许"的授权集合，不跨会话持久化到项目配置。
@@ -96,9 +97,12 @@ class Session:
     turn_counter: int = 0
     frame_counter: int = 0
     request_id_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # 已处理工具结果的 turn id → 结果指纹与响应体；
-    # 客户端更换 request_id 重试同一批工具结果时，直接返回首次响应而不重复执行
-    completed_tool_turn_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 已提交 turn 的紧凑身份是权威；完整响应仅作为有界热缓存。
+    completed_turn_ledger: dict[str, dict[str, Any]] = field(default_factory=dict)
+    completed_response_hot_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    workflow_lineage: str = ""
+    workflow_manifest_digest: str = ""
+    workflow_manifest_generation: int = 0
     pending_tool_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
     session_allow: set[SessionAllowGrant] = field(default_factory=set)
     effort: str = "standard"
@@ -106,6 +110,8 @@ class Session:
     delegate_groups: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_plan: dict[str, Any] | None = None
     verify_retry_count: dict[str, int] = field(default_factory=dict)
+    verify_attempts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    verify_state: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_verify_candidates: list[dict[str, Any]] = field(default_factory=list)
     pending_map_write_after_read: dict[str, Any] | None = None
     pending_map_validation_after_read: dict[str, Any] | None = None
@@ -505,8 +511,8 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         仅含 JSON 原生类型的字典。
     """
     return {
-        # 持久化 schema 版本：供 migrate_session_payload 判断是否需要升级
         "schema_version": SESSION_SCHEMA_VERSION,
+        "schema_epoch": SESSION_SCHEMA_EPOCH,
         "session_id": session.session_id,
         "session_epoch": session.session_epoch,
         "agent_stack": [_frame_to_dict(f) for f in session.agent_stack],
@@ -515,7 +521,14 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "turn_counter": session.turn_counter,
         "frame_counter": session.frame_counter,
         "request_id_cache": session.request_id_cache,
-        "completed_tool_turn_cache": session.completed_tool_turn_cache,
+        "completed_turn_ledger": session.completed_turn_ledger,
+        "completed_response_hot_cache": session.completed_response_hot_cache,
+        "workflow": {
+            "schema_epoch": SESSION_SCHEMA_EPOCH,
+            "lineage": session.workflow_lineage,
+            "manifest_digest": session.workflow_manifest_digest,
+            "generation": session.workflow_manifest_generation,
+        },
         "pending_tool_calls": session.pending_tool_calls,
         "session_allow": [list(grant) for grant in sorted(session.session_allow)],
         "effort": session.effort,
@@ -523,13 +536,14 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "delegate_groups": session.delegate_groups,
         "pending_plan": session.pending_plan,
         "verify_retry_count": session.verify_retry_count,
+        "verify_attempts": session.verify_attempts,
+        "verify_state": session.verify_state,
         "pending_verify_candidates": session.pending_verify_candidates,
         "pending_map_write_after_read": session.pending_map_write_after_read,
         "pending_map_validation_after_read": session.pending_map_validation_after_read,
         "pending_map_tool_after_read": session.pending_map_tool_after_read,
         "latest_context_used_tokens": session.latest_context_used_tokens,
         "force_compact_next_turn": session.force_compact_next_turn,
-        "map_task_state": session.map_task_state.to_dict(),
         "map_request_scope": session.map_request_scope.to_dict(),
         "map_task_lineage": session.map_task_lineage,
         "history_event_counter": session.history_event_counter,
@@ -560,109 +574,12 @@ def _as_int(value: Any, default: int = 0) -> int:
     return default
 
 
-def _macro_owner_link(
-    pending_plan: dict[str, Any] | None,
-    owner_frame_id: str,
-) -> tuple[str, str] | None:
-    """从持久化 macro 状态查找 owner 的 step/domain-task 链接。"""
-    if not isinstance(pending_plan, dict):
-        return None
-    raw_state = pending_plan.get("macro_plan_state")
-    raw_steps = raw_state.get("steps") if isinstance(raw_state, dict) else None
-    if not isinstance(raw_steps, dict):
-        return None
-    for step_id, raw_step in raw_steps.items():
-        if not isinstance(raw_step, dict):
-            continue
-        if raw_step.get("owner_frame_id") != owner_frame_id:
-            continue
-        domain_task_id = raw_step.get("domain_task_id")
-        if isinstance(step_id, str) and isinstance(domain_task_id, str):
-            return step_id, domain_task_id
-    return None
-
-
-def _repair_or_mark_malformed_map_owners(session: Session) -> None:
-    """定向迁移旧版被误标成 worker 的 map owner；歧义状态只记录诊断。"""
-    frame_ids = {frame.id for frame in session.agent_stack}
-    for frame in session.agent_stack:
-        if not (frame.agent.role == "map_orchestrator" and frame.agent.map_stage == "orchestrator"):
-            continue
-        malformed = bool(
-            frame.map_stage_contract
-            or frame.worker_instance_id
-            or frame.result_schema == MAP_WORKER_RESULT_SCHEMA
-            or frame.allowed_next_stages
-        )
-        if not malformed:
-            continue
-        macro_link = _macro_owner_link(session.pending_plan, frame.id)
-        state = session.map_task_state
-        state_link_matches = bool(
-            state.owner_frame_id == frame.id and state.macro_step_id and state.domain_task_id
-        )
-        step_id = state.macro_step_id if state_link_matches else ""
-        domain_task_id = state.domain_task_id if state_link_matches else ""
-        if macro_link is not None:
-            step_id, domain_task_id = macro_link
-        run_effect = (
-            session.task_run.get("side_effect_state")
-            if isinstance(session.task_run, dict)
-            else None
-        )
-        lineage_intact = bool(
-            frame.parent_id in frame_ids
-            and frame.map_task_id
-            and frame.map_task_id == state.task_id
-            and frame.map_request_lineage_id
-            and frame.map_request_lineage_id == state.task_lineage_id
-            and step_id
-            and domain_task_id
-        )
-        no_worker_effect = bool(
-            run_effect == "none"
-            and not frame.map_evidence
-            and frame.persistent_edit_map_turn_count == 0
-            and not state.executed_batches
-        )
-        diagnostic = {
-            "error_code": "map_route_contract_violation",
-            "migration": "legacy_owner_worker_contract_v9",
-            "lineage_intact": lineage_intact,
-            "side_effect_state": run_effect or "unknown",
-        }
-        if not (lineage_intact and no_worker_effect):
-            frame.structured_diagnostics.append({**diagnostic, "outcome": "blocked_no_mutation"})
-            continue
-        frame.map_stage_contract = {}
-        frame.contract_id = None
-        frame.worker_instance_id = None
-        frame.result_schema = None
-        frame.allowed_next_stages = ()
-        frame.response_contract_mode = None
-        frame.response_contract_schema_digest = None
-        frame.messages = [
-            message
-            for message in frame.messages
-            if not (
-                message.get("role") == "system"
-                and isinstance(message.get("content"), str)
-                and message["content"].startswith("Runtime Map Stage Contract")
-            )
-        ]
-        frame.domain_owner_contract = DomainOwnerContract(
-            domain="map",
-            owner_frame_id=frame.id,
-            parent_frame_id=frame.parent_id,
-            macro_step_id=step_id,
-            domain_task_id=domain_task_id,
-            durable_task_id=frame.map_task_id,
-            request_lineage_id=frame.map_request_lineage_id,
-        ).to_dict()
-        frame.structured_diagnostics.append({**diagnostic, "outcome": "repaired"})
-
-
-def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Session:
+def session_from_dict(
+    data: dict[str, Any],
+    available_tools: set[str],
+    *,
+    map_task_state: MapTaskState | None = None,
+) -> Session:
     """从持久化字典恢复 `Session`。
 
     持久化文件可能是合法 JSON 但字段类型错误（例如 `{"items": null}`、
@@ -680,11 +597,7 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
     Raises:
         ValueError: 顶层不是对象，或缺少必需的 `session_id` 字段。
     """
-    if not isinstance(data, dict):
-        raise ValueError("session payload must be an object")
-    # 反序列化前先执行 schema 迁移：把旧版字段映射到当前结构，
-    # 迁移后 data 已经是最新 schema，后续代码无需再处理兼容
-    data, _ = migrate_session_payload(data)
+    validate_session_payload(data)
     if not isinstance(data.get("session_id"), str) or not data["session_id"]:
         raise ValueError("session payload missing string session_id")
     raw_history_events = data.get("history_events", [])
@@ -705,7 +618,11 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         stored_event_counter = 0
     history_event_counter = max(stored_event_counter, restored_event_counter)
     pending_plan = data.get("pending_plan")
-    map_task_state = MapTaskState.from_dict(data.get("map_task_state"))
+    if map_task_state is None:
+        raise WorkflowIntegrityError(
+            "current Session hydration requires a manifest-replayed workflow state"
+        )
+    workflow = data["workflow"]
     session = Session(
         session_id=str(data["session_id"]),
         session_epoch=str(data.get("session_epoch", "")),
@@ -719,7 +636,19 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         turn_counter=_as_int(data.get("turn_counter")),
         frame_counter=_as_int(data.get("frame_counter")),
         request_id_cache=_as_dict(data.get("request_id_cache")),
-        completed_tool_turn_cache=_as_dict(data.get("completed_tool_turn_cache")),
+        completed_turn_ledger={
+            str(key): dict(value)
+            for key, value in _as_dict(data.get("completed_turn_ledger")).items()
+            if isinstance(value, dict)
+        },
+        completed_response_hot_cache={
+            str(key): dict(value)
+            for key, value in _as_dict(data.get("completed_response_hot_cache")).items()
+            if isinstance(value, dict)
+        },
+        workflow_lineage=str(workflow["lineage"]),
+        workflow_manifest_digest=str(workflow["manifest_digest"]),
+        workflow_manifest_generation=int(workflow["generation"]),
         pending_tool_calls=_as_dict(data.get("pending_tool_calls")),
         session_allow={
             (str(item[0]), str(item[1]), str(item[2]), str(item[3]) if len(item) >= 4 else "")
@@ -731,6 +660,16 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         delegate_groups=_as_dict(data.get("delegate_groups")),
         pending_plan=pending_plan if isinstance(pending_plan, dict) else None,
         verify_retry_count=_as_dict(data.get("verify_retry_count")),
+        verify_attempts={
+            str(key): dict(value)
+            for key, value in _as_dict(data.get("verify_attempts")).items()
+            if isinstance(value, dict)
+        },
+        verify_state={
+            str(key): dict(value)
+            for key, value in _as_dict(data.get("verify_state")).items()
+            if isinstance(value, dict)
+        },
         pending_verify_candidates=[
             item
             for item in _as_list(data.get("pending_verify_candidates"))
@@ -761,7 +700,6 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         rag_context=str(data.get("rag_context", "")),
         task_run=(dict(data["task_run"]) if isinstance(data.get("task_run"), dict) else None),
     )
-    _repair_or_mark_malformed_map_owners(session)
     return session
 
 
@@ -803,6 +741,8 @@ class SessionStore:
         *,
         project_root: Path | None = None,
         reset_failure_injector: ResetFailureInjector | None = None,
+        workflow_snapshot_event_threshold: int = 256,
+        workflow_snapshot_byte_threshold: int = 1_048_576,
     ) -> None:
         """初始化会话存储。
 
@@ -811,11 +751,34 @@ class SessionStore:
             project_root: 工程根目录；提供后会用已占用 artifact turn 修正
                 重启时的单调计数器。
         """
+        if workflow_snapshot_event_threshold < 1 or workflow_snapshot_byte_threshold < 1:
+            raise ValueError("workflow snapshot thresholds must be positive")
         self._storage_dir = storage_dir
         self._project_root = project_root
+        self._workflow_project_root = (
+            project_root.resolve()
+            if project_root is not None
+            else (
+                storage_dir.parent.parent.resolve()
+                if storage_dir.parent.name == ".ai_agent_service"
+                else storage_dir.parent.resolve()
+            )
+        )
+        self._workflow_snapshot_event_threshold = workflow_snapshot_event_threshold
+        self._workflow_snapshot_byte_threshold = workflow_snapshot_byte_threshold
         self._reset_failure_injector = reset_failure_injector
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+    def _workflow_store(self, session_id: str, session_epoch: str) -> WorkflowStore:
+        """为指定 Session epoch 构造当前版工作流 store。"""
+        return WorkflowStore(
+            self._workflow_project_root,
+            session_id,
+            session_epoch,
+            snapshot_event_threshold=self._workflow_snapshot_event_threshold,
+            snapshot_byte_threshold=self._workflow_snapshot_byte_threshold,
+        )
 
     def hit_reset_failpoint(self, name: str) -> None:
         """仅在构造时注入测试依赖后触发命名 reset 故障。"""
@@ -840,6 +803,31 @@ class SessionStore:
     def _task_run_path_for(self, session_id: str) -> Path:
         """返回独立 Attempt journal 路径，避免破坏 Session 原子提交边界。"""
         return self._storage_dir / "_attempts" / f"{_safe_filename(session_id)}.json"
+
+    def _turn_counter_path_for(self, session_id: str) -> Path:
+        """返回独立 turn 预留 journal，避免写出半截 Session 文档。"""
+        return self._storage_dir / "_turns" / f"{_safe_filename(session_id)}.json"
+
+    def _reserved_turn_counter(self, session_id: str, session_epoch: str) -> int:
+        """读取当前 epoch 已持久预留的最大 turn 计数器。"""
+        path = self._turn_counter_path_for(session_id)
+        if not path.exists():
+            return 0
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise WorkflowIntegrityError("turn reservation journal is unreadable") from exc
+        if not isinstance(payload, dict):
+            raise WorkflowIntegrityError("turn reservation journal must be an object")
+        if (
+            payload.get("session_id") != session_id
+            or payload.get("session_epoch") != session_epoch
+        ):
+            return 0
+        value = payload.get("turn_counter")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise WorkflowIntegrityError("turn reservation journal has an invalid counter")
+        return value
 
     def current_epoch(self, session_id: str, *, create: bool = True) -> str | None:
         """读取当前持久化 epoch；首次会话可按需原子创建。"""
@@ -869,6 +857,19 @@ class SessionStore:
             },
         )
         return epoch
+
+    def persisted_event_cursor(self, session_id: str, session_epoch: str) -> int:
+        """读取当前 epoch 的持久化事件高水位，不触发 Session hydration。"""
+        current = self._sessions.get(session_id)
+        if current is not None and current.session_epoch == session_epoch:
+            return max(current.history_event_counter, 0)
+        payload = self._read_persisted_payload(self._path_for(session_id))
+        if not payload or payload.get("session_epoch") != session_epoch:
+            return 0
+        value = payload.get("history_event_counter", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise WorkflowIntegrityError("session history event cursor is invalid")
+        return value
 
     def begin_reset(
         self,
@@ -964,6 +965,7 @@ class SessionStore:
         self._sessions.pop(session_id, None)
         self._path_for(session_id).unlink(missing_ok=True)
         self._task_run_path_for(session_id).unlink(missing_ok=True)
+        self._turn_counter_path_for(session_id).unlink(missing_ok=True)
 
     def finish_reset(self, record: dict[str, Any]) -> None:
         """把 reset 记录推进为 cleaned；重复调用保持幂等。"""
@@ -1063,6 +1065,21 @@ class SessionStore:
                 epoch,
             )
             session = Session(session_id=session_id, session_epoch=epoch or "")
+        if restored is None:
+            session.workflow_lineage = f"session:{session.session_epoch}"
+            manifest = self._workflow_store(
+                session.session_id,
+                session.session_epoch,
+            ).initialize(
+                session.map_task_state,
+                lineage=session.workflow_lineage,
+            )
+            session.workflow_manifest_digest = manifest.digest
+            session.workflow_manifest_generation = manifest.generation
+        session.turn_counter = max(
+            session.turn_counter,
+            self._reserved_turn_counter(session_id, session.session_epoch),
+        )
         task_run = self._load_task_run(session_id, session.session_epoch)
         if task_run is not None:
             session.task_run = task_run
@@ -1087,21 +1104,31 @@ class SessionStore:
         """
         current_epoch = self.current_epoch(session.session_id)
         if not session.session_epoch:
-            if self._project_root is not None:
-                from app.orchestrator.map_artifacts import adopt_legacy_artifact_epoch
-
-                adopt_legacy_artifact_epoch(
-                    self._project_root,
-                    session.session_id,
-                    current_epoch or "",
-                )
-            session.session_epoch = current_epoch or ""
+            raise UnsupportedSessionSchemaError(
+                "current Session requires a durable session_epoch"
+            )
         if session.session_epoch != current_epoch:
             raise ValueError(
                 "refusing to persist stale Session epoch "
                 f"session={session.session_id} stored={session.session_epoch!r} "
                 f"current={current_epoch!r}"
             )
+        if not session.workflow_lineage:
+            raise WorkflowIntegrityError("Session workflow lineage is missing")
+        session.turn_counter = max(
+            session.turn_counter,
+            self._reserved_turn_counter(session.session_id, session.session_epoch),
+        )
+        workflow_store = self._workflow_store(
+            session.session_id,
+            session.session_epoch,
+        )
+        prepared_workflow = workflow_store.prepare(
+            session.map_task_state,
+            lineage=session.workflow_lineage,
+        )
+        session.workflow_manifest_digest = prepared_workflow.manifest.digest
+        session.workflow_manifest_generation = prepared_workflow.manifest.generation
         path = self._path_for(session.session_id)
         persisted = self._read_persisted_payload(path)
         if persisted.get("session_epoch") == session.session_epoch:
@@ -1115,6 +1142,14 @@ class SessionStore:
             )
         session._turn_counter_reserver = self._reserve_turn_counter
         atomic_write_json(path, session_to_dict(session))
+        try:
+            workflow_store.commit_prepared(prepared_workflow, session.map_task_state)
+        except (OSError, WorkflowIntegrityError):
+            workflow_store.reconcile(
+                manifest_digest=session.workflow_manifest_digest,
+                generation=session.workflow_manifest_generation,
+            )
+            session.map_task_state.pending_workflow_events.clear()
         self._sessions[session.session_id] = session
         logger.debug(
             "Session saved session=%s frames=%d pending=%s cache_entries=%d path=%s",
@@ -1217,22 +1252,20 @@ class SessionStore:
 
     def _reserve_turn_counter(self, session_id: str, value: int) -> None:
         """Durably reserve a turn number before exposing it to a caller."""
-        path = self._path_for(session_id)
-        payload = self._read_persisted_payload(path)
         current_epoch = self.current_epoch(session_id)
-        if payload and payload.get("session_epoch") not in {None, "", current_epoch}:
-            payload = {}
-        if value <= _as_int(payload.get("turn_counter")):
+        if current_epoch is None:
+            raise WorkflowIntegrityError("turn reservation requires a session epoch")
+        if value <= self._reserved_turn_counter(session_id, current_epoch):
             return
-        if not payload:
-            payload = {
-                "schema_version": SESSION_SCHEMA_VERSION,
+        atomic_write_json(
+            self._turn_counter_path_for(session_id),
+            {
+                "version": 1,
                 "session_id": session_id,
                 "session_epoch": current_epoch,
-            }
-        payload["session_epoch"] = current_epoch
-        payload["turn_counter"] = value
-        atomic_write_json(path, payload)
+                "turn_counter": value,
+            },
+        )
 
     def reset(self, session_id: str) -> None:
         """清空指定会话（内存与本地持久化文件）。
@@ -1276,39 +1309,48 @@ class SessionStore:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            # 加载时先检测持久化文件的 schema 版本，执行迁移后再反序列化，
-            # 使旧文件能透明升级到当前 SESSION_SCHEMA_VERSION
-            if not isinstance(data, dict):
-                raise ValueError("session payload must be an object")
-            source_version = session_payload_version(data)
-            migrated_data, migrated = migrate_session_payload(data)
-            session = session_from_dict(migrated_data, available_tools)
-            current_epoch = self.current_epoch(session_id)
-            if not session.session_epoch:
-                session.session_epoch = current_epoch or ""
-                migrated = True
-            elif session.session_epoch != current_epoch:
-                logger.info(
-                    "Stale Session payload isolated session=%s stored_epoch=%s current_epoch=%s",
-                    session_id,
-                    session.session_epoch,
-                    current_epoch,
-                )
-                return None
-            if self._project_root is not None:
-                from app.orchestrator.map_artifacts import MapArtifactStore
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise WorkflowIntegrityError("current Session document is unreadable") from exc
+        if not isinstance(data, dict):
+            raise UnsupportedSessionSchemaError("Session payload 必须是当前版对象")
+        validate_session_payload(data)
+        stored_epoch = data.get("session_epoch")
+        current_epoch = self.current_epoch(session_id)
+        if stored_epoch != current_epoch:
+            raise WorkflowIntegrityError(
+                "Session document epoch does not match the durable epoch barrier"
+            )
+        workflow = data["workflow"]
+        workflow_store = self._workflow_store(session_id, str(stored_epoch))
+        manifest = workflow_store.reconcile(
+            manifest_digest=str(workflow.get("manifest_digest", "")),
+            generation=int(workflow.get("generation", 0)),
+        )
+        if (
+            manifest.digest != workflow.get("manifest_digest")
+            or manifest.generation != workflow.get("generation")
+            or manifest.lineage != workflow.get("lineage")
+        ):
+            raise WorkflowIntegrityError(
+                "Session workflow reference does not match the current manifest"
+            )
+        map_task_state = workflow_store.load(lineage=manifest.lineage)
+        session = session_from_dict(
+            data,
+            available_tools,
+            map_task_state=map_task_state,
+        )
+        if self._project_root is not None:
+            from app.orchestrator.map_artifacts import MapArtifactStore
 
-                session.turn_counter = max(
-                    session.turn_counter,
-                    MapArtifactStore(
-                        self._project_root,
-                        session_id,
-                        session_epoch=session.session_epoch,
-                    ).max_reserved_turn_counter(),
-                )
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            logger.warning("Session load failed session=%s path=%s error=%s", session_id, path, exc)
-            return None
+            session.turn_counter = max(
+                session.turn_counter,
+                MapArtifactStore(
+                    self._project_root,
+                    session_id,
+                    session_epoch=session.session_epoch,
+                ).max_reserved_turn_counter(),
+            )
         # 文件名是 session_id 的哈希；正常情况下不会串读，但仍校验磁盘中记录的
         # session_id 与请求值一致，防止历史遗留文件或人为改名导致的串读。
         if session.session_id != session_id:
@@ -1318,17 +1360,6 @@ class SessionStore:
                 session.session_id,
                 path,
             )
-            return None
-        # 若发生了 schema 迁移，立即将升级后的会话回写磁盘，
-        # 避免每次加载都重复执行迁移逻辑
-        if migrated:
-            atomic_write_json(path, session_to_dict(session))
-            logger.info(
-                "Session payload migrated session=%s from_version=%d to_version=%d path=%s",
-                session_id,
-                source_version,
-                SESSION_SCHEMA_VERSION,
-                path,
-            )
+            raise WorkflowIntegrityError("Session id does not match its storage key")
         logger.debug("Session loaded from disk session=%s path=%s", session_id, path)
         return session

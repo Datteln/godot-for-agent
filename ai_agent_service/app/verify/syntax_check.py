@@ -11,14 +11,24 @@ import asyncio
 import logging
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
-from app.api.schemas import VerifyIssue
+from app.verify.contracts import VerifyIssue
 
 logger = logging.getLogger(__name__)
 
 _LINE_NUMBER_PATTERN = re.compile(r":(\d+)\b")
 _STDERR_PREVIEW_CHARS = 500
+
+
+@dataclass(frozen=True, slots=True)
+class SyntaxCheckResult:
+    status: Literal["passed", "failed", "unavailable"]
+    reason_code: Literal["verified", "syntax_issue", "validator_missing", "validator_timeout"]
+    issues: tuple[VerifyIssue, ...] = ()
+    summary: str = ""
 
 
 def _build_command(path: str, project_root: Path, godot_path: str) -> list[str] | None:
@@ -72,7 +82,7 @@ async def run_syntax_check(
     project_root: Path,
     godot_path: str,
     timeout_s: int,
-) -> tuple[bool, list[VerifyIssue]] | None:
+) -> SyntaxCheckResult:
     """对单个文件运行 Phase 1 语法快检。
 
     Args:
@@ -88,7 +98,11 @@ async def run_syntax_check(
     """
     command = _build_command(path, project_root, godot_path)
     if command is None:
-        return None
+        return SyntaxCheckResult(
+            status="unavailable",
+            reason_code="validator_missing",
+            summary="No deterministic syntax validator is configured for this file type.",
+        )
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -99,7 +113,11 @@ async def run_syntax_check(
         )
     except (FileNotFoundError, OSError) as exc:
         logger.warning("Verify syntax check unavailable command=%s error=%s", command[0], exc)
-        return None
+        return SyntaxCheckResult(
+            status="unavailable",
+            reason_code="validator_missing",
+            summary=f"Syntax validator executable is unavailable: {command[0]}",
+        )
 
     try:
         _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
@@ -107,10 +125,18 @@ async def run_syntax_check(
         process.kill()
         await process.wait()
         logger.warning("Verify syntax check timed out command=%s path=%s timeout_s=%d", command[0], path, timeout_s)
-        return None
+        return SyntaxCheckResult(
+            status="unavailable",
+            reason_code="validator_timeout",
+            summary=f"Syntax validator timed out after {timeout_s} seconds.",
+        )
 
     if process.returncode == 0:
-        return True, []
+        return SyntaxCheckResult(
+            status="passed",
+            reason_code="verified",
+            summary="Deterministic syntax validation passed.",
+        )
 
     stderr_text = stderr.decode("utf-8", errors="replace")
     issues = _parse_stderr_issues(stderr_text, path)
@@ -123,4 +149,9 @@ async def run_syntax_check(
                 message=stderr_text.strip()[:_STDERR_PREVIEW_CHARS] or "语法检查失败，命令未输出详细信息",
             )
         ]
-    return False, issues
+    return SyntaxCheckResult(
+        status="failed",
+        reason_code="syntax_issue",
+        issues=tuple(issues),
+        summary=issues[0].message,
+    )

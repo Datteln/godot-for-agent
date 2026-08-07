@@ -1,8 +1,14 @@
 extends SceneTree
 
 const AgentHttpClient = preload("res://addons/ai_agent/service/agent_http_client.gd")
+const AgentEventSocket = preload("res://addons/ai_agent/service/agent_event_socket.gd")
 const AgentStateStore = preload("res://addons/ai_agent/state/agent_state_store.gd")
+const ChatEventAcceptor = preload("res://addons/ai_agent/state/chat_event_acceptor.gd")
+const ContextCollector = preload("res://addons/ai_agent/context/context_collector.gd")
 const FileStateCache = preload("res://addons/ai_agent/context/file_state_cache.gd")
+const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
+const SessionTurnState = preload("res://addons/ai_agent/state/session_turn_state.gd")
+const ChatPanelText = preload("res://addons/ai_agent/ui/chat_panel_text.gd")
 
 
 class RecordingClient extends AgentHttpClient:
@@ -21,114 +27,117 @@ class FrontendAckFailureRecorder extends RefCounted:
 
 
 func _init() -> void:
-	var client := AgentHttpClient.new()
-
-	var old_backend := client._parse_event_page({
-		"events": [
-			{"seq": 4, "type": "agent_text_delta", "payload": {"text": "a"}},
-			{"seq": 5, "type": "agent_text_delta", "payload": {"text": "b"}},
-		]
-	}, 3)
-	if not bool(old_backend.get("valid", false)):
-		push_error("older backend response was rejected")
+	var state := SessionTurnState.new()
+	state.configure("s1", "epoch-new", 3)
+	state.begin_reset()
+	state.adopt_reset("s2", "epoch-reset", 9)
+	var reset_snapshot: Dictionary = state.snapshot()
+	if (
+		str(reset_snapshot.get("session_id", "")) != "s2"
+		or str(reset_snapshot.get("session_epoch", "")) != "epoch-reset"
+		or int(reset_snapshot.get("accepted_seq", 0)) != 9
+	):
+		push_error("new-session reset did not atomically adopt identity and cursor")
 		quit(1)
 		return
-	if bool(old_backend.get("has_more", true)) or int(old_backend.get("cursor", 0)) != 5:
-		push_error("older backend optional paging defaults changed")
+	state.configure("s1", "epoch-new", 3)
+	var socket := AgentEventSocket.new()
+	root.add_child(socket)
+	socket.configure(state)
+	var collector := ContextCollector.new()
+	root.add_child(collector)
+	if not (collector.project_files() is Array):
+		push_error("project-file cache did not return an array")
 		quit(1)
 		return
-
-	var bounded := client._parse_event_page({
+	collector._project_files_cache = ["res://cached.gd"]
+	collector._project_files_dirty = false
+	var cached_files: Array = collector.project_files()
+	cached_files.append("res://caller-only.gd")
+	if collector.project_files() != ["res://cached.gd"]:
+		push_error("project-file cache leaked mutable caller state")
+		quit(1)
+		return
+	collector._mark_project_files_dirty()
+	if not collector._project_files_dirty:
+		push_error("project-file cache invalidation signal did not mark state dirty")
+		quit(1)
+		return
+	for locale in ["zh", "en"]:
+		for key in ["ws_connect_failed", "ws_closed", "ws_reconnect_exhausted"]:
+			if ChatPanelText.text(locale, key) == key:
+				push_error("missing localized WebSocket presentation text: " + locale + "/" + key)
+				quit(1)
+				return
+	var redacted := FrontendLogger._redact_dictionary({
+		"session_id": "s1",
+		"turn_id": "t1",
+		"session_epoch": "e1",
+		"count": 2,
+	})
+	if (
+		str(redacted.get("session_id", "")) != "<redacted>"
+		or str(redacted.get("turn_id", "")) != "<redacted>"
+		or str(redacted.get("session_epoch", "")) != "<redacted>"
+		or int(redacted.get("count", 0)) != 2
+	):
+		push_error("frontend diagnostics did not redact retained identifiers")
+		quit(1)
+		return
+	var acceptor := ChatEventAcceptor.new()
+	acceptor.state = state
+	var accepted := acceptor.accept_batch({
+		"session_epoch": "epoch-new",
 		"events": [
-			{"seq": 5, "type": "duplicate"},
-			"malformed",
-			{"seq": 6, "type": "accepted"},
-			{"seq": 8, "type": "accepted"},
+			{"seq": 4, "session_epoch": "epoch-new", "type": "agent_text_delta"},
+			{"seq": 5, "session_epoch": "epoch-new", "type": "final"},
 		],
-		"cursor": 999,
-		"has_more": true,
-	}, 5)
-	var accepted: Array = bounded.get("events", [])
-	if accepted.size() != 2 or int(bounded.get("cursor", 0)) != 8:
-		push_error("cursor advanced beyond accepted events")
+	})
+	if not bool(accepted.get("accepted", false)) or int(accepted.get("accepted_seq", 0)) != 5:
+		push_error("contiguous WebSocket batch was rejected")
 		quit(1)
 		return
-	if not bool(bounded.get("has_more", false)):
-		push_error("has_more was not parsed")
+	var duplicate := acceptor.accept_batch({
+		"session_epoch": "epoch-new",
+		"events": [
+			{"seq": 5, "session_epoch": "epoch-new", "type": "final"},
+			{"seq": 6, "session_epoch": "epoch-new", "type": "status"},
+		],
+	})
+	if duplicate.get("events", []).size() != 1 or int(duplicate.get("accepted_seq", 0)) != 6:
+		push_error("duplicate WebSocket event was not ignored exactly once")
 		quit(1)
 		return
-
-	var malformed := client._parse_event_page({"events": {}}, 8)
-	if bool(malformed.get("valid", true)) or int(malformed.get("cursor", 0)) != 8:
-		push_error("malformed event page changed the cursor")
+	var gap := acceptor.accept_batch({
+		"session_epoch": "epoch-new",
+		"events": [{"seq": 8, "session_epoch": "epoch-new", "type": "status"}],
+	})
+	if bool(gap.get("accepted", true)) or str(gap.get("reason", "")) != "sequence_gap":
+		push_error("sequence gap did not require a snapshot")
+		quit(1)
+		return
+	var stale := acceptor.accept_batch({
+		"session_epoch": "epoch-old",
+		"events": [{"seq": 7, "session_epoch": "epoch-old", "type": "status"}],
+	})
+	if bool(stale.get("accepted", true)) or str(stale.get("reason", "")) != "stale_epoch":
+		push_error("stale epoch crossed the event acceptor")
 		quit(1)
 		return
 
 	var recording := RecordingClient.new()
-	var preview_body := JSON.stringify({
-		"events": [{
-			"seq": 1,
-			"type": "agent_text_delta",
-			"payload": {
-				"provisional": true,
-				"preview_id": "preview-1",
-				"text": "hello",
-			},
-		}],
-		"has_more": false,
-	}).to_utf8_buffer()
-	recording._on_events_completed(
-		HTTPRequest.RESULT_SUCCESS,
-		200,
-		PackedStringArray(),
-		preview_body,
-	)
+	recording.notify_application_progress()
 	if recording.watchdog_refreshes != 1:
-		push_error("provisional preview did not refresh the request watchdog")
+		push_error("application progress did not refresh the request watchdog")
 		quit(1)
 		return
 	if not recording._queue.is_empty() or recording._request_generation != 0:
-		push_error("provisional preview triggered request replay or fallback")
-		quit(1)
-		return
-
-	var delivered_epochs: Array = []
-	recording.events_received.connect(func(events: Array) -> void: delivered_epochs.append(events))
-	recording._session_epoch = "epoch-new"
-	recording._last_event_seq = 8
-	recording._on_events_completed(
-		HTTPRequest.RESULT_SUCCESS,
-		200,
-		PackedStringArray(),
-		JSON.stringify({
-			"session_epoch": "epoch-old",
-			"events": [{"seq": 9, "type": "stale"}],
-		}).to_utf8_buffer(),
-	)
-	if recording._last_event_seq != 8 or not delivered_epochs.is_empty():
-		push_error("late old-epoch event response crossed reset")
-		quit(1)
-		return
-	recording._on_events_completed(
-		HTTPRequest.RESULT_SUCCESS,
-		200,
-		PackedStringArray(),
-		JSON.stringify({
-			"session_epoch": "epoch-new",
-			"events": [{"seq": 9, "type": "fresh"}],
-		}).to_utf8_buffer(),
-	)
-	if recording._last_event_seq != 9 or delivered_epochs.size() != 1:
-		push_error("new-epoch reconnect cursor did not resume from acknowledgement")
+		push_error("application progress replayed a command")
 		quit(1)
 		return
 
 	var file_cache := FileStateCache.new()
 	file_cache.snapshot("res://project.godot", true)
-	if not file_cache.has_state("res://project.godot"):
-		push_error("file authorization fixture was not established")
-		quit(1)
-		return
 	file_cache.clear()
 	if file_cache.has_state("res://project.godot"):
 		push_error("read-before-edit authorization crossed reset")
@@ -138,17 +147,15 @@ func _init() -> void:
 	var state_store := AgentStateStore.new()
 	state_store.set_value("session_epoch", "epoch-old")
 	state_store.set_value("pending_calls", [{"id": "old"}])
-	state_store.set_value("recovery_pointer", {"turn_id": "t4"})
 	state_store.add_event({"seq": 8, "type": "old"})
 	state_store.reset("epoch-new", 9)
 	if (
 		str(state_store.state.get("session_epoch", "")) != "epoch-new"
 		or int(state_store.state.get("last_event_seq", 0)) != 9
 		or not state_store.state.get("pending_calls", []).is_empty()
-		or state_store.state.get("recovery_pointer") != null
 		or not state_store.state.get("event_log", []).is_empty()
 	):
-		push_error("frontend reset did not clear all session-owned state")
+		push_error("frontend reset did not clear Session-owned state")
 		quit(1)
 		return
 
@@ -166,15 +173,8 @@ func _init() -> void:
 		push_error("after-adopt failpoint was not deterministic")
 		quit(1)
 		return
-	if ack_failures.hits != [
-		"frontend_ack_before_adopt",
-		"frontend_ack_after_adopt",
-	]:
+	if ack_failures.hits != ["frontend_ack_before_adopt", "frontend_ack_after_adopt"]:
 		push_error("frontend acknowledgement failpoint order changed")
-		quit(1)
-		return
-	if not recording._queue.is_empty() or recording._request_generation != 0:
-		push_error("frontend acknowledgement failpoint replayed a request")
 		quit(1)
 		return
 

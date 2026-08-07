@@ -14,7 +14,12 @@ from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, Frame
 from app.config import AppSettings
 from app.llm.provider import AssistantTurn, LLMError, OpenAICompatibleProvider, ResponseContract
-from app.orchestrator.agent import _finish_frame, _map_structured_output_error, run_turn
+from app.orchestrator.map_turn import (
+    MapTurnPolicy,
+    _finish_frame,
+    _map_structured_output_error,
+)
+from app.orchestrator.turn.driver import TurnDriver
 from app.orchestrator.map_contracts import (
     MAP_WORKER_RESULT_JSON_SCHEMA_V1,
     MAP_WORKER_RESULT_SCHEMA,
@@ -31,7 +36,7 @@ from app.orchestrator.map_progress import (
 )
 from app.orchestrator.map_recovery import SEMANTIC_RETRY_MAX_ATTEMPTS
 from app.orchestrator.map_workflow import replace_map_state_field
-from app.sessions.store import Session, session_from_dict, session_to_dict
+from app.sessions.store import Session, SessionStore, session_from_dict, session_to_dict
 from app.security.settings import SecuritySettings
 from app.tools.context import ToolContext
 
@@ -296,6 +301,7 @@ def test_provider_downgrades_response_format_once_before_model_fallback() -> Non
     provider = object.__new__(OpenAICompatibleProvider)
     provider._default_model = "primary"  # type: ignore[attr-defined]
     provider._fallback_model = "fallback"  # type: ignore[attr-defined]
+    provider._max_attempts = 5  # type: ignore[attr-defined]
     calls: list[tuple[str, str]] = []
 
     async def fake_chat_once(
@@ -348,11 +354,11 @@ def test_response_contract_and_deterministic_overrides_only_reach_final_turn() -
     intermediate.agent.effective_tools.append("read_file")
     normal_provider = _CaptureProvider("not a final structured result")
     asyncio.run(
-        run_turn(
-            Session(session_id="s1", agent_stack=[intermediate]),
-            normal_provider,
-            security,
-            tool_ctx,
+        TurnDriver(MapTurnPolicy()).run(
+            session=Session(session_id="s1", agent_stack=[intermediate]),
+            llm=normal_provider,
+            security=security,
+            tool_ctx=tool_ctx,
             max_turns=1,
         )
     )
@@ -368,11 +374,11 @@ def test_response_contract_and_deterministic_overrides_only_reach_final_turn() -
     )
     final_provider = _CaptureProvider(json.dumps(_valid_reader_result(final), ensure_ascii=False))
     asyncio.run(
-        run_turn(
-            Session(session_id="s2", agent_stack=[final]),
-            final_provider,
-            security,
-            ToolContext(
+        TurnDriver(MapTurnPolicy()).run(
+            session=Session(session_id="s2", agent_stack=[final]),
+            llm=final_provider,
+            security=security,
+            tool_ctx=ToolContext(
                 security=security,
                 session_id="s2",
                 session_epoch="e1",
@@ -416,11 +422,11 @@ def test_parallel_final_turns_keep_response_modes_and_overrides_isolated() -> No
         """并发驱动两个独立 Session。"""
         await asyncio.gather(
             *(
-                run_turn(
-                    session,
-                    provider,
-                    security,
-                    ToolContext(
+                TurnDriver(MapTurnPolicy()).run(
+                    session=session,
+                    llm=provider,
+                    security=security,
+                    tool_ctx=ToolContext(
                         security=security,
                         session_id=session.session_id,
                         session_epoch="e1",
@@ -480,11 +486,11 @@ def test_scripted_invalid_results_succeed_without_repeating_map_reads(
     security = SecuritySettings(project_root=Path.cwd())
 
     asyncio.run(
-        run_turn(
-            Session(session_id="s1", agent_stack=[frame]),
-            provider,
-            security,
-            ToolContext(
+        TurnDriver(MapTurnPolicy()).run(
+            session=Session(session_id="s1", agent_stack=[frame]),
+            llm=provider,
+            security=security,
+            tool_ctx=ToolContext(
                 security=security,
                 session_id="s1",
                 session_epoch="e1",
@@ -679,18 +685,19 @@ def test_provisional_invalid_result_cannot_mutate_map_task_state() -> None:
     assert session.top_frame() is child
 
 
-def test_legacy_frame_defaults_structured_metadata_on_restore() -> None:
-    """旧持久化 Frame 缺少新增字段时按兼容默认值恢复。"""
-    session = Session(
-        session_id="s1",
-        agent_stack=[
+def test_current_frame_optional_structured_metadata_defaults_on_restore(
+    tmp_path: Path,
+) -> None:
+    """当前 Session 的可选结构化运行字段缺省时使用领域默认值。"""
+    store = SessionStore(tmp_path / "sessions", project_root=tmp_path)
+    session = store.get_or_create("s1", set())
+    session.agent_stack = [
             Frame(
                 id="f1",
                 agent=get_agent("coordinator", set()),
                 messages=[],
             )
-        ],
-    )
+        ]
     payload = session_to_dict(session)
     frame_payload = payload["agent_stack"][0]
     for key in (
@@ -705,7 +712,11 @@ def test_legacy_frame_defaults_structured_metadata_on_restore() -> None:
     ):
         frame_payload.pop(key, None)
 
-    restored = session_from_dict(payload, set()).agent_stack[0]
+    restored = session_from_dict(
+        payload,
+        set(),
+        map_task_state=MapTaskState(),
+    ).agent_stack[0]
 
     assert restored.structured_attempt_count == 0
     assert restored.structured_correction_limit == 0
@@ -894,11 +905,11 @@ def test_final_structured_turn_thinking_budget_falls_back_to_effort_tier() -> No
     final_provider = _CaptureProvider(json.dumps(_valid_reader_result(final), ensure_ascii=False))
     security = SecuritySettings(project_root=Path.cwd())
     asyncio.run(
-        run_turn(
-            Session(session_id="s2", agent_stack=[final]),
-            final_provider,
-            security,
-            ToolContext(security=security, session_id="s2", session_epoch="e1"),
+        TurnDriver(MapTurnPolicy()).run(
+            session=Session(session_id="s2", agent_stack=[final]),
+            llm=final_provider,
+            security=security,
+            tool_ctx=ToolContext(security=security, session_id="s2", session_epoch="e1"),
             max_turns=1,
             map_worker_response_contract_mode="json_schema",
             # map_worker_structured_thinking_budget 默认 0 → 应回退到 effort 档（非零）
@@ -976,7 +987,7 @@ def test_successful_non_platform_plan_advances_to_write_despite_sibling_pending(
 def test_production_settings_supply_correction_floor_of_two() -> None:
     """9.2：生产设置不显式覆盖 correction-limit 时默认≥2，worker 能拿到第二次本地纠错。
 
-    构造无 correction-limit 覆盖的生产设置，把其 correction floor 原样送入 run_turn；
+    构造无 correction-limit 覆盖的生产设置，把其 correction floor 原样送入 TurnDriver.run；
     worker 首回合中间文本后连续两次无效结构化结果仍能继续纠错，第 4 次才给出有效结果。
     只有 correction floor≥2 才会出现第 4 次调用（floor=1 时第 1 次纠错失败即
     fail-closed，只会产生 3 次调用），从而证明生产默认值把纠错底线抬到至少 2。
@@ -1003,11 +1014,11 @@ def test_production_settings_supply_correction_floor_of_two() -> None:
     )
     security = SecuritySettings(project_root=Path.cwd())
     asyncio.run(
-        run_turn(
-            Session(session_id="s1", agent_stack=[frame]),
-            provider,
-            security,
-            ToolContext(security=security, session_id="s1", session_epoch="e1"),
+        TurnDriver(MapTurnPolicy()).run(
+            session=Session(session_id="s1", agent_stack=[frame]),
+            llm=provider,
+            security=security,
+            tool_ctx=ToolContext(security=security, session_id="s1", session_epoch="e1"),
             max_turns=1,
             map_worker_structured_output_enabled=settings.map_worker_structured_output_enabled,
             map_worker_response_contract_mode=settings.map_worker_response_contract_mode,
@@ -1040,11 +1051,11 @@ def test_structured_thinking_budget_fallback_consistent_across_surfaces() -> Non
     security = SecuritySettings(project_root=Path.cwd())
     session = Session(session_id="s2", agent_stack=[final])
     asyncio.run(
-        run_turn(
-            session,
-            provider,
-            security,
-            ToolContext(security=security, session_id="s2", session_epoch="e1"),
+        TurnDriver(MapTurnPolicy()).run(
+            session=session,
+            llm=provider,
+            security=security,
+            tool_ctx=ToolContext(security=security, session_id="s2", session_epoch="e1"),
             max_turns=1,
             map_worker_response_contract_mode="json_schema",
             map_worker_structured_thinking_budget=0,

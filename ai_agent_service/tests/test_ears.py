@@ -287,12 +287,17 @@ class EarsTests(unittest.TestCase):
         panel = (
             repo / "ai_agent_frontend/addons/ai_agent/ui/chat_panel.gd"
         ).read_text(encoding="utf-8")
+        panel_text = (
+            repo / "ai_agent_frontend/addons/ai_agent/ui/chat_panel_text.gd"
+        ).read_text(encoding="utf-8")
         manager = (
             repo / "ai_agent_frontend/addons/ai_agent/service/service_manager.gd"
         ).read_text(encoding="utf-8")
         self.assertIn("func _try_run_slash_command", panel)
         self.assertIn("_http_client.run_command(command_name, args)", panel)
-        self.assertIn("命令参数必须是 JSON 对象", panel)
+        # 用户可见文案按 10.12 集中于 ChatPanelText；面板只引用本地化键。
+        self.assertIn('_ui("command_param_error")', panel)
+        self.assertIn("命令参数必须是 JSON 对象", panel_text)
         self.assertIn('"AI_AGENT_RAG_AUTO_BUILD_ENABLED"', manager)
 
     def test_build_manager_creates_all_configured_indexes(self) -> None:

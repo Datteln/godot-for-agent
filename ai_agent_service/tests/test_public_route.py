@@ -21,7 +21,6 @@ from app.agents.types import AgentDefinition, Frame
 from app.config import AppSettings
 from app.llm.provider import AssistantTurn, ToolCallRequest
 from app.main import create_app
-from app.orchestrator.agent import _normalize_plan_steps
 from app.orchestrator.macro_contracts import MacroPlan, MacroPlanState
 from app.orchestrator.map_contracts import MAP_WORKER_RESULT_SCHEMA
 from app.orchestrator.map_planning_contexts import (
@@ -36,6 +35,7 @@ from app.orchestrator.map_progress import (
     record_map_owner_link,
     record_planning_context_refresh,
 )
+from app.orchestrator.map_turn import _normalize_plan_steps
 from app.orchestrator.map_workflow import (
     make_map_workflow_event,
     reduce_map_workflow,
@@ -368,8 +368,8 @@ def test_chat_route_creates_owner_then_typed_planner_child() -> None:
                 map_worker_response_contract_mode="prompt_only",
             ),
             token="test-token",
+            llm_provider=provider,
         )
-        app.state.query_engine._llm = provider
         headers = {"Authorization": "Bearer test-token"}
         with TestClient(app) as client:
             first = client.post(
@@ -383,7 +383,7 @@ def test_chat_route_creates_owner_then_typed_planner_child() -> None:
             )
             assert first.status_code == 200
             first_body = first.json()
-            debug_session = app.state.query_engine._store.get_or_create("public-map-route", set())
+            debug_session = app.state.session_store.get_or_create("public-map-route", set())
             assert first_body["type"] == "tool_calls", (
                 f"body={first_body['type']} owner="
                 f"{debug_session.map_task_state.owner_frame_id!r} "
@@ -437,7 +437,7 @@ def test_chat_route_creates_owner_then_typed_planner_child() -> None:
             assert second_body["type"] == "tool_calls"
             assert [call["name"] for call in second_body["calls"]] == ["compute_reachable_frontier"]
 
-        session = app.state.query_engine._store.get_or_create("public-map-route", set())
+        session = app.state.session_store.get_or_create("public-map-route", set())
         planner = session.top_frame()
         assert planner is not None
         owner = next(
@@ -487,10 +487,6 @@ class TestMultiContextPublicRoute:
 
     def test_multi_context_bundle_at_runtime(self) -> None:
         """验证 Mid + Background 多上下文在运行时正确构造为 bundle。"""
-        from app.orchestrator.map_planning_contexts import (
-            MapPlanningContextBundle,
-            MapPlanningContextEntry,
-        )
 
         mid = MapPlanningContextEntry(
             context_id="mid-ctx",
@@ -526,10 +522,6 @@ class TestMultiContextPublicRoute:
         """验证 planner 合同使用多上下文 bundle。"""
         from app.orchestrator.frame_contract_types import (
             MapWorkerStageContract,
-        )
-        from app.orchestrator.map_planning_contexts import (
-            MapPlanningContextBundle,
-            MapPlanningContextEntry,
         )
 
         mid = MapPlanningContextEntry(
@@ -584,8 +576,8 @@ class TestMultiContextPublicRoute:
                     map_worker_response_contract_mode="prompt_only",
                 ),
                 token="test-token",
+                llm_provider=provider,
             )
-            app.state.query_engine._llm = provider
             headers = {"Authorization": "Bearer test-token"}
             with TestClient(app) as client:
                 first = client.post(
@@ -647,7 +639,7 @@ class TestMultiContextPublicRoute:
                 assert second_body["type"] == "tool_calls"
                 assert [call["name"] for call in second_body["calls"]] == ["compute_reachable_frontier"]
 
-            session = app.state.query_engine._store.get_or_create("multi-context-route", set())
+            session = app.state.session_store.get_or_create("multi-context-route", set())
             planner = session.top_frame()
             assert planner is not None
             owner = next(
@@ -851,9 +843,6 @@ class TestFailpointCoverage:
         session = self._fresh_session()
         replace_map_state_field(session.map_task_state, "stage", "plan")
 
-        from app.orchestrator.map_progress import record_map_child_lineage
-        from app.orchestrator.map_workflow import make_map_workflow_event
-        from app.orchestrator.map_workflow import reduce_map_workflow
 
         # 合法 child_start：stage 从 read -> plan
         valid_event = make_map_workflow_event(
@@ -1037,9 +1026,11 @@ class TestLegacyFixtureMigration:
             revision=7,
         )
         # 验证事件已记录
-        assert len(state.workflow_events) > 0
+        assert len(state.pending_workflow_events) > 0
         child_start_events = [
-            event for event in state.workflow_events if event["event_type"] == "map_child_started"
+            event
+            for event in state.pending_workflow_events
+            if event["event_type"] == "map_child_started"
         ]
         assert len(child_start_events) == 1
         assert child_start_events[0]["payload"]["child_frame_id"] == "fc"
@@ -1047,10 +1038,6 @@ class TestLegacyFixtureMigration:
 
     def test_context_bundle_is_runtime_bound(self) -> None:
         """验证 context bundle 在运行时绑定，不硬编码在 legacy fixture 中。"""
-        from app.orchestrator.map_planning_contexts import (
-            MapPlanningContextBundle,
-            MapPlanningContextEntry,
-        )
 
         mid = MapPlanningContextEntry(
             context_id="mid-ctx",

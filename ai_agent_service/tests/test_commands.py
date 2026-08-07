@@ -23,12 +23,17 @@ class CommandArgumentTests(unittest.TestCase):
 
     def test_frontend_formats_structured_command_results_as_text(self) -> None:
         repo = Path(__file__).resolve().parents[2]
+        formatter = (
+            repo / "ai_agent_frontend/addons/ai_agent/ui/chat_report_formatter.gd"
+        ).read_text(encoding="utf-8")
         panel = (
             repo / "ai_agent_frontend/addons/ai_agent/ui/chat_panel.gd"
         ).read_text(encoding="utf-8")
-        self.assertIn("func _format_command_response", panel)
-        self.assertIn("func _format_rebuild_index_result", panel)
-        self.assertIn("func _format_compact_result", panel)
+        self.assertIn("static func command_response", formatter)
+        self.assertIn("static func rebuild_index_result", formatter)
+        self.assertIn("static func compact_result", formatter)
+        self.assertIn("ChatReportFormatter.command_response", panel)
+        self.assertNotIn("func _format_command_response", panel)
         self.assertNotIn(
             'command_text += "\\n\\n" + JSON.stringify(command_result', panel
         )

@@ -10,17 +10,17 @@ from app.agents.types import Frame
 from app.api.schemas import ChatRequest, SessionHistoryResponse
 from app.events.store import Event
 from app.llm.provider import _reasoning_tokens_from_usage
-from app.orchestrator.agent import (
+from app.orchestrator.map_turn import (
     _delegate_child_frame,
     _delta_callback,
     _estimate_stream_token_count,
-    _resolve_request_model,
 )
-from app.query.engine import (
+from app.orchestrator.turn.model_policy import resolve_request_model
+from app.application.publication import _event_payload_for_log
+from app.application.submission.turn_service import _normalize_model_override
+from app.query.helpers import (
     _assistant_history_blocks,
-    _event_payload_for_log,
     _history_context_used_tokens,
-    _normalize_model_override,
     _structured_history_for_frame,
     _structured_session_history,
     _tool_history_blocks,
@@ -72,7 +72,7 @@ def test_request_model_selector_is_temporary_and_trims_input() -> None:
 def test_request_model_override_has_highest_priority() -> None:
     agent = replace(get_agent("coordinator", set()), model="agent-model")
 
-    selected = _resolve_request_model(
+    selected = resolve_request_model(
         agent,
         "deep",
         lambda _effort: "effort-model",

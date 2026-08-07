@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from app.security.settings import SecuritySettings
 
 if TYPE_CHECKING:
+    from app.orchestrator.map_artifacts import StagedMapArtifactTurn
     from app.skills.catalog import SkillCatalog
 
 
@@ -46,3 +47,4 @@ class ToolContext:
     agent_role: str | None = None
     worker_mode: str | None = None
     rag_index_path: Path | None = None
+    staged_map_artifact_turn: StagedMapArtifactTurn | None = None
