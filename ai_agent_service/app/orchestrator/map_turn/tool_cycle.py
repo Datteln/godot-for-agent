@@ -10,14 +10,11 @@ from app.orchestrator.map_contracts import (
     MAP_WORKER_TO_RUNTIME_STAGE,
     arm_map_worker_structured_completion,
 )
-from app.orchestrator.map_progress import (
-    # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
-    bind_authoritative_snapshot,
-    cached_validation_result,
-    map_write_stage_error,
-    remember_map_tool_failure,
-    repeated_map_tool_failure_error,
-)
+from app.orchestrator.map_failure_guard import remember_map_tool_failure, repeated_map_tool_failure_error
+from app.orchestrator.map_platform_planning import bind_authoritative_snapshot
+from app.orchestrator.map_validation import cached_validation_result
+from app.orchestrator.map_write_authorization import map_write_stage_error
+
 from app.orchestrator.map_resources import normalize_edit_map_resources
 from app.orchestrator.map_turn.budgets import (
     _uses_persistent_map_budget,

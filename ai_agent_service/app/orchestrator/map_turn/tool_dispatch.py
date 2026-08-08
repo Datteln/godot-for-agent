@@ -19,11 +19,9 @@ from app.orchestrator.map_capabilities import map_tools_for_stage
 from app.orchestrator.map_contracts import (
     MAP_WORKER_STAGES,
 )
-from app.orchestrator.map_progress import (
-    # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
-    latest_map_revision,
-    platform_write_requires_validation,
-)
+from app.orchestrator.map_context import latest_map_revision
+from app.orchestrator.map_write_authorization import platform_write_requires_validation
+
 from app.orchestrator.map_turn.budgets import _uses_persistent_map_budget
 from app.orchestrator.map_turn.contracts import (
     _tool_message,

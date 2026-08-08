@@ -24,7 +24,8 @@ from app.events.store import EventStore
 from app.llm.provider import AssistantTurn, LLMProvider
 from app.memory.store import MemoryStore
 from app.orchestrator.map_turn import _requires_create_plan_before_map_delegate
-from app.orchestrator.map_progress import MapTaskState
+from app.orchestrator.map_state import MapTaskState
+
 from app.query.helpers import _schedule_map_completion_continuation
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import security_settings_from_app

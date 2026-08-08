@@ -20,7 +20,8 @@ from app.application.publication import SubmissionPublisher
 from app.config import AppSettings
 from app.events.store import EventStore
 from app.orchestrator.map_artifacts import clear_session_artifacts
-from app.orchestrator.map_progress import resume_map_task
+from app.orchestrator.map_state import resume_map_task
+
 from app.orchestrator.map_request_scope import invalidate_completion_candidate
 from app.orchestrator.map_turn.contracts import _tool_message
 from app.recovery.pointer import RecoveryPointerStore

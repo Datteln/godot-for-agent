@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from app.orchestrator.map_progress import MapTaskState
+from app.orchestrator.map_state import MapTaskState
+
 from app.orchestrator.map_workflow import (
     WorkflowEvent,
     dispatch_map_workflow_event,

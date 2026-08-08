@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.orchestrator.map_progress import MapTaskState
+from app.orchestrator.map_state import MapTaskState
+
 from app.orchestrator.map_workflow import (
     dispatch_map_workflow_event,
     make_map_workflow_event,

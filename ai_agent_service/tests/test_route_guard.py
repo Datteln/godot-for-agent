@@ -14,7 +14,9 @@ from app.orchestrator.map_turn import MapTurnPolicy, _planner_route_guard
 from app.orchestrator.turn.driver import TurnDriver
 from app.orchestrator.frame_factory import create_child_frame
 from app.orchestrator.map_contracts import MAP_WORKER_RESULT_SCHEMA
-from app.orchestrator.map_progress import MapTaskState, record_map_owner_link
+from app.orchestrator.map_context import record_map_owner_link
+from app.orchestrator.map_state import MapTaskState
+
 from app.recovery.supervisor import FAILURE_POLICIES
 from app.security.settings import SecuritySettings
 from app.sessions.store import Session

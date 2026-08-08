@@ -412,3 +412,5 @@ ai_map_agent/
 *.md
 !ai_agent_service/**/*.md
 !openspec/**/*.md
+ai_agent_service/.pytest_*/
+

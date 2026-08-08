@@ -15,12 +15,10 @@ from app.orchestrator.map_contracts import (
     MAP_WORKER_RESULT_SCHEMA,
     MAP_WORKER_STAGES,
 )
-from app.orchestrator.map_progress import (
-    # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
-    latest_map_revision,
-    map_platform_plan_call_error,
-    validation_call_error,
-)
+from app.orchestrator.map_context import latest_map_revision
+from app.orchestrator.map_platform_planning import map_platform_plan_call_error
+from app.orchestrator.map_validation import validation_call_error
+
 from app.orchestrator.map_routing import assess_map_task
 from app.orchestrator.map_turn.contracts import (
     _tool_message,

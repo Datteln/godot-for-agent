@@ -28,13 +28,9 @@ from app.orchestrator.map_planning_contexts import (
     MapPlanningContextEntry,
 )
 from app.orchestrator.map_planning_snapshots import PlanningSnapshotStore
-from app.orchestrator.map_progress import (
-    MapTaskState,
-    record_map_approval_identity,
-    record_map_child_lineage,
-    record_map_owner_link,
-    record_planning_context_refresh,
-)
+from app.orchestrator.map_context import record_map_approval_identity, record_map_child_lineage, record_map_owner_link, record_planning_context_refresh
+from app.orchestrator.map_state import MapTaskState
+
 from app.orchestrator.map_turn import _normalize_plan_steps
 from app.orchestrator.map_workflow import (
     make_map_workflow_event,

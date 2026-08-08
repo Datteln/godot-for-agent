@@ -15,10 +15,9 @@ from app.orchestrator.map_artifacts import (
     MapArtifactTurnConflictError,
     StagedMapArtifactTurn,
 )
-from app.orchestrator.map_progress import (
-    MapTaskState,
-    consume_committed_platform_approvals,
-)
+from app.orchestrator.map_state import MapTaskState
+from app.orchestrator.map_write_authorization import consume_committed_platform_approvals
+
 from app.application.composition import build_application_use_cases
 from app.sessions.store import Session, SessionStore, session_to_dict
 from app.tools.front_tools import register_front_tools

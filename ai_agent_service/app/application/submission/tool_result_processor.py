@@ -23,16 +23,11 @@ from app.application.submission.tool_evidence import (
 )
 from app.config import AppSettings
 from app.orchestrator.map_artifacts import MapArtifactLocator
-from app.orchestrator.map_progress import (
-    map_platform_plan_attempt_count,
-    parse_map_plan_outcome,
-    remember_map_plan_progress,
-    remember_map_tool_failure,
-    remember_planning_snapshot_evidence,
-    remember_validation_cache,
-    remember_validation_progress,
-    validation_mode,
-)
+from app.orchestrator.map_failure_guard import remember_map_tool_failure
+from app.orchestrator.map_plan_progress import remember_map_plan_progress
+from app.orchestrator.map_platform_planning import map_platform_plan_attempt_count, parse_map_plan_outcome, remember_planning_snapshot_evidence
+from app.orchestrator.map_validation import remember_validation_cache, remember_validation_progress, validation_mode
+
 from app.orchestrator.map_request_scope import mark_completion_candidate
 from app.orchestrator.map_turn.contracts import AgentPromptFactory, _tool_message
 from app.orchestrator.map_workers import (

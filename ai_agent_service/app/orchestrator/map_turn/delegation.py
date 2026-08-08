@@ -20,11 +20,8 @@ from app.orchestrator.map_planning_contexts import (
     MapPlanningContextEntry,
     MapPlanningContextError,
 )
-from app.orchestrator.map_progress import (
-    # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
-    latest_map_revision,
-    record_map_child_lineage,
-)
+from app.orchestrator.map_context import latest_map_revision, record_map_child_lineage
+
 from app.orchestrator.map_turn.contracts import (
     MAX_AGENT_DEPTH,
     AgentPromptFactory,

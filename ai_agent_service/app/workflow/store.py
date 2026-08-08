@@ -22,7 +22,8 @@ from app.workflow.contracts import (
 )
 
 if TYPE_CHECKING:
-    from app.orchestrator.map_progress import MapTaskState
+    from app.orchestrator.map_state import MapTaskState
+
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +232,8 @@ class WorkflowStore:
 
     def load(self, *, lineage: str | None = None) -> "MapTaskState":
         """验证 manifest、快照、段链并通过 reducer 回放完整状态。"""
-        from app.orchestrator.map_progress import MapTaskState
+        from app.orchestrator.map_state import MapTaskState
+
         from app.orchestrator.map_workflow import reduce_map_workflow, reducer_write_scope
 
         manifest = self._read_manifest()

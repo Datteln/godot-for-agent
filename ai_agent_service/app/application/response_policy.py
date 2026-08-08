@@ -7,7 +7,8 @@ from typing import Any
 
 from app.agents.types import Frame
 from app.api.schemas import ChatErrorResponse, ChatFinalResponse, ChatResponse
-from app.orchestrator.map_progress import parse_map_plan_outcome
+from app.orchestrator.map_platform_planning import parse_map_plan_outcome
+
 from app.sessions.store import Session
 
 

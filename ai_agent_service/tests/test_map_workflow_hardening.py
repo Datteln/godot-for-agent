@@ -8,12 +8,8 @@ import pytest
 from app.agents.types import AgentDefinition, Frame
 from app.orchestrator.completion_gate import evaluate_map_completion
 from app.orchestrator.map_contracts import MAP_WORKER_RESULT_SCHEMA
-from app.orchestrator.map_progress import (
-    MAP_TASK_FIELD_LIFECYCLE,
-    MapTaskState,
-    MapTaskStatus,
-    resume_map_task,
-)
+from app.orchestrator.map_state import MAP_TASK_FIELD_LIFECYCLE, MapTaskState, MapTaskStatus, resume_map_task
+
 from app.orchestrator.map_request_scope import MapRequestScope
 from app.orchestrator.map_workflow import (
     consume_map_resume_authorization,

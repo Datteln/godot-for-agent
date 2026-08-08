@@ -9,10 +9,9 @@ from app.agents.types import Frame
 from app.api.schemas import ChatToolCallsResponse, FrontToolCallDTO
 from app.application.response_policy import _planner_completion_text
 from app.orchestrator.map_contracts import MapResponseMode, arm_map_worker_structured_completion
-from app.orchestrator.map_progress import (
-    consume_committed_platform_approvals,
-    latest_map_revision,
-)
+from app.orchestrator.map_context import latest_map_revision
+from app.orchestrator.map_write_authorization import consume_committed_platform_approvals
+
 from app.orchestrator.map_workers import MAP_REVISION_GUARDED_TOOL_NAMES
 from app.orchestrator.map_workflow import increment_map_counter, replace_map_state_field
 from app.sessions.store import Session

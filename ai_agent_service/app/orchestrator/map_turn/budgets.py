@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from app.agents.types import Frame
-from app.orchestrator.map_progress import (
-    # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
-    map_pause_message,
-)
+from app.orchestrator.map_failure_guard import map_pause_message
+
 from app.orchestrator.map_turn.contracts import logger
 from app.orchestrator.turn.contracts import (
     ErrorTurnOutcome,

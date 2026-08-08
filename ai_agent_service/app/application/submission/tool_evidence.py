@@ -9,7 +9,8 @@ from app.agents.types import Frame
 from app.api.schemas import ToolResult
 from app.config import AppSettings
 from app.orchestrator.evidence import EvidenceValidationError, register_screenshot_evidence
-from app.orchestrator.map_progress import latest_map_revision
+from app.orchestrator.map_context import latest_map_revision
+
 from app.sessions.store import Session
 
 logger = logging.getLogger(__name__)

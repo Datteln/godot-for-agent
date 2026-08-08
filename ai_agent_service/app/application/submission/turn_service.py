@@ -34,7 +34,8 @@ from app.llm.cache_observability import CacheMetricsCollector
 from app.llm.provider import LLMProvider
 from app.orchestrator.completion_gate import completion_gate_text, evaluate_map_completion
 from app.orchestrator.map_contracts import MAP_WORKER_TO_RUNTIME_STAGE
-from app.orchestrator.map_progress import build_map_progress_digest
+from app.orchestrator.map_context import build_map_progress_digest
+
 from app.orchestrator.map_turn import AgentPromptFactory, MapTurnPolicy
 from app.orchestrator.map_workflow import (
     consume_map_resume_authorization,

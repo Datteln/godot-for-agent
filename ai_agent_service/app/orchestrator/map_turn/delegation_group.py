@@ -15,10 +15,8 @@ from app.orchestrator.macro_contracts import (
     MacroPlanError,
     MacroPlanState,
 )
-from app.orchestrator.map_progress import (
-    # 本轮整改：revision 查询改为图层感知，避免跨图层 revision 冲突
-    record_map_owner_link,
-)
+from app.orchestrator.map_context import record_map_owner_link
+
 from app.orchestrator.map_turn.contracts import (
     MAX_AGENT_DEPTH,
     AgentPromptFactory,

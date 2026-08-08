@@ -7,7 +7,8 @@ from dataclasses import replace
 
 from app.api.schemas import ChatRequest
 from app.orchestrator.completion_gate import has_canonical_map_target_revision
-from app.orchestrator.map_progress import reset_map_task_progress, resume_map_task
+from app.orchestrator.map_state import reset_map_task_progress, resume_map_task
+
 from app.orchestrator.map_request_scope import (
     MapRequestScope,
     bind_map_task,

@@ -360,3 +360,65 @@ def test_map_turn_handler_module_size_budgets() -> None:
         assert len(logical_lines) <= budget, (
             f"{path.name} has {len(logical_lines)} logical lines, budget is {budget}"
         )
+
+
+def test_map_orchestration_module_size_budgets() -> None:
+    """每个 app/orchestrator/map_*.py 模块 ≤700 逻辑行，且 map_progress.py 已删除。"""
+    orchestrator_dir = APP_ROOT / "orchestrator"
+    assert not (orchestrator_dir / "map_progress.py").exists(), (
+        "map_progress.py must be deleted, not kept as a facade"
+    )
+    for path in orchestrator_dir.glob("map_*.py"):
+        source = path.read_text(encoding="utf-8")
+        logical_lines = [
+            line for line in source.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert len(logical_lines) <= 700, (
+            f"{path.name} has {len(logical_lines)} logical lines, budget is 700"
+        )
+
+
+def test_map_progress_decomposition_has_no_facade_or_cycles() -> None:
+    """分解后的 map_*.py 子模块不得野个体导入/回导出旧面，且依赖无环、map_state 为根。"""
+    import re
+
+    orchestrator_dir = APP_ROOT / "orchestrator"
+    modules = [
+        "map_state",
+        "map_validation",
+        "map_context",
+        "map_platform_planning",
+        "map_plan_progress",
+        "map_write_authorization",
+        "map_failure_guard",
+    ]
+    for name in modules:
+        source = (orchestrator_dir / f"{name}.py").read_text(encoding="utf-8")
+        assert "import *" not in source, f"{name}.py uses a wildcard import"
+    edges: dict[str, set[str]] = {m: set() for m in modules}
+    for name in modules:
+        source = (orchestrator_dir / f"{name}.py").read_text(encoding="utf-8")
+        for m in modules:
+            if m != name and re.search(rf"from \.{m} import", source):
+                edges[name].add(m)
+    assert not edges["map_state"], "map_state must be the root (no sibling imports)"
+
+    visiting: set[str] = set()
+    done: set[str] = set()
+
+    def has_cycle(module: str) -> bool:
+        if module in done:
+            return False
+        if module in visiting:
+            return True
+        visiting.add(module)
+        for nxt in edges[module]:
+            if has_cycle(nxt):
+                return True
+        visiting.discard(module)
+        done.add(module)
+        return False
+
+    for m in modules:
+        assert not has_cycle(m), f"map decomposition has an import cycle involving {m}"

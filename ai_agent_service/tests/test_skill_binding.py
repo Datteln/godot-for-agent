@@ -16,7 +16,8 @@ import pytest
 
 from app.agents.types import AgentDefinition
 from app.orchestrator.map_contracts import MAP_WORKER_RESULT_SCHEMA
-from app.orchestrator.map_progress import MapTaskState
+from app.orchestrator.map_state import MapTaskState
+
 from app.orchestrator.map_workflow import replace_map_state_field
 from app.orchestrator.runtime_contracts import SkillBindingResult
 from app.skills.binding import SkillBindingContext, SkillBindingResolver

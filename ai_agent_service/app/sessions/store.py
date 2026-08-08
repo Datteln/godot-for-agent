@@ -21,7 +21,8 @@ from typing import Any, Literal
 
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, CompactSnapshot, Frame
-from app.orchestrator.map_progress import MapTaskState
+from app.orchestrator.map_state import MapTaskState
+
 from app.orchestrator.map_request_scope import MapRequestScope
 from app.orchestrator.map_workers import restore_project_agent
 from app.permissions.engine import SessionAllowGrant

@@ -70,7 +70,7 @@ REDUCER_OWNED_FIELDS = frozenset(
 )
 DIRECT_WRITE_HYDRATION_ALLOWLIST = frozenset(
     {
-        ("map_progress.py", "MapTaskState.from_dict"),
+        ("map_state.py", "MapTaskState.from_dict"),
     }
 )
 

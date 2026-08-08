@@ -4,7 +4,8 @@ from copy import deepcopy
 
 import pytest
 
-from app.orchestrator.map_progress import MapTaskState
+from app.orchestrator.map_state import MapTaskState
+
 from app.orchestrator.map_recovery import record_plan_attempt
 from app.orchestrator.plan_scheduler import PlanGraph, PlanGraphError
 from app.orchestrator.runtime_contracts import PlanStepResult
