@@ -838,7 +838,18 @@ static func coord_key(coords: Vector3i) -> String:
 	return "%d,%d,%d" % [coords.x, coords.y, coords.z]
 
 
+static func region_bounds_error(region: Dictionary) -> String:
+	for key in ["min_x", "max_x", "min_y", "max_y", "min_z", "max_z"]:
+		if not region.has(key):
+			return "invalid_region_missing_%s" % key
+	return ""
+
+
 static func in_region(coords: Vector3i, region: Dictionary) -> bool:
+	var bounds_error := region_bounds_error(region)
+	if bounds_error != "":
+		push_warning("MapValidator.in_region: %s" % bounds_error)
+		return false
 	return coords.x >= int(region["min_x"]) and coords.x <= int(region["max_x"]) \
 		and coords.y >= int(region["min_y"]) and coords.y <= int(region["max_y"]) \
 		and coords.z >= int(region["min_z"]) and coords.z <= int(region["max_z"])

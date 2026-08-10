@@ -88,7 +88,7 @@ func _render_event(root: VBoxContainer, item: Dictionary, block: Dictionary) -> 
 
 func _render_tool(root: VBoxContainer, item: Dictionary, block: Dictionary) -> void:
 	var call: Dictionary = block.get("call", {}) if block.get("call", {}) is Dictionary else {}
-	var preview := ToolPreviewRenderer.render_call(call, theme_colors)
+	var preview := ToolPreviewRenderer.render_call(call, theme_colors, true)
 	root.add_child(preview)
 	var result: Dictionary = block.get("result", {}) if block.get("result", {}) is Dictionary else {}
 	var status := str(result.get("status", item.get("status", "")))
@@ -99,6 +99,12 @@ func _render_tool(root: VBoxContainer, item: Dictionary, block: Dictionary) -> v
 		elif status == "applied":
 			status_color = theme_colors.get("success_text", null)
 		root.add_child(log_renderer.make_log_rich_text(status, status_color))
+	if not result.is_empty():
+		var result_text := JSON.stringify(result, "\t")
+		if result_text.length() > 12000:
+			result_text = result_text.left(12000) + "\n... (truncated)"
+		var result_toggle: Button = log_renderer.make_workflow_toggle("result · %d chars" % result_text.length(), theme_colors.get("muted_text", Color(0.6, 0.6, 0.6)))
+		log_renderer.append_collapsible(root, result_toggle, result_text, "⚙")
 
 
 func _limited_text(value: String, limit: int) -> String:

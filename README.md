@@ -17,6 +17,7 @@
   - [功能总览](#功能总览)
   - [后端服务 (`ai_agent_service`)](#后端服务-ai_agent_service)
     - [后端快速启动](#后端快速启动)
+    - [本地模型准备（启动服务前必做）](#本地模型准备启动服务前必做)
     - [API 端点一览](#api-端点一览)
       - [`/chat` 请求体](#chat-请求体)
       - [`/chat` 三态响应](#chat-三态响应)
@@ -194,6 +195,40 @@ python -m app
 
 <!-- 📸 在此处插入后端启动终端截图 -->
 <!-- ![后端启动](docs/images/backend-startup.png) -->
+
+### 本地模型准备（启动服务前必做）
+
+RAG 的本地模型（embedding / rerank）**不会自动下载**：`app/rag/__init__.py` 在包导入时强制设置 `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`，服务每次启动只读取本地文件。模型缺失时静默降级、不阻塞启动：
+
+| 组件 | 缺模型时的行为 |
+| --- | --- |
+| cross-encoder 重排 | 记录 `Reranker unavailable; using fused order`，退回融合分数排序 |
+| 本地 embedding（`bge-m3` / `local`） | 退回纯 BM25 检索 |
+
+因此**启用本地模型前，必须先手动下载一次**：
+
+```powershell
+# 重排模型（约 2.28 GB；--exclude "*.bin" 跳过冗余的 PyTorch 权重）
+hf download BAAI/bge-reranker-v2-m3 --exclude "*.bin"
+
+# Embedding 模型（约 2.3 GB，仅 AI_AGENT_EMBEDDING_PROVIDER=bge-m3/local 时需要）
+hf download BAAI/bge-m3 --exclude "*.bin"
+```
+
+> `hf` 是 `huggingface_hub` 的 CLI（服务 venv 里自带）；新版中 `huggingface-cli` 已废弃不再工作。
+
+下载位置与配置的对应关系：
+
+| 下载方式 | 模型文件位置 | 环境变量取值 |
+| --- | --- | --- |
+| 不带 `--local-dir`（推荐） | 默认 HF 缓存 `%USERPROFILE%\.cache\huggingface\hub` | Hub ID，如 `AI_AGENT_RERANK_MODEL=BAAI/bge-reranker-v2-m3` |
+| 带 `--local-dir D:\models\bge-reranker-v2-m3` | 自定义目录 | 本地路径，如 `AI_AGENT_RERANK_MODEL=D:/models/bge-reranker-v2-m3` |
+
+说明：
+
+- `CrossEncoder` / `SentenceTransformer` 对环境变量传入的字符串原样解析：Hub ID 从默认 HF 缓存读取，本地路径直接读取该目录。
+- 仅下载步骤需要联网（huggingface.co）；下载完成后服务永久离线运行，不再发起任何网络请求。
+- 验证：`Test-Path "$env:USERPROFILE\.cache\huggingface\hub\models--BAAI--bge-reranker-v2-m3\snapshots"` 返回 `True`。
 
 ### API 端点一览
 
@@ -390,6 +425,8 @@ Invoke-RestMethod `
 | `AI_AGENT_RAG_TOKEN_BUDGET` | `1500` | RAG 注入 prompt 的 token 预算（下限 128） |
 | `AI_AGENT_GRAPH_MAX_DEPTH` | `2` | 图检索最大深度（0–8） |
 | `AI_AGENT_GRAPH_MAX_NEIGHBORS` | `5` | 图检索每节点最大邻居数（1–100） |
+
+> ⚠️ 本地模型（`BAAI/bge-m3` / `BAAI/bge-reranker-v2-m3`）不会自动下载，启动服务前需先手动下载，见[本地模型准备（启动服务前必做）](#本地模型准备启动服务前必做)。
 
 #### RAG 自动构建
 

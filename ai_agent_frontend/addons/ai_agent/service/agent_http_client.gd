@@ -170,16 +170,7 @@ func send_tool_results(results: Array, model = null) -> void:
 		})
 		return
 	if valid_results.is_empty():
-		FrontendLogger.warn(editor_interface, "HTTP", "No valid tool results to send; request suppressed.", {})
-		response_received.emit({
-			"type": "error",
-			"text": "No valid tool results were available; the pending batch was preserved.",
-			"error_code": "front_tool_result_malformed",
-			"disposition": "wait_frontend",
-			"retryable": true,
-			"side_effect_state": "prepared",
-			"next_action": {"action": "collect_pending_tool_results", "owner": "frontend"},
-		})
+		FrontendLogger.debug(editor_interface, "HTTP", "No tool results to send; suppressed silently.", {})
 		return
 	var payload := {
 		"session_id": _session_id(),

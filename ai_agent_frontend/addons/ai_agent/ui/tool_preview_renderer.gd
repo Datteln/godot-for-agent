@@ -7,7 +7,7 @@ const MAX_DIFF_LINES_PER_SIDE := 260
 const MAX_DIFF_LINES_SHOWN := 240
 
 
-static func render_call(call: Dictionary, theme_colors: Dictionary = {}) -> Control:
+static func render_call(call: Dictionary, theme_colors: Dictionary = {}, compact: bool = false) -> Control:
 	var box := VBoxContainer.new()
 	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
@@ -24,9 +24,11 @@ static func render_call(call: Dictionary, theme_colors: Dictionary = {}) -> Cont
 		"run":
 			box.add_child(_render_execution_confirm(call))
 		"list":
-			box.add_child(_render_op_list(call))
+			if not compact:
+				box.add_child(_render_op_list(call))
 		_:
-			box.add_child(_render_json(call))
+			if not compact:
+				box.add_child(_render_json(call))
 	return box
 
 

@@ -98,7 +98,7 @@ static func describe_selection(editor_interface: EditorInterface) -> Dictionary:
 			return {"ok": true, "path": path, "type": "TileMapLayer"}
 
 	if root == null:
-		return {"ok": false, "message": "Select a TileMapLayer first"}
+		return {"ok": false, "message": "No edited scene; open a scene first.", "error_code": "no_edited_scene", "recovery_actions": ["open_scene_with_map"]}
 	var found: Array = []
 	_collect_tilemap_layers(root, found)
 	if found.size() == 1:
@@ -108,8 +108,25 @@ static func describe_selection(editor_interface: EditorInterface) -> Dictionary:
 		var paths: Array = []
 		for n in found:
 			paths.append(str(root.get_path_to(n)))
-		return {"ok": false, "message": "Multiple TileMapLayer nodes found, select one", "candidates": paths}
-	return {"ok": false, "message": "Select a TileMapLayer first"}
+		return {"ok": false, "message": "Multiple TileMapLayer nodes found, select one", "error_code": "selection_required", "candidates": paths, "recovery_actions": ["select_tilemap_layer"]}
+	var legacy: Array = []
+	_collect_tilemaps(root, legacy)
+	if not legacy.is_empty():
+		var fallback_node: Node = legacy[0]
+		var fallback_path := str(root.get_path_to(fallback_node))
+		return {
+			"ok": true,
+			"path": fallback_path,
+			"type": "TileMap",
+			"auto_detected": true,
+			"selection_fallback": {"reason": "no_selection_using_first_tilemap", "target": fallback_path},
+		}
+	return {
+		"ok": false,
+		"message": "No TileMapLayer or TileMap node in the edited scene; select or create a map target first.",
+		"error_code": "no_compatible_layer",
+		"recovery_actions": ["open_scene_with_map", "create_tilemap_layer"],
+	}
 
 
 static func _collect_tilemap_layers(node: Node, out: Array) -> void:
@@ -117,6 +134,13 @@ static func _collect_tilemap_layers(node: Node, out: Array) -> void:
 		out.append(node)
 	for child in node.get_children():
 		_collect_tilemap_layers(child, out)
+
+
+static func _collect_tilemaps(node: Node, out: Array) -> void:
+	if node.get_class() == "TileMap":
+		out.append(node)
+	for child in node.get_children():
+		_collect_tilemaps(child, out)
 
 
 static func _count_scene_nodes(node: Node) -> int:
@@ -1182,6 +1206,7 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	var width := max(1, int(input.get("width", 1)))
 	var height := max(1, int(input.get("height", 1)))
 	var depth := max(1, int(input.get("depth", 1))) if dimension == 3 else 1
+	var region := MapValidator.region_from_input(input, dimension)
 	var cells_format := str(input.get("cells_format", "summary_only")).to_lower()
 	if not ["summary_only", "non_empty_only", "full"].has(cells_format):
 		return {"ok": false, "message": "cells_format must be summary_only, non_empty_only, or full", "error_code": "invalid_cells_format"}
@@ -1256,18 +1281,7 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		"filled_cells": non_empty_count,
 		"map_layer": map_layer,
 	}
-	result["object_occupancy"] = _live_object_occupancy(
-		target,
-		{
-			"x": origin.x,
-			"y": origin.y,
-			"z": origin.z,
-			"width": width,
-			"height": height,
-			"depth": depth,
-		},
-		dimension
-	)
+	result["object_occupancy"] = _live_object_occupancy(target, region, dimension)
 	if cells_format != "summary_only":
 		result["cells"] = returned_cells
 	if requested_cells > MAX_DESCRIBED_CELLS:
@@ -2567,6 +2581,9 @@ static func _used_bounds_3d(cells: Array) -> Dictionary:
 
 static func _live_object_occupancy(target: Node, region: Dictionary, dimension: int) -> Dictionary:
 	## 从当前 edited scene 的碰撞对象计算实时占用；不依赖可能过期的 spatial index。
+	var bounds_error := MapValidator.region_bounds_error(region)
+	if bounds_error != "":
+		return {"source": "edited_scene_tree_collision_objects", "freshness": "unavailable", "complete": false, "objects": [], "error_code": "invalid_region"}
 	var tree := target.get_tree()
 	var root: Node = tree.edited_scene_root if tree != null else null
 	if root == null:
@@ -6303,6 +6320,10 @@ static func _entry_matches(entry: Dictionary, want_tags: Array, want_resource: S
 
 
 static func _entry_in_region(entry: Dictionary, region: Dictionary, dimension: int) -> bool:
+	var bounds_error := MapValidator.region_bounds_error(region)
+	if bounds_error != "":
+		push_warning("MapValidator._entry_in_region: %s" % bounds_error)
+		return false
 	var coords = entry.get("coords", {})
 	if not (coords is Dictionary):
 		return true

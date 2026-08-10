@@ -125,6 +125,9 @@ func _insert(raw_item: Dictionary) -> Dictionary:
 	var item: Dictionary = validation.get("item", {})
 	if str(item.get("session_epoch", "")) != _session_epoch:
 		return {"ok": false, "reason": "epoch_mismatch"}
+	for key_part in (item.get("order_key", []) as Array):
+		if not (key_part is int):
+			return {"ok": false, "reason": "mixed_order_key_types"}
 	var item_id := str(item.get("item_id", ""))
 	if _items_by_id.has(item_id):
 		var existing: Dictionary = _items_by_id[item_id]

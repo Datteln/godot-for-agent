@@ -86,6 +86,7 @@ var _last_selection_refresh_ms := 0
 var _message_context_popup: PopupMenu
 var _message_context_source: RichTextLabel
 var _timeline_controller := ChatTimelineController.new()
+var _pending_user_local_id := ""
 var _renderer_registry := ChatItemRendererRegistry.new()
 var _session_state_reducer := SessionTurnStateReducer.new()
 var _virtual_scroller: ChatVirtualScroller
@@ -520,6 +521,7 @@ func _on_send() -> void:
 	_selection_signature = ""
 	_refresh_context_bar()
 	_set_state(AgentState.WAITING_LLM)
+	_pending_user_local_id = _present_local_text("user", text)
 	if undo_manager != null:
 		undo_manager.begin_batch("AI: " + text.left(40))
 	_submission_controller.submit_user(
@@ -971,6 +973,8 @@ func _run_selected_command(command_name: String, args: Dictionary) -> void:
 func _handle_tool_calls(response: Dictionary) -> void:
 	var raw_calls: Variant = response.get("calls", [])
 	var calls: Array = raw_calls if raw_calls is Array else []
+	if calls.is_empty():
+		return
 	var turn_id := str(response.get("turn_id", ""))
 	if not turn_id.is_empty():
 		_session_state.adopt_turn(turn_id)
@@ -1335,6 +1339,7 @@ func _handle_reset_response(response: Dictionary) -> void:
 
 func _on_interrupt() -> void:
 	FrontendLogger.warn(editor_interface, "ChatPanel", "Interrupt requested.", {"state": _status.text})
+	var interrupt_turn_id := str(_session_state.snapshot().get("active_turn_id", ""))
 	_interrupted_locally = true
 	_streaming_controller.clear()
 	_clear_inline_confirmation()
@@ -1347,6 +1352,7 @@ func _on_interrupt() -> void:
 	if state_store != null:
 		state_store.set_value("pending_calls", [])
 		state_store.set_value("current_turn_id", "")
+	_timeline_controller.interrupt_pending_tools(interrupt_turn_id)
 	_set_state(AgentState.PAUSED)
 	_present_local_text("system", _ui("interrupted"))
 
@@ -1508,6 +1514,9 @@ func _drain_event_queue() -> void:
 func _handle_event(event: Dictionary) -> void:
 	var event_type := str(event.get("type", ""))
 	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+	if event_type == "user_submitted" and _pending_user_local_id != "":
+		_timeline_controller.promote_local_to_next_insert(_pending_user_local_id)
+		_pending_user_local_id = ""
 	_session_state_reducer.reduce(event)
 	if not _timeline_controller.present_event(event):
 		FrontendLogger.error(editor_interface, "ChatPanel", "Canonical Timeline rejected event.", {
@@ -1517,7 +1526,7 @@ func _handle_event(event: Dictionary) -> void:
 		return
 	if event_type == "server_tool_result":
 		_remember_server_file_read(event)
-	if event_type == "tool_calls" or event_type == "agent_tool_calls":
+	if event_type == "tool_calls":
 		_handle_tool_calls(payload)
 	elif event_type == "final":
 		if payload.has("text"):
@@ -1886,15 +1895,14 @@ func _set_state(value: int) -> void:
 			"to": value,
 			"text": _status.text
 		})
-
-
-func _present_local_text(role: String, text: String, color = null) -> void:
+func _present_local_text(role: String, text: String, color = null) -> String:
 	var style_token := "error" if role == "error" else role
 	var item_id := _timeline_controller.present_local_text(role, _limit_render_text(text, MAX_MESSAGE_RENDER_CHARS), style_token)
 	if item_id.is_empty():
 		FrontendLogger.error(editor_interface, "ChatPanel", "Local Timeline item rejected.", {"role": role})
-		return
+		return ""
 	_scroll_to_bottom()
+	return item_id
 
 
 func _clear_messages(reset_history := true) -> void:
@@ -1902,6 +1910,7 @@ func _clear_messages(reset_history := true) -> void:
 		"reset_history": reset_history,
 		"store_before": _timeline_controller.store.size(),
 	})
+	_pending_user_local_id = ""
 	var epoch := str(_session_state.snapshot().get("session_epoch", ""))
 	if epoch.is_empty():
 		epoch = "pending:%s" % _current_session_id()
