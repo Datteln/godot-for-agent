@@ -18,7 +18,7 @@ The system MUST publish assistant text and reasoning preview deltas incrementall
 - **THEN** the event channel continues to expose those chunks incrementally without adding a second delivery path
 
 ### Requirement: Provisional previews have an explicit lifecycle
-Every preview emitted before atomic commit MUST carry stable submission identity and MUST be resolved by a commit or discard boundary without being duplicated as committed text.
+Every preview emitted before atomic commit MUST carry stable submission identity and MUST be resolved by a commit or discard boundary without being duplicated as committed text. Interrupt and cancel boundaries MUST also resolve pending provisional tool items: every tool item left in a non-terminal status at interrupt SHALL be finalized with an interrupted status or discarded, and no item may remain permanently `pending`.
 
 #### Scenario: Submission commits
 - **WHEN** Session persistence and transactional publication succeed after provisional previews were emitted
@@ -35,6 +35,10 @@ Every preview emitted before atomic commit MUST carry stable submission identity
 #### Scenario: A stale boundary arrives
 - **WHEN** the client receives a commit or discard boundary for a request older than the active preview
 - **THEN** it applies the boundary only to matching preview identity and does not alter the active request
+
+#### Scenario: Interrupt leaves no zombie tool block
+- **WHEN** the user interrupts a turn while front tools are executing or awaiting results
+- **THEN** every tool item of that turn left in a non-terminal status is finalized with an interrupted status or discarded, and no tool block remains `pending` after the interrupt boundary
 
 ### Requirement: Event delivery applies bounded backpressure
 The WebSocket event channel MUST send ordered bounded batches, limit unacknowledged event count and bytes per connection, and use cumulative client acknowledgements to advance delivery. Authoritative events MUST remain in the event store rather than depending on the socket queue.
@@ -89,7 +93,7 @@ The system SHALL record structured diagnostics that distinguish provider streami
 - **THEN** logs provide request-correlated first-chunk, first-publication, batch/backlog, and commit-or-discard evidence without logging secrets or full prompt content
 
 ### Requirement: Live and historical content share one canonical Timeline projection
-Accepted WebSocket chat events and canonical history event pages MUST enter the same pure `ChatTimelineProjector` and produce the same `ChatTimelineItem` structure and stable identities for equivalent content. Every item MUST carry a stable `item_id`, Session epoch, deterministic order key, closed kind and role, typed content blocks, lifecycle, status, copy text, style token, and applicable Frame, message, tool, artifact, and preview source identities. Rendered text MUST NOT be used as identity.
+Accepted WebSocket chat events and canonical history event pages MUST enter the same pure `ChatTimelineProjector` and produce the same `ChatTimelineItem` structure and stable identities for equivalent content. Every item MUST carry a stable `item_id`, Session epoch, deterministic order key, closed kind and role, typed content blocks, lifecycle, status, copy text, style token, and applicable Frame, message, tool, artifact, and preview source identities. Rendered text MUST NOT be used as identity. All order keys MUST be drawn from a single totally ordered integer sequence space shared by event, message, tool, and local items; item comparison MUST NOT mix key types, and locally created items MUST be keyed relative to the accepted sequence high-water mark instead of a fixed large integer offset.
 
 #### Scenario: Live stream is restored from history
 - **WHEN** an assistant or reasoning item first arrives through WebSocket and is later loaded from a history page
@@ -102,6 +106,14 @@ Accepted WebSocket chat events and canonical history event pages MUST enter the 
 #### Scenario: Backend history is requested
 - **WHEN** the frontend loads canonical history for a Session epoch
 - **THEN** the backend returns canonical event records and does not generate `_history_log_text`, `_history_thought`, `_history_code`, or `_history_front_tool_result`
+
+#### Scenario: Local and server items interleave chronologically
+- **WHEN** a local notice or optimistic user item is inserted between accepted server events
+- **THEN** it is positioned by its chronological order key relative to the accepted sequence high-water mark, and is never grouped above or below server items merely because of its origin
+
+#### Scenario: Mixed-type order keys fail closed
+- **WHEN** projection or insertion produces an order key whose element types differ from an existing item's at the same comparison position
+- **THEN** the store rejects the mutation with a typed reason instead of silently falling back to string comparison
 
 ### Requirement: Streaming and preview lifecycles mutate stable Timeline items
 Text and reasoning deltas MUST patch their existing stable Timeline items. A final event MUST finalize the matching assistant item rather than append or deduplicate by text. Preview commit or discard MUST update only the matching preview-backed item. Reasoning and body ordering MUST derive from Timeline order keys, not UI-node creation timing.
@@ -119,7 +131,7 @@ Text and reasoning deltas MUST patch their existing stable Timeline items. A fin
 - **THEN** their canonical order keys produce the same relative order in live rendering and history restoration
 
 ### Requirement: Tool previews and all visible nodes use the renderer registry
-Tool calls, results, diffs, reasoning disclosures, Markdown, system messages, errors, and finals MUST store serializable content blocks, render descriptors, or artifact references. TimelineStore MUST NOT contain a prebuilt Godot `Control`, and no visible node may bypass `ChatItemRendererRegistry`. Markdown, truncation, copy text, theme, indentation, lifecycle status, and status-color policy MUST be shared by live and historical rendering.
+Tool calls, results, diffs, reasoning disclosures, Markdown, system messages, errors, and finals MUST store serializable content blocks, render descriptors, or artifact references. TimelineStore MUST NOT contain a prebuilt Godot `Control`, and no visible node may bypass `ChatItemRendererRegistry`. Markdown, truncation, copy text, theme, indentation, lifecycle status, and status-color policy MUST be shared by live and historical rendering. Timeline rendering of `json` and `list` render-kind tool items MUST NOT display the raw tool-input JSON; it SHALL show the tool title and lifecycle status only. Approval and confirmation previews MAY continue to display full input detail. Structured `diff`, `map`, and `run` previews are unaffected.
 
 #### Scenario: Tool diff appears live and in history
 - **WHEN** the same tool result is rendered first from a WebSocket event and later from canonical history
@@ -133,8 +145,20 @@ Tool calls, results, diffs, reasoning disclosures, Markdown, system messages, er
 - **WHEN** release architecture checks inspect ChatPanel and VirtualScroller integration
 - **THEN** ChatPanel has no direct append or external-node insertion path and VirtualScroller subscribes only to TimelineStore mutations
 
+#### Scenario: Parameterless front tool in timeline
+- **WHEN** a `json` or `list` render-kind tool item is rendered in the Timeline
+- **THEN** the node shows only the tool title and lifecycle status, with no raw input JSON block regardless of whether the input is empty
+
+#### Scenario: Confirmation preview retains input detail
+- **WHEN** a `needs_confirm` tool is presented in the approval dialog
+- **THEN** the preview continues to display the full input detail needed for the approval decision
+
+#### Scenario: Structured previews unchanged
+- **WHEN** `diff`, `map`, or `run` render-kind tool items are rendered live or from history
+- **THEN** their computed structured previews render exactly as before
+
 ### Requirement: Accepted WebSocket events are the sole live presentation authority
-HTTP chat and tool-result responses MUST be command acknowledgements only and MUST NOT create, patch, finalize, discard, or deduplicate a live Timeline item. Live `tool_calls`, `final`, `error`, text, reasoning, preview, system, and tool-result presentation MUST originate from accepted WebSocket events and enter ChatTimelineProjector exactly once. Bounded history or snapshot recovery MAY hydrate canonical events through the same projector but MUST NOT establish a second live response-rendering path.
+HTTP chat and tool-result responses MUST be command acknowledgements only and MUST NOT create, patch, finalize, discard, or deduplicate a live Timeline item. Live `tool_calls`, `final`, `error`, text, reasoning, preview, system, and tool-result presentation MUST originate from accepted WebSocket events and enter ChatTimelineProjector exactly once. Bounded history or snapshot recovery MAY hydrate canonical events through the same projector but MUST NOT establish a second live response-rendering path. As a narrow exception for submission latency, the client MUST render the user's own submission immediately at send time as a local provisional item; the accepted `user_submitted` event MUST reconcile that provisional item exactly once (replace or discard) so that exactly one user item remains.
 
 #### Scenario: HTTP acknowledgement arrives before its terminal event
 - **WHEN** a chat command returns `tool_calls`, `final`, or `error` acknowledgement before the matching accepted WebSocket event
@@ -147,6 +171,33 @@ HTTP chat and tool-result responses MUST be command acknowledgements only and MU
 #### Scenario: Snapshot recovery restores visible content
 - **WHEN** a typed `snapshot_required` disposition triggers bounded HTTP recovery
 - **THEN** recovered canonical events enter the same projector and stable identities, while continuous HTTP polling and direct snapshot rendering remain absent
+
+#### Scenario: Optimistic user bubble at send time
+- **WHEN** the user submits a chat message
+- **THEN** the client immediately renders a local provisional user item at the timeline tail without waiting for any server event
+
+#### Scenario: user_submitted echo reconciles once
+- **WHEN** the accepted `user_submitted` event arrives while its provisional user item is visible
+- **THEN** the client replaces or discards the provisional item exactly once and exactly one user item remains for that submission
+
+#### Scenario: Echo is lost but history restores
+- **WHEN** the `user_submitted` echo is never accepted but canonical history for the epoch contains the submission
+- **THEN** history restoration shows exactly one user item and no duplicate provisional item survives an epoch reset
+
+### Requirement: Display-only orchestration events never trigger execution
+The client MUST treat `agent_tool_calls` and other orchestration or progress events as presentation-only. Only canonical `tool_calls` events carrying a non-empty `calls` array SHALL dispatch front-tool execution or tool-result submission. Event routing into the execution path MUST NOT depend on payload keys that display events lack.
+
+#### Scenario: agent_tool_calls arrives
+- **WHEN** the client accepts an `agent_tool_calls` event for a sub-agent frame
+- **THEN** no front-tool execution, tool-result submission, synthetic error, or state transition occurs
+
+#### Scenario: tool_calls with empty calls arrives
+- **WHEN** the client accepts a `tool_calls` event whose `calls` array is empty
+- **THEN** the client performs no execution and no submission, and chat state is unchanged
+
+#### Scenario: tool_calls with front calls arrives
+- **WHEN** the client accepts a `tool_calls` event with a non-empty `calls` array
+- **THEN** the existing execution and result-submission pipeline processes the batch exactly as before
 
 ### Requirement: Chat events use only an authenticated resumable WebSocket
 Chat event delivery MUST use a WebSocket authenticated by the bearer token in handshake headers. After connection, the client MUST bind the stream with `session_id`, `session_epoch`, and `after_seq`; credentials MUST NOT appear in URLs or logs. No HTTP event-polling route or transport fallback may exist.
