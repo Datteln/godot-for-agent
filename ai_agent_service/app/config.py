@@ -85,8 +85,8 @@ class AppSettings(BaseSettings):
     completion_continuation_limit: int = Field(default=4, ge=1, le=16)
     map_compaction_token_threshold: int = Field(default=120_000, ge=1_000, le=2_000_000)
     completed_response_hot_cache_size: int = Field(default=128, ge=1, le=4_096)
-    websocket_batch_event_limit: int = Field(default=64, ge=1, le=512)
-    websocket_batch_byte_limit: int = Field(default=262_144, ge=1_024, le=4_194_304)
+    websocket_batch_event_limit: int = Field(default=128, ge=1, le=512)
+    websocket_batch_byte_limit: int = Field(default=524_288, ge=1_024, le=4_194_304)
     websocket_unacked_event_limit: int = Field(default=256, ge=1, le=4_096)
     websocket_unacked_byte_limit: int = Field(
         default=1_048_576,

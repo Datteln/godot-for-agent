@@ -93,6 +93,7 @@ func _process(_delta: float) -> void:
 
 func _open() -> void:
 	_peer = WebSocketPeer.new()
+	_peer.inbound_buffer_size = 10 * 1024 * 1024
 	var token := str(service.token) if service != null else ""
 	_peer.handshake_headers = PackedStringArray(["Authorization: Bearer " + token])
 	var error := _peer.connect_to_url(_socket_url())
