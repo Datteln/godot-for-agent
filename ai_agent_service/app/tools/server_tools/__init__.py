@@ -20,6 +20,7 @@ from app.tools.server_tools.read_planning_snapshot import (
 from app.tools.server_tools.read_file import register_read_file_tool
 from app.tools.server_tools.search_codebase import register_search_codebase_tool
 from app.tools.server_tools.search_tools import register_search_tools_tool
+from app.tools.server_tools.codeact_tools import register_codeact_tools
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ def register_server_tools() -> None:
     register_read_planning_snapshot_tool()
     register_search_tools_tool()
     register_search_codebase_tool()
+    register_codeact_tools()
     logger.debug("Server tools registered before=%d after=%d", before, len(REGISTRY))
 
 

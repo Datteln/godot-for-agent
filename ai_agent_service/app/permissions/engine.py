@@ -92,6 +92,21 @@ def _session_allow_match(ctx: PermissionContext, tool: ToolDef, args: dict[str, 
     return make_session_allow_grant(tool, args) in ctx.session_allow
 
 
+def explicit_approval_granted(
+    tool: ToolDef,
+    args: dict[str, Any],
+    ctx: PermissionContext,
+) -> bool:
+    """判断调用是否具有可审计的显式策略预批准，而非默认放行。"""
+    if ctx.security.trusted and match_rules(ctx.allow_rules, tool, args, "allow"):
+        return True
+    if _session_allow_match(ctx, tool, args):
+        return True
+    if ctx.security.permission_mode == "full_access":
+        return True
+    return ctx.security.permission_mode == "auto_approve" and ctx.security.trusted
+
+
 def make_session_allow_grant(
     tool: ToolDef, args: dict[str, Any] | None = None
 ) -> SessionAllowGrant:

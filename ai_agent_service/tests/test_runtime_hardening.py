@@ -378,7 +378,9 @@ class ApplyTextEditToolRegistrationTests(unittest.TestCase):
         agent_def = (
             repo / "ai_agent_service/app/agents/agent_defs/programming-agent.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("apply_text_edit", agent_def.split("---")[1])
+        header = agent_def.split("---")[1]
+        self.assertIn("project.edit", header)
+        self.assertNotIn("apply_text_edit", header)
 
     def test_frontend_dispatches_apply_text_edit_to_local_edit_handler(self) -> None:
         repo = Path(__file__).resolve().parents[2]

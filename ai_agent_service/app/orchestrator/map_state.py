@@ -143,6 +143,7 @@ class MapTaskState:
     plan_attempt_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
     task_convergence_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
     transaction_journals: list[dict[str, Any]] = field(default_factory=list)
+    codeact_execution: dict[str, Any] = field(default_factory=dict)
     # 宏观计划与地图域工作流的类型化链接（task 4.1）：owner 身份、macro 步骤、
     # 域任务、子帧 lineage、owner 发布与审批身份。独立于 MacroPlanState 持久化，
     # 两者通过 (macro_step_id, domain_task_id, owner_frame_id) 稳定关联。
@@ -387,6 +388,7 @@ class MapTaskState:
             "retry_registry",
             "plan_attempt_registry",
             "task_convergence_registry",
+            "codeact_execution",
             "pause_report",
         ):
             if not isinstance(data.get(key), dict):
@@ -402,6 +404,13 @@ class MapTaskState:
         ):
             if not isinstance(data.get(key), list):
                 data[key] = []
+        legacy_journals = data.get("transaction_journals", [])
+        if legacy_journals:
+            execution = dict(data.get("codeact_execution", {}))
+            execution["legacy_editor_transactions_retired"] = len(legacy_journals)
+            execution.setdefault("recovery_disposition", "retain_diff")
+            data["codeact_execution"] = execution
+            data["transaction_journals"] = []
         # 校验 status 和 stage 是否在合法枚举内；不合法时回退默认值，
         # 防止旧持久化数据或损坏数据导致运行时崩溃。
         if data.get("status") not in _MAP_STATUS_TRANSITIONS:
@@ -540,6 +549,7 @@ MAP_TASK_FIELD_LIFECYCLE: Final[dict[str, MapTaskFieldLifecycle]] = {
     "plan_attempt_registry": MapTaskFieldLifecycle("task"),
     "task_convergence_registry": MapTaskFieldLifecycle("task"),
     "transaction_journals": MapTaskFieldLifecycle("task"),
+    "codeact_execution": MapTaskFieldLifecycle("task"),
     "macro_step_id": MapTaskFieldLifecycle("task"),
     "owner_frame_id": MapTaskFieldLifecycle("task"),
     "domain_task_id": MapTaskFieldLifecycle("task"),

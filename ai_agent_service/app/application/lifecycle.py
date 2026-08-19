@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.api.schemas import (
     ChatErrorResponse,
@@ -29,6 +29,9 @@ from app.recovery.supervisor import RecoverySupervisor
 from app.sessions.resource_registry import BACKEND_RESET_STEPS
 from app.sessions.store import SessionStore
 
+if TYPE_CHECKING:
+    from app.codeact.gateway import ExecutionGateway
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +51,7 @@ class SessionLifecycleService:
         progress: TurnProgressRegistry,
         history_cache: dict[tuple[str, str], tuple[tuple[int, int, int], list[Any]]],
         available_tools: Callable[[], set[str]],
+        execution_gateway: ExecutionGateway | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
@@ -59,6 +63,7 @@ class SessionLifecycleService:
         self._progress = progress
         self._history_blocks_cache = history_cache
         self._available_tools = available_tools
+        self._execution_gateway = execution_gateway
         self._resume_incomplete_resets()
 
     @property
@@ -214,6 +219,12 @@ class SessionLifecycleService:
         await self._cancel_active_tasks(session_id)
         async with self._store.lock_for(session_id):
             old_session = self._store.get_or_create(session_id, self.available_tools)
+            if self._execution_gateway is not None:
+                await self._execution_gateway.finish_session(
+                    session_id,
+                    old_session.session_epoch,
+                    outcome="session_reset",
+                )
             event_highwater = max(
                 old_session.history_event_counter,
                 self._events.last_seq(session_id) if self._events is not None else 0,
@@ -302,8 +313,10 @@ class SessionLifecycleService:
 
         discarded = 0
         map_checkpoint_created = False
+        session_epoch = ""
         async with self._store.lock_for(session_id):
             session = self._store.get_or_create(session_id, self.available_tools)
+            session_epoch = session.session_epoch
             if session.map_task_state.status == "running":
                 session.map_task_state.make_checkpoint(
                     cause,
@@ -358,6 +371,13 @@ class SessionLifecycleService:
                         "Unable to record interrupted TaskRun session=%s",
                         session_id,
                     )
+
+        if self._execution_gateway is not None:
+            await self._execution_gateway.finish_session(
+                session_id,
+                session_epoch,
+                outcome=cause,
+            )
 
         self._publisher.emit(
             session_id,
@@ -509,8 +529,10 @@ class SessionLifecycleService:
         Returns:
             是否取消成功及取消后的任务状态。
         """
+        session_epoch = ""
         async with self._store.lock_for(session_id):
             session = self._store.get_or_create(session_id, self.available_tools)
+            session_epoch = session.session_epoch
             state = session.map_task_state
             # 前置条件：只有运行中或暂停中的任务才能被取消
             if state.status not in {"running", "paused"}:
@@ -546,6 +568,12 @@ class SessionLifecycleService:
                 "status": state.status,
                 "task_id": task_id,
             }
+        if self._execution_gateway is not None:
+            await self._execution_gateway.finish_session(
+                session_id,
+                session_epoch,
+                outcome="map_task_cancelled",
+            )
         self._publisher.emit(session_id, "map_task_cancelled", {"task_id": task_id})
         logger.info("Map task explicitly cancelled session=%s task_id=%s", session_id, task_id)
         return result

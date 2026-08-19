@@ -342,6 +342,12 @@ def build_map_progress_digest(session: Session, project_root: Path | None = None
                 "planning_publication="
                 + json.dumps(publication_digest, ensure_ascii=False, separators=(",", ":"))
             )
+    if state.codeact_execution:
+        codeact = {
+            key: state.codeact_execution.get(key)
+            for key in ("task_execution_id", "execution_status", "retries_remaining", "diff_artifact", "validation", "repair_context")
+        }
+        parts.append("codeact_repair=" + json.dumps(codeact, ensure_ascii=False, separators=(",", ":")))
     if project_root is not None:
         # task 3：注入 map_artifacts.json 的 relative_ref，让 LLM 压缩后能定位持久化的地图工具结果。
         try:

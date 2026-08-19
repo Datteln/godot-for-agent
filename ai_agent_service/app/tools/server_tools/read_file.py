@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from app.security.paths import path_ok
+from app.security.paths import normalized_project_path, path_ok, resolved_path_for
 from app.tools.context import ToolContext
 from app.tools.registry import ToolDef, register
 
@@ -58,11 +58,14 @@ async def read_file_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str,
         raise ValueError("path 不能为空")
     if not path_ok(path, ctx.security, write=False):
         raise ValueError("path 不在允许读取范围内")
+    normalized_path = normalized_project_path(path)
+    if normalized_path is None:
+        raise ValueError("path 不是合法项目路径")
 
     offset = _clamp_int(args.get("offset", 1), default=1, minimum=1, maximum=2**31 - 1)
     limit = _clamp_int(args.get("limit", DEFAULT_LIMIT_LINES), default=DEFAULT_LIMIT_LINES, minimum=1, maximum=MAX_LIMIT_LINES)
 
-    full_path = ctx.security.project_root / path
+    full_path = resolved_path_for(normalized_path, ctx.security, write=False)
     logger.info(
         "read_file start session=%s path=%s offset=%d limit=%d",
         ctx.session_id,
@@ -102,7 +105,7 @@ async def read_file_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str,
         scan_truncated,
     )
     return {
-        "path": path,
+        "path": normalized_path,
         "content": page_text,
         "encoding": "utf-8",
         "offset": offset,

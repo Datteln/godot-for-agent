@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,19 @@ from typing import Any
 from app.security.settings import SecuritySettings
 
 logger = logging.getLogger(__name__)
+
+
+class ProjectRootResolutionError(ValueError):
+    """表示逻辑项目根无法安全解析为 worker 写入边界。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectRoots:
+    """保存逻辑工程根、实际挂载根与只读 Git 根。"""
+
+    logical_project_root: Path
+    resolved_project_root: Path
+    repository_root: Path | None
 
 
 def _resolved(path: Path) -> Path:
@@ -30,6 +44,54 @@ def _resolved(path: Path) -> Path:
         大小写不一致场景下的安全比较。
     """
     return Path(os.path.normcase(str(path.resolve())))
+
+
+def resolve_project_roots(security: SecuritySettings) -> ProjectRoots:
+    """安全解析逻辑工程根、允许的链接目标和独立 Git 根。"""
+    logical = Path(os.path.normcase(str(security.project_root.absolute())))
+    resolved = _resolved(security.project_root)
+    allowed = [_resolved(root) for root in security.allowed_symlink_targets]
+    if resolved != _resolved(logical) and not any(
+        resolved == root or root in resolved.parents for root in allowed
+    ):
+        raise ProjectRootResolutionError("resolved project root is outside allowed symlink targets")
+    return ProjectRoots(
+        logical_project_root=logical,
+        resolved_project_root=resolved,
+        repository_root=_find_repository_root(logical),
+    )
+
+
+def _find_repository_root(start: Path) -> Path | None:
+    """向上寻找 Git 元数据目录并返回解析后的只读仓库根。"""
+    for candidate in (start, *start.parents):
+        if candidate.joinpath(".git").exists():
+            return _resolved(candidate)
+    return None
+
+
+def resolved_path_for(target: str, security: SecuritySettings, *, write: bool = False) -> Path:
+    """返回经过现有边界检查的已解析工程内路径。"""
+    normalized = normalized_project_path(target)
+    if normalized is None or not path_ok(normalized, security, write=write):
+        raise ProjectRootResolutionError("path is outside the allowed project boundary")
+    return _resolved(security.project_root / normalized)
+
+
+def normalized_project_path(target: object) -> str | None:
+    """把相对路径或 `res://` 路径规范化为安全的项目相对路径。"""
+    if not isinstance(target, str):
+        return None
+    cleaned = target.strip().replace("\\", "/")
+    if not cleaned or _has_malformed_godot_scheme(cleaned):
+        return None
+    if cleaned.startswith("res://"):
+        cleaned = cleaned.removeprefix("res://").lstrip("/")
+    elif "://" in cleaned:
+        return None
+    if not cleaned or any(":" in part for part in cleaned.split("/")):
+        return None
+    return cleaned
 
 
 def _matches_deny(rel: str, deny_patterns: list[str]) -> bool:
@@ -65,14 +127,15 @@ def path_ok(target: object, security: SecuritySettings, write: bool = False) -> 
     Returns:
         路径合法且未被拒绝时返回 True，否则返回 False。
     """
-    if not isinstance(target, str):
+    normalized = normalized_project_path(target)
+    if normalized is None:
         logger.debug(
-            "Path rejected reason=non_string target_type=%s write=%s",
+            "Path rejected reason=invalid_project_path target_type=%s write=%s",
             type(target).__name__,
             write,
         )
         return False
-    target_path = Path(target)
+    target_path = Path(normalized)
     if target_path.is_absolute():
         logger.debug("Path rejected reason=absolute target=%s write=%s", target, write)
         return False
@@ -170,8 +233,8 @@ def capture_path_ok(target: object, security: SecuritySettings, write: bool = Fa
     if "://" in cleaned and not cleaned.startswith("res://"):
         logger.debug("Capture path rejected reason=unknown_scheme target=%s write=%s", target, write)
         return False
-    project_target = cleaned.removeprefix("res://").lstrip("/")
-    return path_ok(project_target, security, write)
+    project_target = normalized_project_path(cleaned)
+    return project_target is not None and path_ok(project_target, security, write)
 
 
 def all_capture_paths_ok(

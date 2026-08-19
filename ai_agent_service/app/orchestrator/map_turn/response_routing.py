@@ -48,6 +48,7 @@ from app.orchestrator.map_turn.tool_guards import (
 )
 from app.orchestrator.turn.contracts import (
     ContinueModel,
+    ErrorTurnOutcome,
     TurnOutcome,
 )
 from app.permissions.engine import PermissionContext, check
@@ -94,6 +95,31 @@ async def route_model_response(
     _emit_cache_hit_event(event_callback, frame, loop_number, turn)
 
     if not turn.tool_calls:
+        execution = session.map_task_state.codeact_execution
+        if frame.agent.name == "map-agent" and execution:
+            execution_status = str(execution.get("execution_status", ""))
+            if execution_status == "failed_validation":
+                return ErrorTurnOutcome(
+                    error_code="failed_validation",
+                    text="地图 CodeAct 校验未通过，已保留当前 diff，不能报告任务成功。",
+                    retryable=False,
+                    details={
+                        "task_execution_id": execution.get("task_execution_id"),
+                        "diff_artifact": execution.get("diff_artifact"),
+                        "validation": execution.get("validation"),
+                    },
+                )
+            if execution_status != "validated":
+                frame.messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "地图 CodeAct 尚未通过最终校验，禁止输出成功结果。"
+                            "继续消费 repair_context 并调用统一 CodeAct 工具完成修复与校验。"
+                        ),
+                    }
+                )
+                return ContinueModel(reason="map_codeact_validation_required")
         if (
             _map_output_schema_for_frame(frame) == MAP_OUTPUT_SCHEMA_V1
             and not frame.force_text_only

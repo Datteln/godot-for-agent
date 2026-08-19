@@ -9,7 +9,7 @@ from typing import Any
 
 import regex
 
-from app.security.paths import path_ok
+from app.security.paths import normalized_project_path, path_ok
 from app.tools.context import ToolContext
 from app.tools.registry import ToolDef, register
 
@@ -116,6 +116,10 @@ async def grep_code_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str,
     include = args.get("include", "**/*")
     if not isinstance(include, str) or not include:
         raise ValueError("include 必须是非空字符串")
+    normalized_include = normalized_project_path(include)
+    if normalized_include is None:
+        raise ValueError("include 必须是项目相对 glob")
+    include = normalized_include
     _validate_glob(include)
 
     max_results_raw = args.get("max_results", MAX_RESULTS)

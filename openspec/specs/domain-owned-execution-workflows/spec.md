@@ -40,15 +40,19 @@ The macro scheduler MUST create or resume exactly one owner identity for a domai
 - **THEN** recovery resolves the existing owner identity and does not submit the macro objective to a new sibling agent
 
 ### Requirement: Domain owners control their internal workflows
-A domain owner SHALL be the only component that creates, resumes, or transitions its specialist-internal workflow. The generic macro scheduler MUST NOT schedule an internal child stage directly and MUST NOT infer internal workflow state from natural-language objectives.
+A domain owner SHALL be the only component that creates, resumes, or transitions its specialist-internal workflow. The generic macro scheduler MUST NOT schedule an internal child stage directly and MUST NOT infer internal workflow state from natural-language objectives. For CodeAct work, the owner MUST select actions only from its role-scoped unified tool protocol, while the coordinator serializes write-capable owners for the same project.
 
 #### Scenario: A map outcome becomes runnable
 - **WHEN** all macro predecessors of a map outcome are satisfied
-- **THEN** the macro scheduler invokes the map owner with the outcome contract and the map owner chooses the next typed internal stage
+- **THEN** the macro scheduler invokes the map owner with the outcome contract and the map owner chooses its next allowed CodeAct action or typed internal stage
 
 #### Scenario: Objective text mentions planning
 - **WHEN** a macro objective contains words such as plan, read, write, or verify
 - **THEN** those words do not grant a Frame an internal role, stage, capability, or tool
+
+#### Scenario: Another owner is writing the same project
+- **WHEN** a domain owner becomes runnable while a write-capable owner for that project is active
+- **THEN** the scheduler keeps it pending without creating a concurrent write-capable action
 
 ### Requirement: Owner publications govern macro completion
 Each domain owner MUST publish a bounded typed result containing owner identity, domain task identity, macro step identity, status, produced outputs or artifact references, and recovery disposition. Internal child completion MUST NOT directly complete the macro step.

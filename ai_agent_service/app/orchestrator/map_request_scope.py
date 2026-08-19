@@ -313,3 +313,14 @@ def mark_completion_candidate(
 def invalidate_completion_candidate(scope: MapRequestScope) -> MapRequestScope:
     """清除旧任务 lineage 留下的完成候选标记。"""
     return replace(scope, completion_candidate=False)
+
+
+def codeact_map_scope(scope: MapRequestScope) -> dict[str, str | bool]:
+    """投影 worker 地图校验所需的稳定请求身份，避免依赖被压缩的消息文本。"""
+    return {
+        "request_id": scope.request_id,
+        "lineage_id": scope.lineage_id,
+        "map_task_id": scope.map_task_id,
+        "intent": scope.intent,
+        "explicit_continuation": scope.explicit_continuation,
+    }

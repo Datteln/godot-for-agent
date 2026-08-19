@@ -168,6 +168,25 @@ static func describe_event(event: Dictionary, ui_text: Dictionary) -> String:
 			return ui_text.get("event_unknown", "Event: %s %s") % [str(event.get("type", "unknown")), "keys=" + ",".join(key_names)]
 
 
+static func _format_codeact_gateway(payload: Dictionary) -> String:
+	var lines: Array[String] = ["CodeAct %s: %s" % [str(payload.get("tool", "action")), str(payload.get("status", "unknown"))]]
+	var diff := str(payload.get("diff", "")).strip_edges()
+	if diff != "":
+		lines.append("Diff evidence available (%d chars)" % diff.length())
+	var validation: Dictionary = payload.get("validation", {}) if payload.get("validation") is Dictionary else {}
+	if not validation.is_empty():
+		lines.append("Validation: %s (%s)" % [str(validation.get("status", "unavailable")), str(validation.get("verifier", "none"))])
+	var artifacts: Array = payload.get("artifacts", []) if payload.get("artifacts") is Array else []
+	for artifact in artifacts:
+		lines.append("Artifact: %s" % str(artifact))
+	var audit_ref := str(payload.get("audit_ref", ""))
+	if audit_ref != "":
+		lines.append("Audit timeline: %s" % audit_ref)
+	if str(payload.get("status", "")) == "approval_required":
+		lines.append("Approval required: %s" % str(payload.get("message", "trusted user decision required")))
+	return "\n".join(lines)
+
+
 static func workflow_entry_from_event_result(payload: Dictionary) -> String:
 	var raw_summary = payload.get("result_summary", {})
 	if not (raw_summary is Dictionary):
@@ -180,6 +199,8 @@ static func workflow_entry_from_event_result(payload: Dictionary) -> String:
 			return format_grep_event_entry(summary)
 		"edit":
 			return format_edit_event_entry(summary)
+		"codeact":
+			return _format_codeact_gateway(summary)
 		_:
 			return ""
 

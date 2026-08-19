@@ -33,8 +33,11 @@ def test_programming_agent_can_use_system_commands() -> None:
     path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "programming-agent.md"
     agent = load_agent_file(path)
 
-    assert "run_system_command" in agent.tools
-    assert "每次都必须由用户确认" in agent.prompt
+    assert "shell.run" in agent.tools
+    assert "run_system_command" not in agent.tools
+    assert "run_system_command" not in agent.prompt
+    assert "apply_text_edit" not in agent.prompt
+    assert "godot.headless" in agent.prompt
 
 
 def test_system_command_session_grant_is_scoped_to_exact_command() -> None:

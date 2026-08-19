@@ -136,7 +136,8 @@ def test_scene_agent_lists_second_batch_tools() -> None:
         "add_input_action",
         "remove_input_action",
     ):
-        assert name in agent.tools
+        assert name not in agent.tools
+    assert {"project.read", "project.edit", "godot.headless"} <= set(agent.tools)
 
 
 def test_resource_agent_lists_animation_and_shader_tools() -> None:
@@ -148,5 +149,5 @@ def test_resource_agent_lists_animation_and_shader_tools() -> None:
 
 def test_programming_agent_lists_export_tools() -> None:
     agent = load_agent_file(_agent_defs_dir() / "programming-agent.md")
-    assert "list_export_presets" in agent.tools
-    assert "export_project" in agent.tools
+    assert "godot.headless" in agent.tools
+    assert "export_project" not in agent.tools

@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from app.security.paths import path_ok
+from app.security.paths import normalized_project_path, path_ok
 from app.tools.context import ToolContext
 from app.tools.registry import ToolDef, register
 
@@ -56,8 +56,10 @@ async def list_files_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str
     pattern = args.get("pattern")
     if not isinstance(pattern, str) or not pattern:
         raise ValueError("pattern 不能为空")
-    if pattern.startswith(("/", "\\")) or ".." in Path(pattern).parts:
+    normalized_pattern = normalized_project_path(pattern)
+    if normalized_pattern is None or ".." in Path(normalized_pattern).parts:
         raise ValueError("pattern 不允许使用绝对路径或 '..'")
+    pattern = normalized_pattern
 
     root = ctx.security.project_root
     matches: list[str] = []

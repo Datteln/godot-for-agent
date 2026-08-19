@@ -57,6 +57,7 @@ REDUCER_OWNED_FIELDS = frozenset(
         "plan_attempt_registry",
         "task_convergence_registry",
         "transaction_journals",
+        "codeact_execution",
         "workflow_scopes",
         "workflow_high_water_seq",
         "pending_workflow_events",

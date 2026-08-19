@@ -611,6 +611,17 @@ FAILURE_POLICIES: Final[dict[str, FailurePolicy]] = {
         False,
         "explicit cancellation is durable",
     ),
+    "failed_validation": _policy(
+        "task",
+        "terminal",
+        False,
+        "committed",
+        "none",
+        "map_validation",
+        0,
+        True,
+        "user reviews the retained diff or explicitly starts a repair task",
+    ),
     "completion_gate_blocked": _policy(
         "task",
         "refresh_and_replan",

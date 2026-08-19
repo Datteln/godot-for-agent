@@ -16,8 +16,17 @@ class OperationalPolicyTests(unittest.TestCase):
         policy = AppSettings().effective_operational_policy()
 
         self.assertEqual(policy["provider_max_attempts"], 3)
-        self.assertEqual(policy["websocket_batch_event_limit"], 64)
+        self.assertEqual(policy["websocket_batch_event_limit"], 128)
+        self.assertFalse(policy["codeact_map_validator_configured"])
         self.assertFalse(any("key" in name or "url" in name for name in policy))
+
+    def test_effective_policy_reports_configured_map_validator(self) -> None:
+        """运维策略必须显式报告地图校验器是否已配置。"""
+        policy = AppSettings(
+            codeact_map_validator_command=["python3", "tools/validate_map.py"]
+        ).effective_operational_policy()
+
+        self.assertTrue(policy["codeact_map_validator_configured"])
 
     def test_unacknowledged_bound_cannot_be_smaller_than_batch(self) -> None:
         with self.assertRaisesRegex(ValidationError, "unacked_event_limit"):

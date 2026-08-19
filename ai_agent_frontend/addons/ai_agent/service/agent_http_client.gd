@@ -132,56 +132,10 @@ func send_user_message(text: String, context: Dictionary, model = null) -> void:
 
 
 func send_tool_results(results: Array, model = null) -> void:
-	if _resetting:
-		error_occurred.emit("Session reset is still in progress.")
-		return
-	FrontendLogger.info(editor_interface, "HTTP", "Queueing tool results.", {"count": results.size()})
-	var valid_results: Array = []
-	var dropped := 0
-	for item in results:
-		if not (item is Dictionary):
-			dropped += 1
-			continue
-		var result: Dictionary = item
-		var missing_required := false
-		for key in ["tool_use_id", "frame_id", "status"]:
-			if str(result.get(key, "")).strip_edges() == "":
-				missing_required = true
-				break
-		if missing_required:
-			dropped += 1
-			FrontendLogger.warn(editor_interface, "HTTP", "Dropping invalid tool result before /chat.", {
-				"keys": result.keys(),
-				"turn_id": str(result.get("turn_id", "")),
-			})
-			continue
-		result["turn_id"] = _active_turn_id()
-		valid_results.append(result)
-	if dropped > 0:
-		FrontendLogger.warn(editor_interface, "HTTP", "Dropped invalid tool results.", {"dropped": dropped, "kept": valid_results.size()})
-		response_received.emit({
-			"type": "error",
-			"text": "Invalid tool results; the pending batch was preserved.",
-			"error_code": "front_tool_result_malformed",
-			"disposition": "wait_frontend",
-			"retryable": true,
-			"side_effect_state": "prepared",
-			"next_action": {"action": "correct_pending_tool_results", "owner": "frontend"},
-		})
-		return
-	if valid_results.is_empty():
-		FrontendLogger.debug(editor_interface, "HTTP", "No tool results to send; suppressed silently.", {})
-		return
-	var payload := {
-		"session_id": _session_id(),
-		"session_epoch": _session_epoch_value() if _session_epoch_value() != "" else null,
-		"request_id": _new_request_id(),
-		"model": model,
-		"permission_mode": _setting("ai_agent/permission_mode"),
-		"tool_results": valid_results,
-		"compact_summary_use_llm": _compact_summary_use_llm_override()
-	}
-	_enqueue("POST", "/chat", payload)
+	FrontendLogger.warn(editor_interface, "HTTP", "Blocked retired frontend tool-result forwarding.", {
+		"count": results.size(), "model_supplied": model != null
+	})
+	error_occurred.emit("Frontend tool-result forwarding is retired; CodeAct continues on the backend.")
 
 
 func _compact_summary_use_llm_override() -> Variant:

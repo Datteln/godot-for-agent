@@ -69,6 +69,8 @@ class SecuritySettings(BaseModel):
     allow_paths: list[str] = Field(default_factory=list)
     deny_rules: list[PermRule] = Field(default_factory=list)
     allow_rules: list[PermRule] = Field(default_factory=list)
+    allowed_symlink_targets: list[Path] = Field(default_factory=list)
+    editor_managed_extensions: frozenset[str] = frozenset({".tscn", ".tres", ".res"})
 
 
 def security_settings_from_app(settings: AppSettings) -> SecuritySettings:
@@ -86,6 +88,8 @@ def security_settings_from_app(settings: AppSettings) -> SecuritySettings:
         permission_mode=settings.permission_mode,
         deny_rules=settings.deny_rules,
         allow_rules=settings.allow_rules,
+        allowed_symlink_targets=[root.resolve() for root in settings.allowed_symlink_targets],
+        editor_managed_extensions=frozenset(settings.editor_managed_extensions),
     )
     logger.info(
         "Security settings resolved project_root=%s permission_mode=%s trusted=%s deny_rules=%d allow_rules=%d",

@@ -29,6 +29,7 @@ from app.application.response_mapping import map_turn_outcome
 from app.application.response_policy import _apply_verification_policy
 from app.application.submission.tool_result_processor import ToolResultProcessor
 from app.config import AppSettings
+from app.codeact.gateway import ExecutionGateway
 from app.llm.cache_decision_engine import CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector
 from app.llm.provider import LLMProvider
@@ -98,6 +99,7 @@ class TurnExecutionService:
         tool_results: ToolResultProcessor,
         verify_runner: VerifyRunner,
         available_tools: Callable[[], set[str]],
+        execution_gateway: ExecutionGateway | None = None,
     ) -> None:
         self._settings = settings
         self._llm = llm
@@ -111,6 +113,7 @@ class TurnExecutionService:
         self._tool_results = tool_results
         self._verify_runner = verify_runner
         self._available_tools = available_tools
+        self._execution_gateway = execution_gateway or ExecutionGateway(settings)
 
     @property
     def available_tools(self) -> set[str]:
@@ -137,10 +140,11 @@ class TurnExecutionService:
                 skill_catalog=self._skill_catalog,
                 rag_index_path=self._settings.resolved_rag_index_path(),
                 staged_map_artifact_turn=(
-                    publication_scope.map_artifact_turn
-                    if publication_scope is not None
-                    else None
+                    publication_scope.map_artifact_turn if publication_scope is not None else None
                 ),
+                execution_gateway=self._execution_gateway,
+                map_task_state=session.map_task_state,
+                map_request_scope=session.map_request_scope,
             ),
             max_turns=self._settings.max_turns,
             session_allow=session.session_allow,
@@ -381,6 +385,7 @@ class TurnExecutionService:
             root.messages[0]["content"] = (
                 layered_prompt.to_content_blocks() if len(layers) >= 2 else layered_prompt.to_text()
             )
+
         async def build_child_agent_prompt(agent: AgentDefinition, task: str) -> str:
             """为委派或自动恢复子 Agent 构造按任务检索的分层 system prompt。
 
@@ -720,5 +725,14 @@ class TurnExecutionService:
             )
             logger.warning(
                 "Chat produced error response session=%s text=%s", session.session_id, response.text
+            )
+        if not isinstance(response, ChatToolCallsResponse):
+            await self._execution_gateway.finish_session(
+                session.session_id,
+                session.session_epoch,
+                outcome=(
+                    "completed" if isinstance(response, ChatFinalResponse) else "terminal_error"
+                ),
+                summary=response.model_dump(mode="json"),
             )
         return response

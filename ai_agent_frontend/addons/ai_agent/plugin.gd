@@ -7,11 +7,13 @@ const ServiceManager = preload("res://addons/ai_agent/service/service_manager.gd
 const AgentStateStore = preload("res://addons/ai_agent/state/agent_state_store.gd")
 const UnifiedUndoManager = preload("res://addons/ai_agent/undo/unified_undo_manager.gd")
 const ChatPanel = preload("res://addons/ai_agent/ui/chat_panel.gd")
+const EditorObservationClient = preload("res://addons/ai_agent/service/editor_observation_client.gd")
 
 var _service: Node
 var _state_store: Node
 var _undo_manager: Node
 var _chat_panel: Control
+var _editor_observation: Node
 
 
 func _enter_tree() -> void:
@@ -26,6 +28,11 @@ func _enter_tree() -> void:
 	_service.name = "AgentServiceManager"
 	_service.editor_interface = get_editor_interface()
 	add_child(_service)
+
+	_editor_observation = EditorObservationClient.new()
+	_editor_observation.name = "EditorObservationClient"
+	_editor_observation.configure(self, get_editor_interface(), _service)
+	add_child(_editor_observation)
 
 	_undo_manager = UnifiedUndoManager.new()
 	_undo_manager.name = "UnifiedUndoManager"
@@ -42,6 +49,7 @@ func _enter_tree() -> void:
 	add_control_to_dock(DOCK_SLOT_RIGHT_BL, _chat_panel)
 
 	_service.start()
+	_editor_observation.start()
 
 
 func _exit_tree() -> void:
@@ -52,9 +60,15 @@ func _exit_tree() -> void:
 		_chat_panel = null
 
 	if _service != null:
+		if _editor_observation != null:
+			_editor_observation.stop()
 		_service.stop()
 		_service.queue_free()
 		_service = null
+
+	if _editor_observation != null:
+		_editor_observation.queue_free()
+		_editor_observation = null
 
 	if _undo_manager != null:
 		_undo_manager.queue_free()

@@ -32,8 +32,8 @@ def test_programming_agent_can_execute_gd_scripts() -> None:
     path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "programming-agent.md"
     agent = load_agent_file(path)
 
-    assert "execute_gd_script" in agent.tools
-    assert "execute_gd_script" in agent.prompt
+    assert "godot.headless" in agent.tools
+    assert "execute_gd_script" not in agent.tools
 
 
 def test_execute_gd_script_session_grant_is_scoped_to_exact_args() -> None:

@@ -20,13 +20,15 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from app.api.routes import create_router
 from app.application.composition import build_application_use_cases
+from app.codeact.audit_routes import add_codeact_audit_routes
+from app.codeact.editor_routes import add_editor_loopback_routes
+from app.codeact.gateway import ExecutionGateway
 from app.config import AppSettings
 from app.events.store import EventStore
 from app.llm.provider import LLMProvider, OpenAICompatibleProvider
 from app.logging_config import configure_logging
 from app.mcp.server import run_mcp_stdio
 from app.memory.store import MemoryStore
-from app.orchestrator.map_capabilities import validate_map_capability_contract
 from app.output_styles.catalog import OutputStyleCatalog
 from app.rag.build_manager import RagIndexBuildManager
 from app.recovery.pointer import RecoveryPointerStore
@@ -96,14 +98,7 @@ def create_app(
     )
 
     register_server_tools()
-    register_front_tools()
-    # 启动时校验地图工具能力合同的完整性：
-    # 确保 MAP_TOOL_CAPABILITIES 中声明的每个工具都已在 REGISTRY 注册，
-    # 且 category/requires_revision/requires_target 等字段合法；
-    # 合同不合法时直接拒绝启动，避免运行时出现难以诊断的权限缺口
-    capability_issues = validate_map_capability_contract(REGISTRY)
-    if capability_issues:
-        raise RuntimeError("地图工具能力合同无效：" + "；".join(capability_issues))
+    register_front_tools(enabled=False)
     security = security_settings_from_app(resolved_settings)
     llm = llm_provider or OpenAICompatibleProvider(
         base_url=resolved_settings.llm_base_url,
@@ -116,12 +111,8 @@ def create_app(
     store = SessionStore(
         resolved_settings.resolved_session_store_dir(),
         project_root=resolved_settings.project_root,
-        workflow_snapshot_event_threshold=(
-            resolved_settings.workflow_snapshot_event_threshold
-        ),
-        workflow_snapshot_byte_threshold=(
-            resolved_settings.workflow_snapshot_byte_threshold
-        ),
+        workflow_snapshot_event_threshold=(resolved_settings.workflow_snapshot_event_threshold),
+        workflow_snapshot_byte_threshold=(resolved_settings.workflow_snapshot_byte_threshold),
     )
     event_store = EventStore()
     recovery_store = RecoveryPointerStore(
@@ -131,6 +122,11 @@ def create_app(
     skill_catalog = SkillCatalog(resolved_settings, security, set(REGISTRY))
     output_style_catalog = OutputStyleCatalog(resolved_settings)
     memory_store = MemoryStore(resolved_settings.resolved_memory_store_path())
+    execution_gateway = ExecutionGateway(resolved_settings)
+    if resolved_settings.codeact_enabled and not resolved_settings.codeact_map_validator_command:
+        logger.warning(
+            "CodeAct map validator is not configured; map writes will end as failed_validation"
+        )
     use_cases = build_application_use_cases(
         settings=resolved_settings,
         session_store=store,
@@ -140,6 +136,7 @@ def create_app(
         output_style_catalog=output_style_catalog,
         event_store=event_store,
         recovery_store=recovery_store,
+        execution_gateway=execution_gateway,
     )
 
     rag_build_manager = RagIndexBuildManager(resolved_settings, security)
@@ -187,11 +184,14 @@ def create_app(
             auto_build_task.add_done_callback(_report_auto_build)
         else:
             logger.info("Automatic RAG index build disabled by configuration")
-        yield
-        if auto_build_task is not None and not auto_build_task.done():
-            auto_build_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await auto_build_task
+        try:
+            yield
+        finally:
+            if auto_build_task is not None and not auto_build_task.done():
+                auto_build_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await auto_build_task
+            await execution_gateway.close()
 
     app = FastAPI(
         title="Godot AI Agent Service",
@@ -199,27 +199,29 @@ def create_app(
         dependencies=[Depends(_auth_dependency(resolved_token))],
         lifespan=lifespan,
     )
-    app.include_router(
-        create_router(
-            settings=resolved_settings,
-            security=security,
-            llm=llm,
-            use_cases=use_cases,
-            auth_enabled=resolved_token is not None,
-            event_store=event_store,
-            recovery_store=recovery_store,
-            skill_catalog=skill_catalog,
-            output_style_catalog=output_style_catalog,
-            memory_store=memory_store,
-            rag_build_manager=rag_build_manager,
-            session_store=store,
-            expected_token=resolved_token,
-        )
+    api_router = create_router(
+        settings=resolved_settings,
+        security=security,
+        llm=llm,
+        use_cases=use_cases,
+        auth_enabled=resolved_token is not None,
+        event_store=event_store,
+        recovery_store=recovery_store,
+        skill_catalog=skill_catalog,
+        output_style_catalog=output_style_catalog,
+        memory_store=memory_store,
+        rag_build_manager=rag_build_manager,
+        session_store=store,
+        expected_token=resolved_token,
     )
+    add_editor_loopback_routes(api_router, execution_gateway.editor_registry)
+    add_codeact_audit_routes(api_router, execution_gateway)
+    app.include_router(api_router)
     app.state.rag_build_manager = rag_build_manager
     app.state.event_store = event_store
     app.state.session_store = store
     app.state.use_cases = use_cases
+    app.state.execution_gateway = execution_gateway
     logger.info(
         "AI agent service app ready tools=%d session_store=%s",
         len(REGISTRY),

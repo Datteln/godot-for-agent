@@ -20,6 +20,19 @@ def _is_map_writer_step(step: PlanStep) -> bool:
     }
 
 
+def _is_write_capable_step(step: PlanStep) -> bool:
+    """判断同一项目计划步骤是否可能触发持久化 CodeAct 写入。"""
+    if _is_map_writer_step(step):
+        return True
+    return step.agent in {
+        "programming-agent",
+        "map-agent",
+        "scene-agent",
+        "resource-agent",
+        "map-worker",
+    }
+
+
 def _execution_blocked_dependency(step: PlanStep) -> bool:
     """判断成功结束的 planner 是否只交付了不可执行规划。"""
     if step.status != "succeeded" or step.result is None:
@@ -268,13 +281,23 @@ class PlanGraph:
         }
 
     def runnable_steps(self) -> tuple[PlanStep, ...]:
-        """按原计划顺序返回所有依赖均成功的 pending 步骤。"""
+        """返回依赖满足的步骤，并确保同项目只有一个写入者可运行。"""
         by_id = {step.step_id: step for step in self.steps}
-        return tuple(
+        candidates = tuple(
             step
             for step in self.steps
             if step.status == "pending"
             and all(by_id[item].status == "succeeded" for item in step.depends_on)
+        )
+        if any(step.status == "running" and _is_write_capable_step(step) for step in self.steps):
+            return tuple(step for step in candidates if not _is_write_capable_step(step))
+        first_writer = next((step.step_id for step in candidates if _is_write_capable_step(step)), None)
+        if first_writer is None:
+            return candidates
+        return tuple(
+            step
+            for step in candidates
+            if not _is_write_capable_step(step) or step.step_id == first_writer
         )
 
     def start(self, step_id: str, frame_id: str) -> PlanGraph:

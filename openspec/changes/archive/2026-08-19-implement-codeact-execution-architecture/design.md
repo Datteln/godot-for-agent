@@ -70,6 +70,22 @@ EditorPlugin 使用仅本机可达的持久 RPC 注册项目标识、Editor 实�
 
 Gateway 以执行 id 关联文件补丁及前后摘要、临时脚本 hash/路径/命令/产物、Shell 与 Godot 参数摘要和输出 artifact、Editor RPC 与审批决定、验证器版本和结果、重试及最终回复。完整日志、代码和截图在持久化前按项目策略限制大小并过滤敏感内容；artifact 内文本、项目文件、日志和模型输出一律是数据，不能提升权限。
 
+### 9. 审查整改收紧可信身份、归属与完成门控
+
+`task_execution_id` 由后端按 session epoch 与 owner frame 派生，统一工具 schema 不接受模型覆盖；每个 CodeAct 调用使用原始工具调用 id 与执行 id 组合出的唯一调用 id。`ask` 动作只能由受信任工程的显式 allow rule、会话授权、`auto_approve` 或 `full_access` 策略预批准，模型参数不能表达批准。
+
+任务 diff 按任务开始时的逐路径内容与状态快照计算，不再假设完整 Git diff 文本保持前缀关系。所有 `res://` 项目路径在权限、Editor 打开文件预检、宿主摘要和 worker 写入前统一规范化为项目相对路径。
+
+地图验证的 `unavailable` 是不可成功完成的终止状态；验证失败可在预算内修复，只有 `passed` 才记录为 `validated` 并允许最终成功回复。legacy 前端执行开关不再作为伪兼容路径暴露，迁移期只保留明确的拒绝与历史数据显示。
+
+### 10. Gateway 负责资源终态、按需 Editor 能力与持久审计
+
+Gateway 按 session epoch 记录实际创建过的执行 id，并在正常完成、类型化终态错误、用户取消、客户端超时、会话 reset 与服务关闭时统一收尾。收尾先记录最终结果并持久化有界审计时间线，再销毁 worker、任务临时目录和隔离缓存，同时删除执行基线、锁和 owner 索引；单次 worker 调用超时或取消也立即触发同一幂等清理路径。
+
+`godot.editor.*` 观察工具属于角色白名单内的 deferred 能力：默认不进入 prompt，只能由 `tool.search` 按需激活。programming、scene、map 可按各自职责获取只读观察，advisor 只获得只读观察，影响 Editor UI 的 `reload_for_validation` 仅提供给确有验证职责的写入角色并继续执行审批策略。
+
+审计时间线在任务终态或服务关闭时写入项目服务目录中的受限持久文件，并通过认证后端只读 API 返回；常规 `server_tool_result` 事件只携带有界摘要、执行 id 和审计引用，前端不再依赖未发射的 `codeact_gateway` 事件类型。启动诊断必须明确报告地图校验器是否配置，未配置仍保持 `unavailable` 的失败关闭语义。
+
 ## Risks / Trade-offs
 
 - [Docker 镜像、Godot 版本或导入依赖与项目不兼容] → 先用真实项目验证镜像、导入和测试入口；不兼容时返回不可用验证而不是声称通过。

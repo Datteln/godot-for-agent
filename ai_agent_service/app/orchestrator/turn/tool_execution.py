@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from app.tools.context import ToolContext
@@ -29,6 +29,8 @@ async def invoke_server_tool(
     tool: ToolDef,
     arguments: dict[str, Any],
     context: ToolContext,
+    *,
+    call_id: str = "",
 ) -> ToolResult:
     """Execute one handler and convert runtime failures into typed tool results."""
     assert tool.handler is not None
@@ -41,7 +43,8 @@ async def invoke_server_tool(
         [name for name in tool.all_path_args if name in arguments],
     )
     try:
-        result = await tool.handler(arguments, context)
+        call_context = replace(context, tool_call_id=call_id) if call_id else context
+        result = await tool.handler(arguments, call_context)
         logger.info(
             "Server tool success session=%s tool=%s elapsed_ms=%d",
             context.session_id,
@@ -82,7 +85,15 @@ async def execute_server_tools(
             if on_start is not None:
                 on_start(call, True)
         outcomes = await asyncio.gather(
-            *(invoke_server_tool(call.tool, call.arguments, context) for call in concurrent)
+            *(
+                invoke_server_tool(
+                    call.tool,
+                    call.arguments,
+                    context,
+                    call_id=call.call_id,
+                )
+                for call in concurrent
+            )
         )
         for call, outcome in zip(concurrent, outcomes):
             results[call.call_id] = outcome
@@ -91,7 +102,12 @@ async def execute_server_tools(
     for call in sequential:
         if on_start is not None:
             on_start(call, False)
-        outcome = await invoke_server_tool(call.tool, call.arguments, context)
+        outcome = await invoke_server_tool(
+            call.tool,
+            call.arguments,
+            context,
+            call_id=call.call_id,
+        )
         results[call.call_id] = outcome
         if on_result is not None:
             on_result(call, outcome)

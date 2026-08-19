@@ -150,7 +150,8 @@ def test_scene_agent_lists_new_scene_and_project_tools() -> None:
         "add_autoload",
         "remove_autoload",
     ):
-        assert name in agent.tools
+        assert name not in agent.tools
+    assert {"project.read", "project.edit", "godot.headless"} <= set(agent.tools)
 
 
 def test_resource_agent_lists_read_resource_tools() -> None:
@@ -161,10 +162,12 @@ def test_resource_agent_lists_read_resource_tools() -> None:
 
 def test_programming_agent_lists_git_read_tools() -> None:
     agent = load_agent_file(_agent_defs_dir() / "programming-agent.md")
-    assert "git_status" in agent.tools
-    assert "git_diff" in agent.tools
+    assert "git.status" in agent.tools
+    assert "git.diff" in agent.tools
 
 
 def test_map_agent_lists_screenshot_tool() -> None:
     agent = load_agent_file(_agent_defs_dir() / "map-agent.md")
-    assert "capture_viewport_screenshot" in agent.tools
+    assert "godot.editor.viewport_capture" in agent.tools
+    assert "tool.search" in agent.tools
+    assert "project.read" in agent.tools

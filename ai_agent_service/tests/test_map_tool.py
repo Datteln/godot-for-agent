@@ -59,8 +59,9 @@ def test_map_agent_delegates_map_writes_instead_of_editing_directly() -> None:
     agent = load_agent_file(path)
 
     assert "edit_map" not in agent.tools
-    assert {"delegate", "delegate_many", "read_map_artifact"} <= set(agent.tools)
-    assert "地图修改只通过 Godot 原生工具" in agent.prompt
+    assert {"delegate", "delegate_many", "project.read", "project.edit"} <= set(agent.tools)
+    assert "地图持久化修改只通过 worker" in agent.prompt
+    assert "在线 Editor" in agent.prompt
 
 
 def test_map_agent_delegates_real_region_reads() -> None:
@@ -76,7 +77,8 @@ def test_scene_agent_must_read_map_region_before_aligning_nodes() -> None:
     path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "scene-agent.md"
     agent = load_agent_file(path)
 
-    assert "describe_map_region" in agent.tools
+    assert "describe_map_region" not in agent.tools
+    assert "project.read" in agent.tools
     assert "node_position" in agent.prompt
 
 
@@ -113,7 +115,8 @@ def test_map_agent_requires_reader_and_artifact_boundaries() -> None:
 
     assert "地图专业职责委派工作" in agent.prompt
     assert "完整地图上下文" in agent.prompt
-    assert "read_map_artifact" in agent.prompt
+    assert 'project.read(kind="map_artifact")' in agent.prompt
+    assert 'project.read(kind="delegate_artifact")' in agent.prompt
     assert "两种 schema 不混用" in agent.prompt
 
 

@@ -15,7 +15,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.permissions.types import PermRule
 
-
 REMOVED_POLLING_ENV_VARS: Final = frozenset(
     {
         "AI_AGENT_ENABLE_EVENT_STREAM",
@@ -50,16 +49,41 @@ class AppSettings(BaseSettings):
         default="gpt-4o-mini",
         description="默认对话模型名。",
     )
-    llm_quick_model: str | None = Field(default=None, description="quick effort 模型；为空时使用 llm_model。")
-    llm_standard_model: str | None = Field(default=None, description="standard effort 模型；为空时使用 llm_model。")
-    llm_deep_model: str | None = Field(default=None, description="deep effort 模型；为空时使用 llm_model。")
-    llm_verify_model: str | None = Field(default=None, description="verify effort 模型；为空时使用 llm_model。")
-    llm_advisor_model: str | None = Field(default=None, description="advisor effort 模型；为空时使用 llm_model。")
-    llm_thinking_budget_quick: int | None = Field(default=None, description="quick effort 的 thinking token 预算；为空时使用内置默认值（1024）。")
-    llm_thinking_budget_standard: int | None = Field(default=None, description="standard effort 的 thinking token 预算；为空时使用内置默认值（4096）。")
-    llm_thinking_budget_deep: int | None = Field(default=None, description="deep effort 的 thinking token 预算；为空时使用内置默认值（16384）。")
-    llm_thinking_budget_verify: int | None = Field(default=None, description="verify effort 的 thinking token 预算；为空时使用内置默认值（0，关闭 thinking）。")
-    llm_thinking_budget_advisor: int | None = Field(default=None, description="advisor effort 的 thinking token 预算；为空时使用内置默认值（2048）。")
+    llm_quick_model: str | None = Field(
+        default=None, description="quick effort 模型；为空时使用 llm_model。"
+    )
+    llm_standard_model: str | None = Field(
+        default=None, description="standard effort 模型；为空时使用 llm_model。"
+    )
+    llm_deep_model: str | None = Field(
+        default=None, description="deep effort 模型；为空时使用 llm_model。"
+    )
+    llm_verify_model: str | None = Field(
+        default=None, description="verify effort 模型；为空时使用 llm_model。"
+    )
+    llm_advisor_model: str | None = Field(
+        default=None, description="advisor effort 模型；为空时使用 llm_model。"
+    )
+    llm_thinking_budget_quick: int | None = Field(
+        default=None,
+        description="quick effort 的 thinking token 预算；为空时使用内置默认值（1024）。",
+    )
+    llm_thinking_budget_standard: int | None = Field(
+        default=None,
+        description="standard effort 的 thinking token 预算；为空时使用内置默认值（4096）。",
+    )
+    llm_thinking_budget_deep: int | None = Field(
+        default=None,
+        description="deep effort 的 thinking token 预算；为空时使用内置默认值（16384）。",
+    )
+    llm_thinking_budget_verify: int | None = Field(
+        default=None,
+        description="verify effort 的 thinking token 预算；为空时使用内置默认值（0，关闭 thinking）。",
+    )
+    llm_thinking_budget_advisor: int | None = Field(
+        default=None,
+        description="advisor effort 的 thinking token 预算；为空时使用内置默认值（2048）。",
+    )
     llm_fallback_model: str | None = Field(
         default=None,
         description="主模型不可用时的降级模型名；为空表示不降级。",
@@ -103,9 +127,7 @@ class AppSettings(BaseSettings):
         default=True,
         description="是否启用地图 worker 的同 Frame 结构化纠错。",
     )
-    map_worker_response_contract_mode: Literal[
-        "json_schema", "json_object", "prompt_only"
-    ] = Field(
+    map_worker_response_contract_mode: Literal["json_schema", "json_object", "prompt_only"] = Field(
         default="prompt_only",
         description="地图 worker 最终回合的显式响应合同模式。",
     )
@@ -151,6 +173,27 @@ class AppSettings(BaseSettings):
         default=False,
         description="工程是否已被用户标记为受信任；未信任时 auto_approve/allow 规则降级（§9 信任模型）。",
     )
+    allowed_symlink_targets: list[Path] = Field(default_factory=list)
+    editor_managed_extensions: list[str] = Field(default_factory=lambda: [".tscn", ".tres", ".res"])
+    codeact_enabled: bool = Field(default=True)
+    codeact_worker_image: str = Field(default="ai-agent-codeact-worker:latest")
+    codeact_godot_version: str = Field(
+        default="4.3-stable", pattern=r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?-stable$"
+    )
+    codeact_worker_cpu: float = Field(default=2.0, ge=0.1, le=64.0)
+    codeact_worker_memory_mb: int = Field(default=2048, ge=128, le=131072)
+    codeact_worker_pids_limit: int = Field(default=256, ge=16, le=32768)
+    codeact_worker_timeout_s: int = Field(default=120, ge=1, le=600)
+    codeact_worker_output_bytes: int = Field(default=1_048_576, ge=4096, le=16_777_216)
+    codeact_action_file_limit: int = Field(default=20, ge=1, le=1000)
+    codeact_action_write_bytes: int = Field(default=262_144, ge=1, le=16_777_216)
+    codeact_map_retry_budget: int = Field(default=2, ge=0, le=16)
+    codeact_map_validator_command: list[str] = Field(
+        default_factory=list,
+        description="在隔离 worker 内执行的项目地图范围、语义和目标区域校验入口。",
+    )
+    codeact_artifact_retention_bytes: int = Field(default=1_048_576, ge=4096, le=64_000_000)
+    codeact_editor_rpc_enabled: bool = Field(default=False)
     deny_rules: list[PermRule] = Field(
         default_factory=list,
         description=(
@@ -318,25 +361,17 @@ class AppSettings(BaseSettings):
         """拒绝不安全的跨字段阈值和已删除的轮询配置。"""
         removed = sorted(key for key in REMOVED_POLLING_ENV_VARS if key in os.environ)
         if removed:
-            raise ValueError(
-                "removed polling settings are unsupported: " + ", ".join(removed)
-            )
+            raise ValueError("removed polling settings are unsupported: " + ", ".join(removed))
         if self.websocket_unacked_event_limit < self.websocket_batch_event_limit:
-            raise ValueError(
-                "websocket_unacked_event_limit must be >= websocket_batch_event_limit"
-            )
+            raise ValueError("websocket_unacked_event_limit must be >= websocket_batch_event_limit")
         if self.websocket_unacked_byte_limit < self.websocket_batch_byte_limit:
-            raise ValueError(
-                "websocket_unacked_byte_limit must be >= websocket_batch_byte_limit"
-            )
+            raise ValueError("websocket_unacked_byte_limit must be >= websocket_batch_byte_limit")
         if self.websocket_stall_timeout_s <= self.websocket_ack_timeout_s:
             raise ValueError(
                 "websocket_stall_timeout_s must be greater than websocket_ack_timeout_s"
             )
         if self.websocket_reconnect_max_s < self.websocket_reconnect_initial_s:
-            raise ValueError(
-                "websocket_reconnect_max_s must be >= websocket_reconnect_initial_s"
-            )
+            raise ValueError("websocket_reconnect_max_s must be >= websocket_reconnect_initial_s")
         return self
 
     def effective_operational_policy(self) -> dict[str, Any]:
@@ -358,6 +393,13 @@ class AppSettings(BaseSettings):
             "websocket_reconnect_initial_s": self.websocket_reconnect_initial_s,
             "websocket_reconnect_max_s": self.websocket_reconnect_max_s,
             "websocket_reconnect_max_attempts": self.websocket_reconnect_max_attempts,
+            "codeact_enabled": self.codeact_enabled,
+            "codeact_map_validator_configured": bool(self.codeact_map_validator_command),
+            "codeact_map_retry_budget": self.codeact_map_retry_budget,
+            "codeact_action_file_limit": self.codeact_action_file_limit,
+            "codeact_action_write_bytes": self.codeact_action_write_bytes,
+            "codeact_artifact_retention_bytes": self.codeact_artifact_retention_bytes,
+            "codeact_editor_rpc_enabled": self.codeact_editor_rpc_enabled,
         }
 
     def resolved_log_dir(self) -> Path:

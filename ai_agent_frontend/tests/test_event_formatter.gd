@@ -54,4 +54,23 @@ func _init() -> void:
 		push_error("legacy boolean Verify payload was projected as passed")
 		quit(1)
 		return
+	var gateway := EventFormatter.describe_event({
+		"type": "server_tool_result",
+		"payload": {
+			"result_summary": {
+				"kind": "codeact",
+				"tool": "project.edit",
+				"status": "approval_required",
+				"diff": "+line",
+				"validation": {"status": "failed", "verifier": "map_range_semantic_target"},
+				"artifacts": ["codeact://exec/diff"],
+				"audit_ref": "/codeact/audit/exec-id",
+				"message": "approve reload",
+			},
+		},
+	}, {})
+	if not gateway.contains("Diff evidence") or not gateway.contains("Validation: failed") or not gateway.contains("Approval required") or not gateway.contains("Audit timeline"):
+		push_error("CodeAct evidence was not rendered as display-only frontend data")
+		quit(1)
+		return
 	quit()

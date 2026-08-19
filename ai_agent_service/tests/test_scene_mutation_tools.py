@@ -73,4 +73,5 @@ def test_scene_agent_can_use_new_scene_tools() -> None:
     agent = load_agent_file(path)
 
     for name in ["delete_node", "reparent_node", "rename_node", "open_scene", "set_project_setting"]:
-        assert name in agent.tools
+        assert name not in agent.tools
+    assert {"project.edit", "godot.headless"} <= set(agent.tools)

@@ -12,10 +12,7 @@ from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnaps
 from app.llm.provider import (
     AssistantTurn,
 )
-from app.orchestrator.map_turn.contracts import (
-    EVENT_MATCH_PREVIEW_ITEMS,
-    EVENT_TEXT_PREVIEW_CHARS,
-)
+from app.orchestrator.turn.event_projection import result_summary_for_event
 
 
 def _event_tool_args(args: dict[str, Any]) -> dict[str, Any]:
@@ -61,55 +58,7 @@ def _event_result_count(result: Any, is_error: bool) -> int | None:
 
 def _event_result_summary(tool_name: str, result: Any, is_error: bool) -> dict[str, Any] | None:
     """Return a bounded, UI-safe summary for workflow event rendering."""
-    if is_error or not isinstance(result, dict):
-        return None
-    if tool_name in {"read_file", "read_script"}:
-        content = result.get("content")
-        if not isinstance(content, str):
-            return None
-        preview = content[:EVENT_TEXT_PREVIEW_CHARS]
-        offset = result.get("offset", 1)
-        line_start = offset if isinstance(offset, int) and offset > 0 else 1
-        return {
-            "kind": "read",
-            "path": str(result.get("path", "")),
-            "line_start": line_start,
-            "line_end": max(line_start, line_start + len(content.splitlines()) - 1),
-            "content": preview,
-            "truncated": bool(result.get("truncated", False)) or len(content) > len(preview),
-        }
-    if tool_name in {"grep_code", "search_codebase", "list_files"}:
-        matches = _event_match_items(result)
-        return {
-            "kind": "grep",
-            "pattern": str(result.get("pattern", result.get("query", ""))),
-            "include": str(result.get("include", result.get("path", "project"))),
-            "match_count": len(matches),
-            "matches": matches[:EVENT_MATCH_PREVIEW_ITEMS],
-            "truncated": bool(result.get("truncated", False))
-            or len(matches) > EVENT_MATCH_PREVIEW_ITEMS,
-        }
-    return None
-
-
-def _event_match_items(result: dict[str, Any]) -> list[dict[str, Any]]:
-    """Normalize search-like result rows for the frontend workflow list."""
-    raw_items = result.get("matches", result.get("results", result.get("files", [])))
-    if not isinstance(raw_items, list):
-        return []
-    normalized: list[dict[str, Any]] = []
-    for item in raw_items:
-        if isinstance(item, dict):
-            normalized.append(
-                {
-                    "path": str(item.get("path", item.get("file", ""))),
-                    "line": item.get("line", item.get("line_no", "")),
-                    "text": str(item.get("text", item.get("preview", ""))),
-                }
-            )
-        else:
-            normalized.append({"path": str(item), "line": "", "text": ""})
-    return normalized
+    return result_summary_for_event(tool_name, result, is_error)
 
 
 def _emit_orchestration_event(

@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 from typing import Any
 
+from app.codeact.identity import codeact_call_id, task_execution_id
 from app.orchestrator.map_contracts import (
     MAP_WORKER_TO_RUNTIME_STAGE,
     arm_map_worker_structured_completion,
@@ -67,7 +68,7 @@ from app.orchestrator.turn.tool_execution import (
     ServerToolCall,
     execute_server_tools,
 )
-from app.permissions.engine import check
+from app.permissions.engine import check, explicit_approval_granted
 from app.tools.registry import REGISTRY
 
 
@@ -89,6 +90,12 @@ async def execute_tool_cycle(
     front_calls: list[FrontToolCall] = []
     pending_items: list[_PendingItem] = []
     turn_id = session.new_turn_id()
+    execution_id = task_execution_id(
+        session.session_id,
+        session.session_epoch,
+        frame.id,
+    )
+    approved_codeact_call_ids: set[str] = set()
 
     # 第一遍：分类每个 tool call，不执行 server handler（同步、保留顺序）。
     for call in turn.tool_calls:
@@ -340,6 +347,8 @@ async def execute_tool_cycle(
 
         if tool.side == "server":
             pending_items.append(_PendingServerCall(call_id=call.id, tool=tool, args=args))
+            if explicit_approval_granted(tool, args, permission_ctx):
+                approved_codeact_call_ids.add(codeact_call_id(execution_id, call.id))
         else:
             front_calls.append(
                 FrontToolCall(
@@ -365,6 +374,10 @@ async def execute_tool_cycle(
         ),
         agent_role=frame.agent.role,
         worker_mode=frame.agent.worker_mode,
+        task_execution_id=execution_id,
+        approved_codeact_call_ids=frozenset(
+            set(tool_ctx.approved_codeact_call_ids) | approved_codeact_call_ids
+        ),
     )
     server_calls = [item for item in pending_items if isinstance(item, _PendingServerCall)]
     invocations = [

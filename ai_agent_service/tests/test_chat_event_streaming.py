@@ -22,6 +22,9 @@ from app.llm.provider import AssistantTurn, LLMProvider
 from app.main import create_app
 from app.orchestrator.map_artifacts import StagedMapArtifactTurn
 from app.sessions.store import SessionStore
+from app.tools.front_tools import register_front_tools
+
+register_front_tools(enabled=True)
 from tests.application_test_support import ApplicationTestRig, build_test_application
 
 

@@ -32,6 +32,7 @@ from app.application.use_cases import (
     SessionSettingsUseCase,
 )
 from app.config import AppSettings
+from app.codeact.gateway import ExecutionGateway
 from app.events.store import EventStore
 from app.llm.cache_decision_engine import CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector
@@ -61,6 +62,7 @@ def build_application_use_cases(
     cache_metrics: CacheMetricsCollector | None = None,
     coordinated_commit_failure_injector: CoordinatedCommitFailureInjector | None = None,
     recovery_failure_injector: RecoveryFailureInjector | None = None,
+    execution_gateway: ExecutionGateway | None = None,
 ) -> ApplicationUseCases:
     """Construct independently injected route-facing use cases."""
     resolved_cache_engine = cache_engine or CacheDecisionEngine()
@@ -71,8 +73,10 @@ def build_application_use_cases(
     progress = TurnProgressRegistry()
     activity = TurnActivityRegistry()
     history_cache: dict[tuple[str, str], tuple[tuple[int, int, int], list[object]]] = {}
+
     def available_tools() -> set[str]:
         return set(REGISTRY)
+
     publisher = SubmissionPublisher(
         settings=settings,
         store=session_store,
@@ -107,6 +111,7 @@ def build_application_use_cases(
         lambda effort: model_for_effort(settings, effort),
         lambda effort: thinking_budget_for_effort(settings, effort),
     )
+    resolved_execution_gateway = execution_gateway or ExecutionGateway(settings)
     turn_service = TurnExecutionService(
         settings=settings,
         llm=llm,
@@ -120,6 +125,7 @@ def build_application_use_cases(
         tool_results=tool_result_processor,
         verify_runner=verify_runner,
         available_tools=available_tools,
+        execution_gateway=resolved_execution_gateway,
     )
     backend_recovery = BackendRecoveryService(
         store=session_store,
@@ -176,6 +182,7 @@ def build_application_use_cases(
         progress=progress,
         history_cache=history_cache,
         available_tools=available_tools,
+        execution_gateway=resolved_execution_gateway,
     )
     history = HistoryQueryService(
         settings=settings,

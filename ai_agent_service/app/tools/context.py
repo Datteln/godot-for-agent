@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from typing import TYPE_CHECKING
 
 from app.security.settings import SecuritySettings
 
 if TYPE_CHECKING:
+    from app.codeact.gateway import ExecutionGateway
     from app.orchestrator.map_artifacts import StagedMapArtifactTurn
     from app.skills.catalog import SkillCatalog
 
@@ -48,3 +50,9 @@ class ToolContext:
     worker_mode: str | None = None
     rag_index_path: Path | None = None
     staged_map_artifact_turn: StagedMapArtifactTurn | None = None
+    execution_gateway: ExecutionGateway | None = None
+    map_task_state: Any | None = None
+    map_request_scope: Any | None = None
+    task_execution_id: str = ""
+    tool_call_id: str = ""
+    approved_codeact_call_ids: frozenset[str] = frozenset()

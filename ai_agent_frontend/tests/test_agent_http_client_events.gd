@@ -131,6 +131,11 @@ func _init() -> void:
 		push_error("application progress did not refresh the request watchdog")
 		quit(1)
 		return
+	recording.send_tool_results([{"tool_use_id": "legacy"}], "model")
+	if not recording._queue.is_empty():
+		push_error("retired frontend tool results were re-injected into /chat")
+		quit(1)
+		return
 	if not recording._queue.is_empty() or recording._request_generation != 0:
 		push_error("application progress replayed a command")
 		quit(1)

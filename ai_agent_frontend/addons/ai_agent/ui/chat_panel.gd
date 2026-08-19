@@ -975,97 +975,30 @@ func _handle_tool_calls(response: Dictionary) -> void:
 	var calls: Array = raw_calls if raw_calls is Array else []
 	if calls.is_empty():
 		return
-	var turn_id := str(response.get("turn_id", ""))
-	if not turn_id.is_empty():
-		_session_state.adopt_turn(turn_id)
-	if _state == AgentState.WAITING_CONFIRM:
-		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring tool_calls while a previous batch is still pending confirmation.", {"count": calls.size()})
-		return
-	var confirm: Array = []
-	var silent_count := 0
-	for call in calls:
-		if call is Dictionary and bool(call.get("needs_confirm", false)):
-			confirm.append(call)
-		elif call is Dictionary:
-			silent_count += 1
 	var call_names: Array = []
 	for call in calls:
 		if call is Dictionary:
 			call_names.append(str(call.get("name", "")))
-	FrontendLogger.info(editor_interface, "ChatPanel", "Handling tool calls.", {
-		"count": calls.size(), "silent": silent_count, "confirm": confirm.size(), "names": call_names
+	FrontendLogger.error(editor_interface, "ChatPanel", "Rejected legacy frontend tool execution batch.", {
+		"count": calls.size(), "names": call_names
 	})
-
 	if state_store != null:
-		state_store.set_value("current_turn_id", str(_session_state.snapshot().get("active_turn_id", "")))
-		state_store.set_value("pending_calls", confirm)
-
-	var results: Array = []
-	if confirm.is_empty():
-		for call in calls:
-			if call is Dictionary:
-				if _interrupted_locally:
-					return
-				_set_state(AgentState.EXECUTING)
-				var result: Dictionary = await _tool_executor.execute(call)
-				if _interrupted_locally:
-					return
-				result = _ensure_tool_result_for_call(call, result)
-				results.append(result)
-	if not confirm.is_empty():
-		var leading_results: Array = []
-		var ordered_calls: Array = []
-		var reached_confirmation := false
-		for call in calls:
-			if not (call is Dictionary):
-				continue
-			if bool(call.get("needs_confirm", false)):
-				reached_confirmation = true
-			if reached_confirmation:
-				ordered_calls.append(call)
-				continue
-			if _interrupted_locally:
-				return
-			_set_state(AgentState.EXECUTING)
-			var leading_result: Dictionary = await _tool_executor.execute(call)
-			if _interrupted_locally:
-				return
-			leading_result = _ensure_tool_result_for_call(call, leading_result)
-			leading_results.append(leading_result)
-		FrontendLogger.info(editor_interface, "ChatPanel", "Waiting for inline tool confirmation.", {"count": confirm.size()})
-		_approval_controller.prepare(confirm, leading_results, ordered_calls)
-		_show_inline_confirmation(confirm.duplicate(true))
-		_set_state(AgentState.WAITING_CONFIRM)
-	else:
-		_set_state(AgentState.WAITING_LLM)
-		_submission_controller.submit_tool_results(results, _request_model())
+		state_store.set_value("pending_calls", [])
+	_clear_inline_confirmation()
+	_set_state(AgentState.IDLE)
+	_present_local_text(
+		"error",
+		"Legacy frontend tool execution is disabled. Retry through the backend CodeAct Gateway."
+	)
 
 
 func _on_decision(results: Array) -> void:
-	FrontendLogger.info(editor_interface, "ChatPanel", "Submitting tool decision.", {"result_count": results.size()})
-	if _interrupted_locally:
-		FrontendLogger.info(editor_interface, "ChatPanel", "Suppressed tool decision after interrupt.")
-		return
-	if _state != AgentState.WAITING_CONFIRM and _state != AgentState.EXECUTING:
-		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring duplicate tool decision.", {"result_count": results.size()})
-		return
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Ignored legacy frontend tool decision.", {"result_count": results.size()})
 	_clear_inline_confirmation()
 	if state_store != null:
 		state_store.set_value("pending_calls", [])
-	if results.is_empty():
-		FrontendLogger.warn(editor_interface, "ChatPanel", "No tool results to submit; ending turn gracefully instead of erroring.", {})
-		if undo_manager != null:
-			undo_manager.abort_batch()
-		if _http_client != null:
-			_session_state.complete_turn()
-			_http_client.discard_pending()
-		if state_store != null:
-			state_store.set_value("current_turn_id", "")
-		_set_state(AgentState.IDLE)
-		_present_local_text("system", _ui("rejected_turn_ended"))
-		return
-	_set_state(AgentState.WAITING_LLM)
-	_submission_controller.submit_tool_results(results, _request_model())
+	_set_state(AgentState.IDLE)
+	_present_local_text("error", "Frontend tool-result forwarding has been retired; use CodeAct approvals.")
 
 
 ## 移除文本中的 `<think>…</think>` XML 块及所有残余的 `</think>` 标签。

@@ -82,8 +82,7 @@ def result_summary_for_event(
             "line_start": line_start,
             "line_end": max(line_start, line_start + len(content.splitlines()) - 1),
             "content": preview,
-            "truncated": bool(result.get("truncated", False))
-            or len(content) > len(preview),
+            "truncated": bool(result.get("truncated", False)) or len(content) > len(preview),
         }
     if tool_name in {"grep_code", "search_codebase", "list_files"}:
         matches = match_items_for_event(result)
@@ -95,6 +94,25 @@ def result_summary_for_event(
             "matches": matches[:EVENT_MATCH_PREVIEW_ITEMS],
             "truncated": bool(result.get("truncated", False))
             or len(matches) > EVENT_MATCH_PREVIEW_ITEMS,
+        }
+    if tool_name.startswith(("project.", "shell.", "godot.", "git.", "skill.", "tool.")):
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        diff = str(data.get("diff", ""))
+        return {
+            "kind": "codeact",
+            "task_execution_id": str(result.get("task_execution_id", "")),
+            "audit_ref": (
+                f"/codeact/audit/{result['task_execution_id']}"
+                if result.get("task_execution_id")
+                else ""
+            ),
+            "tool": tool_name,
+            "status": str(result.get("status", "unknown")),
+            "message": str(result.get("message", "")),
+            "diff": diff[:EVENT_TEXT_PREVIEW_CHARS],
+            "diff_truncated": len(diff) > EVENT_TEXT_PREVIEW_CHARS,
+            "validation": data.get("validation", {}),
+            "artifacts": list(result.get("artifacts", [])),
         }
     return None
 
