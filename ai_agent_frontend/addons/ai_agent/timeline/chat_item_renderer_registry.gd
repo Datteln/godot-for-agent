@@ -165,12 +165,12 @@ func _reasoning_header_text(block: Dictionary, item: Dictionary) -> String:
 	if str(item.get("lifecycle", "")) == "committed":
 		var elapsed_ms := int(block.get("elapsed_ms", 0))
 		if elapsed_ms > 0:
-			return "Thought for %.2fs ✓" % (float(elapsed_ms) / 1000.0)
-		return "Thought ✓"
+			return "● Thought for %.2fs ✓" % (float(elapsed_ms) / 1000.0)
+		return "● Thought ✓"
 	var token_count := int(block.get("token_count", 0))
 	if token_count > 0:
-		return "Thinking · %d tokens" % token_count
-	return "Thinking"
+		return "○ Thinking · %d tokens" % token_count
+	return "○ Thinking"
 
 
 func _register_stream_label(root: VBoxContainer, item: Dictionary, block_index: int, rich: RichTextLabel, marker_text: String) -> void:
