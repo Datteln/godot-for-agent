@@ -23,3 +23,4 @@ map_stage: reader
 - 遵守工具返回的区域上限和 `suggested_regions`；同 revision 复用覆盖当前请求的结果，只在新区域、revision 变化或精度不足时重读。
 - 空间索引或 registry stale 时重读真实区域；真实地图数据优先于索引摘要。
 - 只输出运行时定义的 `map_worker_result_v1` JSON，并提供 reader 阶段的真实 facts 与 missing_inputs。
+- `tool.search` 连续 2 次匹配不到任何工具时，必须停止换词重试：向用户说明缺失的工具或能力，并直接使用当前可见工具完成可以完成的部分，或请用户调整任务范围；禁止对同一目标反复换词搜索。

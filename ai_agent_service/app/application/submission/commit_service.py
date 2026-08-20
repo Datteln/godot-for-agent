@@ -271,10 +271,7 @@ class SubmissionCommitService:
                 self._publisher.flush(publication_buffer)
                 self._publisher.resolve_previews(
                     publication_buffer,
-                    committed=not isinstance(
-                        recovered_response,
-                        ChatErrorResponse,
-                    ),
+                    committed=True,
                     reason=(
                         recovered_response.error_code
                         or "submission_returned_error"
@@ -420,7 +417,9 @@ class SubmissionCommitService:
             self._publisher.flush(publication_buffer)
             self._publisher.resolve_previews(
                 publication_buffer,
-                committed=not isinstance(response, ChatErrorResponse),
+                # agent 层错误（会话已提交）同样保留 preview 并标记失败原因，
+                # 让用户看到失败前的思考与工具轨迹；基础设施回滚走 committed=False
+                committed=True,
                 reason=(
                     response.error_code or "submission_returned_error"
                     if isinstance(response, ChatErrorResponse)

@@ -45,7 +45,7 @@ class PartialStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """Exercise the provider interruption through the atomic application use case."""
 
     async def test_partial_stream_never_regenerates_or_publishes_tool_effects(self) -> None:
-        """A partial completion becomes one typed error and one discarded preview."""
+        """A partial completion becomes one typed error; the accepted prefix is retained and marked."""
         with tempfile.TemporaryDirectory() as tmp:
             provider = _PartialProvider()
             events = EventStore()
@@ -75,10 +75,13 @@ class PartialStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(previews), 1)
             self.assertEqual(previews[0].payload["text"], "accepted-prefix")
             self.assertIs(previews[0].payload["provisional"], True)
+            # agent 层错误（会话已提交）保留 preview 并标记失败原因，而不是 discard
             self.assertEqual(
-                [item.type for item in published].count("submission_preview_discarded"),
+                [item.type for item in published].count("submission_preview_committed"),
                 1,
             )
+            boundary = published[-1]
+            self.assertEqual(boundary.payload["reason"], "partial_stream_interrupted")
             self.assertFalse(
                 any(
                     item.type in {"tool_started", "tool_finished", "tool_calls"}

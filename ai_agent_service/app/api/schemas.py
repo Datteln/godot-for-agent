@@ -230,6 +230,11 @@ class DoctorResponse(BaseModel):
     capabilities: dict[str, Any] = Field(default_factory=dict)
     llm_base_url_configured: bool
     llm_model: str
+    llm_quick_model: str | None = None
+    effort_models: dict[str, str] = Field(
+        default_factory=dict,
+        description="每个 effort 档位实际会使用的模型名（quick/standard/deep/verify/advisor）。",
+    )
     session_store_dir: str
     operational_policy: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)

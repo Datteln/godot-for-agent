@@ -1,13 +1,196 @@
-"""Core tool registrations for the front-facing Godot tools."""
+"""Core orchestration tools: delegation and planning.
+
+These tools execute on the server side through frame-level routing
+(`app.orchestrator.map_turn.response_routing`, `delegation*.py`) and only
+need their schemas registered — they never carry a ``handler``.  They were
+originally registered under ``front_tools`` and got swept away by the
+CodeAct front-tool disable switch; this module keeps them on the server
+side so that roles declaring them always resolve them.
+"""
 
 from __future__ import annotations
 
-from app.tools.registry import ToolDef
+from typing import Any
 
-from app.tools.front_tools._shared import _object_schema, _worker_spec_schema, register
+from app.tools.registry import ToolDef, register
 
 
-def register_core_tools() -> None:
+def _object_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required or [],
+    }
+
+
+def _worker_spec_schema() -> dict[str, Any]:
+    """返回动态地图 worker 的参数 schema。"""
+    return _object_schema(
+        {
+            "name": {"type": "string"},
+            "objective": {"type": "string"},
+            "mode": {
+                "type": "string",
+                "enum": [
+                    "read_only",
+                    "propose_only",
+                    "write_one_batch",
+                    "review_only",
+                    "repair_propose",
+                    "repair_write_one_batch",
+                ],
+            },
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional additional map skills. For planner modes the service derives and "
+                    "adds required pipeline skills from canonical operation names."
+                ),
+            },
+            "operations": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Canonical registered tool names for this worker stage; planner operations "
+                    "deterministically select required planning skills."
+                ),
+            },
+            "constraints": {
+                "type": "array",
+                "items": _object_schema(
+                    {
+                        "validator": {"type": "string"},
+                        "required_args": {"type": "object"},
+                    },
+                    ["validator"],
+                ),
+            },
+            "output_schema": {"type": "string", "enum": ["map_worker_result_v1"]},
+            "authoritative_snapshot": {
+                "type": "object",
+                "description": (
+                    "Legacy single-context planner input; runtime migrates it into a one-entry "
+                    "planning_context_bundle."
+                ),
+                "properties": {
+                    "artifact_ref": {"type": "string"},
+                    "snapshot_id": {"type": "string"},
+                    "digest": {"type": "string"},
+                    "target_path": {"type": "string"},
+                    "map_layer": {"type": "integer"},
+                    "map_revision": {"type": "integer"},
+                    "execution_eligible": {"type": "boolean"},
+                },
+                "required": [
+                    "artifact_ref",
+                    "snapshot_id",
+                    "digest",
+                    "target_path",
+                    "map_layer",
+                    "map_revision",
+                ],
+            },
+            "planning_context_bundle": {
+                "type": "object",
+                "description": (
+                    "Runtime-owned planner reference contexts; entries may use different "
+                    "targets, layers, regions, and source revisions."
+                ),
+                "properties": {
+                    "bundle_id": {"type": "string"},
+                    "required_roles": {"type": "array", "items": {"type": "string"}},
+                    "contexts": {
+                        "type": "array",
+                        "items": _object_schema(
+                            {
+                                "context_id": {"type": "string"},
+                                "semantic_role": {"type": "string"},
+                                "artifact_ref": {"type": "string"},
+                                "digest": {"type": "string"},
+                                "provenance": {"type": "object"},
+                                "target_path": {"type": "string"},
+                                "map_layer": {"type": "integer"},
+                                "region": {"type": "object"},
+                                "source_revision": {"type": "integer"},
+                                "fact_fields": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "fresh": {"type": "boolean"},
+                            },
+                            [
+                                "context_id",
+                                "semantic_role",
+                                "artifact_ref",
+                                "digest",
+                            ],
+                        ),
+                    },
+                },
+                "required": ["contexts"],
+            },
+            "required_context_roles": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "approved_batch": {
+                "type": "object",
+                "description": (
+                    "Required for write modes; immutable planner/validator artifact identity "
+                    "for the exact target and revision."
+                ),
+                "properties": {
+                    "artifact_ref": {"type": "string"},
+                    "batch_id": {"type": "string"},
+                    "target_path": {"type": "string"},
+                    "map_layer": {"type": "integer"},
+                    "map_revision": {"type": "integer"},
+                    "snapshot_id": {"type": "string"},
+                    "snapshot_digest": {"type": "string"},
+                    "batch_fingerprint": {"type": "string"},
+                    "execution_operations": {
+                        "type": "array",
+                        "items": _object_schema(
+                            {
+                                "operation_id": {"type": "string"},
+                                "target_path": {"type": "string"},
+                                "map_layer": {"type": "integer"},
+                                "expected_revision": {"type": "integer"},
+                                "write_payload": {"type": "object"},
+                                "artifact_ref": {"type": "string"},
+                                "batch_id": {"type": "string"},
+                            },
+                            [
+                                "operation_id",
+                                "target_path",
+                                "map_layer",
+                                "expected_revision",
+                                "write_payload",
+                            ],
+                        ),
+                    },
+                },
+                "required": [
+                    "artifact_ref",
+                    "batch_id",
+                    "target_path",
+                    "map_layer",
+                    "map_revision",
+                    "snapshot_id",
+                    "snapshot_digest",
+                    "batch_fingerprint",
+                ],
+            },
+            "stage_id": {"type": "string"},
+            "max_turns": {"type": "integer", "minimum": 1, "maximum": 12},
+        },
+        ["name", "objective", "mode", "operations", "output_schema"],
+    )
+
+
+def register_orchestration_tools() -> None:
+    """注册服务端执行的委托与计划工具 schema。"""
     register(
         ToolDef(
             name="delegate",

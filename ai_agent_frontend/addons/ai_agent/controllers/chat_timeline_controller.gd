@@ -38,10 +38,15 @@ func present_event(event: Dictionary) -> bool:
 	for mutation_value in mutations:
 		if mutation_value is Dictionary and str((mutation_value as Dictionary).get("kind", "")) == "insert":
 			_stamp_item((mutation_value as Dictionary).get("item", {}))
-	var result := store.apply_all(mutations)
-	if not bool(result.get("ok", false)):
-		projection_rejected.emit(str(result.get("reason", "mutation_failed")), event.duplicate(true))
-		return false
+	# boundary 事件（commit/discard）的 preview_ids 可能含个别已失效条目
+	# （比如先被移除的 tool 条目），逐条应用而非整批原子：单条失败只提示，
+	# 不能拖垮同批其它 finalize（否则 reasoning 会永远停留在 streaming 状态）。
+	for mutation_value in mutations:
+		if not (mutation_value is Dictionary):
+			continue
+		var result := store.apply_mutation(mutation_value as Dictionary)
+		if not bool(result.get("ok", false)):
+			projection_rejected.emit(str(result.get("reason", "mutation_failed")), event.duplicate(true))
 	return true
 
 

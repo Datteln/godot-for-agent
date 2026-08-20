@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -37,6 +38,14 @@ logger = logging.getLogger(__name__)
 _MAP_AUTO_COMPACT_CONTEXT_TOKENS = 64_000
 _MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
 _PREVIEW_EVENT_TYPES = frozenset({"agent_text_delta", "agent_reasoning_delta"})
+
+# 前端会展示、需要在运行期尽快到达的工具/步骤事件：以节流小批量实时发布，
+# 而不是缓冲到提交时一次性倾泻（restore-delegation-tools-and-live-events）。
+_LIVE_EVENT_TYPES = frozenset(
+    {"agent_tool_calls", "server_tool_start", "server_tool_result", "agent_step"}
+)
+LIVE_BATCH_MAX = 4
+LIVE_FLUSH_WINDOW_S = 0.25
 
 # Re-export the buffer event type for type-safe usage.
 BufferedEvent = tuple[str, str, dict[str, Any]]
@@ -73,6 +82,11 @@ class SubmissionScope:
     events: list[BufferedEvent] = field(default_factory=list)
     preview: PreviewLifecycle = field(default_factory=PreviewLifecycle)
     resolved: bool = False
+    # 运行期节流实时发布状态：live_buffer 里的事件以最终 payload 发布，
+    # 提交 flush 时只清空剩余缓冲，不会重复发布（见 SubmissionPublisher._publish_live）。
+    live_buffer: list[BufferedEvent] = field(default_factory=list)
+    live_preview_ids: set[str] = field(default_factory=set)
+    last_live_flush: float = field(default_factory=time.monotonic)
 
     def buffer_event(self, session_id: str, event_type: str, payload: dict[str, Any]) -> None:
         """暂存一个事务事件；该操作不会发布事件。"""
@@ -94,10 +108,12 @@ class SubmissionScope:
 
 def _submission_event_delivery(event_type: str) -> str:
     """返回提交事件的发布时机。"""
-    if event_type == "turn_progress":
+    if event_type in {"turn_progress", "agent_reasoning_complete"}:
         return "out_of_band_liveness"
     if event_type in _PREVIEW_EVENT_TYPES:
         return "provisional_preview"
+    if event_type in _LIVE_EVENT_TYPES:
+        return "throttled_live"
     return "transactional"
 
 
@@ -184,6 +200,10 @@ class SubmissionPublisher:
                 staged_payload,
                 session_epoch=scope.session.session_epoch,
             ).seq
+        if delivery == "throttled_live":
+            if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
+                self.record_history_event(scope.session, event_type, staged_payload)
+            return self._publish_live(session_id, event_type, staged_payload, scope)
         if delivery == "transactional":
             staged_payload.setdefault("delivery", delivery)
         if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
@@ -249,6 +269,79 @@ class SubmissionPublisher:
                 bool(payload.get("provider_first_chunk", False)),
             )
         return event.seq
+
+    def _publish_live(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        scope: SubmissionScope,
+    ) -> int:
+        """运行期节流实时发布工具/步骤事件（provisional，可被边界解析）。"""
+        frame_id = str(payload.get("frame_id") or "")
+        tool_use_id = str(payload.get("tool_use_id") or "")
+        if not tool_use_id and event_type == "agent_tool_calls":
+            raw_calls = payload.get("calls")
+            if isinstance(raw_calls, list) and raw_calls and isinstance(raw_calls[0], dict):
+                tool_use_id = str(raw_calls[0].get("id", raw_calls[0].get("tool_use_id", "")))
+        message_id = str(
+            payload.get("message_id")
+            or (f"{frame_id}:{tool_use_id}" if tool_use_id else f"{frame_id}:{event_type}")
+        )
+        preview_id = str(
+            payload.get("preview_id")
+            or (
+                f"{scope.request_id or scope.turn_id}:{scope.turn_id}:"
+                f"{event_type}:{message_id}"
+            )
+        )
+        payload.update(
+            {
+                "delivery": "transactional",
+                "provisional": True,
+                "preview_id": preview_id,
+                "message_id": message_id,
+            }
+        )
+        scope.preview.add(
+            preview_id,
+            {
+                "preview_id": preview_id,
+                "event_type": event_type,
+                "frame_id": frame_id,
+                "message_id": message_id,
+            },
+        )
+        scope.live_preview_ids.add(preview_id)
+        scope.live_buffer.append((session_id, event_type, payload))
+        if len(scope.live_buffer) >= LIVE_BATCH_MAX or (
+            time.monotonic() - scope.last_live_flush
+        ) >= LIVE_FLUSH_WINDOW_S:
+            return self._flush_live(scope)
+        return 0
+
+    def _flush_live(self, scope: SubmissionScope) -> int:
+        """把 live 缓冲区批量写入事件存储（幂等，提交时只清空剩余）。"""
+        if self.events is None or not scope.live_buffer:
+            return 0
+        last_seq = 0
+        for live_session_id, event_type, payload in scope.live_buffer:
+            event = self.events.append(
+                live_session_id,
+                event_type,
+                payload,
+                session_epoch=scope.session.session_epoch,
+            )
+            last_seq = event.seq
+        logger.debug(
+            "Live event batch persisted session=%s count=%d last_seq=%d",
+            scope.session.session_id,
+            len(scope.live_buffer),
+            last_seq,
+        )
+        scope.live_buffer.clear()
+        scope.last_live_flush = time.monotonic()
+        return last_seq
 
     def resolve_previews(
         self,
@@ -338,6 +431,9 @@ class SubmissionPublisher:
         if self.events is None:
             scope.resolved = True
             return
+        # 先清空运行期 live 缓冲，避免窗口内未发布的事件在会话提交后缺失；
+        # 已 live 发布的事件不进入 scope.events，不会重复发布。
+        self._flush_live(scope)
         undelivered: list[BufferedEvent] = []
         for event_index, (session_id, event_type, payload) in enumerate(scope.events):
             payload.setdefault(

@@ -161,6 +161,8 @@ func _patch(item_id: String, patch: Dictionary) -> Dictionary:
 		block["text"] = str(block.get("text", "")) + next_text if bool(patch.get("append_text", false)) else next_text
 		if patch.has("token_count"):
 			block["token_count"] = int(patch.get("token_count", 0))
+		if patch.has("elapsed_ms"):
+			block["elapsed_ms"] = int(patch.get("elapsed_ms", 0))
 		blocks[block_index] = block
 		item["content_blocks"] = blocks
 		item["copy_text"] = str(item.get("copy_text", "")) + next_text if bool(patch.get("append_text", false)) else str(patch.get("copy_text", next_text))

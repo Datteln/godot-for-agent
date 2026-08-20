@@ -9,6 +9,7 @@ const ContextCollector = preload("res://addons/ai_agent/context/context_collecto
 const EventFormatter = preload("res://addons/ai_agent/ui/event_formatter.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
 const ChatPanelText = preload("res://addons/ai_agent/ui/chat_panel_text.gd")
+const SCROLL_BOTTOM_DEAD_ZONE := 16.0   # 自动贴底的死区像素：reveal 期间滚动轴微变不触发强拉
 const ChatPanelTheme = preload("res://addons/ai_agent/ui/chat_panel_theme.gd")
 const ChatTimelineController = preload("res://addons/ai_agent/controllers/chat_timeline_controller.gd")
 const ChatItemRendererRegistry = preload("res://addons/ai_agent/timeline/chat_item_renderer_registry.gd")
@@ -142,6 +143,7 @@ var _post_delta_scroll_frames := 0   # 文本流刷新后持续滚动到底部�
 var _post_history_layout_frames := 0  # 历史节点完成布局后重新测量虚拟列表的剩余帧数
 var _user_is_dragging_scrollbar := false   # 用户正在拖拽滚动条
 var _user_scroll_intent := false
+var _last_scroll_to_bottom_ms := 0   # 自动贴底最小帧间隔，防滚动轴抽搐
 var _user_scrolled_up_ms: int = 0   # 用户主动上滚的时间戳，用于冷却期
 var _empty_final_ignored_ms: int = -1   # 空 final 被忽略的时间戳，超时后强制结束 turn
 
@@ -160,7 +162,9 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
-	if _streaming_controller.has_pending():
+	# 热重载脚本时成员会先置空再重建，_process 可能在重建完成前被调用；
+	# 对流式控制器做空保护，避免 "Nonexistent function 'has_pending' in base 'Nil'"。
+	if _streaming_controller != null and _streaming_controller.has_pending():
 		_drain_event_queue()
 	if _virtual_scroller != null:
 		var resync_request := _virtual_scroller.consume_resync_request()
@@ -169,16 +173,27 @@ func _process(_delta: float) -> void:
 				float(_scroll.scroll_vertical) if _scroll != null else 0.0,
 				bool(resync_request.get("stick_to_bottom", false))
 			)
+		# 打字机 reveal：每帧推进流式文本块的可见字符并贴底跟随
+		if _virtual_scroller.advance_reveals():
+			_virtual_scroller.sync(
+				float(_scroll.scroll_vertical) if _scroll != null else 0.0,
+				_auto_scroll
+			)
 	var selection_now := Time.get_ticks_msec()
 	if selection_now - _last_selection_refresh_ms >= 500:
 		_last_selection_refresh_ms = selection_now
 		_refresh_context_bar()
 	if _auto_scroll and not _user_is_dragging_scrollbar and _scroll != null:
+		# 打字机 reveal 期间 scrollbar max 逐帧微变：用足够大的死区 + 连续帧
+		# 抑制避免"到底判定→强拉到底"的高频拉锯（滚动轴抽搐）。
 		var stream_bar := _scroll.get_v_scroll_bar()
 		var stream_bottom := maxf(0.0, stream_bar.max_value - stream_bar.page)
-		if float(_scroll.scroll_vertical) < stream_bottom - 2.0:
-			_sync_virtual_messages()
-			_do_scroll_to_bottom()
+		if float(_scroll.scroll_vertical) < stream_bottom - SCROLL_BOTTOM_DEAD_ZONE \
+				and not _user_scroll_intent:
+			if Time.get_ticks_msec() - _last_scroll_to_bottom_ms >= 33:
+				_last_scroll_to_bottom_ms = Time.get_ticks_msec()
+				_sync_virtual_messages()
+				_do_scroll_to_bottom()
 	if _post_history_layout_frames > 0:
 		_post_history_layout_frames -= 1
 		_sync_virtual_messages()
@@ -509,7 +524,9 @@ func _on_send() -> void:
 	_event_socket.connect_stream()
 	FrontendLogger.info(editor_interface, "ChatPanel", "Sending user message.", {"chars": text.length()})
 	var requested_model = _request_model()
-	_active_model_name = str(requested_model) if requested_model != null else _model_input.placeholder_text
+	_active_model_name = str(requested_model) if requested_model != null else (
+		_active_model_name if _active_model_name.strip_edges() != "" else _model_input.placeholder_text
+	)
 	_auto_scroll = true
 	_force_scroll_once = true
 	_interrupted_locally = false
@@ -748,7 +765,9 @@ func _dismiss_auto_context(key: String, referenced_path: String) -> void:
 func _configure_message_rich_text(rich: RichTextLabel) -> void:
 	rich.selection_enabled = true
 	rich.context_menu_enabled = false
-	rich.gui_input.connect(_on_message_rich_input.bind(rich))
+	# setup 回调可能被多次调用（热重载/重建路径），连接必须幂等
+	if not rich.gui_input.is_connected(_on_message_rich_input.bind(rich)):
+		rich.gui_input.connect(_on_message_rich_input.bind(rich))
 
 
 func _on_message_rich_input(event: InputEvent, rich: RichTextLabel) -> void:
@@ -813,6 +832,13 @@ func _on_response(response: Dictionary) -> void:
 	})
 	if response.has("python_version"):
 		_last_doctor_report = response
+		# 空闲模型名：跟随当前 effort 档位（quick/standard/deep...）对应模型；
+		# 仅当用户未手动填写模型 override 时才刷新，避免覆盖用户显式选择。
+		if _model_input != null and _model_input.text.strip_edges() == "":
+			var effort_model := _effort_model_name()
+			if effort_model != "":
+				_active_model_name = effort_model
+				_refresh_status_text()
 		if _extensions_pending:
 			_extensions_pending = false
 			_present_local_text("system", ChatReportFormatter.extensions_report({
@@ -1370,6 +1396,8 @@ func _fetch_initial_service_data() -> void:
 	_history_controller.fetch_initial()
 	_http_client.fetch_recovery_pointer()
 	_http_client.fetch_output_styles()
+	# doctor 携带 quick/默认模型配置：空闲状态栏据此显示实际会用的模型
+	_http_client.fetch_doctor()
 
 
 func _on_events(events: Array) -> void:
@@ -1397,7 +1425,7 @@ func _on_events(events: Array) -> void:
 				"text_len": str(payload.get("text", "")).length()
 			})
 			_enqueue_event(event)
-	if _streaming_controller.has_pending():
+	if _streaming_controller != null and _streaming_controller.has_pending():
 		_drain_event_queue()
 
 
@@ -1526,6 +1554,12 @@ func _on_effort_selected(index: int) -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Effort selected.", {"effort": effort})
 	ConfigMigrations.set_value(editor_interface, "ai_agent/effort", effort)
 	_http_client.run_command("set_effort", {"effort": effort})
+	# 空闲状态栏的模型名跟随档位：quick/deep 各档对应服务端配置的模型
+	if _model_input != null and _model_input.text.strip_edges() == "":
+		var effort_model := _effort_model_name()
+		if effort_model != "":
+			_active_model_name = effort_model
+			_refresh_status_text()
 	if state_store != null:
 		state_store.set_value("effort", effort)
 
@@ -1723,6 +1757,19 @@ func _clear_inline_confirmation() -> void:
 func _request_model():
 	var model := _model_input.text.strip_edges()
 	return model if model != "" else null
+
+
+func _effort_model_name() -> String:
+	## 从最近一次 doctor 报告解析当前 effort 档位对应的模型名；
+	## 无报告时返回空（调用方保持现状）。
+	var effort := "standard"
+	if _effort_options != null:
+		effort = _effort_options.get_item_text(_effort_options.selected)
+		if effort == "":
+			effort = "standard"
+	var raw_models: Variant = _last_doctor_report.get("effort_models", {})
+	var models: Dictionary = raw_models if raw_models is Dictionary else {}
+	return str(models.get(effort, _last_doctor_report.get("llm_model", ""))).strip_edges()
 
 
 func _ensure_tool_result_for_call(call: Dictionary, result: Dictionary) -> Dictionary:

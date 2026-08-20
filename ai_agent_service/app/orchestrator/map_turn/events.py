@@ -134,8 +134,26 @@ def _delta_callback(
     # 身份，不能再以通道切换作为正文分段边界，否则会截断正文并导致 final
     # 无法收敛替换流式消息。
     def _on_delta(kind: str, text: str, token_count: int | None) -> None:
-        nonlocal chunk_index
+        nonlocal chunk_index, last_reasoning_elapsed_ms
         chunk_index += 1
+        if kind == "reasoning_done":
+            # 推理段结束信号（provider 流收尾统一发出）：不携带文本，
+            # 只带本段最终思考耗时；前端据此把 Thinking 块切为 "Thought for x.xs"。
+            # message_id 与 delta 发布层注入规则同构，避免前端 fallback 浮点拼接过失配。
+            event_callback(
+                "agent_reasoning_complete",
+                {
+                    "frame_id": frame_id,
+                    "loop": loop,
+                    "message_index": message_index,
+                    "timeline_frame_id": timeline_frame_id,
+                    "timeline_message_index": timeline_message_index,
+                    "stream_segment": 0,
+                    "elapsed_ms": last_reasoning_elapsed_ms,
+                    "message_id": f"{frame_id}:{message_index}",
+                },
+            )
+            return
         # 同一次 LLM 调用内的 reasoning/content 均使用同一个 segment。
         # 前端据此把 reasoning 合并进同一 Thought，并持续累积同一正文块。
         event_type = "agent_reasoning_delta" if kind == "reasoning" else "agent_text_delta"
@@ -154,6 +172,7 @@ def _delta_callback(
         }
         if kind == "reasoning":
             payload["elapsed_ms"] = max(int((time.monotonic() - reasoning_started_at) * 1000), 1)
+            last_reasoning_elapsed_ms = payload["elapsed_ms"]
             payload["token_count"] = (
                 token_count
                 if token_count is not None
@@ -161,6 +180,7 @@ def _delta_callback(
             )
         event_callback(event_type, payload)
 
+    last_reasoning_elapsed_ms = 0
     return _on_delta
 
 

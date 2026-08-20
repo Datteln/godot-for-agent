@@ -81,6 +81,13 @@ func _on_registration_completed(result: int, response_code: int, _headers: Packe
 		return
 	_socket = WebSocketPeer.new()
 	_hello_sent = false
+	# 握手必须与主通道一致携带 Bearer：服务端 editor socket 路由同样受
+	# 全局鉴权保护，缺少 Authorization 会得到 401（Godot Output 打印
+	# "Invalid status code. Got: '401', expected '101'"）。
+	if str(_service.token) != "":
+		_socket.handshake_headers = PackedStringArray(
+			["Authorization: Bearer " + str(_service.token)]
+		)
 	var socket_url := _websocket_root(str(_service.base_url)) + "/internal/codeact/editor/socket?project_id=%s&instance_id=%s" % [
 		_project_id.uri_encode(),
 		_instance_id.uri_encode(),

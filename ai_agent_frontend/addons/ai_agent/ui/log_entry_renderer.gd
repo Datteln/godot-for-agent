@@ -242,6 +242,14 @@ func apply_mono_font(rich: RichTextLabel) -> void:
 
 
 func make_rich_text(text: String, color = null, marker_text: String = "") -> RichTextLabel:
+	var rich := _new_rich_text(color)
+	write_rich_text(rich, text, marker_text)
+	if rich_text_setup.is_valid():
+		rich_text_setup.call(rich)
+	return rich
+
+
+func _new_rich_text(color = null) -> RichTextLabel:
 	var rich := RichTextLabel.new()
 	rich.bbcode_enabled = true
 	rich.selection_enabled = true
@@ -257,15 +265,21 @@ func make_rich_text(text: String, color = null, marker_text: String = "") -> Ric
 	# 改成 PASS：消息本身仍能响应选中/右键菜单，同时滚轮继续向上传递。
 	rich.mouse_filter = Control.MOUSE_FILTER_PASS
 	apply_mono_font(rich)
+	return rich
+
+
+func write_rich_text(rich: RichTextLabel, text: String, marker_text: String = "") -> void:
+	## 覆写已有 RichTextLabel 的文本内容（保留节点与显示状态）。
+	## 流式 reveal 重建内容时复用，避免整节点重建丢失折叠/滚动状态。
+	## 注意：只换内容，不重跑 rich_text_setup（那是单次初始化，重复执行
+	## 会对同一控件重复连接信号）。
+	rich.clear()
 	var bbcode := MarkdownRenderer.markdown_to_bbcode(text, theme_colors)
 	if marker_text != "":
 		bbcode = "[color=%s]%s[/color]  %s" % [_marker_color_tag(marker_text), marker_text, bbcode]
 	rich.append_text(bbcode)
 	# Keep the source text available for the message-level copy fallback.
 	rich.set_meta("copy_text", text)
-	if rich_text_setup.is_valid():
-		rich_text_setup.call(rich)
-	return rich
 
 
 func make_log_rich_text(text: String, color = null, marker_text: String = "", indent := false) -> RichTextLabel:

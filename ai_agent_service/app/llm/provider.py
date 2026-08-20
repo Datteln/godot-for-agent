@@ -646,6 +646,7 @@ class OpenAICompatibleProvider:
             last_content_emit = 0.0
             last_reasoning_emit = 0.0
             reasoning_tokens: int | None = None
+            reasoning_boundary_reported = False
             cached_tokens: int | None = None
             cache_creation_tokens: int | None = None
             total_input_tokens: int | None = None
@@ -699,6 +700,18 @@ class OpenAICompatibleProvider:
                             last_reasoning_emit = now
                             if delta_text:
                                 on_delta("reasoning", delta_text, None)
+                    if (
+                        not reasoning_boundary_reported
+                        and "reasoning" in accepted_kinds
+                        and (delta.content or delta.tool_calls)
+                    ):
+                        if on_delta is not None:
+                            full_reasoning = "".join(reasoning_parts)
+                            if emitted_reasoning_len < len(full_reasoning):
+                                on_delta("reasoning", full_reasoning[emitted_reasoning_len:], None)
+                                emitted_reasoning_len = len(full_reasoning)
+                            on_delta("reasoning_done", "", None)
+                        reasoning_boundary_reported = True
                     if delta.content:
                         accepted_kinds.add("content")
                         content_parts.append(delta.content)
@@ -793,6 +806,15 @@ class OpenAICompatibleProvider:
                 delta_text = content[emitted_content_len:]
                 if delta_text:
                     on_delta("content", delta_text, None)
+
+        # reasoning 段结束信号：本流输出过推理且在收尾处统一发出一次。
+        # 覆盖两种结束形态——推理后转入正文（content 分支先触发），
+        # 以及推理后直接结束（工具调用/流结束）——都由这一处兜底，
+        # 保证每个 thinking 块恰好在推理阶段结束时收到完成标记。
+        if not reasoning_boundary_reported and "reasoning" in accepted_kinds:
+            if on_delta is not None:
+                on_delta("reasoning_done", "", None)
+            reasoning_boundary_reported = True
 
         tool_calls = [
             ToolCallRequest(

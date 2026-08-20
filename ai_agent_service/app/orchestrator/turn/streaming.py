@@ -53,8 +53,27 @@ def make_delta_callback(
     chunk_index = 0
 
     def _on_delta(kind: str, text: str, token_count: int | None) -> None:
-        nonlocal chunk_index
+        nonlocal chunk_index, last_reasoning_elapsed_ms
         chunk_index += 1
+        if kind == "reasoning_done":
+            # 推理段结束信号：不携带文本，只带本段最终思考耗时，
+            # 前端据此把 Thinking 块切换为 "Thought for x.xs"。
+            # message_id 与 delta 发布层的注入规则保持同构（frame:message_index），
+            # 否则前端 fallback 拼接会因浮点表示产生 "f1:2.0" 与 "f1:2" 失配。
+            event_callback(
+                "agent_reasoning_complete",
+                {
+                    "frame_id": frame_id,
+                    "loop": loop,
+                    "message_index": message_index,
+                    "timeline_frame_id": timeline_frame_id,
+                    "timeline_message_index": timeline_message_index,
+                    "stream_segment": 0,
+                    "elapsed_ms": last_reasoning_elapsed_ms,
+                    "message_id": f"{frame_id}:{message_index}",
+                },
+            )
+            return
         event_type = (
             "agent_reasoning_delta" if kind == "reasoning" else "agent_text_delta"
         )
@@ -75,6 +94,7 @@ def make_delta_callback(
             payload["elapsed_ms"] = max(
                 int((time.monotonic() - reasoning_started_at) * 1000), 1
             )
+            last_reasoning_elapsed_ms = payload["elapsed_ms"]
             payload["token_count"] = (
                 token_count
                 if token_count is not None
@@ -82,6 +102,7 @@ def make_delta_callback(
             )
         event_callback(event_type, payload)
 
+    last_reasoning_elapsed_ms = 0
     return _on_delta
 
 

@@ -11,7 +11,31 @@ from app.tools.registry import REGISTRY, ToolDef, register
 
 MAX_RESULTS = 12
 
+# 连续空匹配的护栏阈值：达到该次数后在结果中返回 search_stop 硬指令，
+# 防止 agent 因规则性提示词（如“必须先 create_plan”）对不存在的工具无限换词重试。
+EMPTY_STREAK_LIMIT = 3
+
 logger = logging.getLogger(__name__)
+
+# 进程内护栏状态：key=(session_id, agent_role)，只在服务进程生命周期有效。
+_EMPTY_MATCH_STREAK: dict[tuple[str, str], int] = {}
+
+
+def _guardrail_key(ctx: ToolContext) -> tuple[str, str]:
+    return (ctx.session_id, ctx.agent_role or "unknown")
+
+
+def _empty_match_advisory(search_stop: bool, visible_tools: list[str]) -> str:
+    if search_stop:
+        return (
+            "search_stop: 你已连续多次搜索不到任何工具，禁止继续换词搜索。"
+            "当前可见工具只有：" + "、".join(visible_tools) + "。"
+            "请直接使用这些工具完成可以完成的部分，并向用户说明缺失的工具/能力。"
+        )
+    return (
+        "未找到任何工具（可见工具与全局注册表均无匹配），继续搜索不会得到新结果。"
+        "当前可见工具：" + "、".join(visible_tools) + "。请改用现有工具或向用户说明。"
+    )
 
 SEARCH_TOOLS_SCHEMA: dict[str, Any] = {
     "name": "search_tools",
@@ -138,17 +162,37 @@ async def search_tools_handler(args: dict[str, Any], ctx: ToolContext) -> dict[s
             }
         )
 
+    visible_tools = sorted(visible)
+    all_empty = len(ranked) == 0 and not unavailable
+    key = _guardrail_key(ctx)
+    search_stop = False
+    if all_empty:
+        streak = _EMPTY_MATCH_STREAK.get(key, 0) + 1
+        _EMPTY_MATCH_STREAK[key] = streak
+        search_stop = streak >= EMPTY_STREAK_LIMIT
+    else:
+        _EMPTY_MATCH_STREAK.pop(key, None)
+
     logger.info(
-        "search_tools success session=%s matches=%d activated=%d",
+        "search_tools success session=%s matches=%d activated=%d visible=%d "
+        "empty_streak=%s search_stop=%s",
         ctx.session_id,
         len(matches),
         len(activated),
+        len(visible_tools),
+        _EMPTY_MATCH_STREAK.get(key, 0) if all_empty else 0,
+        search_stop,
     )
     return {
         "query": query,
         "tools": matches,
         "activated_tools": activated,
         "unavailable_tools": unavailable,
+        "visible_tools": visible_tools,
+        "advisory": (
+            _empty_match_advisory(search_stop, visible_tools) if all_empty else None
+        ),
+        "search_stop": search_stop,
         "note": (
             "activated_tools 会在下一轮对话中加入当前 agent 的工具 schema。"
             "unavailable_tools 是当前阶段或 agent 范围裁剪结果，不是用户待批准权限。"

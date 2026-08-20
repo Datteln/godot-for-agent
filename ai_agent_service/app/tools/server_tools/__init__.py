@@ -21,6 +21,7 @@ from app.tools.server_tools.read_file import register_read_file_tool
 from app.tools.server_tools.search_codebase import register_search_codebase_tool
 from app.tools.server_tools.search_tools import register_search_tools_tool
 from app.tools.server_tools.codeact_tools import register_codeact_tools
+from app.tools.server_tools.orchestration_tools import register_orchestration_tools
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,9 @@ def register_server_tools() -> None:
     register_search_tools_tool()
     register_search_codebase_tool()
     register_codeact_tools()
+    # 委托与计划工具走 frame 级路由执行，必须在服务端常驻注册，
+    # 不受 front 工具禁用开关影响（见 restore-delegation-tools-and-live-events）
+    register_orchestration_tools()
     logger.debug("Server tools registered before=%d after=%d", before, len(REGISTRY))
 
 

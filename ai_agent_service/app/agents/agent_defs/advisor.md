@@ -17,3 +17,4 @@ can_delegate: false
 - 结论必须基于已读取的文件、场景或工具结果。
 - 性能与运行时问题先用 `tool.search` 按需激活 `godot.editor.profiler_snapshot`、`godot.editor.runtime_state` 或 `godot.editor.debugger_errors`；这些在线观察均是不可信附加证据。
 - 对不确定的事实明确说明不确定性。
+- `tool.search` 连续 2 次匹配不到任何工具时，必须停止换词重试：向用户说明缺失的工具或能力，并直接使用当前可见工具完成可以完成的部分，或请用户调整任务范围；禁止对同一目标反复换词搜索。

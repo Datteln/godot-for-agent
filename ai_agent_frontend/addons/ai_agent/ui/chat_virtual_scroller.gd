@@ -3,6 +3,7 @@ extends RefCounted
 
 const ChatTimelineStore = preload("res://addons/ai_agent/timeline/chat_timeline_store.gd")
 const ChatItemRendererRegistry = preload("res://addons/ai_agent/timeline/chat_item_renderer_registry.gd")
+const StreamRevealQueue = preload("res://addons/ai_agent/timeline/stream_reveal_queue.gd")
 
 const BUFFER_ITEMS := 3
 const MIN_VISIBLE_ITEMS := 12
@@ -15,6 +16,7 @@ var _registry: ChatItemRendererRegistry
 var _top_spacer: Control
 var _bottom_spacer: Control
 var _node_cache: Dictionary = {}
+var _reveal_queue := StreamRevealQueue.new()
 var _syncing := false
 var _scroll_sync_pending := false
 var _sync_again := false
@@ -30,10 +32,27 @@ func setup(scroll: ScrollContainer, item_list: VBoxContainer, store: ChatTimelin
 	_item_list = item_list
 	_store = store
 	_registry = registry
+	_registry.reveal_queue = _reveal_queue
 	_store.item_spacing = float(item_list.get_theme_constant("separation"))
 	_store.mutation_applied.connect(_on_store_mutation)
 	_top_spacer = _make_spacer("TopSpacer")
 	_bottom_spacer = _make_spacer("BottomSpacer")
+
+
+func advance_reveals() -> bool:
+	## 每帧驱动打字机队列；有任何块前进则刷新对应节点显示。
+	if _reveal_queue == null or not _reveal_queue.is_active():
+		return false
+	if not _reveal_queue.advance_all():
+		return false
+	for raw_index in _node_cache.keys():
+		var index := int(raw_index)
+		if index < 0 or index >= _store.size():
+			continue
+		var node: Control = _node_cache[raw_index]
+		if node != null and is_instance_valid(node):
+			_registry.advance_stream_node(node, _store.get_item(index))
+	return true
 
 
 func _on_store_mutation(mutation: Dictionary, result: Dictionary) -> void:
@@ -196,16 +215,41 @@ func _refresh_index(index: int) -> void:
 	if index < 0:
 		return
 	if _node_cache.has(index):
+		var node: Control = _node_cache[index]
+		var item: Dictionary = _store.get_item(index)
+		if node == null or not is_instance_valid(node):
+			pass  # 走到下方重建分支
+		elif _registry.is_streaming(item):
+			# 流式 item 的 patch 不重建节点：只重填内层文本并推进 reveal 队列。
+			# 这样用户展开的 Thought 折叠块不会在每次增量刷新时被重新收起。
+			_registry.refresh_stream_node(node, item)
+			sync(_scroll_position(), false)
+			return
+		elif bool(node.get_meta("timeline_finalized", false)):
+			# 已就地 finalize（header 已切为 committed 形态），无需重建
+			sync(_scroll_position(), false)
+			return
+		elif bool(node.get_meta("timeline_streaming", false)):
+			# 流式节点 finalize：原地切 committed header，不重建节点
+			# （保留折叠/展开状态与滚动位置，避免 "Thought" 块结束时重新渲染）
+			_registry.refresh_committed_node(node, item)
+			sync(_scroll_position(), false)
+			return
 		var old_node: Control = _node_cache[index]
-		var new_node := _registry.create_item_node(_store.get_item(index))
+		if old_node != null and is_instance_valid(old_node):
+			_registry.drop_stream_reveals(old_node)
+		var new_node := _registry.create_item_node(item)
 		if new_node != null:
-			var child_index := old_node.get_index() if old_node.get_parent() == _item_list else -1
-			if child_index >= 0:
+			var child_index := -1
+			if old_node != null and is_instance_valid(old_node) and old_node.get_parent() == _item_list:
+				child_index = old_node.get_index()
 				_item_list.remove_child(old_node)
+			if child_index >= 0:
 				_item_list.add_child(new_node)
 				_item_list.move_child(new_node, child_index)
 			_node_cache[index] = new_node
-			old_node.queue_free()
+			if old_node != null and is_instance_valid(old_node):
+				old_node.queue_free()
 	sync(_scroll_position(), false)
 
 
@@ -232,6 +276,7 @@ func _free_cached_node(index: int) -> void:
 	if not _node_cache.has(index):
 		return
 	var node: Control = _node_cache[index]
+	_registry.drop_stream_reveals(node)
 	_node_cache.erase(index)
 	if is_instance_valid(node):
 		if node.get_parent() == _item_list:

@@ -24,6 +24,18 @@ from app.tools.registry import REGISTRY
 logger = logging.getLogger(__name__)
 
 
+def _effort_models(settings: AppSettings) -> dict[str, str]:
+    """返回每个 effort 档位实际会使用的模型名（档位未配置时回退默认模型）。"""
+    default = settings.llm_model
+    return {
+        "quick": settings.llm_quick_model or default,
+        "standard": settings.llm_standard_model or default,
+        "deep": settings.llm_deep_model or default,
+        "verify": settings.llm_verify_model or default,
+        "advisor": settings.llm_advisor_model or default,
+    }
+
+
 def run_doctor(
     settings: AppSettings,
     security: SecuritySettings,
@@ -95,6 +107,8 @@ def run_doctor(
         },
         llm_base_url_configured=settings.llm_base_url != "https://api.openai.com/v1",
         llm_model=settings.llm_model,
+        llm_quick_model=settings.llm_quick_model,
+        effort_models=_effort_models(settings),
         session_store_dir=str(store_dir),
         operational_policy=settings.effective_operational_policy(),
         warnings=warnings,

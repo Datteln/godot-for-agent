@@ -34,6 +34,8 @@ func project(event: Dictionary, fallback_epoch: String = "") -> Dictionary:
 			mutations = _stream_mutations(event_type, payload, epoch, order_key, false)
 		"agent_reasoning_delta":
 			mutations = _stream_mutations(event_type, payload, epoch, order_key, true)
+		"agent_reasoning_complete":
+			mutations = _reasoning_complete_mutations(payload, epoch)
 		"final":
 			mutations = _final_mutations(payload, epoch, order_key)
 		"submission_preview_committed":
@@ -88,8 +90,20 @@ func _stream_mutations(event_type: String, payload: Dictionary, epoch: String, o
 				"copy_text": text,
 				"status": "streaming",
 				"token_count": int(payload.get("token_count", 0)),
+				# 思考累计耗时（服务端每个 reasoning delta 附带），
+				# 最后一条即思考总时长，供 committed 态显示 "Thought for x.xs"。
+				"elapsed_ms": int(payload.get("elapsed_ms", 0)),
 			}
 		},
+	]
+
+
+func _reasoning_complete_mutations(payload: Dictionary, epoch: String) -> Array[Dictionary]:
+	## reasoning 段结束信号：把该 Thinking 块 finalize，header 随即切换为
+	## "Thought for x.xs"。与 submission preview 边界的 finalize 幂等（重复 finalize 无害）。
+	var item_id := _message_item_id(payload, "reasoning")
+	return [
+		{"kind": "finalize", "item_id": item_id, "status": "complete"},
 	]
 
 
@@ -110,10 +124,15 @@ func _preview_mutations(payload: Dictionary, kind: String) -> Array[Dictionary]:
 	var raw_ids: Variant = payload.get("preview_ids", [])
 	if not (raw_ids is Array):
 		return result
+	var reason := str(payload.get("reason", ""))
 	for raw_id in raw_ids:
 		var preview_id := str(raw_id).strip_edges()
 		if not preview_id.is_empty():
-			result.append({"kind": kind, "preview_id": preview_id, "status": str(payload.get("reason", ""))})
+			# status 与 reason 双通道：status 驱动生命周期状态机，
+			# reason 供渲染层展示失败原因（如 agent_turn_budget_exhausted）
+			result.append(
+				{"kind": kind, "preview_id": preview_id, "status": reason, "reason": reason}
+			)
 	return result
 
 
@@ -208,7 +227,11 @@ func _message_item_id(payload: Dictionary, channel: String) -> String:
 		return explicit
 	var message_id := str(payload.get("message_id", "")).strip_edges()
 	if message_id.is_empty():
-		message_id = "%s:%s" % [str(payload.get("frame_id", "root")), str(payload.get("message_index", payload.get("timeline_message_index", "0")))]
+		var raw_index: Variant = payload.get("message_index", payload.get("timeline_message_index", 0))
+		# JSON 数字在 Godot 中解析为 float；整数值必须规整为 int 字符串，
+		# 否则 "f1:2.0" 与 delta 注入的字符串 "f1:2" 失配（item_not_found）
+		var index_text := str(int(raw_index)) if raw_index is int or (raw_index is float and float(raw_index) == floorf(float(raw_index))) else str(raw_index)
+		message_id = "%s:%s" % [str(payload.get("frame_id", "root")), index_text]
 	return "%s:%s" % [channel, message_id]
 
 
