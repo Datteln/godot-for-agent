@@ -84,6 +84,11 @@ class FinalResult:
     """`run_turn` 正常结束并产出最终文本。"""
 
     text: str
+    frame_id: str = ""
+    loop: int = 0
+    message_index: int = -1
+    timeline_frame_id: str = ""
+    timeline_message_index: int = -1
     type: Literal["final"] = "final"
 
 
@@ -511,6 +516,8 @@ async def _continue_delegate_group(
 async def _finish_frame(
     session: Session,
     text: str,
+    frame: Frame,
+    loop: int,
     prompt_factory: AgentPromptFactory | None = None,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> FinalResult | None:
@@ -534,7 +541,18 @@ async def _finish_frame(
         logger.info("Root frame finished session=%s text_length=%d", session.session_id, len(text))
         if session.pending_plan is not None:
             session.pending_plan = None
-        return FinalResult(text=text)
+        return FinalResult(
+            text=text,
+            frame_id=frame.id,
+            loop=loop,
+            message_index=len(frame.messages) - 1,
+            timeline_frame_id=frame.history_anchor_frame_id or frame.id,
+            timeline_message_index=(
+                frame.history_anchor_message_index
+                if frame.history_anchor_message_index is not None
+                else len(frame.messages) - 1
+            ),
+        )
     done = session.agent_stack.pop()
     logger.info(
         "Child frame finished session=%s frame=%s agent=%s text_length=%d",
@@ -592,6 +610,8 @@ async def _handle_frame_turns_exhausted(
         session,
         f"子 agent「{frame.agent.name}」已达到自身{limit_label}上限（{limit}），"
         "任务未完成，已强制收尾。以上为已执行步骤记录，请据此判断是否需要重新拆分任务或继续委派。",
+        frame,
+        0,
         prompt_factory,
         event_callback,
     )
@@ -1447,7 +1467,12 @@ async def run_turn(
 
         if not turn.tool_calls:
             finish_result = await _finish_frame(
-                session, turn.content or "", agent_prompt_factory, event_callback
+                session,
+                turn.content or "",
+                frame,
+                loop_index + 1,
+                agent_prompt_factory,
+                event_callback,
             )
             if finish_result is not None:
                 logger.info(

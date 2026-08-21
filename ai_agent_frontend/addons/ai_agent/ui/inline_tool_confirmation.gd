@@ -73,12 +73,14 @@ func show(
 
 	_apply_btn = Button.new()
 	_apply_btn.text = str(ui_text.get("apply", "Apply"))
-	_apply_btn.pressed.connect(apply_callback)
+	if apply_callback.is_valid():
+		_apply_btn.pressed.connect(apply_callback)
 	actions.add_child(_apply_btn)
 
 	_reject_btn = Button.new()
 	_reject_btn.text = str(ui_text.get("reject", "Reject"))
-	_reject_btn.pressed.connect(reject_callback)
+	if reject_callback.is_valid():
+		_reject_btn.pressed.connect(reject_callback)
 	actions.add_child(_reject_btn)
 
 	confirm_box = row

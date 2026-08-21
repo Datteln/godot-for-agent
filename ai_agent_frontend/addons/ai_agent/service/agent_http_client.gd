@@ -2,7 +2,6 @@
 extends Node
 
 signal response_received(response: Dictionary)
-signal events_received(events: Array)
 signal error_occurred(message: String)
 
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
@@ -19,8 +18,8 @@ const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd
 ## 的短超时，所以 `/chat` 用单独的、更宽松的超时设置。
 const DEFAULT_REQUEST_TIMEOUT_S := 30.0
 const DEFAULT_CHAT_REQUEST_TIMEOUT_S := 300.0
-## 上面那个超时现在按"空闲"语义续期（见 `_on_events_completed`）：只要
-## `/chat/events` 轮询还能拿到新事件（流式文本、delegate、工具调用……），
+## 上面那个超时现在按"空闲"语义续期：只要事件 WebSocket 仍在投递
+## 流式文本、delegate、工具调用等进展，
 ## 就说明后端没卡死，超时计时器会被重置而不是任由它在固定总时长后到期。
 ## 这个硬上限是兜底：哪怕事件一直在零星地来、后端实际已经死循环/卡死，
 ## 单条 `/chat` 请求也不会无限续期下去。
@@ -31,16 +30,13 @@ var service: Node
 var current_turn_id: String = ""
 
 var _http: HTTPRequest
-var _event_http: HTTPRequest
 var _queue: Array[Dictionary] = []
 var _busy := false
 var _inflight_generation := -1
 var _inflight_path := ""
 var _inflight_session_id := ""
 var _request_generation := 0
-var _last_event_seq := 0
 var _suppress_events := false
-var _event_timer: Timer
 var _request_timeout_timer: Timer
 var _timeout_generation := -1
 var _inflight_started_at_msec := 0
@@ -48,14 +44,6 @@ var _inflight_started_at_msec := 0
 
 func _ready() -> void:
 	_create_chat_http()
-
-	_create_event_http()
-
-	_event_timer = Timer.new()
-	_event_timer.one_shot = false
-	add_child(_event_timer)
-	_event_timer.timeout.connect(poll_events)
-	_event_timer.stop()
 
 	_request_timeout_timer = Timer.new()
 	_request_timeout_timer.one_shot = true
@@ -70,13 +58,6 @@ func _create_chat_http() -> void:
 	_http.request_completed.connect(_on_request_completed)
 
 
-func _create_event_http() -> void:
-	_event_http = HTTPRequest.new()
-	_event_http.name = "EventHttp"
-	add_child(_event_http)
-	_event_http.request_completed.connect(_on_events_completed)
-
-
 func _replace_chat_http() -> void:
 	# A cancelled HTTPRequest may emit completion later. Destroying the node also
 	# destroys that signal source, so it cannot mutate a newer request's state.
@@ -89,19 +70,8 @@ func _replace_chat_http() -> void:
 	_create_chat_http()
 
 
-func _replace_event_http() -> void:
-	if is_instance_valid(_event_http):
-		if _event_http.request_completed.is_connected(_on_events_completed):
-			_event_http.request_completed.disconnect(_on_events_completed)
-		if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-			_event_http.cancel_request()
-		_event_http.queue_free()
-	_create_event_http()
-
-
 func send_user_message(text: String, context: Dictionary, model = null) -> void:
 	_suppress_events = false
-	_configure_event_timer()
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing user message.", {
 		"chars": text.length(),
 		"has_context": not context.is_empty()
@@ -111,7 +81,7 @@ func send_user_message(text: String, context: Dictionary, model = null) -> void:
 		"request_id": _new_request_id(),
 		"user_message": text,
 		"context": context,
-		"permission_mode": _setting("ai_agent/permission_mode"),
+		"permission_mode": ConfigMigrations.normalize_permission_mode(_setting("ai_agent/permission_mode")),
 		"effort": _setting("ai_agent/effort"),
 		"output_style": _setting("ai_agent/output_style"),
 		"model": model,
@@ -168,14 +138,11 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 	_replace_chat_http()
 	_busy = false
 	_request_timeout_timer.stop()
-	_replace_event_http()
 	current_turn_id = ""
-	_last_event_seq = 0
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != new_session_id:
 		_enqueue("POST", "/chat/interrupt", {"session_id": previous_session_id})
 	_enqueue("POST", "/reset", {"session_id": new_session_id})
-	_configure_event_timer()
 
 
 func interrupt_current() -> void:
@@ -190,9 +157,6 @@ func interrupt_current() -> void:
 	# 迟到的信号会被 `_on_request_completed` 的生成号检查丢弃。
 	_busy = false
 	_request_timeout_timer.stop()
-	_replace_event_http()
-	if _event_timer != null:
-		_event_timer.stop()
 	current_turn_id = ""
 	# 仅断开本地连接还不够：后端的 agent 循环（自动执行的静默工具）会继续跑完
 	# 整轮并持续写入新事件，等下一条用户消息发出后这些旧事件会被一起拉取、
@@ -210,13 +174,10 @@ func switch_to_session(previous_session_id: String) -> void:
 	_replace_chat_http()
 	_busy = false
 	_request_timeout_timer.stop()
-	_replace_event_http()
 	current_turn_id = ""
-	_last_event_seq = 0
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != _session_id():
 		_enqueue("POST", "/chat/interrupt", {"session_id": previous_session_id})
-	_configure_event_timer()
 
 
 func discard_pending() -> void:
@@ -270,26 +231,10 @@ func fetch_session_history(limit: int = 200) -> void:
 	_enqueue("GET", path, {})
 
 
-func sync_event_cursor(last_event_seq: int) -> void:
-	_last_event_seq = max(_last_event_seq, last_event_seq)
-
-
 ## 从恢复指针同步本地事件序号与挂起的 turn_id，供恢复提示"接受"分支调用。
 func resume_from_pointer(pointer: Dictionary) -> void:
-	_last_event_seq = max(_last_event_seq, int(pointer.get("last_event_seq", 0)))
 	var pending_turn_id = pointer.get("pending_turn_id")
 	current_turn_id = str(pending_turn_id) if pending_turn_id != null else ""
-	_configure_event_timer()
-
-
-func poll_events() -> void:
-	if _event_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		return
-	var path := "/chat/events?session_id=%s&after=%d" % [_session_id().uri_encode(), _last_event_seq]
-	var err := _event_http.request(_url(path), _headers(), HTTPClient.METHOD_GET)
-	if err != OK:
-		FrontendLogger.warn(editor_interface, "HTTP", "Failed to start event poll.", {"error": err})
-		error_occurred.emit("Failed to poll events: " + str(err))
 
 
 func _enqueue(method: String, path: String, payload: Dictionary) -> void:
@@ -381,6 +326,10 @@ func _maybe_extend_request_timeout() -> void:
 		"hard_cap_s": hard_cap
 	})
 	_request_timeout_timer.start(_timeout_for_path(_inflight_path))
+
+
+func note_event_progress() -> void:
+	_maybe_extend_request_timeout()
 
 
 func _on_request_timeout() -> void:
@@ -481,11 +430,9 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 		if response.has("cancelled") and response.has("last_event_seq"):
 			# `/chat/interrupt` 的确认：跳过中断前后后端可能残留写入的旧事件，
 			# 不把这条纯内部 ack 转发给 ChatPanel。
-			if _inflight_session_id == _session_id():
-				_last_event_seq = max(_last_event_seq, int(response.get("last_event_seq", 0)))
 			FrontendLogger.info(editor_interface, "HTTP", "Interrupt acknowledged by backend.", {
 				"cancelled": response.get("cancelled", false),
-				"last_event_seq": _last_event_seq,
+				"last_event_seq": int(response.get("last_event_seq", 0)),
 				"path": _inflight_path,
 				"session_id": _inflight_session_id
 			})
@@ -497,30 +444,6 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 	else:
 		response_received.emit({"type": "data", "value": parsed})
 	_pump()
-
-
-func _on_events_completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
-	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
-		return
-	var parsed := JSON.parse_string(body.get_string_from_utf8())
-	if parsed is Dictionary:
-		var raw_events: Variant = parsed.get("events", [])
-		if not (raw_events is Array):
-			FrontendLogger.warn(editor_interface, "HTTP", "Ignored malformed events response.", {})
-			return
-		var events: Array = raw_events
-		if not events.is_empty():
-			FrontendLogger.debug(editor_interface, "HTTP", "Received events.", {"count": events.size()})
-			_maybe_extend_request_timeout()
-		for event in events:
-			if event is Dictionary:
-				_last_event_seq = max(_last_event_seq, int(event.get("seq", _last_event_seq)))
-		if _suppress_events:
-			if not events.is_empty():
-				FrontendLogger.debug(editor_interface, "HTTP", "Suppressed events after interrupt.", {"count": events.size()})
-			return
-		if not events.is_empty():
-			events_received.emit(events)
 
 
 func _headers() -> PackedStringArray:
@@ -560,13 +483,3 @@ func _language_hint() -> String:
 
 func _new_request_id() -> String:
 	return "%d-%d" % [Time.get_ticks_usec(), randi()]
-
-
-func _configure_event_timer() -> void:
-	if editor_interface == null:
-		return
-	if bool(_setting("ai_agent/enable_event_stream")):
-		_event_timer.wait_time = max(0.2, float(_setting("ai_agent/event_poll_interval_sec")))
-		_event_timer.start()
-	else:
-		_event_timer.stop()

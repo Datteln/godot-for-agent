@@ -222,21 +222,6 @@ class DoctorResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-class ChatEventDTO(BaseModel):
-    """`GET /chat/events` 返回的一条事件。"""
-
-    seq: int
-    session_id: str
-    type: str
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
-class ChatEventsResponse(BaseModel):
-    """`GET /chat/events` 响应。"""
-
-    events: list[ChatEventDTO]
-
-
 class SessionHistoryItemDTO(BaseModel):
     """A frontend-renderable session history item."""
 

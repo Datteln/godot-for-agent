@@ -2,6 +2,7 @@
 extends VBoxContainer
 
 const AgentDTO = preload("res://addons/ai_agent/dto/agent_dto.gd")
+const ChatEventSocket = preload("res://addons/ai_agent/service/chat_event_socket.gd")
 const AgentHttpClient = preload("res://addons/ai_agent/service/agent_http_client.gd")
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 const ContextCollector = preload("res://addons/ai_agent/context/context_collector.gd")
@@ -58,6 +59,7 @@ var state_store: Node
 var undo_manager: Node
 
 var _http_client: Node
+var _event_socket: Node
 var _collector: Node
 var _tool_executor: Node
 var _recovery_prompt: ConfirmationDialog
@@ -257,6 +259,8 @@ func _notification(what: int) -> void:
 	if what == NOTIFICATION_THEME_CHANGED:
 		_refresh_theme_colors()
 		_refresh_live_theme_overrides()
+	elif what == NOTIFICATION_PREDELETE and _event_socket != null:
+		_event_socket.stop()
 
 
 func _build_ui() -> void:
@@ -381,6 +385,11 @@ func _build_children() -> void:
 	_http_client.service = service
 	add_child(_http_client)
 
+	_event_socket = ChatEventSocket.new()
+	_event_socket.editor_interface = editor_interface
+	_event_socket.service = service
+	add_child(_event_socket)
+
 	_collector = ContextCollector.new()
 	_collector.editor_interface = editor_interface
 	add_child(_collector)
@@ -434,8 +443,11 @@ func _connect_signals() -> void:
 	_file_suggestions.item_activated.connect(_on_file_reference_selected)
 	_message_context_popup.id_pressed.connect(_on_message_context_action)
 	_http_client.response_received.connect(_on_response)
-	_http_client.events_received.connect(_on_events)
 	_http_client.error_occurred.connect(_on_error)
+	_event_socket.event_received.connect(_on_event_received)
+	_event_socket.history_gap_received.connect(_on_event_history_gap)
+	_event_socket.resync_required_received.connect(_on_event_resync_required)
+	_event_socket.protocol_error_received.connect(_on_event_protocol_error)
 	_recovery_prompt.accepted_recovery.connect(_on_recovery_accepted)
 	_recovery_prompt.rejected_recovery.connect(_on_recovery_rejected)
 	_scroll.get_v_scroll_bar().value_changed.connect(_on_scroll_value_changed)
@@ -1423,7 +1435,8 @@ func _handle_session_history(response: Dictionary) -> void:
 	if state_store != null:
 		state_store.set_value("session_id", session_id)
 	var pending_turn_id = response.get("pending_turn_id")
-	_http_client.sync_event_cursor(int(response.get("last_event_seq", 0)))
+	if _event_socket != null:
+		_event_socket.start(_current_session_id(), int(response.get("last_event_seq", 0)))
 	if pending_turn_id != null:
 		_http_client.current_turn_id = str(pending_turn_id)
 		if state_store != null:
@@ -1831,7 +1844,10 @@ func _on_reset() -> void:
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	_clear_messages()
+	if _event_socket != null:
+		_event_socket.stop()
 	_http_client.reset_session()
+	_http_client.fetch_session_history()
 	if state_store != null:
 		state_store.reset()
 	_update_context_usage_status(0, _context_token_limit)
@@ -1873,6 +1889,9 @@ func _on_new_session() -> void:
 		undo_manager.abort_batch()
 	if _http_client != null:
 		_http_client.start_new_session(previous_session_id, session_id)
+		_http_client.fetch_session_history()
+	if _event_socket != null:
+		_event_socket.stop()
 	if state_store != null:
 		state_store.reset()
 		state_store.set_value("session_id", session_id)
@@ -1889,6 +1908,8 @@ func _on_recovery_accepted(pointer: Dictionary) -> void:
 	})
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", str(pointer.get("session_id", "default")))
 	_clear_messages()   # 清空当前内容，确保历史加载时消息列表为空
+	if _event_socket != null:
+		_event_socket.stop()
 	_http_client.resume_from_pointer(pointer)
 	_http_client.fetch_session_history()
 	if state_store != null:
@@ -1898,7 +1919,6 @@ func _on_recovery_accepted(pointer: Dictionary) -> void:
 			"last_event_seq": int(pointer.get("last_event_seq", 0)),
 			"current_turn_id": _http_client.current_turn_id
 		})
-	_http_client.poll_events()
 
 
 func _on_recovery_rejected() -> void:
@@ -1921,6 +1941,8 @@ func _on_service_failed(message: String) -> void:
 	_append_message("error", _ui("service_failed") % message)
 	if service != null and str(service.token) != "":
 		_append_message("system", _ui("service_manual_full") % [str(service.base_url), str(service.token)])
+	if _event_socket != null:
+		_event_socket.stop()
 
 
 func _fetch_initial_service_data() -> void:
@@ -1939,6 +1961,26 @@ func _fetch_initial_service_data() -> void:
 	_http_client.fetch_session_history()
 	_http_client.fetch_recovery_pointer()
 	_http_client.fetch_output_styles()
+
+
+func _on_event_received(event: Dictionary) -> void:
+	if _http_client != null:
+		_http_client.note_event_progress()
+	_on_events([event])
+
+
+func _on_event_history_gap(details: Dictionary) -> void:
+	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket history gap; reloading history.", details)
+	_http_client.fetch_session_history()
+
+
+func _on_event_resync_required(details: Dictionary) -> void:
+	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket resync required; reloading history.", details)
+	_http_client.fetch_session_history()
+
+
+func _on_event_protocol_error(details: Dictionary) -> void:
+	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket protocol error.", details)
 
 
 func _on_events(events: Array) -> void:
@@ -2816,6 +2858,8 @@ func _switch_to_session(session_id: String) -> void:
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", session_id)
 	if _http_client != null:
 		_http_client.switch_to_session(previous_session_id)
+	if _event_socket != null:
+		_event_socket.stop()
 	if state_store != null:
 		state_store.reset()
 		state_store.set_value("session_id", session_id)

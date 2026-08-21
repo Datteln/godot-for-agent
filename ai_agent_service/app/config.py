@@ -107,6 +107,12 @@ class AppSettings(BaseSettings):
 
     host: str = Field(default="127.0.0.1", description="仅绑定本机回环地址。")
     port: int = Field(default=0, description="监听端口；0 表示由操作系统分配随机端口。")
+    event_outbound_queue_size: int = Field(
+        default=128, ge=8, le=4096, description="单个 WebSocket 订阅的有界事件队列容量。"
+    )
+    event_heartbeat_interval_s: float = Field(
+        default=20.0, ge=0.1, le=120.0, description="空闲 WebSocket 事件连接的协议心跳间隔。"
+    )
 
     session_store_dir: Path = Field(
         default_factory=lambda: Path(".ai_agent_service") / "sessions",

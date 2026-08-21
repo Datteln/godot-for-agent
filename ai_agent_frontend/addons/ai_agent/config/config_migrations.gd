@@ -51,8 +51,6 @@ const DEFAULTS := {
 	"ai_agent/log_level": "info",
 	"ai_agent/log_to_file": true,
 	"ai_agent/log_file_path": "res://logs/ai_agent_frontend.log",
-	"ai_agent/enable_event_stream": true,
-	"ai_agent/event_poll_interval_sec": 1.0,
 	"ai_agent/enable_lsp_diagnostics": true,
 	"ai_agent/show_recovery_prompt": true,
 	"ai_agent/trusted_project_extensions": false,
@@ -67,6 +65,18 @@ const DEFAULTS := {
 	"ai_agent/gd_script_timeout_ms": 60000,
 	"ai_agent/export_timeout_ms": 600000,
 	"ai_agent/session_history_json": ""
+}
+
+## 旧版设置曾使用 `full_access`；服务端权限契约改为 `auto_approve` 后，
+## EditorSettings 会保留该旧值，不能仅依赖缺失值的默认填充。
+const LEGACY_PERMISSION_MODE_ALIASES := {
+	"full_access": "auto_approve",
+}
+const PERMISSION_MODES := {
+	"default": true,
+	"plan": true,
+	"auto_approve": true,
+	"read_only": true,
 }
 
 const PROPERTY_HINTS := {
@@ -162,10 +172,6 @@ const PROPERTY_HINTS := {
 		"hint": PROPERTY_HINT_GLOBAL_FILE,
 		"hint_string": "*.log,*.txt"
 	},
-	"ai_agent/event_poll_interval_sec": {
-		"hint": PROPERTY_HINT_RANGE,
-		"hint_string": "0.2,10,0.1,suffix:s"
-	},
 	"ai_agent/python_executable": {
 		"hint": PROPERTY_HINT_GLOBAL_FILE,
 		"hint_string": ""
@@ -214,7 +220,22 @@ static func apply_defaults(editor_interface: EditorInterface) -> void:
 	for key in DEFAULTS.keys():
 		if not settings.has_setting(key):
 			settings.set_setting(key, DEFAULTS[key])
+		elif key == "ai_agent/permission_mode":
+			var normalized_mode := normalize_permission_mode(settings.get_setting(key))
+			if settings.get_setting(key) != normalized_mode:
+				settings.set_setting(key, normalized_mode)
 		_add_property_info(settings, key, DEFAULTS[key])
+
+
+## 该方法也由 HTTP 请求边界使用，保证历史配置或外部脚本写入非法值时，
+## 不会把无法通过后端 schema 校验的枚举发到 `/chat`。
+static func normalize_permission_mode(value: Variant) -> String:
+	var mode := str(value).strip_edges().to_lower()
+	if LEGACY_PERMISSION_MODE_ALIASES.has(mode):
+		return str(LEGACY_PERMISSION_MODE_ALIASES[mode])
+	if PERMISSION_MODES.has(mode):
+		return mode
+	return str(DEFAULTS["ai_agent/permission_mode"])
 
 
 static func get_value(editor_interface: EditorInterface, key: String) -> Variant:

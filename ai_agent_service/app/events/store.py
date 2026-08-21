@@ -1,91 +1,209 @@
-"""轻量事件日志（§13 事件流）。"""
+"""可恢复 WebSocket 传输使用的进程内事件日志。"""
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_MAX_EVENTS_PER_SESSION = 500
+_STREAM_EVENT_TYPES = frozenset({"agent_text_delta", "agent_reasoning_delta"})
+_STREAM_PUBLICATION_INTERVAL_S = 0.05
+
 
 @dataclass(frozen=True)
 class Event:
-    """一条内部事件。"""
+    """表示一条具备稳定身份的会话事件。"""
 
     seq: int
     session_id: str
     type: str
     payload: dict[str, Any] = field(default_factory=dict)
+    task_id: str | None = None
+    turn_id: str | None = None
+
+    @property
+    def event_id(self) -> str:
+        """返回由会话和序号确定的不可变事件标识。"""
+        return f"{self.session_id}:{self.seq}"
+
+    def to_wire(self) -> dict[str, Any]:
+        """返回 WebSocket 协议使用的规范事件包络。"""
+        return {
+            "event_id": self.event_id,
+            "session_id": self.session_id,
+            "seq": self.seq,
+            "type": self.type,
+            "task_id": self.task_id,
+            "turn_id": self.turn_id,
+            "payload": copy.deepcopy(self.payload),
+        }
 
 
-_MAX_EVENTS_PER_SESSION = 500
+@dataclass(frozen=True)
+class ResyncRequired:
+    """表示订阅者因队列背压必须重同步。"""
 
-# 这两种事件是逐字/逐 token 的流式增量，同一段（相同 type + frame_id + loop）
-# 往往会产生几十条事件，但每条都携带"截至当前的完整累积文本"——只有同一段里
-# 最后一条对历史回放/SSE 补发有意义，中间那些只是同一份内容的早期截断版本。
-# 不去重的话，_MAX_EVENTS_PER_SESSION 的额度会被这些中间态迅速消耗掉，导致
-# 较早几轮的 Thought/正文流被挤出缓冲区，历史回放时只剩最近一两段。
-_COALESCED_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta"}
+    session_id: str
+    after_seq: int
+    reason: str = "outbound_queue_overflow"
 
 
-def _coalesce_stream_key(event_type: str, payload: dict[str, Any]) -> tuple[str, str, str] | None:
-    """非流式增量事件返回 None；流式增量返回其 (type, frame_id, loop) 去重键。"""
-    if event_type not in _COALESCED_EVENT_TYPES:
-        return None
-    return (event_type, str(payload.get("frame_id", "")), str(payload.get("loop", "")))
+@dataclass(eq=False)
+class EventSubscription:
+    """表示单个会话的有界实时事件订阅。"""
+
+    session_id: str
+    queue: asyncio.Queue[Event | ResyncRequired]
+    acknowledged_seq: int = 0
+    closed: bool = False
+
+    def acknowledge(self, seq: int) -> None:
+        """记录客户端已连续接受的最大序号。"""
+        self.acknowledged_seq = max(self.acknowledged_seq, seq)
+
+    def close(self) -> None:
+        """标记订阅为已关闭，禁止后续投递。"""
+        self.closed = True
 
 
 class EventStore:
-    """进程内事件存储；每个会话最多保留最近
-    `_MAX_EVENTS_PER_SESSION` 条，超出后丢弃最早的事件，避免长会话无界增长。
-    同一段流式增量（见 `_coalesce_stream_key`）原地覆盖而不追加，使额度按
-    "动作/分段数"而不是"token tick 数"消耗。M2 可替换为持久化/SSE。
-    """
+    """维护有界、不可变且可供实时订阅的会话事件序列。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, max_events_per_session: int = _MAX_EVENTS_PER_SESSION, outbound_queue_size: int = 128
+    ) -> None:
+        """初始化事件保留区、订阅注册表和流式发布限速器。"""
         self._events: dict[str, list[Event]] = {}
         self._seq: dict[str, int] = {}
+        self._subscriptions: dict[str, set[EventSubscription]] = {}
+        self._max_events_per_session = max_events_per_session
+        self._outbound_queue_size = outbound_queue_size
+        self._last_stream_publication: dict[tuple[str, str, str, str], float] = {}
+        self._pending_streams: dict[tuple[str, str, str, str], tuple[str, dict[str, Any]]] = {}
 
     def append(self, session_id: str, event_type: str, payload: dict[str, Any]) -> Event:
-        """追加事件并返回带 seq 的记录；超出上限时丢弃该会话最早的事件。"""
-        seq = self._seq.get(session_id, 0) + 1
-        self._seq[session_id] = seq
-        event = Event(seq=seq, session_id=session_id, type=event_type, payload=payload)
-        events = self._events.setdefault(session_id, [])
-
-        stream_key = _coalesce_stream_key(event_type, payload)
-        if stream_key is not None and events:
-            last = events[-1]
-            if (last.type, str(last.payload.get("frame_id", "")), str(last.payload.get("loop", ""))) == stream_key:
-                events[-1] = event
-                logger.debug(
-                    "Event coalesced session=%s seq=%d type=%s replaces_seq=%d",
-                    session_id,
-                    seq,
-                    event_type,
-                    last.seq,
-                )
-                return event
-
-        events.append(event)
-        if len(events) > _MAX_EVENTS_PER_SESSION:
-            del events[: len(events) - _MAX_EVENTS_PER_SESSION]
-            logger.debug(
-                "Event store pruned session=%s max_events=%d",
-                session_id,
-                _MAX_EVENTS_PER_SESSION,
-            )
-        logger.debug("Event appended session=%s seq=%d type=%s", session_id, seq, event_type)
-        return event
+        """追加事件；高频流式快照会在分配序号前限速并于边界处刷新。"""
+        stream_key = self._stream_key(session_id, event_type, payload)
+        if stream_key is not None and not self._should_publish_stream(stream_key):
+            self._pending_streams[stream_key] = (event_type, copy.deepcopy(payload))
+            return self._latest_event(session_id)
+        if stream_key is None:
+            self._flush_pending_streams(session_id)
+        return self._publish(session_id, event_type, payload, stream_key)
 
     def list_after(self, session_id: str, after: int = 0) -> list[Event]:
-        """返回指定 seq 之后的事件。"""
-        events = [event for event in self._events.get(session_id, []) if event.seq > after]
-        if events:
-            logger.debug("Events listed session=%s after=%d count=%d", session_id, after, len(events))
-        return events
+        """返回指定游标之后保留的事件，顺序始终递增。"""
+        return [event for event in self._events.get(session_id, []) if event.seq > after]
+
+    def retained_range(self, session_id: str) -> tuple[int | None, int]:
+        """返回会话当前保留范围的最早与最新序号。"""
+        events = self._events.get(session_id, [])
+        return (events[0].seq if events else None, self.last_seq(session_id))
 
     def last_seq(self, session_id: str) -> int:
-        """返回某会话最后事件序号。"""
+        """返回会话已经发布的最大事件序号。"""
         return self._seq.get(session_id, 0)
+
+    def subscribe(self, session_id: str, after_seq: int) -> tuple[list[Event], EventSubscription]:
+        """原子地取得重放事件并注册后续实时投递。"""
+        replay = self.list_after(session_id, after_seq)
+        subscription = EventSubscription(
+            session_id=session_id,
+            queue=asyncio.Queue(maxsize=self._outbound_queue_size),
+            acknowledged_seq=after_seq,
+        )
+        self._subscriptions.setdefault(session_id, set()).add(subscription)
+        return replay, subscription
+
+    def unsubscribe(self, subscription: EventSubscription) -> None:
+        """移除连接已关闭的订阅。"""
+        subscription.close()
+        subscribers = self._subscriptions.get(subscription.session_id)
+        if subscribers is None:
+            return
+        subscribers.discard(subscription)
+        if not subscribers:
+            self._subscriptions.pop(subscription.session_id, None)
+
+    def _publish(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        stream_key: tuple[str, str, str, str] | None,
+    ) -> Event:
+        """为一条已通过限速的事件分配序号并扇出。"""
+        seq = self._seq.get(session_id, 0) + 1
+        self._seq[session_id] = seq
+        immutable_payload = copy.deepcopy(payload)
+        event = Event(
+            seq=seq,
+            session_id=session_id,
+            type=event_type,
+            payload=immutable_payload,
+            task_id=self._optional_payload_id(immutable_payload, "task_id"),
+            turn_id=self._optional_payload_id(immutable_payload, "turn_id"),
+        )
+        events = self._events.setdefault(session_id, [])
+        events.append(event)
+        if len(events) > self._max_events_per_session:
+            del events[: len(events) - self._max_events_per_session]
+        if stream_key is not None:
+            self._last_stream_publication[stream_key] = time.monotonic()
+        self._fan_out(event)
+        logger.debug("Event published session=%s seq=%d type=%s", session_id, seq, event_type)
+        return event
+
+    def _flush_pending_streams(self, session_id: str) -> None:
+        """在非流式边界前发布该会话待发送的最新流式快照。"""
+        pending_keys = [key for key in self._pending_streams if key[0] == session_id]
+        for key in pending_keys:
+            event_type, payload = self._pending_streams.pop(key)
+            self._publish(session_id, event_type, payload, key)
+
+    def _latest_event(self, session_id: str) -> Event:
+        """返回最新已发布事件，供不改变游标的限速调用使用。"""
+        events = self._events.get(session_id, [])
+        if events:
+            return events[-1]
+        return self._publish(session_id, "stream_publication_started", {}, None)
+
+    def _should_publish_stream(self, stream_key: tuple[str, str, str, str]) -> bool:
+        """判断当前流式快照是否已达到下一次可发布时间。"""
+        previous = self._last_stream_publication.get(stream_key)
+        return previous is None or time.monotonic() - previous >= _STREAM_PUBLICATION_INTERVAL_S
+
+    def _stream_key(
+        self, session_id: str, event_type: str, payload: dict[str, Any]
+    ) -> tuple[str, str, str, str] | None:
+        """为需要限速的流式事件构造稳定分段键。"""
+        if event_type not in _STREAM_EVENT_TYPES:
+            return None
+        return (session_id, event_type, str(payload.get("frame_id", "")), str(payload.get("loop", "")))
+
+    def _fan_out(self, event: Event) -> None:
+        """无阻塞地向当前订阅者投递事件，并隔离慢客户端。"""
+        for subscription in tuple(self._subscriptions.get(event.session_id, ())):
+            if subscription.closed:
+                continue
+            try:
+                subscription.queue.put_nowait(event)
+            except asyncio.QueueFull:
+                subscription.closed = True
+                while not subscription.queue.empty():
+                    subscription.queue.get_nowait()
+                subscription.queue.put_nowait(
+                    ResyncRequired(session_id=event.session_id, after_seq=subscription.acknowledged_seq)
+                )
+
+    @staticmethod
+    def _optional_payload_id(payload: dict[str, Any], key: str) -> str | None:
+        """读取有效的任务或轮次标识，缺失时保留空值。"""
+        value = payload.get(key)
+        return str(value) if value is not None and str(value) else None

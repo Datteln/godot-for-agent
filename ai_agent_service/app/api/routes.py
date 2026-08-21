@@ -7,8 +7,6 @@ import logging
 from fastapi import APIRouter, Response, status
 
 from app.api.schemas import (
-    ChatEventDTO,
-    ChatEventsResponse,
     ChatRequest,
     ChatResponse,
     CommandInfo,
@@ -30,7 +28,6 @@ from app.api.schemas import (
 )
 from app.config import AppSettings
 from app.doctor.checks import run_doctor
-from app.events.store import EventStore
 from app.llm.provider import LLMProvider
 from app.memory.store import MemoryStore
 from app.output_styles.catalog import OutputStyleCatalog
@@ -110,7 +107,6 @@ def create_router(
     llm: LLMProvider,
     query_engine: QueryEngine,
     auth_enabled: bool,
-    event_store: EventStore,
     recovery_store: RecoveryPointerStore,
     skill_catalog: SkillCatalog,
     output_style_catalog: OutputStyleCatalog,
@@ -182,23 +178,6 @@ def create_router(
         logger.info("HTTP /output-styles count=%d", len(summaries))
         return OutputStylesResponse(
             output_styles=[summary.__dict__ for summary in summaries]
-        )
-
-    @router.get("/chat/events", response_model=ChatEventsResponse)
-    async def chat_events(session_id: str, after: int = 0) -> ChatEventsResponse:
-        events = event_store.list_after(session_id, after)
-        if events:
-            logger.debug("HTTP /chat/events session=%s after=%d count=%d", session_id, after, len(events))
-        return ChatEventsResponse(
-            events=[
-                ChatEventDTO(
-                    seq=event.seq,
-                    session_id=event.session_id,
-                    type=event.type,
-                    payload=event.payload,
-                )
-                for event in events
-            ]
         )
 
     @router.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)

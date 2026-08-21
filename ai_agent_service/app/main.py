@@ -21,6 +21,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from app.api.routes import create_router
 from app.config import AppSettings
 from app.events.store import EventStore
+from app.events.websocket import install_event_websocket_route
 from app.llm.provider import OpenAICompatibleProvider
 from app.logging_config import configure_logging
 from app.mcp.server import run_mcp_stdio
@@ -97,7 +98,7 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         fallback_model=resolved_settings.llm_fallback_model,
     )
     store = SessionStore(resolved_settings.resolved_session_store_dir())
-    event_store = EventStore()
+    event_store = EventStore(outbound_queue_size=resolved_settings.event_outbound_queue_size)
     recovery_store = RecoveryPointerStore(
         resolved_settings.resolved_recovery_pointer_path(),
         resolved_settings.project_root,
@@ -172,7 +173,6 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
             llm=llm,
             query_engine=query_engine,
             auth_enabled=resolved_token is not None,
-            event_store=event_store,
             recovery_store=recovery_store,
             skill_catalog=skill_catalog,
             output_style_catalog=output_style_catalog,
@@ -180,6 +180,13 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
             rag_build_manager=rag_build_manager,
         )
     )
+    install_event_websocket_route(
+        app,
+        event_store=event_store,
+        expected_token=resolved_token,
+        heartbeat_interval_s=resolved_settings.event_heartbeat_interval_s,
+    )
+    app.state.event_store = event_store
     app.state.rag_build_manager = rag_build_manager
     logger.info(
         "AI agent service app ready tools=%d session_store=%s",

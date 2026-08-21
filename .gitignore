@@ -410,3 +410,6 @@ ai_map_agent/
 **/.coverage
 .godot/
 *.md
+!ai_agent_service/**/*.md
+!openspec/**/*.md
+ai_agent_service/.pytest_*/
