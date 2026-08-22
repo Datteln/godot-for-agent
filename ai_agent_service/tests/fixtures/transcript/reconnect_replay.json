@@ -1,0 +1,79 @@
+{
+  "contract_version": 1,
+  "name": "reconnect_replay",
+  "description": "重连后服务端重放已接受事件（相同 event_id/seq）并续投新事件：重放部分不得产生重复或状态回退，新补丁正常应用。",
+  "session_id": "s1",
+  "reconnect_after_seq": 1,
+  "steps": [
+    {
+      "action": "patch",
+      "event_id": "s1:1",
+      "seq": 1,
+      "entry": {
+        "entry_id": "e1",
+        "ordinal": 0,
+        "kind": "user",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "继续写", "client_message_id": "m1", "has_context": false }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:2",
+      "seq": 2,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "assistant",
+        "state": "streaming",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "第一段内容。" }
+      }
+    },
+    { "action": "disconnect" },
+    {
+      "action": "patch",
+      "event_id": "s1:2",
+      "seq": 2,
+      "replayed": true,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "assistant",
+        "state": "streaming",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "第一段内容。" }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:3",
+      "seq": 3,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "assistant",
+        "state": "complete",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "第一段内容。第二段内容。" }
+      }
+    }
+  ],
+  "expect": {
+    "session_id": "s1",
+    "entry_count": 2,
+    "entries": [
+      { "entry_id": "e1", "ordinal": 0, "kind": "user", "state": "complete", "revision": 1 },
+      { "entry_id": "e2", "ordinal": 1, "kind": "assistant", "state": "complete", "revision": 2, "text": "第一段内容。第二段内容。" }
+    ]
+  }
+}

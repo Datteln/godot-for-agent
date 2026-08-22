@@ -24,7 +24,12 @@ from app.storage.atomic import atomic_write_json
 logger = logging.getLogger(__name__)
 
 _MAX_HISTORY_EVENTS = 500
-_COALESCED_HISTORY_EVENT_TYPES = {"agent_text_delta", "agent_reasoning_delta", "context_usage"}
+_COALESCED_HISTORY_EVENT_TYPES = {
+    "agent_text_delta",
+    "agent_reasoning_delta",
+    "context_usage",
+    "transcript_patch",
+}
 
 
 @dataclass
@@ -75,6 +80,19 @@ class Session:
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
+    transcript_entries: list[dict[str, Any]] = field(default_factory=list)
+    """权威可见展示稿条目，按 `ordinal`（= 创建顺序）排列；每个条目是
+    `app.transcript.models.TranscriptEntryDTO` 的 JSON 字典形态。"""
+    transcript_entry_counter: int = 0
+    """展示稿 `entry_id`（形如 `e<N>`）分配计数器。"""
+    transcript_index: dict[str, str] = field(default_factory=dict)
+    """展示稿关联索引：流/工具/审批/校验等关联键 → `entry_id`，供同一可见
+    事实的后续迁移（流式增量、工具结果、审批决定）定位到同一条目。"""
+    transcript_meta: dict[str, Any] = field(default_factory=dict)
+    """展示稿元信息：`legacy`（是否来自旧会话一次性兼容转换）等。"""
+    event_seq: int = 0
+    """会话已发布的最大事件序号（与 WebSocket `seq` 同一空间的持久化值），
+    用作展示稿快照的 `upto_event_seq` 原子游标与重启后的序号下限。"""
 
     def top_frame(self) -> Frame | None:
         """返回当前活跃帧（栈顶），栈为空时返回 None。
@@ -162,12 +180,12 @@ class Session:
                 previous_payload = {}
             previous_key = (
                 str(previous.get("type", "")),
-                str(previous_payload.get("frame_id", "")),
+                str(previous_payload.get("stream_key", "") or previous_payload.get("frame_id", "")),
                 str(previous_payload.get("loop", "")),
             )
             current_key = (
                 event_type,
-                str(payload.get("frame_id", "")),
+                str(payload.get("stream_key", "") or payload.get("frame_id", "")),
                 str(payload.get("loop", "")),
             )
             if previous_key == current_key:
@@ -295,6 +313,11 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
         "rag_context": session.rag_context,
+        "transcript_entries": session.transcript_entries,
+        "transcript_entry_counter": session.transcript_entry_counter,
+        "transcript_index": session.transcript_index,
+        "transcript_meta": session.transcript_meta,
+        "event_seq": session.event_seq,
     }
 
 
@@ -359,6 +382,27 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         stored_event_counter = 0
     history_event_counter = max(stored_event_counter, restored_event_counter)
     pending_plan = data.get("pending_plan")
+    transcript_entries = [
+        entry
+        for entry in _as_list(data.get("transcript_entries"))
+        if isinstance(entry, dict)
+    ]
+    transcript_entry_counter = _as_int(data.get("transcript_entry_counter"))
+    # 防御：计数器不得低于已恢复条目编号的最大值，避免 entry_id 复用。
+    for entry in transcript_entries:
+        entry_id = str(entry.get("entry_id", ""))
+        if entry_id.startswith("e"):
+            try:
+                transcript_entry_counter = max(transcript_entry_counter, int(entry_id[1:]))
+            except ValueError:
+                continue
+    transcript_index = {
+        str(key): str(value) for key, value in _as_dict(data.get("transcript_index")).items()
+    }
+    transcript_meta = _as_dict(data.get("transcript_meta"))
+    # 旧版本持久化文件没有 `event_seq`：用历史事件计数器作为下限迁移，保证
+    # 展示稿快照游标与 WebSocket 序号空间不回退。
+    event_seq = max(_as_int(data.get("event_seq")), history_event_counter)
     return Session(
         session_id=str(data["session_id"]),
         agent_stack=[
@@ -390,6 +434,11 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         history_event_counter=history_event_counter,
         history_events=history_events,
         rag_context=str(data.get("rag_context", "")),
+        transcript_entries=transcript_entries,
+        transcript_entry_counter=_as_int(data.get("transcript_entry_counter")),
+        transcript_index=transcript_index,
+        transcript_meta=transcript_meta,
+        event_seq=event_seq,
     )
 
 

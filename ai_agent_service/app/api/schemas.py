@@ -11,6 +11,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.transcript.models import TranscriptSnapshotDTO
+
 PermissionMode = Literal["default", "plan", "auto_approve", "read_only"]
 Effort = Literal["quick", "standard", "deep", "verify", "advisor"]
 
@@ -101,6 +103,9 @@ class ChatRequest(BaseModel):
 
     session_id: str
     request_id: str | None = None
+    client_message_id: str | None = None
+    """客户端为本条用户消息生成的稳定身份；服务端将其确认为对应用户展示稿
+    条目的身份（`payload.client_message_id`），供乐观条目对账。"""
     user_message: str | None = None
     context: Context | None = None
     language_hint: str | None = None
@@ -393,7 +398,12 @@ SessionHistoryBlock = Annotated[
 
 
 class SessionHistoryResponse(BaseModel):
-    """`GET /sessions/{session_id}/history` response."""
+    """`GET /sessions/{session_id}/history` response.
+
+    `transcript` 为权威可见展示稿快照（含原子游标 `upto_event_seq`），
+    是前端渲染的唯一事实来源；`items`/`blocks` 为兼容字段，展示稿存在时
+    返回空列表。
+    """
 
     ok: bool = True
     session_id: str
@@ -403,6 +413,7 @@ class SessionHistoryResponse(BaseModel):
     context_token_limit: int = 0
     items: list[SessionHistoryItemDTO] = Field(default_factory=list)
     blocks: list[SessionHistoryBlock] = Field(default_factory=list)
+    transcript: TranscriptSnapshotDTO | None = None
 
 
 class RecoveryPointerDTO(BaseModel):

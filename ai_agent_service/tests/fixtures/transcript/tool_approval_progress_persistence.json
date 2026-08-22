@@ -1,0 +1,200 @@
+{
+  "contract_version": 1,
+  "name": "tool_approval_progress_persistence",
+  "description": "工具活动原地更新（running→resolved）、审批决定（pending→approved）、计划与步骤进度在快照中完整保留；重载后条目身份、状态与顺序不变。",
+  "session_id": "s1",
+  "steps": [
+    {
+      "action": "patch",
+      "event_id": "s1:1",
+      "seq": 1,
+      "entry": {
+        "entry_id": "e1",
+        "ordinal": 0,
+        "kind": "user",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "修改跳跃高度并确认", "client_message_id": "m1", "has_context": false }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:2",
+      "seq": 2,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "tool_activity",
+        "state": "running",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": "call-read-1",
+        "payload": { "tool": "read_file", "args": { "path": "scripts/player.gd" }, "is_error": false, "result_summary": null, "result_count": null, "render_kind": null }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:3",
+      "seq": 3,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "tool_activity",
+        "state": "resolved",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": "call-read-1",
+        "payload": { "tool": "read_file", "args": { "path": "scripts/player.gd" }, "is_error": false, "result_summary": { "kind": "read", "path": "scripts/player.gd", "line_start": 1, "line_end": 41 }, "result_count": 1, "render_kind": null }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:4",
+      "seq": 4,
+      "entry": {
+        "entry_id": "e3",
+        "ordinal": 2,
+        "kind": "approval",
+        "state": "pending",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": "call-edit-1",
+        "payload": { "tool": "apply_text_edit", "args": { "path": "scripts/player.gd" }, "decision": null, "render_kind": "diff" }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:5",
+      "seq": 5,
+      "entry": {
+        "entry_id": "e3",
+        "ordinal": 2,
+        "kind": "approval",
+        "state": "approved",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": "call-edit-1",
+        "payload": { "tool": "apply_text_edit", "args": { "path": "scripts/player.gd" }, "decision": "approved", "render_kind": "diff" }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:6",
+      "seq": 6,
+      "entry": {
+        "entry_id": "e4",
+        "ordinal": 3,
+        "kind": "plan",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "summary": "两步完成", "steps": [ { "title": "读取脚本", "status": "pending" }, { "title": "修改常量", "status": "pending" } ] }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:7",
+      "seq": 7,
+      "entry": {
+        "entry_id": "e5",
+        "ordinal": 4,
+        "kind": "progress",
+        "state": "running",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "step_index": 0, "total_steps": 2, "title": "读取脚本", "summary": null }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:8",
+      "seq": 8,
+      "entry": {
+        "entry_id": "e5",
+        "ordinal": 4,
+        "kind": "progress",
+        "state": "complete",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "step_index": 0, "total_steps": 2, "title": "读取脚本", "summary": "已读取 41 行" }
+      }
+    },
+    {
+      "action": "snapshot_roundtrip",
+      "snapshot": {
+        "version": 1,
+        "session_id": "s1",
+        "upto_event_seq": 8,
+        "legacy": false,
+        "entries": [
+          {
+            "entry_id": "e1",
+            "ordinal": 0,
+            "kind": "user",
+            "state": "complete",
+            "revision": 1,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "text": "修改跳跃高度并确认", "client_message_id": "m1", "has_context": false }
+          },
+          {
+            "entry_id": "e2",
+            "ordinal": 1,
+            "kind": "tool_activity",
+            "state": "resolved",
+            "revision": 2,
+            "turn_id": "t1",
+            "tool_call_id": "call-read-1",
+            "payload": { "tool": "read_file", "args": { "path": "scripts/player.gd" }, "is_error": false, "result_summary": { "kind": "read", "path": "scripts/player.gd", "line_start": 1, "line_end": 41 }, "result_count": 1, "render_kind": null }
+          },
+          {
+            "entry_id": "e3",
+            "ordinal": 2,
+            "kind": "approval",
+            "state": "approved",
+            "revision": 2,
+            "turn_id": "t1",
+            "tool_call_id": "call-edit-1",
+            "payload": { "tool": "apply_text_edit", "args": { "path": "scripts/player.gd" }, "decision": "approved", "render_kind": "diff" }
+          },
+          {
+            "entry_id": "e4",
+            "ordinal": 3,
+            "kind": "plan",
+            "state": "complete",
+            "revision": 1,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "summary": "两步完成", "steps": [ { "title": "读取脚本", "status": "pending" }, { "title": "修改常量", "status": "pending" } ] }
+          },
+          {
+            "entry_id": "e5",
+            "ordinal": 4,
+            "kind": "progress",
+            "state": "complete",
+            "revision": 2,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "step_index": 0, "total_steps": 2, "title": "读取脚本", "summary": "已读取 41 行" }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "session_id": "s1",
+    "entry_count": 5,
+    "entries": [
+      { "entry_id": "e1", "ordinal": 0, "kind": "user", "state": "complete", "revision": 1 },
+      { "entry_id": "e2", "ordinal": 1, "kind": "tool_activity", "state": "resolved", "revision": 2 },
+      { "entry_id": "e3", "ordinal": 2, "kind": "approval", "state": "approved", "revision": 2 },
+      { "entry_id": "e4", "ordinal": 3, "kind": "plan", "state": "complete", "revision": 1 },
+      { "entry_id": "e5", "ordinal": 4, "kind": "progress", "state": "complete", "revision": 2 }
+    ]
+  }
+}

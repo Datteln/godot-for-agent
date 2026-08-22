@@ -70,7 +70,7 @@ func _replace_chat_http() -> void:
 	_create_chat_http()
 
 
-func send_user_message(text: String, context: Dictionary, model = null) -> void:
+func send_user_message(text: String, context: Dictionary, model = null, client_message_id: String = "") -> void:
 	_suppress_events = false
 	FrontendLogger.info(editor_interface, "HTTP", "Queueing user message.", {
 		"chars": text.length(),
@@ -89,6 +89,8 @@ func send_user_message(text: String, context: Dictionary, model = null) -> void:
 		"language_hint": _language_hint(),
 		"compact_summary_use_llm": _compact_summary_use_llm_override()
 	}
+	if client_message_id != "":
+		payload["client_message_id"] = client_message_id
 	_enqueue("POST", "/chat", payload)
 
 

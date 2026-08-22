@@ -1,0 +1,91 @@
+{
+  "contract_version": 1,
+  "name": "stale_session_history",
+  "description": "客户端已切换到会话 B（hydration generation 2）后，会话 A 的迟到快照必须被整体拒绝，活动展示稿不受影响。",
+  "session_id": "session-b",
+  "steps": [
+    {
+      "action": "begin_hydration",
+      "session_id": "session-a",
+      "generation": 1
+    },
+    {
+      "action": "snapshot",
+      "generation": 1,
+      "snapshot": {
+        "version": 1,
+        "session_id": "session-a",
+        "upto_event_seq": 2,
+        "legacy": false,
+        "entries": [
+          {
+            "entry_id": "e1",
+            "ordinal": 0,
+            "kind": "user",
+            "state": "complete",
+            "revision": 1,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "text": "会话 A 的消息", "client_message_id": "a-m1", "has_context": false }
+          }
+        ]
+      }
+    },
+    {
+      "action": "begin_hydration",
+      "session_id": "session-b",
+      "generation": 2
+    },
+    {
+      "action": "snapshot",
+      "generation": 2,
+      "snapshot": {
+        "version": 1,
+        "session_id": "session-b",
+        "upto_event_seq": 1,
+        "legacy": false,
+        "entries": [
+          {
+            "entry_id": "e1",
+            "ordinal": 0,
+            "kind": "user",
+            "state": "complete",
+            "revision": 1,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "text": "会话 B 的消息", "client_message_id": "b-m1", "has_context": false }
+          }
+        ]
+      }
+    },
+    {
+      "action": "snapshot",
+      "generation": 1,
+      "snapshot": {
+        "version": 1,
+        "session_id": "session-a",
+        "upto_event_seq": 9,
+        "legacy": false,
+        "entries": [
+          {
+            "entry_id": "e9",
+            "ordinal": 0,
+            "kind": "assistant",
+            "state": "complete",
+            "revision": 1,
+            "turn_id": "t9",
+            "tool_call_id": null,
+            "payload": { "text": "迟到的会话 A 内容" }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "session_id": "session-b",
+    "entry_count": 1,
+    "entries": [
+      { "entry_id": "e1", "ordinal": 0, "kind": "user", "state": "complete", "revision": 1, "text": "会话 B 的消息" }
+    ]
+  }
+}

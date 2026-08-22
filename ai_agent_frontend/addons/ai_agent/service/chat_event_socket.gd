@@ -34,6 +34,12 @@ var _subscribe_sent := false
 
 
 func start(session_id: String, after_seq: int = 0) -> void:
+	# 事件序号按会话独立计数：切换到不同会话时必须清零并清空去重表，
+	# 否则旧会话遗留的高位游标会把新会话的低序号事件全部误丢弃。
+	if session_id != _session_id:
+		_highest_contiguous_seq = 0
+		_seen_event_ids.clear()
+		_reconnect_delay_s = 1.0
 	_session_id = session_id
 	_highest_contiguous_seq = max(_highest_contiguous_seq, after_seq)
 	_stopped = false

@@ -16,42 +16,19 @@ const MarkdownRenderer = preload("res://addons/ai_agent/ui/markdown_renderer.gd"
 const RecoveryPrompt = preload("res://addons/ai_agent/ui/recovery_prompt.gd")
 const ToolExecutor = preload("res://addons/ai_agent/tools/tool_executor.gd")
 const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_renderer.gd")
+const TranscriptStore = preload("res://addons/ai_agent/transcript/transcript_store.gd")
+const TranscriptProjector = preload("res://addons/ai_agent/transcript/transcript_projector.gd")
+const TranscriptRenderer = preload("res://addons/ai_agent/transcript/transcript_renderer.gd")
 
 enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
 
 const PENDING_TOOL_RESULTS_ERROR := "当前会话仍有待回传的工具结果，不能开始新的用户消息"
-const STREAM_RENDER_INTERVAL_MS := 120
-const REASONING_RENDER_INTERVAL_MS := 250
 const EVENT_DRAIN_BATCH_SIZE := 24
 const EVENT_DRAIN_TIME_BUDGET_MS := 6
 const MAX_MESSAGE_LIST_CHILDREN := 240
-const MAX_LIVE_RENDER_CHARS := 60000
 const MAX_MESSAGE_RENDER_CHARS := 90000
-const MAX_REASONING_RENDER_CHARS := 30000
 const INPUT_MIN_HEIGHT := 60
 const INPUT_MAX_HEIGHT := 240
-## Plan/Verify 的展示性事件：通常没有活跃 LLM 文本流陪同到达，需要强制滚动一次，
-## 否则容易在 ScrollContainer 重新计算高度期间被误判为"用户已上滑"而停止跟随。
-const _MILESTONE_EVENT_TYPES := {
-	"plan_created": true,
-	"plan_step_started": true,
-	"plan_step_completed": true,
-	"verify_started": true,
-	"verify_completed": true,
-	"cache_hit": true,
-	"compact_started": true,
-	"compact_boundary": true,
-}
-const _REASONING_BOUNDARY_EVENT_TYPES := {
-	"delegate_start": true,
-	"server_tool_start": true,
-	"server_tool_result": true,
-	"plan_created": true,
-	"plan_step_started": true,
-	"plan_step_completed": true,
-	"verify_started": true,
-	"verify_completed": true,
-}
 
 var editor_interface: EditorInterface
 var service: Node
@@ -113,38 +90,27 @@ var _pending_calls: Array = []
 var _pending_silent_results: Array = []
 var _inline_confirm := InlineToolConfirmation.new()
 var _interrupted_locally := false
-var _indent_current_text := false
 var _event_queue: Array = []
 var _draining_events := false
 var _force_scroll_once := false
 
-var _stream_key := ""
-var _stream_row: Control
-var _stream_content_rich: RichTextLabel
-var _stream_started_ms: int = -1
-var _stream_display_text := ""
-var _stream_text_dirty := false
-var _stream_last_render_ms := 0
-var _reasoning_key := ""
-var _reasoning_toggle: Button
-var _reasoning_detail_rich: RichTextLabel
-var _reasoning_text := ""
-var _reasoning_started_ms: int = -1
-var _reasoning_token_count: int = 0
-var _reasoning_text_dirty := false
-var _reasoning_last_render_ms := 0
-var _rendered_assistant_keys := {}
-var _live_response_keys := {}   # 仅追踪本轮实时响应，避免历史加载的指纹误判为重复
-var _closed_stream_keys := {}
-var _closed_reasoning_keys := {}   # 新增：专门追踪已关闭的 reasoning stream
-var _finished_reasoning_headers := {}
+## 权威展示稿三件套：Store（数据）+ Projector（水合状态机）+ Renderer（按 kind 渲染）。
+var _transcript_store: RefCounted
+var _projector: RefCounted
+var _transcript_renderer: RefCounted
+## 当前水合世代；发起一次历史加载前递增，用于拒绝迟到的旧会话/旧世代响应。
+var _hydration_generation := 0
+## 本轮是否已经通过 transcript_patch 接受了完成态助手条目；HTTP final 只作确认，
+## 若完成补丁始终没有实时到达则回退到重新水合（任务 3.2）。
+var _assistant_completed_this_turn := false
+## 乐观用户条目的 client_message_id 生成计数器。
+var _optimistic_counter := 0
+
 var _theme_colors: Dictionary = {}
 var _auto_scroll := true
 var _suppress_scroll_check := false   # 程序滚动时抑制 value_changed 误判
 var _scroll_request_pending := false
 var _post_final_scroll_frames := 0   # final 响应后持续滚动到底部的剩余帧数
-var _post_delta_scroll_frames := 0   # 文本流刷新后持续滚动到底部的剩余帧数（避免每帧都强制滚动）
-var _empty_final_ignored_ms: int = -1   # 空 final 被忽略的时间戳，超时后强制结束 turn
 
 
 func _ready() -> void:
@@ -163,73 +129,10 @@ func _process(_delta: float) -> void:
 	if selection_now - _last_selection_refresh_ms >= 500:
 		_last_selection_refresh_ms = selection_now
 		_refresh_context_bar()
-	if _stream_text_dirty and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-		var now_ms := Time.get_ticks_msec()
-		if _stream_last_render_ms == 0 or now_ms - _stream_last_render_ms >= STREAM_RENDER_INTERVAL_MS:
-			_render_stream_content()
-	if _post_delta_scroll_frames > 0 and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-		_post_delta_scroll_frames -= 1
-		_do_scroll_to_bottom()
 	# final 响应后连续多帧强制滚动到底部，等待 fit_content RichTextLabel 完成布局
 	if _post_final_scroll_frames > 0:
 		_post_final_scroll_frames -= 1
 		_do_scroll_to_bottom()
-	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
-		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
-	if _reasoning_text_dirty and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
-		var reasoning_now_ms := Time.get_ticks_msec()
-		if _reasoning_last_render_ms == 0 or reasoning_now_ms - _reasoning_last_render_ms >= REASONING_RENDER_INTERVAL_MS:
-			_render_reasoning_entry()
-	# 空 final 超时兜底：收到空 final 后 60 秒内没有真正的 final 到来，强制结束 turn
-	if _empty_final_ignored_ms >= 0 and _state != AgentState.IDLE:
-		var elapsed_ms := Time.get_ticks_msec() - _empty_final_ignored_ms
-		if elapsed_ms > 60000:
-			FrontendLogger.warn(editor_interface, "ChatPanel", "[handle_final] TIMEOUT: no real final after 60s, forcing IDLE", {
-				"elapsed_ms": str(elapsed_ms)
-			})
-			_empty_final_ignored_ms = -1
-			_mark_current_stream_closed()
-			_mark_reasoning_stream_closed()
-			_finish_reasoning_stream()
-			_finish_streaming()
-			_append_message("system", "⚠ 服务端未返回最终回复，已自动结束。")
-			if undo_manager != null:
-				undo_manager.commit_batch()
-			_set_state(AgentState.IDLE)
-			_http_client.current_turn_id = ""
-			if state_store != null:
-				state_store.set_value("current_turn_id", "")
-				state_store.set_value("pending_calls", [])
-
-
-func _render_stream_content() -> void:
-	if _stream_content_rich == null or not is_instance_valid(_stream_content_rich):
-		return
-	_stream_content_rich.clear()
-	_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(
-		_limit_render_text(_stream_display_text, MAX_LIVE_RENDER_CHARS),
-		_theme_colors
-	))
-	_stream_text_dirty = false
-	_stream_last_render_ms = Time.get_ticks_msec()
-	if _auto_scroll:
-		# 内容刚刷新，给 fit_content RichTextLabel 几帧时间稳定布局后再滚动，而不是
-		# 像之前那样不管有没有新内容都每帧滚动一次——长会话里 _message_list 子节点
-		# 一多，每帧都强制重算 ScrollContainer 高度是明显的卡顿来源（§界面卡顿）。
-		_post_delta_scroll_frames = 2
-
-
-func _render_reasoning_entry() -> void:
-	if _reasoning_detail_rich == null or not is_instance_valid(_reasoning_detail_rich):
-		return
-	_reasoning_detail_rich.clear()
-	_reasoning_detail_rich.append_text(MarkdownRenderer.markdown_to_bbcode(
-		_limit_render_text(_reasoning_text, MAX_REASONING_RENDER_CHARS),
-		_theme_colors
-	))
-	_reasoning_text_dirty = false
-	_reasoning_last_render_ms = Time.get_ticks_msec()
-	_scroll_to_bottom()
 
 
 func _limit_render_text(text: String, max_chars: int) -> String:
@@ -419,6 +322,14 @@ func _build_children() -> void:
 	_log_renderer.editor_interface = editor_interface
 	_log_renderer.rich_text_setup = _configure_message_rich_text
 
+	_transcript_store = TranscriptStore.new()
+	_projector = TranscriptProjector.new(_transcript_store)
+	_transcript_renderer = TranscriptRenderer.new()
+	_transcript_renderer.log_renderer = _log_renderer
+	_transcript_renderer.theme_colors = _theme_colors
+	_transcript_renderer.ui_text = _ui
+	_transcript_renderer.attach(_message_list)
+
 
 func _connect_signals() -> void:
 	_send_btn.pressed.connect(_on_send)
@@ -461,12 +372,10 @@ func _refresh_theme_colors() -> void:
 
 
 func _refresh_live_theme_overrides() -> void:
-	if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-		_stream_content_rich.add_theme_color_override("default_color", _theme_color("text"))
-	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
-		ChatPanelTheme.set_button_text_colors(_reasoning_toggle, _theme_color("muted_text"), _theme_color("hover_text"))
-	if _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
-		_reasoning_detail_rich.add_theme_color_override("default_color", _theme_color("muted_text"))
+	if _transcript_renderer != null:
+		_transcript_renderer.theme_colors = _theme_colors
+	if _log_renderer != null:
+		_log_renderer.theme_colors = _theme_colors
 
 
 func _theme_color(key: String) -> Color:
@@ -489,30 +398,45 @@ func _on_send() -> void:
 	_auto_scroll = true
 	_force_scroll_once = true
 	_interrupted_locally = false
-	_finish_streaming()
-	_mark_reasoning_stream_closed()
-	_finish_reasoning_stream()
-	_closed_stream_keys.clear()
-	_closed_reasoning_keys.clear()   # 新增
-	_finished_reasoning_headers.clear()
-	_live_response_keys.clear()
-	_empty_final_ignored_ms = -1   # 重置空 final 超时计时器
+	_assistant_completed_this_turn = false
 	_input.text = ""
 	_update_input_height()
 	var referenced_paths: Array = _referenced_files.keys()
 	_referenced_files.clear()
 	_selection_signature = ""
 	_refresh_context_bar()
-	# 在用户消息之前追加两条空白消息：强制撑开 ScrollContainer 使滚动到底部，
-	# 同时作为上一轮回复与当前用户消息之间的视觉间距
-	_append_message("system", " ")
-	_append_message("system", " ")
-	_append_message("user", text)
+	# 乐观用户条目：仅凭 client_message_id 与服务端展示稿条目对账；服务端条目
+	# 到达（补丁或快照）时自动替换该乐观条目。
+	_optimistic_counter += 1
+	var client_message_id := "cm_%d_%d" % [Time.get_ticks_msec(), _optimistic_counter]
+	_transcript_store.add_optimistic_user_entry(text, client_message_id)
+	_render_optimistic_user_entry(client_message_id, text)
 	_append_message("system", _ui("waiting_model"))
 	_set_state(AgentState.WAITING_LLM)
 	if undo_manager != null:
 		undo_manager.begin_batch("AI: " + text.left(40))
-	_http_client.send_user_message(text, _collector.collect("any", referenced_paths), requested_model)
+	_http_client.send_user_message(text, _collector.collect("any", referenced_paths), requested_model, client_message_id)
+
+
+## 渲染乐观用户条目（临时节点；快照/补丁确认后由展示稿渲染器接管）。
+func _render_optimistic_user_entry(client_message_id: String, text: String) -> void:
+	var entry: Dictionary = _transcript_store.get_entry("optimistic:" + client_message_id)
+	if entry.is_empty():
+		return
+	_transcript_renderer.apply_entry(entry)
+	_scroll_to_bottom()
+
+
+## 本地结束一轮（final 确认/超时兜底共用）：提交 undo、复位状态与 turn id。
+func _end_turn_locally() -> void:
+	if undo_manager != null:
+		undo_manager.commit_batch()
+	_set_state(AgentState.IDLE)
+	if _http_client != null:
+		_http_client.current_turn_id = ""
+	if state_store != null:
+		state_store.set_value("current_turn_id", "")
+		state_store.set_value("pending_calls", [])
 
 
 func _try_run_slash_command(text: String) -> bool:
@@ -1176,13 +1100,6 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		FrontendLogger.warn(editor_interface, "ChatPanel", "Ignoring tool_calls while a previous batch is still pending confirmation.", {"count": calls.size()})
 		return
 
-	_mark_current_stream_closed()
-	_discard_stream_message()
-	# 模型这一轮已经决定调用工具，说明它的思考已经结束——必须在这里冻结计时器，
-	# 否则 _process() 会一直用 _reasoning_started_ms 刷新这条 "Thought for Xs"，
-	# 直到下一轮 reasoning_delta 到来才会被关闭，期间会一直跟着 Edit/确认框走。
-	_mark_reasoning_stream_closed()
-	_finish_reasoning_stream()
 	var silent: Array = []
 	var confirm: Array = []
 	for call in calls:
@@ -1198,13 +1115,9 @@ func _handle_tool_calls(response: Dictionary) -> void:
 		"count": calls.size(), "silent": silent.size(), "confirm": confirm.size(), "names": call_names
 	})
 
-	# workflow 工具（Edit/Write）的"宣告"消息直接跳过：确认框本身（confirm 分支）
-	# 或下面紧接着渲染的 diff 预览（silent 分支）已经表达了同样的信息，等结果出来
-	# 后只追加一条合并了 diff 的永久条目，避免一次编辑显示成两个工作流条目。
-	for call in confirm:
-		if call is Dictionary and not EventFormatter.is_workflow_tool(str(call.get("name", ""))):
-			_append_message("system", EventFormatter.format_tool_call_header(call))
-
+	# 可见记录全部由展示稿条目（tool_activity/approval）表达；这里只负责执行与
+	# 确认交互。workflow 工具的 diff 预览必须在执行前渲染（执行后磁盘上的文件
+	# 已变成 after_text），登记给展示稿渲染器，在对应条目补丁到达时复用。
 	if state_store != null:
 		state_store.set_value("current_turn_id", _http_client.current_turn_id)
 		state_store.set_value("pending_calls", confirm)
@@ -1215,21 +1128,15 @@ func _handle_tool_calls(response: Dictionary) -> void:
 			if _interrupted_locally:
 				return
 			var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-			var preview: Control = null
-			var stats := {}
 			if is_workflow:
-				# 必须在执行前渲染：之后文件已经被改写成 after_text，就读不到
-				# 真正的 before 内容了。
-				preview = ToolPreviewRenderer.render_call(call, _theme_colors)
-				stats = ToolPreviewRenderer.diff_stats(call)
-			else:
-				_append_message("system", EventFormatter.format_tool_call_header(call))
+				var preview: Control = ToolPreviewRenderer.render_call(call, _theme_colors)
+				var stats := ToolPreviewRenderer.diff_stats(call)
+				_transcript_renderer.register_preview(str(call.get("id", "")), preview, stats)
 			_set_state(AgentState.EXECUTING)
 			var result: Dictionary = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
 			results.append(result)
-			_append_tool_result(call, result, preview, stats)
 
 	if not confirm.is_empty():
 		FrontendLogger.info(editor_interface, "ChatPanel", "Waiting for inline tool confirmation.", {"count": confirm.size()})
@@ -1269,139 +1176,47 @@ func _on_decision(results: Array) -> void:
 	_http_client.send_tool_results(results, _request_model())
 
 
-## 移除文本中的 `<think>…</think>` XML 块及所有残余的 `</think>` 标签。
-func _strip_think_xml(text: String) -> String:
-	var result := text
-	var start := result.find("<think>")
-	while start != -1:
-		var end_tag := result.find("</think>", start)
-		if end_tag == -1:
-			result = result.substr(0, start)
-			break
-		result = result.substr(0, start) + result.substr(end_tag + "</think>".length())
-		start = result.find("<think>")
-	result = result.replace("</think>", "")
-	# 如果移除 <think> 块后文本变空或几乎为空，记录警告
-	if result.strip_edges().is_empty() and text.strip_edges().length() > 10:
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[strip_think_xml] WARNING: text becomes EMPTY after stripping", {
-			"original_length": text.strip_edges().length(),
-			"preview": text.left(100).replace("\n", "\\n")
-		})
-	return result
-
-
-## 若回复以 `Thought: ...` 摘要行开头，拆分出摘要文本与剩余正文。
-func _split_thought_summary(text: String) -> Dictionary:
-	var stripped := text.strip_edges()
-	if not stripped.begins_with("Thought:"):
-		return {"summary": "", "rest": text}
-	var newline := stripped.find("\n")
-	var first_line := stripped if newline == -1 else stripped.substr(0, newline)
-	var rest := "" if newline == -1 else stripped.substr(newline + 1)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[split_thought_summary] Thought found", {
-		"summary_len": first_line.length(), "rest_len": rest.strip_edges().length()
-	})
-	# 如果 Thought 之后没有正文，记录警告
-	if rest.strip_edges().is_empty():
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[split_thought_summary] WARNING: no body text after Thought summary", {
-			"preview": text.left(150).replace("\n", "\\n")
-		})
-	return {
-		"summary": first_line.substr("Thought:".length()).strip_edges(),
-		"rest": rest.strip_edges()
-	}
-
-
-## 把模型最终回复开头的 `Thought: ...` 摘要行转换为可折叠 workflow 条目格式。
-func _apply_thought_prefix(text: String) -> String:
-	var parts := _split_thought_summary(text)
-	var summary := str(parts.get("summary", ""))
-	if summary == "":
-		return text
-	var elapsed := 0.0
-	if _stream_started_ms >= 0:
-		elapsed = maxf(0.01, (Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)
-	var thought_line := "Thought for %.2fs > %s" % [elapsed, summary]
-	var rest := str(parts.get("rest", ""))
-	if rest == "":
-		return thought_line
-	return "%s\n\n%s" % [thought_line, rest]
-
-
-## 渲染后端为历史回放重建的 "Thought for Xs\n<思考正文>" 条目：第一行做折叠标题，
-## 剩余部分原样作为 detail，整段不经过通用的按行动作前缀拆分（见调用处注释）。
-func _append_history_thought_item(text: String) -> void:
-	var stripped := text.strip_edges()
-	var newline := stripped.find("\n")
-	var header := stripped if newline == -1 else stripped.substr(0, newline)
-	var detail := "" if newline == -1 else stripped.substr(newline + 1).strip_edges()
-	_log_renderer.append_history_thought_entry(_message_list, header, detail)
-	_scroll_to_bottom()
-
-
+## HTTP final 只是命令确认：正文必须经由 transcript_patch（或快照）呈现。
+## 若本轮的完成补丁始终无法被实时接受，则回退到重新水合历史快照（任务 3.2）。
 func _handle_final(response: Dictionary) -> void:
-	FrontendLogger.info(editor_interface, "ChatPanel", "Received final response.", {
-		"chars": str(response.get("text", "")).length()
+	FrontendLogger.info(editor_interface, "ChatPanel", "Received final response (confirmation-only).", {
+		"chars": str(response.get("text", "")).length(),
+		"assistant_completed_by_patch": _assistant_completed_this_turn
 	})
 	var text := str(response.get("text", ""))
-	var assistant_key := _message_fingerprint(text)
-	var split := _split_thought_summary(text)
-	var rest := str(split.get("rest", ""))
-	var render_text := rest if rest.strip_edges() != "" else text
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[handle_final]", {
-		"text_len": text.length(),
-		"render_text_len": render_text.strip_edges().length()
-	})
-	if render_text.strip_edges().is_empty():
-		# 空的 final 只是 agent 中间轮次的心跳/占位，不代表真正回复结束。
-		# 跳过所有关闭和状态切换，继续等下一个非空 final。
-		if _empty_final_ignored_ms < 0:
-			_empty_final_ignored_ms = Time.get_ticks_msec()
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[handle_final] EMPTY final ignored, still waiting", {
-			"preview": text.left(200).replace("\n", "\\n"),
-			"since_ms": _empty_final_ignored_ms
-		})
-		return
-	# 收到非空 final，重置空 final 计时器
-	_empty_final_ignored_ms = -1
-	render_text = render_text + "\n\n"
-	_mark_current_stream_closed()
-	_mark_reasoning_stream_closed()   # 阻止后续迟到的 reasoning delta
-	_finish_reasoning_stream()         # 置空 toggle，停止 _process 刷新
-
-	# 用 _live_response_keys（每次 send 清空）判断本轮是否已渲染，避免历史加载的
-	# 指纹污染 _rendered_assistant_keys 导致当前回复被误判为重复而丢弃。
-	if not _live_response_keys.has(assistant_key):
-		_live_response_keys[assistant_key] = true
-		_rendered_assistant_keys[assistant_key] = true
-		if _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-			_stream_content_rich.clear()
-			_stream_content_rich.append_text(MarkdownRenderer.markdown_to_bbcode(
-				_limit_render_text(render_text, MAX_MESSAGE_RENDER_CHARS),
-				_theme_colors
-			))
-			_finish_streaming()
+	if text.strip_edges().is_empty():
+		# 空 final 仅作确认处理（任务 4.7）：新契约下服务端不会把空正文当作成功
+		# 完成下发。若本轮已接受有效的助手完成补丁，直接终结本轮；否则不等待
+		# 超时，立即重新水合对账。
+		if _assistant_completed_this_turn and _projector.is_ready():
+			FrontendLogger.debug(editor_interface, "ChatPanel", "[handle_final] EMPTY final is terminal: completion patch already accepted", {})
+			_auto_scroll = true
+			_force_scroll_once = true
+			_do_scroll_to_bottom()
+			_post_final_scroll_frames = 10
+			_end_turn_locally()
 		else:
-			_discard_stream_message()
-			_indent_current_text = true
-			_append_log_stream_message(render_text)
-			_indent_current_text = false
-		# 无论走流式还是非流式路径，都在 _process 中连续多帧强制滚动到底部，
-		# 等待 fit_content RichTextLabel 完成复杂 Markdown（表格、代码块）的布局计算
-		_auto_scroll = true
-		_force_scroll_once = true
-		_do_scroll_to_bottom()
-		_post_final_scroll_frames = 10
-	else:
-		FrontendLogger.debug(editor_interface, "ChatPanel", "Skipped duplicate final response.", {"key_len": assistant_key.length()})
-		_discard_stream_message()
-	if undo_manager != null:
-		undo_manager.commit_batch()
-	_set_state(AgentState.IDLE)
-	_http_client.current_turn_id = ""
-	if state_store != null:
-		state_store.set_value("current_turn_id", "")
-		state_store.set_value("pending_calls", [])
+			FrontendLogger.warn(editor_interface, "ChatPanel", "[handle_final] EMPTY final without accepted completion; re-hydrating", {})
+			_end_turn_locally()
+			_begin_hydration(_current_session_id())
+			_http_client.fetch_session_history()
+		return
+	# 完成补丁未到达，或水合因 gap/resync 停在 HYDRATING（例如间隙发生在活跃
+	# 轮次中间、历史响应因状态非 IDLE 被暂缓）时，都回退到重新水合。
+	var projector_ready: bool = _projector.is_ready()
+	var needs_resync: bool = (not _assistant_completed_this_turn) or (not projector_ready)
+	if needs_resync and _state == AgentState.WAITING_LLM:
+		FrontendLogger.warn(editor_interface, "ChatPanel", "Final confirmation arrived without an accepted completion; re-hydrating.", {
+			"assistant_completed_by_patch": _assistant_completed_this_turn,
+			"projector_ready": projector_ready
+		})
+		_begin_hydration(_current_session_id())
+		_http_client.fetch_session_history()
+	_auto_scroll = true
+	_force_scroll_once = true
+	_do_scroll_to_bottom()
+	_post_final_scroll_frames = 10
+	_end_turn_locally()
 
 
 func _handle_session_history(response: Dictionary) -> void:
@@ -1410,371 +1225,62 @@ func _handle_session_history(response: Dictionary) -> void:
 			"state": _status.text
 		})
 		return
-	var raw_items: Variant = response.get("items", [])
-	var items: Array = raw_items if raw_items is Array else []
-	var raw_blocks: Variant = response.get("blocks", [])
-	var blocks: Array = raw_blocks if raw_blocks is Array else []
-	var session_id := str(response.get("session_id", ""))
-	# 响应 session_id 与当前不符说明是切换会话后迟到的过期响应，直接丢弃。
-	if session_id != "" and session_id != _current_session_id():
-		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored stale session history: session mismatch.", {
-			"response_session": session_id,
-			"current": _current_session_id()
+	# 水合顺序：先由 Projector 校验（session_id + generation）并原子替换 Store，
+	# 再从 Store 渲染，最后才以快照游标订阅 WebSocket——订阅不得早于替换完成。
+	var generation := _hydration_generation
+	if not _projector.apply_snapshot(response, generation):
+		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored stale session history snapshot.", {
+			"response_session": str(response.get("session_id", "")),
+			"current": _current_session_id(),
+			"generation": generation
 		})
 		return
-	FrontendLogger.info(editor_interface, "ChatPanel", "Restoring session history.", {
+	var session_id := str(response.get("session_id", ""))
+	var entry_count: int = _transcript_store.entry_count()
+	FrontendLogger.info(editor_interface, "ChatPanel", "Restoring session transcript.", {
 		"session_id": session_id,
-		"count": blocks.size() if response.has("blocks") else items.size(),
-		"structured": response.has("blocks")
+		"entries": entry_count,
+		"upto_event_seq": _transcript_store.upto_event_seq,
+		"legacy": _transcript_store.legacy
 	})
 	_clear_messages()
+	_transcript_renderer.render_all(_ordered_store_entries())
 	_update_context_usage_status(
 		int(response.get("context_used_tokens", 0)),
 		int(response.get("context_token_limit", 0))
 	)
 	if state_store != null:
 		state_store.set_value("session_id", session_id)
+		state_store.set_value("last_event_seq", _transcript_store.upto_event_seq)
 	var pending_turn_id = response.get("pending_turn_id")
-	if _event_socket != null:
-		_event_socket.start(_current_session_id(), int(response.get("last_event_seq", 0)))
 	if pending_turn_id != null:
 		_http_client.current_turn_id = str(pending_turn_id)
 		if state_store != null:
 			state_store.set_value("current_turn_id", _http_client.current_turn_id)
 	var saved_auto_scroll := _auto_scroll
 	_auto_scroll = false
-	if response.has("blocks"):
-		for block in blocks:
-			if block is Dictionary:
-				_render_history_block(block)
-	else:
-		_render_legacy_history_items(items)
 	if pending_turn_id != null:
 		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
 		_show_pending_results_notice()
 		_set_state(AgentState.WAITING_CONFIRM)
-	# 旧服务没有 blocks 时保留恢复提示；结构化响应本身已经完整表达内容，
-	# 不再向历史时间线注入一条并不存在的系统消息。
-	if not response.has("blocks") and not items.is_empty():
-		_append_message("system", _ui("history_restored") % str(items.size()))
-	elif blocks.is_empty() and items.is_empty() and _message_list.get_child_count() == 0:
+	if entry_count == 0 and _message_list.get_child_count() == 0:
 		_append_message("system", _ui("switch_session_empty"))
 	_auto_scroll = saved_auto_scroll
 	_force_scroll_once = true
 	_scroll_to_bottom()
+	# 替换完成后才订阅：after_seq = 快照游标，保证不重放快照内已表示的补丁。
+	if _event_socket != null:
+		_event_socket.start(_current_session_id(), _transcript_store.upto_event_seq)
 
 
-func _render_legacy_history_items(items: Array) -> void:
-	for item in items:
-		if not (item is Dictionary):
-			continue
-		var role := str(item.get("role", "system"))
-		var raw_text := str(item.get("text", ""))
-		if role == "assistant" and raw_text.strip_edges().begins_with("Thought for "):
-			_append_history_thought_item(raw_text)
-			continue
-		var text := _normalize_history_text(role, _strip_think_xml(raw_text)).strip_edges()
-		if text == "":
-			continue
-		# agent_tool_calls 事件对应的历史条目，实时对话不显示，历史也跳过
-		if text.begins_with("Tool calls"):
-			continue
-		var processed := _apply_thought_prefix(text) if role == "assistant" else text
-		if role == "assistant" and processed.begins_with("Thought for "):
-			_append_history_thought_item(processed)
-		elif role == "assistant":
-			_indent_current_text = true
-			_append_message(role, processed)
-			_indent_current_text = false
-		else:
-			_append_message(role, processed)
-
-
-func _render_history_block(block: Dictionary) -> void:
-	var block_type := str(block.get("type", ""))
-	match block_type:
-		"user":
-			_render_message_block("user", str(block.get("text", "")))
-		"error":
-			_render_message_block("error", str(block.get("text", "")))
-		"log_text":
-			_log_renderer.append_history_text_entry(
-				_message_list,
-				str(block.get("text", "")),
-				bool(block.get("marker", false)),
-				bool(block.get("indent", false))
-			)
-		"log_read":
-			_append_log_stream_message(
-				"Read %s (lines %d-%d)" % [
-					str(block.get("path", "<unknown>")),
-					int(block.get("line_start", 1)),
-					int(block.get("line_end", 1))
-				]
-			)
-		"log_grep":
-			_render_history_grep_block(block)
-		"log_edit":
-			_append_log_stream_message(
-				"Edit %s\n+%d -%d lines" % [
-					str(block.get("path", "<unknown>")),
-					int(block.get("added", 0)),
-					int(block.get("removed", 0))
-				]
-			)
-			var edit_after_text := str(block.get("after_text", ""))
-			if edit_after_text != "":
-				var ext := str(block.get("path", "")).get_extension().to_lower()
-				var lang := "gdscript" if ext == "gd" else ("python" if ext == "py" else "")
-				_log_renderer.append_history_code_entry(_message_list, edit_after_text, lang, true)
-		"node_tree":
-			_render_history_node_tree(block)
-		"thought":
-			_log_renderer.append_history_thought_entry(
-				_message_list,
-				str(block.get("header", "Thought")),
-				str(block.get("detail", ""))
-			)
-		"plan_created":
-			_render_history_plan_created(block)
-		"step_started":
-			_append_log_stream_message(
-				"Step %d/%d started:\n%s%s" % [
-					int(block.get("index", 0)), int(block.get("total", 0)),
-					str(block.get("title", "")), _history_agent_suffix(block)
-				], null, true
-			)
-		"step_completed":
-			_append_log_stream_message(
-				"Step %d/%d completed:\n%s" % [
-					int(block.get("index", 0)), int(block.get("total", 0)),
-					str(block.get("summary", ""))
-				], null, true
-			)
-		"verify_started":
-			_append_log_stream_message(
-				"Verify started:\n%s (%s)" % [
-					str(block.get("file_path", "")), str(block.get("phase", ""))
-				], null, true
-			)
-		"verify_passed":
-			_append_log_stream_message(
-				"Verify passed:\n%s" % str(block.get("summary", "")), null, true
-			)
-		"verify_failed":
-			_append_log_stream_message(
-				"Verify found %d issue(s):\n%s" % [
-					int(block.get("issues_count", 0)), str(block.get("summary", ""))
-				], null, true
-			)
-		"delegate_results":
-			_render_history_delegate_results(block)
-		"delegate_result":
-			_append_log_stream_message(
-				"Delegate result: %s\n%s" % [
-					str(block.get("agent", "")),
-					str(block.get("summary", ""))
-				], null, true
-			)
-		"event":
-			var payload: Dictionary = block.get("payload", {}) if block.get("payload", {}) is Dictionary else {}
-			_render_event_description({
-				"type": str(block.get("event_type", "")),
-				"payload": payload
-			})
-		"system_text":
-			_render_message_block("system", str(block.get("text", "")))
-
-
-func _history_agent_suffix(block: Dictionary) -> String:
-	var agent := str(block.get("agent", "")).strip_edges()
-	return " (%s)" % agent if agent != "" else ""
-
-
-func _render_history_node_tree(block: Dictionary) -> void:
-	var lines: Array[String] = [str(block.get("title", "Scene tree"))]
-	var tree = block.get("tree", {})
-	if tree is Dictionary and not tree.is_empty():
-		_append_history_node_lines(tree, "", true, lines)
-	else:
-		lines.append("(empty)")
-	_append_log_stream_message("\n".join(lines), null, true)
-
-
-func _append_history_node_lines(node: Dictionary, prefix: String, is_last: bool, lines: Array[String]) -> void:
-	var branch := "└─ " if is_last else "├─ "
-	var name := str(node.get("name", node.get("path", "Node")))
-	var type_name := str(node.get("type", "Node"))
-	lines.append(prefix + branch + name + " (" + type_name + ")")
-	var children: Array = node.get("children", []) if node.get("children", []) is Array else []
-	var child_prefix := prefix + ("   " if is_last else "│  ")
-	for index in range(children.size()):
-		if children[index] is Dictionary:
-			_append_history_node_lines(children[index], child_prefix, index == children.size() - 1, lines)
-
-
-func _render_history_grep_block(block: Dictionary) -> void:
-	var lines: Array[String] = []
-	lines.append("Grep \"%s\" (in %s)" % [
-		str(block.get("pattern", "")).replace("\"", "\\\""),
-		str(block.get("include", "project"))
-	])
-	lines.append("%d match(es)" % int(block.get("match_count", 0)))
-	var results: Array = block.get("results", [])
-	for result in results:
-		if not (result is Dictionary):
-			continue
-		var location := str(result.get("path", ""))
-		var line = result.get("line")
-		if line != null:
-			location += ":%d" % int(line)
-		lines.append("%s %s" % [location, str(result.get("text", ""))])
-	if bool(block.get("truncated", false)):
-		lines.append("... (truncated)")
-	_append_log_stream_message("\n".join(lines))
-
-
-func _render_history_plan_created(block: Dictionary) -> void:
-	var lines: Array[String] = ["Plan created:"]
-	var summary := str(block.get("summary", "")).strip_edges()
-	if summary != "":
-		lines.append(summary)
-	var steps: Array = block.get("steps", [])
-	for step in steps:
-		if not (step is Dictionary):
-			continue
-		var label := str(step.get("title", "")).strip_edges()
-		if label == "":
-			label = str(step.get("task", "")).strip_edges()
-		var agent := str(step.get("agent", "")).strip_edges()
-		var suffix := " (%s)" % agent if agent != "" else ""
-		lines.append("%d. %s%s" % [int(step.get("index", 0)), label, suffix])
-	_append_log_stream_message("\n".join(lines), null, true)
-
-
-func _render_history_delegate_results(block: Dictionary) -> void:
-	var lines: Array[String] = ["Delegate results:"]
-	var results: Array = block.get("results", [])
-	for index in range(results.size()):
-		var result = results[index]
-		if not (result is Dictionary):
-			continue
-		lines.append("")
-		lines.append("**%d. %s**" % [index + 1, str(result.get("agent", "delegate"))])
-		lines.append(str(result.get("summary", "")))
-	_append_log_stream_message("\n".join(lines), null, true)
-
-
-func _normalize_history_text(role: String, text: String) -> String:
-	if role != "system":
-		return text
-	var json_text := _extract_history_json_text(text)
-	if not _looks_like_history_json_text(json_text):
-		return text
-	var parser := JSON.new()
-	if parser.parse(json_text) != OK:
-		return text
-	var parsed = parser.data
-	if not (parsed is Dictionary):
-		return text
-	var payload: Dictionary = parsed
-	if _history_payload_has_delegate_results(payload):
-		return _format_history_delegate_results(payload)
-	if _history_payload_has_delegate_summary(payload):
-		return _format_history_delegate_summary(payload)
-	if _history_payload_has_plan_tasks(payload):
-		return _format_history_plan_result(payload)
-	return text
-
-
-func _extract_history_json_text(text: String) -> String:
-	var stripped := text.strip_edges()
-	if stripped.begins_with("```json"):
-		stripped = stripped.substr("```json".length()).strip_edges()
-		if stripped.ends_with("```"):
-			stripped = stripped.substr(0, stripped.length() - 3).strip_edges()
-	return stripped
-
-
-func _looks_like_history_json_text(text: String) -> bool:
-	return text.strip_edges().begins_with("{")
-
-
-func _history_payload_has_delegate_results(payload: Dictionary) -> bool:
-	var results = payload.get("results")
-	if not (results is Array) or results.is_empty():
-		return false
-	for item in results:
-		if not (item is Dictionary) or not item.has("summary"):
-			return false
-	return true
-
-
-func _history_payload_has_delegate_summary(payload: Dictionary) -> bool:
-	return payload.has("summary") and not payload.has("results")
-
-
-func _history_payload_has_plan_tasks(payload: Dictionary) -> bool:
-	return bool(payload.get("ok", false)) and payload.get("tasks") is Array
-
-
-func _format_history_delegate_results(payload: Dictionary) -> String:
-	var lines := ["Delegate results:"]
-	var raw_results: Variant = payload.get("results", [])
-	var results: Array = raw_results if raw_results is Array else []
-	var limit = mini(results.size(), 8)
-	for index in range(limit):
-		var item = results[index]
-		if not (item is Dictionary):
-			continue
-		var agent := str(item.get("agent", "")).strip_edges()
-		var summary := _truncate_history_markdown(str(item.get("summary", "")), 1600)
-		lines.append("")
-		lines.append("**%d. %s**" % [index + 1, agent if agent != "" else "delegate"])
-		lines.append(summary if summary != "" else "No summary")
-	if results.size() > limit:
-		lines.append("")
-		lines.append("... %d more result(s)" % [results.size() - limit])
-	return "\n".join(lines)
-
-
-func _format_history_delegate_summary(payload: Dictionary) -> String:
-	var agent := str(payload.get("agent", "")).strip_edges()
-	var summary := _truncate_history_markdown(str(payload.get("summary", "")), 2000)
-	var title := "Delegate result: %s" % agent if agent != "" else "Delegate result:"
-	return "%s\n%s" % [title, summary if summary != "" else "No summary"]
-
-
-func _format_history_plan_result(payload: Dictionary) -> String:
-	var lines := ["Plan created"]
-	var raw_tasks: Variant = payload.get("tasks", [])
-	var tasks: Array = raw_tasks if raw_tasks is Array else []
-	var limit = mini(tasks.size(), 8)
-	for index in range(limit):
-		var task = tasks[index]
-		if not (task is Dictionary):
-			continue
-		var agent := str(task.get("agent", "")).strip_edges()
-		var label := _compact_history_summary(str(task.get("task", "")), 180)
-		var suffix := " (%s)" % agent if agent != "" else ""
-		lines.append("%d. %s%s" % [index + 1, label if label != "" else "Untitled task", suffix])
-	if tasks.size() > limit:
-		lines.append("... %d more task(s)" % [tasks.size() - limit])
-	return "\n".join(lines)
-
-
-func _compact_history_summary(text: String, max_chars: int) -> String:
-	var compact := " ".join(text.strip_edges().split())
-	if compact.length() > max_chars:
-		return compact.left(max_chars) + "..."
-	return compact
-
-
-func _truncate_history_markdown(text: String, max_chars: int) -> String:
-	var stripped := text.strip_edges()
-	if stripped.length() > max_chars:
-		return stripped.left(max_chars) + "\n... (truncated)"
-	return stripped
+## 按 Store 顺序取出全部条目字典（含未确认的乐观条目）。
+func _ordered_store_entries() -> Array:
+	var result: Array = []
+	for entry_id in _transcript_store.ordered_entry_ids():
+		var entry: Dictionary = _transcript_store.get_entry(str(entry_id))
+		if not entry.is_empty():
+			result.append(entry)
+	return result
 
 
 func _on_error(message: String) -> void:
@@ -1783,8 +1289,6 @@ func _on_error(message: String) -> void:
 		_commands_requested = false
 		_commands_btn.disabled = _state != AgentState.IDLE
 	_append_message("error", message)
-	_finish_streaming()
-	_finish_reasoning_stream()
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	if state_store != null:
@@ -1847,6 +1351,7 @@ func _on_reset() -> void:
 	if _event_socket != null:
 		_event_socket.stop()
 	_http_client.reset_session()
+	_begin_hydration(_current_session_id())
 	_http_client.fetch_session_history()
 	if state_store != null:
 		state_store.reset()
@@ -1860,8 +1365,6 @@ func _on_interrupt() -> void:
 	_event_queue.clear()
 	_draining_events = false
 	_clear_inline_confirmation()
-	_finish_streaming()
-	_finish_reasoning_stream()
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	if _http_client != null:
@@ -1889,6 +1392,7 @@ func _on_new_session() -> void:
 		undo_manager.abort_batch()
 	if _http_client != null:
 		_http_client.start_new_session(previous_session_id, session_id)
+		_begin_hydration(session_id)
 		_http_client.fetch_session_history()
 	if _event_socket != null:
 		_event_socket.stop()
@@ -1911,6 +1415,7 @@ func _on_recovery_accepted(pointer: Dictionary) -> void:
 	if _event_socket != null:
 		_event_socket.stop()
 	_http_client.resume_from_pointer(pointer)
+	_begin_hydration(str(pointer.get("session_id", "default")))
 	_http_client.fetch_session_history()
 	if state_store != null:
 		state_store.merge({
@@ -1958,6 +1463,7 @@ func _fetch_initial_service_data() -> void:
 	if root.strip_edges().is_empty():
 		return
 	FrontendLogger.debug(editor_interface, "ChatPanel", "Fetching initial service data.", {"base_url": root})
+	_begin_hydration(_current_session_id())
 	_http_client.fetch_session_history()
 	_http_client.fetch_recovery_pointer()
 	_http_client.fetch_output_styles()
@@ -1966,16 +1472,103 @@ func _fetch_initial_service_data() -> void:
 func _on_event_received(event: Dictionary) -> void:
 	if _http_client != null:
 		_http_client.note_event_progress()
-	_on_events([event])
+	if _interrupted_locally:
+		return
+	if state_store != null and state_store.has_method("add_events"):
+		state_store.add_events([event])
+	var event_type := str(event.get("type", ""))
+	if event_type == "transcript_patch":
+		_handle_transcript_patch(event)
+		return
+	_handle_transport_event(event)
+
+
+## 应用一条 transcript_patch：只有 Projector 校验通过（READY + session +
+## generation + event_id/revision）才改变 Store 与渲染。
+func _handle_transcript_patch(event: Dictionary) -> void:
+	if not _projector.apply_event(event, _hydration_generation):
+		return
+	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+	var entry_value: Variant = payload.get("entry", {})
+	if not (entry_value is Dictionary):
+		return
+	var entry: Dictionary = entry_value
+	var entry_id := str(entry.get("entry_id", ""))
+	var stored: Dictionary = _transcript_store.get_entry(entry_id)
+	if stored.is_empty():
+		return
+	var entry_payload: Dictionary = stored.get("payload", {}) if stored.get("payload", {}) is Dictionary else {}
+	# 服务端用户条目到达：移除同 client_message_id 的乐观节点，由权威条目接管。
+	var client_message_id := str(entry_payload.get("client_message_id", ""))
+	if client_message_id != "":
+		_transcript_renderer.forget_entry("optimistic:" + client_message_id)
+	if str(stored.get("kind", "")) == "assistant" and str(stored.get("state", "")) == "complete":
+		_assistant_completed_this_turn = true
+	if str(stored.get("kind", "")) == "tool_activity" and str(stored.get("state", "")) == "resolved":
+		_remember_server_file_read_from_entry(entry_payload)
+	_transcript_renderer.apply_entry(stored)
+	_scroll_to_bottom()
+
+
+## 已读文件缓存钩子：由 resolved 的 read_file/read_script 条目驱动。
+func _remember_server_file_read_from_entry(payload: Dictionary) -> void:
+	var tool_name := str(payload.get("tool", ""))
+	if tool_name != "read_file" and tool_name != "read_script":
+		return
+	if bool(payload.get("is_error", false)):
+		return
+	var path := ""
+	var summary_value = payload.get("result_summary")
+	if summary_value is Dictionary:
+		path = str(summary_value.get("path", ""))
+	if path == "":
+		var args_value = payload.get("args")
+		if args_value is Dictionary:
+			path = str(args_value.get("path", ""))
+	if path != "" and _tool_executor != null:
+		_tool_executor.remember_server_file_read(path)
+
+
+## 非展示稿的传输事件：只驱动状态栏/压缩状态，不产生聊天记录。
+func _handle_transport_event(event: Dictionary) -> void:
+	var event_type := str(event.get("type", ""))
+	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+	match event_type:
+		"agent_model_selected":
+			_active_model_name = str(payload.get("model", "")).strip_edges()
+			_refresh_status_text()
+		"agent_model_fallback":
+			_active_model_name = str(payload.get("fallback_model", "")).strip_edges()
+			_refresh_status_text()
+		"context_usage":
+			_update_context_usage_status(
+				int(payload.get("used_tokens", 0)),
+				int(payload.get("token_limit", 0))
+			)
+		"compact_started":
+			# `compact_started`/`compact_boundary` 成对到达；压缩窗口内状态栏显示
+			# "正在压缩"，结束后还原压缩前状态，而不是固定回到 IDLE。
+			if _state != AgentState.IDLE:
+				_state_before_compact = _state
+				_set_state(AgentState.COMPACTING)
+		"compact_boundary":
+			if _state == AgentState.COMPACTING:
+				_set_state(_state_before_compact)
+		_:
+			FrontendLogger.debug(editor_interface, "ChatPanel", "Transport event ignored for display.", {
+				"type": event_type
+			})
 
 
 func _on_event_history_gap(details: Dictionary) -> void:
-	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket history gap; reloading history.", details)
+	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket history gap; re-hydrating transcript.", details)
+	_begin_hydration(_current_session_id())
 	_http_client.fetch_session_history()
 
 
 func _on_event_resync_required(details: Dictionary) -> void:
-	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket resync required; reloading history.", details)
+	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket resync required; re-hydrating transcript.", details)
+	_begin_hydration(_current_session_id())
 	_http_client.fetch_session_history()
 
 
@@ -1983,168 +1576,13 @@ func _on_event_protocol_error(details: Dictionary) -> void:
 	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket protocol error.", details)
 
 
-func _on_events(events: Array) -> void:
-	if _interrupted_locally:
-		FrontendLogger.debug(editor_interface, "ChatPanel", "Suppressed events after interrupt.", {"count": events.size()})
-		return
-	var coalesced := _coalesce_events(events)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "Handling events.", {
-		"count": events.size(),
-		"coalesced_count": coalesced.size()
-	})
-	if state_store != null and state_store.has_method("add_events"):
-		state_store.add_events(coalesced)
-	for event in coalesced:
-		if event is Dictionary:
-			var event_type := str(event.get("type", "<unknown>"))
-			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-			FrontendLogger.debug(editor_interface, "ChatPanel", "Event", {
-				"type": event_type,
-				"seq": int(event.get("seq", 0)),
-				"payload_keys": payload.keys(),
-				"text_len": str(payload.get("text", "")).length()
-			})
-			_event_queue.append(event)
-	if not _draining_events:
-		_drain_event_queue()
-
-
-func _coalesce_events(events: Array) -> Array:
-	var result: Array = []
-	var latest_delta := {}
-	var ordered_delta_keys: Array[String] = []
-	for raw_event in events:
-		if not (raw_event is Dictionary):
-			continue
-		var event: Dictionary = raw_event
-		var event_type := str(event.get("type", ""))
-		if event_type == "agent_reasoning_delta" or event_type == "agent_text_delta":
-			_remember_delta_event(event, latest_delta, ordered_delta_keys)
-			continue
-		_flush_delta_events(result, latest_delta, ordered_delta_keys)
-		result.append(event)
-	_flush_delta_events(result, latest_delta, ordered_delta_keys)
-	return result
-
-
-func _remember_delta_event(event: Dictionary, latest_delta: Dictionary, ordered_delta_keys: Array[String]) -> void:
-	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-	var key := "%s:%s:%s" % [
-		str(event.get("type", "")),
-		str(payload.get("frame_id", "")),
-		str(payload.get("loop", ""))
-	]
-	if not latest_delta.has(key):
-		ordered_delta_keys.append(key)
-	latest_delta[key] = event
-
-
-func _flush_delta_events(result: Array, latest_delta: Dictionary, ordered_delta_keys: Array[String]) -> void:
-	for key in ordered_delta_keys:
-		if latest_delta.has(key):
-			result.append(latest_delta[key])
-	latest_delta.clear()
-	ordered_delta_keys.clear()
-
-
-func _drain_event_queue() -> void:
-	if _event_queue.is_empty():
-		_draining_events = false
-		return
-	_draining_events = true
-	if _interrupted_locally:
-		_event_queue.clear()
-		_draining_events = false
-		return
-	var started_ms := Time.get_ticks_msec()
-	var processed := 0
-	while not _event_queue.is_empty() and processed < EVENT_DRAIN_BATCH_SIZE:
-		var event = _event_queue.pop_front()
-		if event is Dictionary:
-			_handle_event(event)
-		processed += 1
-		if Time.get_ticks_msec() - started_ms >= EVENT_DRAIN_TIME_BUDGET_MS:
-			break
-	if _event_queue.is_empty():
-		_draining_events = false
-	else:
-		call_deferred("_drain_event_queue")
-
-
-func _handle_event(event: Dictionary) -> void:
-	var event_type := str(event.get("type", ""))
-	if event_type == "server_tool_result":
-		_remember_server_file_read(event)
-	if event_type == "agent_reasoning_delta":
-		_on_reasoning_delta(event)
-	elif event_type == "agent_text_delta":
-		_on_text_delta(event)
-	elif event_type == "final":
-		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-		if payload.has("text"):
-			FrontendLogger.debug(editor_interface, "ChatPanel", "[event] -> route: final (via event stream)", {})
-			_handle_final(payload)
-	elif event_type == "agent_model_selected":
-		var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-		_active_model_name = str(payload.get("model", "")).strip_edges()
-		_refresh_status_text()
-	else:
-		if event_type == "agent_model_fallback":
-			var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-			_active_model_name = str(payload.get("fallback_model", "")).strip_edges()
-			_refresh_status_text()
-		if event_type == "context_usage":
-			var usage_payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
-			_update_context_usage_status(
-				int(usage_payload.get("used_tokens", 0)),
-				int(usage_payload.get("token_limit", 0))
-			)
-		# `compact_started`/`compact_boundary` 总是成对到达（见后端 `compact()`），
-		# 中间跨越的才是压缩真正发生的窗口；据此让状态栏在这段时间显示"正在压缩"，
-		# 结束后还原成压缩前原本的状态（等待模型/执行工具等），而不是固定回到 IDLE。
-		if event_type == "compact_started" and _state != AgentState.IDLE:
-			_state_before_compact = _state
-			_set_state(AgentState.COMPACTING)
-		if _REASONING_BOUNDARY_EVENT_TYPES.has(event_type):
-			_mark_reasoning_stream_closed()
-			_finish_reasoning_stream()
-		var force_milestone_scroll := _MILESTONE_EVENT_TYPES.has(event_type)
-		if force_milestone_scroll:
-			_force_scroll_once = true
-		var rendered_description := _render_event_description(event)
-		if rendered_description != "":
-			FrontendLogger.debug(editor_interface, "ChatPanel", "-> rendered", {
-				"type": event_type,
-				"description_len": rendered_description.length()
-			})
-			if force_milestone_scroll:
-				_force_scroll_once = true
-				_scroll_to_bottom()
-				_post_final_scroll_frames = max(_post_final_scroll_frames, 5)
-		if event_type == "compact_boundary" and _state == AgentState.COMPACTING:
-			_set_state(_state_before_compact)
-
-
-func _remember_server_file_read(event: Dictionary) -> void:
-	var payload_value = event.get("payload", {})
-	if not payload_value is Dictionary:
-		return
-	var payload: Dictionary = payload_value
-	if bool(payload.get("is_error", false)):
-		return
-	var tool_name := str(payload.get("tool", ""))
-	if tool_name != "read_file" and tool_name != "read_script":
-		return
-	var result_summary_value = payload.get("result_summary", {})
-	var path := ""
-	if result_summary_value is Dictionary:
-		path = str(result_summary_value.get("path", ""))
-	if path == "":
-		var args_value = payload.get("args", {})
-		if args_value is Dictionary:
-			path = str(args_value.get("path", ""))
-	if path != "" and _tool_executor != null:
-		_tool_executor.remember_server_file_read(path)
+## 开始一次水合：递增 generation、清空 Store、停止接受实时补丁。
+func _begin_hydration(session_id: String) -> int:
+	_hydration_generation = _projector.begin_hydration(session_id)
+	_assistant_completed_this_turn = false
+	_event_queue.clear()
+	_draining_events = false
+	return _hydration_generation
 
 
 func _on_extensions() -> void:
@@ -2224,12 +1662,13 @@ func _on_inline_apply() -> void:
 		if not (call is Dictionary):
 			continue
 		var should_apply := _inline_confirm.should_apply(index)
-		# 只对 workflow 工具（Edit/Write）合并成带 diff 的单条目；其它工具（如
-		# set_node_property/add_node）走旧的"宣告 + 结果"两条文本消息——它们的
-		# 宣告消息在上面没有被跳过，混进新面板只会再造一次重复条目。
+		# 确认框里的预览是执行前渲染的，搬给展示稿渲染器，由 approval/tool_activity
+		# 条目在补丁到达时复用，避免执行后再从磁盘读 before_text 产生错误 diff。
 		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
 		var preview := _inline_confirm.preview_for(index, is_workflow)
 		var stats := _inline_confirm.diff_stats_for(index, is_workflow)
+		if preview != null:
+			_transcript_renderer.register_preview(str(call.get("id", "")), preview, stats)
 		if should_apply:
 			if _interrupted_locally:
 				return
@@ -2239,11 +1678,9 @@ func _on_inline_apply() -> void:
 				return
 			result["grant_session_allow"] = _inline_confirm.grant_session_allow()
 			results.append(result)
-			_append_tool_result(call, result, preview, stats)
 		else:
 			var rejected := AgentDTO.rejected_result(call)
 			results.append(rejected)
-			_append_tool_result(call, rejected, preview, stats)
 	_inline_confirm.set_busy(false)
 	_on_decision(results)
 
@@ -2266,7 +1703,8 @@ func _on_inline_reject() -> void:
 		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
 		var preview := _inline_confirm.preview_for(index, is_workflow)
 		var stats := _inline_confirm.diff_stats_for(index, is_workflow)
-		_append_tool_result(call, rejected, preview, stats)
+		if preview != null:
+			_transcript_renderer.register_preview(str(call.get("id", "")), preview, stats)
 	_inline_confirm.set_busy(false)
 	_on_decision(results)
 
@@ -2346,231 +1784,19 @@ func _set_state(value: int) -> void:
 		})
 
 
-func _on_reasoning_delta(event: Dictionary) -> void:
-	var raw_payload: Variant = event.get("payload", {})
-	var payload: Dictionary = raw_payload if raw_payload is Dictionary else {}
-	var key := _stream_event_key(payload)
-	var token_count := int(payload.get("token_count", 0))
-	if key != "" and _closed_reasoning_keys.has(key):
-		if token_count > 0 and _finished_reasoning_headers.has(key):
-			var finished: Dictionary = _finished_reasoning_headers[key]
-			var toggle = finished.get("toggle")
-			if toggle is Button and is_instance_valid(toggle):
-				toggle.text = "✻  %s · %s tokens ✓" % [
-					str(finished.get("base_header", "Thought")), _format_token_count(token_count)
-				]
-		FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta] IGNORED - key already closed", {
-			"key": key,
-			"token_count": token_count
-		})
-		return
-	var text := str(payload.get("text", ""))
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[reasoning_delta]", {
-		"key": key, "text_len": text.length(), "preview": text.left(60).replace("\n", "\\n")
-	})
-	_ensure_reasoning_entry(key)
-	_reasoning_text = text
-	if token_count > 0:
-		_reasoning_token_count = token_count
-	_update_reasoning_entry()
 
-
-func _on_text_delta(event: Dictionary) -> void:
-	var raw_payload: Variant = event.get("payload", {})
-	var payload: Dictionary = raw_payload if raw_payload is Dictionary else {}
-	var text := str(payload.get("text", ""))
-	var key := _stream_event_key(payload)
-	if _should_ignore_stream_delta(key, text):
-		return
-	_mark_reasoning_stream_closed()   # 防止迟到的 reasoning delta 再创建条目
-	_finish_reasoning_stream()         # 置空 toggle，停止 _process 中的计时刷新
-	if key != _stream_key:
-		# 流式 key 变了（典型场景：coordinator 在服务端 delegate 给子 agent，
-		# frame_id 从 f1 变成 f2，前端从未收到 tool_calls，_handle_tool_calls()
-		# 不会被调用）。这里必须先把"旧 key"已经显示在屏幕上的文本保留为
-		# 工作流条目，再开始新 key 的流式行——否则下面整段会直接覆盖
-		# _stream_display_text，旧内容就在用户眼前消失得无影无踪。
-		_finalize_stream_as_persistent()
-	var stripped := _strip_think_xml(text)
-	var parts := _split_thought_summary(stripped)
-	var rest := str(parts.get("rest", ""))
-	_stream_display_text = rest if rest.strip_edges() != "" else stripped
-	_stream_text_dirty = true
-	_ensure_stream_message(key, true)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[text_delta]", {
-		"key": key, "text_len": text.length(), "display_len": _stream_display_text.length(),
-		"preview": text.left(40).replace("\n", "\\n")
-	})
-
-
-func _stream_event_key(payload: Dictionary) -> String:
-	return "%s:%s" % [str(payload.get("frame_id", "")), str(payload.get("loop", ""))]
-
-
-func _should_ignore_stream_delta(key: String, text: String) -> bool:
-	if key != "" and _closed_stream_keys.has(key):
-		return true
-	# 只检查本轮实时响应的指纹，避免历史加载的 _rendered_assistant_keys 误拦截当前回复。
-	var text_key := _message_fingerprint(text)
-	if text_key != "" and _live_response_keys.has(text_key):
-		if _stream_key == key:
-			_discard_stream_message()
-		return true
-	return false
-
-
-func _ensure_reasoning_entry(key: String) -> void:
-	if _reasoning_key == key and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
-		return
-	_mark_reasoning_stream_closed()
-	_finish_reasoning_stream()
-	_reasoning_key = key
-	_reasoning_started_ms = Time.get_ticks_msec()
-	if _stream_started_ms < 0:
-		_stream_started_ms = _reasoning_started_ms
-
-	var body := VBoxContainer.new()
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	body.add_theme_constant_override("separation", 2)
-	# 容器默认 mouse_filter=STOP；鼠标悬停在 Thought 区块（即使没有点在 toggle/
-	# 文本上，比如行间空隙）时会拦住滚轮事件，导致流式思考期间无法上滑看历史。
-	body.mouse_filter = Control.MOUSE_FILTER_PASS
-
-	var toggle := _log_renderer.make_workflow_toggle(_format_reasoning_header(), _theme_color("muted_text"))
-	var detail_rich := _log_renderer.append_collapsible(body, toggle, "", "✻")
-
-	_message_list.add_child(body)
-	_reasoning_toggle = toggle
-	_reasoning_detail_rich = detail_rich
-	_scroll_to_bottom()
-
-
-func _update_reasoning_entry() -> void:
-	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle):
-		_reasoning_toggle.text = "✻  " + _format_reasoning_header()
-	_reasoning_text_dirty = true
-
-
-func _format_reasoning_header() -> String:
-	var header := _format_reasoning_base_header()
-	if _reasoning_token_count > 0:
-		header += " · %s tokens" % _format_token_count(_reasoning_token_count)
-	return header
-
-
-func _format_reasoning_base_header() -> String:
-	var elapsed := 0.0
-	if _reasoning_started_ms >= 0:
-		elapsed = maxf(0.01, (Time.get_ticks_msec() - _reasoning_started_ms) / 1000.0)
-	return "Thought for %.2fs" % elapsed
-
-
-func _format_token_count(count: int) -> String:
-	if count < 1000:
-		return str(count)
-	return "%d,%03d" % [count / 1000, count % 1000]
-
-
-func _ensure_stream_message(key: String, indent := false) -> void:
-	if _stream_key == key and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
-		return
-	_discard_stream_message()
-	_stream_key = key
-	_stream_started_ms = Time.get_ticks_msec()
-
-	var content_rich := _log_renderer.make_log_rich_text("", null, "", indent)
-
-	_message_list.add_child(content_rich)
-	_stream_row = content_rich
-	_stream_content_rich = content_rich
-	_scroll_to_bottom()
-
-
-func _finish_streaming() -> void:
-	_stream_key = ""
-	_stream_row = null
-	_stream_content_rich = null
-	_stream_started_ms = -1
-	_stream_display_text = ""
-	_stream_text_dirty = false
-	_stream_last_render_ms = 0
-
-
-func _finish_reasoning_stream() -> void:
-	if _reasoning_text_dirty and _reasoning_detail_rich != null and is_instance_valid(_reasoning_detail_rich):
-		_render_reasoning_entry()
-	if _reasoning_toggle != null and is_instance_valid(_reasoning_toggle) and _reasoning_started_ms >= 0:
-		var finished_header := _format_reasoning_header()
-		_reasoning_toggle.text = "✻  " + finished_header + " ✓"
-		if _reasoning_key != "":
-			_finished_reasoning_headers[_reasoning_key] = {
-				"toggle": _reasoning_toggle,
-				"base_header": _format_reasoning_base_header()
-			}
-	_reasoning_key = ""
-	_reasoning_toggle = null
-	_reasoning_detail_rich = null
-	_reasoning_text = ""
-	_reasoning_started_ms = -1
-	_reasoning_token_count = 0
-	_reasoning_text_dirty = false
-	_reasoning_last_render_ms = 0
-
-
-func _mark_current_stream_closed() -> void:
-	if _stream_key != "":
-		_closed_stream_keys[_stream_key] = true
-
-
-func _mark_reasoning_stream_closed() -> void:
-	if _reasoning_key != "":
-		_closed_reasoning_keys[_reasoning_key] = true
-
-
-func _discard_stream_message() -> void:
-	if _stream_row != null and is_instance_valid(_stream_row):
-		_stream_row.queue_free()
-	_finish_streaming()
-
-
-## 把 LLM 在决定调用工具之前已经输出的流式文本，从临时流式行转成持久的
-## 工作流条目（带 `●`/`○` 前缀），而不是像 `_discard_stream_message()` 一样
-## 直接丢弃——这样用户能看到模型在工具调用之间的说明/思考文字。
-func _finalize_stream_as_persistent() -> void:
-	var text := _stream_display_text
-	if _stream_row != null and is_instance_valid(_stream_row):
-		_stream_row.queue_free()
-	if text.strip_edges() != "":
-		_indent_current_text = true
-		_append_log_stream_message(text, null, true)
-		_indent_current_text = false
-		_rendered_assistant_keys[_message_fingerprint(text)] = true
-	_finish_streaming()
-
-
-func _render_message_block(role: String, text: String, color = null) -> void:
-	_append_message(role, text, color)
-
-
-func _render_event_description(event: Dictionary) -> String:
-	var description := EventFormatter.describe_event(event, _ui_table())
-	if description != "":
-		_render_message_block("system", description)
-	return description
-
-
+## 面板级临时消息（系统提示、命令输出、错误）——不属于权威展示稿，重载后消失；
+## 聊天记录只由 transcript 条目渲染。不做任何基于文本的去重。
 func _append_message(role: String, text: String, color = null) -> void:
-	if role == "assistant":
-		var assistant_key := _message_fingerprint(text)
-		if _rendered_assistant_keys.has(assistant_key):
-			FrontendLogger.debug(editor_interface, "ChatPanel", "Skipped duplicate assistant message.", {
-				"chars": text.length()
-		})
-			return
-		_rendered_assistant_keys[assistant_key] = true
-
 	if role != "user" and role != "error":
-		_append_log_stream_message(text, color, role != "assistant")
+		_log_renderer.append_log_stream_message(
+			_message_list,
+			_limit_render_text(text, MAX_MESSAGE_RENDER_CHARS),
+			color,
+			true,
+			false
+		)
+		_scroll_to_bottom()
 		return
 
 	var row := HBoxContainer.new()
@@ -2599,106 +1825,9 @@ func _append_message(role: String, text: String, color = null) -> void:
 	_scroll_to_bottom()
 
 
-func _message_fingerprint(text: String) -> String:
-	return " ".join(text.strip_edges().split())
-
-
-func _append_log_stream_message(text: String, color = null, mark_text: bool = false) -> void:
-	_log_renderer.append_log_stream_message(
-		_message_list,
-		_limit_render_text(text, MAX_MESSAGE_RENDER_CHARS),
-		color,
-		mark_text,
-		_indent_current_text
-	)
-	_scroll_to_bottom()
-
-
-## `preview`/`diff_stats` 仅在调用方已经为这个 call 渲染过 diff 预览时传入
-## （即 workflow 类工具：Edit/Write）。传入时渲染一条带彩色 diff 的永久面板，
-## 取代"宣告 + 结果"两条消息——避免同一次编辑在工作流列表里显示成两个条目。
-func _append_tool_result(call: Dictionary, result: Dictionary, preview: Control = null, diff_stats: Dictionary = {}) -> void:
-	var name := str(call.get("name", "unknown"))
-	var status := str(result.get("status", ""))
-	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
-
-	if preview != null and is_instance_valid(preview):
-		_append_tool_result_panel(call, result, preview, diff_stats)
-		return
-
-	var detail := EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
-	if status == "applied":
-		detail = EventFormatter.format_log_tool_result(name, input, result, detail)
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_result]", {
-		"name": name, "status": status, "detail_len": detail.length(),
-		"detail": detail.left(120).replace("\n", "\\n")
-	})
-	var color := _theme_color("error_text") if status == "error" else _theme_color("text")
-	_append_message("system", detail, color)
-
-
-## 把已渲染好的 diff/参数预览（在工具执行前从确认框搬出，此时文件内容还是
-## before_text）和执行结果合并成一条永久工作流条目：● 标记 + 标题行 + 缩进的
-## diff 预览 + 状态行。特意不用卡片面板包起来——要和 Read/Grep 等其它工作流
-## 条目保持同样的"⏺ 标记 + 纯文本行"外观，否则会显得是另一种不同的 UI 元素。
-func _append_tool_result_panel(call: Dictionary, result: Dictionary, preview: Control, diff_stats: Dictionary) -> void:
-	var status := str(result.get("status", ""))
-	var content := VBoxContainer.new()
-	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	content.add_theme_constant_override("separation", 2)
-
-	var marker := _log_renderer.workflow_marker_text("edit")
-	content.add_child(_log_renderer.make_log_rich_text(EventFormatter.format_tool_call_header(call), null, marker))
-
-	var old_parent := preview.get_parent()
-	if old_parent != null:
-		old_parent.remove_child(preview)
-	var indent := MarginContainer.new()
-	indent.add_theme_constant_override("margin_left", 24)
-	indent.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	indent.add_child(preview)
-	content.add_child(indent)
-
-	var name := str(call.get("name", "unknown"))
-	var input: Dictionary = call.get("input", {}) if call.get("input") is Dictionary else {}
-	var is_diff_kind := ToolPreviewRenderer.infer_render_kind(call) == "diff"
-
-	var status_text := ""
-	var status_color := _theme_color("text")
-	match status:
-		"applied":
-			if is_diff_kind:
-				status_text = "+%d -%d lines" % [int(diff_stats.get("added", 0)), int(diff_stats.get("removed", 0))]
-			else:
-				status_text = EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
-			status_color = _theme_color("success_text")
-		"rejected":
-			status_text = _ui("tool_rejected")
-			status_color = _theme_color("muted_text")
-		"error":
-			status_text = EventFormatter.format_tool_result_detail(name, input, status, result, _ui_table())
-			status_color = _theme_color("error_text")
-		_:
-			status_text = status
-	if status_text != "":
-		content.add_child(_log_renderer.make_log_rich_text(status_text, status_color))
-
-	FrontendLogger.debug(editor_interface, "ChatPanel", "[tool_result]", {
-		"name": name, "status": status, "status_text": status_text
-	})
-
-	_message_list.add_child(content)
-	_scroll_to_bottom()
-
-
 func _clear_messages() -> void:
-	_finish_streaming()
-	_finish_reasoning_stream()
-	_rendered_assistant_keys.clear()
-	_live_response_keys.clear()
-	_closed_stream_keys.clear()
-	_closed_reasoning_keys.clear()   # 新增
-	_finished_reasoning_headers.clear()
+	if _transcript_renderer != null:
+		_transcript_renderer.clear_all()
 	for child in _message_list.get_children():
 		child.queue_free()
 
@@ -2733,13 +1862,32 @@ func _on_scroll_value_changed(value: float) -> void:
 	if is_at_bottom:
 		_auto_scroll = true
 	else:
-		# 如果自动滚动已开启且正在流式输出，此次偏移是内容增长引起的，不要关闭自动滚动，直接同步把滚动条推到底（避免 call_deferred 链追不上内容增长导致末尾消息无法滚到底部）。
-		if _auto_scroll and _stream_content_rich != null and is_instance_valid(_stream_content_rich):
+		# 如果自动滚动已开启且正在流式输出（末尾助手条目仍处 streaming），此次偏移
+		# 是内容增长引起的，不要关闭自动滚动，直接同步把滚动条推到底。
+		if _auto_scroll and _is_live_streaming():
 			_suppress_scroll_check = true
 			_scroll.scroll_vertical = 999999
 			call_deferred("_reset_scroll_suppress_deferred")
 			return
 		_auto_scroll = false
+
+
+## 末尾条目是否仍处于流式中间态（助手正文流或思考中，用于区分"内容增长"与"用户上滑"）。
+func _is_live_streaming() -> bool:
+	if _transcript_store == null:
+		return false
+	var ids: Array = _transcript_store.ordered_entry_ids()
+	for index in range(ids.size() - 1, -1, -1):
+		var entry: Dictionary = _transcript_store.get_entry(str(ids[index]))
+		if entry.is_empty():
+			continue
+		var kind := str(entry.get("kind", ""))
+		if kind == "assistant":
+			return str(entry.get("state", "")) == "streaming"
+		if kind == "thought":
+			return str(entry.get("state", "")) == "thinking"
+		return false
+	return false
 
 
 func _scroll_to_bottom_deferred() -> void:
@@ -2848,7 +1996,6 @@ func _switch_to_session(session_id: String) -> void:
 	_save_session_to_history(previous_session_id)
 	_auto_scroll = true
 	_post_final_scroll_frames = 0
-	_post_delta_scroll_frames = 0
 	_interrupted_locally = false
 	_event_queue.clear()
 	_draining_events = false
@@ -2866,6 +2013,7 @@ func _switch_to_session(session_id: String) -> void:
 	_clear_messages()
 	_update_context_usage_status(0, _context_token_limit)
 	_set_state(AgentState.IDLE)
+	_begin_hydration(session_id)
 	_http_client.fetch_session_history()
 	_save_session_to_history(session_id)
 

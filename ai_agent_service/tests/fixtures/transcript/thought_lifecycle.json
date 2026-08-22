@@ -1,0 +1,166 @@
+{
+  "contract_version": 1,
+  "name": "thought_lifecycle",
+  "description": "用户可见 Thought：thinking 期间内容/累计 token 更新同一身份条目，完成时写入规范 duration_seconds；历史重载与重连重放后仍保留完整内容与耗时，且过期修订被拒绝。",
+  "session_id": "s1",
+  "steps": [
+    {
+      "action": "patch",
+      "event_id": "s1:1",
+      "seq": 1,
+      "entry": {
+        "entry_id": "e1",
+        "ordinal": 0,
+        "kind": "user",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "帮我设计跳跃手感", "client_message_id": "m1", "has_context": false }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:2",
+      "seq": 2,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "thinking",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先看当前参数", "token_count": 3, "started_at": 1750000000.0, "duration_seconds": null }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:3",
+      "seq": 3,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "thinking",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先看当前参数，再调整重力与初速度", "token_count": 12, "started_at": 1750000000.0, "duration_seconds": null }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:4",
+      "seq": 4,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "complete",
+        "revision": 3,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先看当前参数，再调整重力与初速度", "token_count": 12, "started_at": 1750000000.0, "duration_seconds": 1.25 }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:5",
+      "seq": 5,
+      "entry": {
+        "entry_id": "e3",
+        "ordinal": 2,
+        "kind": "assistant",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "建议把重力降到 900。" }
+      }
+    },
+    {
+      "action": "snapshot_roundtrip",
+      "snapshot": {
+        "version": 1,
+        "session_id": "s1",
+        "upto_event_seq": 5,
+        "legacy": false,
+        "entries": [
+          {
+            "entry_id": "e1",
+            "ordinal": 0,
+            "kind": "user",
+            "state": "complete",
+            "revision": 1,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "text": "帮我设计跳跃手感", "client_message_id": "m1", "has_context": false }
+          },
+          {
+            "entry_id": "e2",
+            "ordinal": 1,
+            "kind": "thought",
+            "state": "complete",
+            "revision": 3,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "content": "先看当前参数，再调整重力与初速度", "token_count": 12, "started_at": 1750000000.0, "duration_seconds": 1.25 }
+          },
+          {
+            "entry_id": "e3",
+            "ordinal": 2,
+            "kind": "assistant",
+            "state": "complete",
+            "revision": 1,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "text": "建议把重力降到 900。" }
+          }
+        ]
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:4",
+      "seq": 4,
+      "replayed": true,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "complete",
+        "revision": 3,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先看当前参数，再调整重力与初速度", "token_count": 12, "started_at": 1750000000.0, "duration_seconds": 1.25 }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:6",
+      "seq": 6,
+      "expect_applied": false,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "thinking",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先看当前参数", "token_count": 3, "started_at": 1750000000.0, "duration_seconds": null }
+      }
+    }
+  ],
+  "expect": {
+    "session_id": "s1",
+    "upto_event_seq": 6,
+    "entry_count": 3,
+    "entries": [
+      { "entry_id": "e1", "ordinal": 0, "kind": "user", "state": "complete", "revision": 1 },
+      { "entry_id": "e2", "ordinal": 1, "kind": "thought", "state": "complete", "revision": 3, "content": "先看当前参数，再调整重力与初速度", "token_count": 12, "duration_seconds": 1.25 },
+      { "entry_id": "e3", "ordinal": 2, "kind": "assistant", "state": "complete", "revision": 1 }
+    ]
+  }
+}

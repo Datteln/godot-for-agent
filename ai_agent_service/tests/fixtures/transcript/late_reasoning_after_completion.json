@@ -1,0 +1,124 @@
+{
+  "contract_version": 1,
+  "name": "late_reasoning_after_completion",
+  "description": "Thought 完成后的迟到推理增量：完成态是单向的——迟到补丁只能以更晚修订保留更完整内容且保持 complete，绝不能退回 thinking；更旧修订的迟到补丁被拒绝。",
+  "session_id": "s1",
+  "steps": [
+    {
+      "action": "patch",
+      "event_id": "s1:1",
+      "seq": 1,
+      "entry": {
+        "entry_id": "e1",
+        "ordinal": 0,
+        "kind": "user",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "分析一下场景", "client_message_id": "m1", "has_context": false }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:2",
+      "seq": 2,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "thinking",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先观察节点树", "token_count": 5, "started_at": 1750000100.0, "duration_seconds": null }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:3",
+      "seq": 3,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "thinking",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先观察节点树，再检查脚本", "token_count": 11, "started_at": 1750000100.0, "duration_seconds": null }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:4",
+      "seq": 4,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "complete",
+        "revision": 3,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先观察节点树，再检查脚本", "token_count": 11, "started_at": 1750000100.0, "duration_seconds": 2.5 }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:5",
+      "seq": 5,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "complete",
+        "revision": 4,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先观察节点树，再检查脚本，最后确认信号连接", "token_count": 17, "started_at": 1750000100.0, "duration_seconds": 2.5 }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:6",
+      "seq": 6,
+      "expect_applied": false,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "thought",
+        "state": "thinking",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "content": "先观察节点树，再检查脚本", "token_count": 11, "started_at": 1750000100.0, "duration_seconds": null }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:7",
+      "seq": 7,
+      "entry": {
+        "entry_id": "e3",
+        "ordinal": 2,
+        "kind": "assistant",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "场景结构正常。" }
+      }
+    }
+  ],
+  "expect": {
+    "session_id": "s1",
+    "upto_event_seq": 7,
+    "entry_count": 3,
+    "entries": [
+      { "entry_id": "e1", "ordinal": 0, "kind": "user", "state": "complete", "revision": 1 },
+      { "entry_id": "e2", "ordinal": 1, "kind": "thought", "state": "complete", "revision": 4, "content": "先观察节点树，再检查脚本，最后确认信号连接", "token_count": 17, "duration_seconds": 2.5 },
+      { "entry_id": "e3", "ordinal": 2, "kind": "assistant", "state": "complete", "revision": 1 }
+    ]
+  }
+}

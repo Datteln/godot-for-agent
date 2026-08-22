@@ -1,0 +1,100 @@
+{
+  "contract_version": 1,
+  "name": "retention_gap_hydration",
+  "description": "客户端游标早于保留窗口时收到 history_gap：必须停止接受实时补丁、整体水合快照、再以快照 upto_event_seq 续收；间隙期间的条目只能来自快照。",
+  "session_id": "s1",
+  "steps": [
+    {
+      "action": "patch",
+      "event_id": "s1:1",
+      "seq": 1,
+      "entry": {
+        "entry_id": "e1",
+        "ordinal": 0,
+        "kind": "user",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "早先的消息", "client_message_id": "m1", "has_context": false }
+      }
+    },
+    {
+      "action": "gap",
+      "details": { "session_id": "s1", "after_seq": 1, "earliest_seq": 40, "last_seq": 42 }
+    },
+    {
+      "action": "patch_during_hydration",
+      "event_id": "s1:43",
+      "seq": 43,
+      "entry": {
+        "entry_id": "e9",
+        "ordinal": 9,
+        "kind": "assistant",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t9",
+        "tool_call_id": null,
+        "payload": { "text": "间隙期间的实时补丁，水合完成前不得渲染" }
+      }
+    },
+    {
+      "action": "snapshot",
+      "generation": 2,
+      "snapshot": {
+        "version": 1,
+        "session_id": "s1",
+        "upto_event_seq": 42,
+        "legacy": false,
+        "entries": [
+          {
+            "entry_id": "e1",
+            "ordinal": 0,
+            "kind": "user",
+            "state": "complete",
+            "revision": 1,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "text": "早先的消息", "client_message_id": "m1", "has_context": false }
+          },
+          {
+            "entry_id": "e2",
+            "ordinal": 1,
+            "kind": "assistant",
+            "state": "complete",
+            "revision": 1,
+            "turn_id": "t1",
+            "tool_call_id": null,
+            "payload": { "text": "间隙中完成的回答" }
+          }
+        ]
+      }
+    },
+    { "action": "resume", "after_seq": 42 },
+    {
+      "action": "patch",
+      "event_id": "s1:43",
+      "seq": 43,
+      "entry": {
+        "entry_id": "e9",
+        "ordinal": 9,
+        "kind": "assistant",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t9",
+        "tool_call_id": null,
+        "payload": { "text": "间隙期间的实时补丁，水合完成前不得渲染" }
+      }
+    }
+  ],
+  "expect": {
+    "session_id": "s1",
+    "upto_event_seq": 43,
+    "entry_count": 3,
+    "entries": [
+      { "entry_id": "e1", "ordinal": 0, "kind": "user", "state": "complete", "revision": 1 },
+      { "entry_id": "e2", "ordinal": 1, "kind": "assistant", "state": "complete", "revision": 1, "text": "间隙中完成的回答" },
+      { "entry_id": "e9", "ordinal": 9, "kind": "assistant", "state": "complete", "revision": 1 }
+    ]
+  }
+}

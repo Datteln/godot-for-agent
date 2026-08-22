@@ -183,7 +183,7 @@ def create_router(
     @router.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)
     async def session_history(session_id: str, limit: int = 200) -> SessionHistoryResponse:
         logger.info("HTTP /sessions/%s/history limit=%d", session_id, limit)
-        return query_engine.session_history(session_id, limit=limit)
+        return await query_engine.session_history(session_id, limit=limit)
 
     @router.get("/recovery-pointer", response_model=RecoveryPointerResponse)
     async def recovery_pointer() -> RecoveryPointerResponse:

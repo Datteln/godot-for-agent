@@ -1,0 +1,93 @@
+{
+  "contract_version": 1,
+  "name": "duplicate_final_delivery",
+  "description": "同一助手完成补丁被重复投递（重连重放相同 event_id），展示稿只应用一次；较旧 revision 的迟到补丁不得覆盖完成态。",
+  "session_id": "s1",
+  "steps": [
+    {
+      "action": "patch",
+      "event_id": "s1:1",
+      "seq": 1,
+      "entry": {
+        "entry_id": "e1",
+        "ordinal": 0,
+        "kind": "user",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "帮我写个开场白", "client_message_id": "m1", "has_context": false }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:2",
+      "seq": 2,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "assistant",
+        "state": "streaming",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "欢迎" }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:3",
+      "seq": 3,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "assistant",
+        "state": "complete",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "欢迎来到游戏世界！" }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:3",
+      "seq": 3,
+      "expect_applied": false,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "assistant",
+        "state": "complete",
+        "revision": 2,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "欢迎来到游戏世界！" }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:4",
+      "seq": 4,
+      "expect_applied": false,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "assistant",
+        "state": "streaming",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "欢迎" }
+      }
+    }
+  ],
+  "expect": {
+    "session_id": "s1",
+    "entry_count": 2,
+    "entries": [
+      { "entry_id": "e1", "ordinal": 0, "kind": "user", "state": "complete", "revision": 1 },
+      { "entry_id": "e2", "ordinal": 1, "kind": "assistant", "state": "complete", "revision": 2, "text": "欢迎来到游戏世界！" }
+    ]
+  }
+}

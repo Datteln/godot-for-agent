@@ -12,7 +12,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _MAX_EVENTS_PER_SESSION = 500
-_STREAM_EVENT_TYPES = frozenset({"agent_text_delta", "agent_reasoning_delta"})
+_STREAM_EVENT_TYPES = frozenset({"agent_text_delta", "agent_reasoning_delta", "transcript_patch"})
 _STREAM_PUBLICATION_INTERVAL_S = 0.05
 
 
@@ -96,6 +96,22 @@ class EventStore:
         if stream_key is None:
             self._flush_pending_streams(session_id)
         return self._publish(session_id, event_type, payload, stream_key)
+
+    def seed(self, session_id: str, seq_floor: int) -> None:
+        """把会话序号下限抬升到持久化游标，保证重启后序号不回退。
+
+        仅抬不降：进程存活期间内存序号可能已高于持久化值。
+
+        Args:
+            session_id: 会话 id。
+            seq_floor: 持久化的最大已发布序号（`Session.event_seq`）。
+        """
+        if seq_floor > self._seq.get(session_id, 0):
+            self._seq[session_id] = seq_floor
+
+    def flush_pending_streams(self, session_id: str) -> None:
+        """立即发布该会话暂存的流式快照，用于轮次收尾等边界。"""
+        self._flush_pending_streams(session_id)
 
     def list_after(self, session_id: str, after: int = 0) -> list[Event]:
         """返回指定游标之后保留的事件，顺序始终递增。"""
@@ -182,10 +198,15 @@ class EventStore:
     def _stream_key(
         self, session_id: str, event_type: str, payload: dict[str, Any]
     ) -> tuple[str, str, str, str] | None:
-        """为需要限速的流式事件构造稳定分段键。"""
+        """为需要限速的流式事件构造稳定分段键。
+
+        `transcript_patch` 用载荷里的 `stream_key`（= 条目 id）分段，
+        其余流式事件沿用 `(frame_id, loop)`。
+        """
         if event_type not in _STREAM_EVENT_TYPES:
             return None
-        return (session_id, event_type, str(payload.get("frame_id", "")), str(payload.get("loop", "")))
+        segment = str(payload.get("stream_key", "")) or str(payload.get("frame_id", ""))
+        return (session_id, event_type, segment, str(payload.get("loop", "")))
 
     def _fan_out(self, event: Event) -> None:
         """无阻塞地向当前订阅者投递事件，并隔离慢客户端。"""

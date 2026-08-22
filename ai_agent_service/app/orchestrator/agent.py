@@ -159,11 +159,11 @@ EFFORT_TEMPERATURE: dict[EffortLevel, float] = {
 # effort 档位 -> thinking token 预算；verify 设为 0 关闭 thinking 以保证确定性；
 # -1 表示"不限预算"（沿用 enable_thinking:true 无 budget 的原有行为）。
 EFFORT_THINKING_BUDGET: dict[EffortLevel, int] = {
-    "quick": 1024,
-    "standard": 4096,
-    "deep": 16384,
-    "verify": 0,
-    "advisor": 2048,
+    "quick": 5120,
+    "standard": 20480,
+    "deep": -1,
+    "verify": -1,
+    "advisor": -1,
 }
 
 
@@ -511,6 +511,68 @@ async def _continue_delegate_group(
             len(group.get("results", [])),
         )
     session.delegate_groups.pop(done.pending_delegate_group_id, None)
+
+
+async def _recover_empty_final_answer(
+    llm: LLMProvider,
+    frame: Frame,
+    effort: EffortLevel,
+    model_selector: Callable[[EffortLevel], str | None] | None,
+    model_override: str | None,
+    thinking_budget_selector: Callable[[EffortLevel], int | None] | None,
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+    loop: int,
+    message_index: int,
+) -> AssistantTurn | None:
+    """对空最终答复执行恰好一次挽救调用（任务 2.8）。
+
+    挽救调用关闭 thinking（`thinking_budget=0`）且不提供任何工具，只要求模型
+    基于当前上下文直接给出最终正文；增量仍走原事件回调，身份沿用原响应的
+    `(frame_id, message_index)`，因此挽救出的正文与既有展示稿条目同身份。
+
+    Args:
+        llm: 大模型 provider。
+        frame: 当前根帧（挽救只发生在根帧）。
+        effort: 当前 effort 档位。
+        model_selector: 按档位选择模型的回调。
+        model_override: 请求级模型覆盖。
+        thinking_budget_selector: 按档位选择思考预算的回调（挽救时不使用）。
+        event_callback: 编排事件回调。
+        loop: 当前循环序号（从 1 开始）。
+        message_index: 助手消息在 `frame.messages` 中的位置（与原响应一致）。
+
+    Returns:
+        携带非空正文的 `AssistantTurn`；挽救仍为空或调用失败时返回 None。
+    """
+    del thinking_budget_selector  # 挽救调用固定关闭 thinking，不使用档位预算
+    resolved_model = _resolve_request_model(frame.agent, effort, model_selector, model_override)
+    try:
+        recovery_turn = await llm.chat(
+            frame.messages,
+            [],
+            model=resolved_model,
+            temperature=_resolve_temperature(effort),
+            thinking_budget=0,
+            on_delta=_delta_callback(
+                event_callback,
+                frame.id,
+                loop,
+                message_index,
+                frame.history_anchor_frame_id or frame.id,
+                (
+                    frame.history_anchor_message_index
+                    if frame.history_anchor_message_index is not None
+                    else len(frame.messages)
+                ),
+            ),
+        )
+    except LLMError as exc:
+        logger.warning("Empty-final recovery call failed frame=%s error=%s", frame.id, exc)
+        return None
+    if not (recovery_turn.content or "").strip():
+        logger.warning("Empty-final recovery returned empty content frame=%s", frame.id)
+        return None
+    return recovery_turn
 
 
 async def _finish_frame(
@@ -1460,6 +1522,49 @@ async def run_turn(
             )
             return ErrorResult(text=str(exc))
 
+        # 原始响应流在此刻被完整消费（任务 2.7）：Thought 的完成结算推迟到这里，
+        # 而不是首个正文增量或工具边界；思考预算边界之后继续产出的正文/工具调用
+        # 不影响已累计的推理内容。
+        assistant_message_index = len(frame.messages)
+        _emit_orchestration_event(
+            event_callback,
+            "assistant_stream_end",
+            {
+                "frame_id": frame.id,
+                "loop": loop_index + 1,
+                "message_index": assistant_message_index,
+                **_history_timeline_payload(frame),
+            },
+        )
+
+        # 根帧的无工具空响应：不把它当作成功的最终答复（任务 2.8/3.6）。在原始流
+        # 结束后执行恰好一次"关闭 thinking、不提供工具"的最终答复挽救；仍为空则
+        # 返回错误，由引擎落为 typed error 条目。
+        if (
+            not turn.tool_calls
+            and not (turn.content or "").strip()
+            and len(session.agent_stack) <= 1
+        ):
+            logger.warning(
+                "Empty final answer detected; attempting one no-thinking recovery session=%s frame=%s",
+                session.session_id,
+                frame.id,
+            )
+            recovered = await _recover_empty_final_answer(
+                llm,
+                frame,
+                effort,
+                model_selector,
+                model_override,
+                thinking_budget_selector,
+                event_callback,
+                loop_index + 1,
+                assistant_message_index,
+            )
+            if recovered is None:
+                return ErrorResult(text="模型两次返回空内容（已进行一次无思考重试），请重试或简化问题。")
+            turn = recovered
+
         frame.messages.append(turn.raw_message)
         _record_cache_metrics(cache_metrics, cache_decision, turn)
         _emit_context_usage_event(event_callback, frame, loop_index + 1, turn, context_token_limit)
@@ -1745,6 +1850,7 @@ async def run_turn(
                         "frame_id": frame.id,
                         "agent": frame.agent.name,
                         "tool": item.tool.name,
+                        "tool_call_id": item.call_id,
                         "args": _event_tool_args(item.args),
                         "concurrent": True,
                         **_history_timeline_payload(frame),
@@ -1762,6 +1868,7 @@ async def run_turn(
                         "frame_id": frame.id,
                         "agent": frame.agent.name,
                         "tool": item.tool.name,
+                        "tool_call_id": item.call_id,
                         "args": _event_tool_args(item.args),
                         "is_error": outcome[1],
                         "result_count": _event_result_count(outcome[0], outcome[1]),
@@ -1784,6 +1891,7 @@ async def run_turn(
                     "frame_id": frame.id,
                     "agent": frame.agent.name,
                     "tool": item.tool.name,
+                    "tool_call_id": item.call_id,
                     "args": _event_tool_args(item.args),
                     "concurrent": False,
                     **_history_timeline_payload(frame),
@@ -1797,6 +1905,7 @@ async def run_turn(
                     "frame_id": frame.id,
                     "agent": frame.agent.name,
                     "tool": item.tool.name,
+                    "tool_call_id": item.call_id,
                     "args": _event_tool_args(item.args),
                     "is_error": results[item.call_id][1],
                     "result_count": _event_result_count(*results[item.call_id]),

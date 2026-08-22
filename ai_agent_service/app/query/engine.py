@@ -86,6 +86,9 @@ from app.skills.catalog import SkillCatalog
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY
 from app.tools.server_tools.read_file import read_file_handler
+from app.transcript.legacy import convert_legacy_blocks
+from app.transcript.models import TranscriptEntryDTO, TranscriptSnapshotDTO
+from app.transcript.writer import TranscriptWriter
 from app.verify.syntax_check import run_syntax_check
 
 logger = logging.getLogger(__name__)
@@ -344,6 +347,25 @@ _PERSISTED_HISTORY_EVENT_TYPES = frozenset(
         "context_usage",
         "turn_interrupted",
         "user_submitted",
+        "transcript_patch",
+    }
+)
+
+# 这些事件在新契约下只以 `transcript_patch` 形式对用户可见：编排回调拦截后
+# 交给 TranscriptWriter，不再作为第二套通用展示事件发布（任务 3.3）。
+# `agent_reasoning_delta` 是生产者显式标记为用户可见的 Thought 流（任务 2.6）。
+_TRANSCRIPT_ONLY_EVENT_TYPES = frozenset(
+    {
+        "agent_text_delta",
+        "agent_reasoning_delta",
+        "assistant_stream_end",
+        "server_tool_start",
+        "server_tool_result",
+        "plan_created",
+        "plan_step_started",
+        "plan_step_completed",
+        "verify_started",
+        "verify_completed",
     }
 )
 
@@ -1901,6 +1923,7 @@ class QueryEngine:
         self._recovery = recovery_store
         self._cache_engine = cache_engine or CacheDecisionEngine()
         self._cache_metrics = cache_metrics or CacheMetricsCollector()
+        self._transcript = TranscriptWriter(self._emit)
         # session_id -> 该会话当前所有"正在处理 /chat 请求"的任务集合（通常只有
         # 一个，但用户可能在前一个请求仍卡在 per-session 锁等待时就发出下一条
         # 消息/中断，short-lived 地出现多个；用 set 而不是单个槎位，避免新任务
@@ -1912,52 +1935,74 @@ class QueryEngine:
         """当前工具注册表里的可见工具名集合。"""
         return set(REGISTRY)
 
-    def session_history(self, session_id: str, limit: int = 200) -> SessionHistoryResponse:
-        """Return frontend-renderable history for a persisted session."""
-        session = self._store.get_or_create(session_id, self.available_tools)
+    async def session_history(self, session_id: str, limit: int = 200) -> SessionHistoryResponse:
+        """返回权威展示稿快照（含原子游标），不再从 frame/事件重建展示语义。
+
+        快照与会话写入共用同一把会话锁：返回时所有
+        `seq <= upto_event_seq` 的可见状态都已反映在条目中。旧会话在首次
+        读取时执行一次性兼容转换并持久化结果。
+
+        Args:
+            session_id: 会话 id。
+            limit: 快照窗口大小（最近 N 个条目）；0 表示不裁剪。
+
+        Returns:
+            携带 `transcript` 快照的历史响应；`items`/`blocks` 保留为空列表。
+        """
+        async with self._store.lock_for(session_id):
+            session = self._load_session_seeded(session_id)
+            if self._ensure_transcript_converted(session):
+                self._store.save(session)
+            entries: list[TranscriptEntryDTO] = []
+            for raw_entry in session.transcript_entries:
+                parsed = TranscriptEntryDTO.model_validate(raw_entry)
+                entries.append(parsed)
+            if limit > 0 and len(entries) > limit:
+                entries = entries[-limit:]
+            snapshot = TranscriptSnapshotDTO(
+                session_id=session.session_id,
+                upto_event_seq=session.event_seq,
+                legacy=bool(session.transcript_meta.get("legacy", False)),
+                entries=entries,
+            )
+            events_for_context = _persisted_history_events(session)
+            logger.info(
+                "Session history served session=%s entries=%d upto_seq=%d legacy=%s pending=%s",
+                session_id,
+                len(entries),
+                session.event_seq,
+                snapshot.legacy,
+                session.pending_turn_id is not None,
+            )
+            return SessionHistoryResponse(
+                session_id=session.session_id,
+                last_event_seq=session.event_seq,
+                pending_turn_id=session.pending_turn_id,
+                context_used_tokens=_history_context_used_tokens(session, events_for_context),
+                context_token_limit=self._settings.auto_compact_token_threshold,
+                items=[],
+                blocks=[],
+                transcript=snapshot,
+            )
+
+    def _ensure_transcript_converted(self, session: Session) -> bool:
+        """确保会话展示稿已完成一次性初始化；返回本次是否发生了转换。
+
+        新会话（无历史帧）转换产物为空，仅打上 `converted` 标记，防止后续
+        读取把实时条目误判为旧数据再次转换；旧会话首次触达时把已持久化
+        frame/事件推断出的 block 序列一次性写入展示稿。调用方必须持有会话锁。
+
+        Returns:
+            True 表示本次调用执行了转换（含空转换），调用方应持久化会话。
+        """
+        if "converted" in session.transcript_meta:
+            return False
         events = _persisted_history_events(session)
         if not events and self._events is not None:
-            events = self._events.list_after(session_id, 0)
-        # 下面的逐 frame/event 转换是 O(frames + events) 的纯 Python 工作；长期
-        # 使用的会话（大量 delegate_many 子 agent frame + 持续累积的事件日志）
-        # 不加界会让这一步随历史总量无限增长，最终触发前端 30s 看门狗超时、把
-        # 本来该串行复用的请求队列卡死。既然最终只展示最近 `limit` 条，这里先
-        # 把输入收窄到最近窗口再转换，而不是转换全量历史后再丢弃大半。
-        if limit > 0:
-            recent_frames = session.agent_stack[-limit:]
-            recent_events = events[-(limit * 8) :] if len(events) > limit * 8 else events
-        else:
-            recent_frames = session.agent_stack
-            recent_events = events
-        blocks = _structured_session_history(recent_frames, recent_events)
-        items: list[SessionHistoryItemDTO] = []
-        for frame in recent_frames:
-            items.extend(_history_items_for_frame(frame))
-        seen = {_history_text_fingerprint(item.text) for item in items}
-        if recent_events:
-            items.extend(_history_items_for_events(recent_events, seen))
-        if limit > 0 and len(items) > limit:
-            items = items[-limit:]
-        if limit > 0 and len(blocks) > limit:
-            blocks = blocks[-limit:]
-        logger.info(
-            "Session history requested session=%s frames=%d/%d items=%d blocks=%d pending=%s",
-            session_id,
-            len(recent_frames),
-            len(session.agent_stack),
-            len(items),
-            len(blocks),
-            session.pending_turn_id is not None,
-        )
-        return SessionHistoryResponse(
-            session_id=session.session_id,
-            last_event_seq=self._events.last_seq(session_id) if self._events is not None else 0,
-            pending_turn_id=session.pending_turn_id,
-            context_used_tokens=_history_context_used_tokens(session, events),
-            context_token_limit=self._settings.auto_compact_token_threshold,
-            items=items,
-            blocks=blocks,
-        )
+            events = self._events.list_after(session.session_id, 0)
+        blocks = _structured_session_history(session.agent_stack, events)
+        convert_legacy_blocks(session, blocks)
+        return True
 
     async def submit_user_turn(self, request: ChatRequest) -> ChatResponse:
         """处理一次 `/chat` 请求。
@@ -2042,6 +2087,10 @@ class QueryEngine:
                 has_results,
             )
             return ChatErrorResponse(text="user_message 与 tool_results 必须二选一")
+
+        # 旧会话升级后首次写入前，先把既有 frame/事件一次性转换为展示稿，
+        # 保证历史内容与后续实时条目共用同一份权威记录。
+        self._ensure_transcript_converted(session)
 
         security = self._security_for_request(request)
         model_override = _normalize_model_override(request.model)
@@ -2146,6 +2195,12 @@ class QueryEngine:
             self._emit(
                 session.session_id, "user_submitted", {"has_context": request.context is not None}
             )
+            self._transcript.record_user_message(
+                session,
+                str(request.user_message),
+                client_message_id=request.client_message_id,
+                has_context=request.context is not None,
+            )
             logger.info(
                 "User turn appended session=%s has_context=%s language_hint=%s",
                 session.session_id,
@@ -2179,6 +2234,14 @@ class QueryEngine:
                 "agent_reasoning_delta",
             }:
                 return
+            if event_type in _TRANSCRIPT_ONLY_EVENT_TYPES:
+                self._record_transcript_event(session, event_type, payload)
+                return
+            if event_type == "delegate_start":
+                # 委派开始意味着当前帧的思考结束；委派调度本身仍不进入展示稿。
+                self._transcript.complete_thought(
+                    session, frame_id=str(payload.get("frame_id", ""))
+                )
             self._emit(session.session_id, event_type, payload)
 
         async def build_child_agent_prompt(agent: AgentDefinition, task: str) -> str:
@@ -2205,6 +2268,9 @@ class QueryEngine:
             )
 
         def emit_verify_turn_event(event_type: str, payload: dict[str, Any]) -> None:
+            if event_type in _TRANSCRIPT_ONLY_EVENT_TYPES:
+                self._record_transcript_event(session, event_type, payload)
+                return
             self._emit(session.session_id, event_type, payload)
 
         step = await run_turn(
@@ -2267,7 +2333,27 @@ class QueryEngine:
                     context_token_limit=self._settings.auto_compact_token_threshold,
                 )
                 response = _step_to_response(step)
+        # 轮次收尾：仍在思考中的 Thought 条目一律完成（耗时以收尾时刻计）。
+        self._transcript.complete_open_thoughts(session)
         if isinstance(response, ChatToolCallsResponse):
+            if isinstance(step, ToolCallsResult):
+                if step.text:
+                    self._transcript.complete_assistant(session, step.text)
+                self._transcript.record_front_tool_calls(
+                    session,
+                    turn_id=step.turn_id,
+                    calls=[
+                        {
+                            "id": call.id,
+                            "name": call.name,
+                            "input": call.input,
+                            "needs_confirm": call.needs_confirm,
+                            "agent": call.agent,
+                            "render_kind": call.render_kind,
+                        }
+                        for call in step.calls
+                    ],
+                )
             self._emit(
                 session.session_id,
                 "tool_calls",
@@ -2280,17 +2366,39 @@ class QueryEngine:
                 len(response.calls),
             )
         elif isinstance(response, ChatFinalResponse):
-            self._emit(session.session_id, "final", {"text_length": len(response.text)})
-            logger.info(
-                "Chat produced final response session=%s text_length=%d",
-                session.session_id,
-                len(response.text),
-            )
+            if not response.text.strip():
+                # 空正文不是成功的最终完成（任务 3.6）：不发布空的助手完成态，
+                # 降级为错误响应并落为 typed error 条目。
+                logger.warning(
+                    "Empty final text downgraded to error session=%s", session.session_id
+                )
+                response = ChatErrorResponse(text="模型未返回任何最终内容，请重试。")
+                self._transcript.record_error(session, response.text)
+            else:
+                final_frame_id: str | None = None
+                final_message_index: int | None = None
+                if isinstance(step, FinalResult):
+                    final_frame_id = step.frame_id or None
+                    final_message_index = step.message_index if step.message_index >= 0 else None
+                self._transcript.complete_assistant(
+                    session,
+                    response.text,
+                    frame_id=final_frame_id,
+                    message_index=final_message_index,
+                )
+                self._emit(session.session_id, "final", {"text_length": len(response.text)})
+                logger.info(
+                    "Chat produced final response session=%s text_length=%d",
+                    session.session_id,
+                    len(response.text),
+                )
         else:
-            self._emit(session.session_id, "error", {"text": response.text})
+            self._transcript.record_error(session, response.text)
             logger.warning(
                 "Chat produced error response session=%s text=%s", session.session_id, response.text
             )
+        if self._events is not None:
+            self._events.flush_pending_streams(session.session_id)
         return response
 
     def _security_for_request(self, request: ChatRequest) -> SecuritySettings:
@@ -2520,6 +2628,13 @@ class QueryEngine:
                 frame.id,
             )
 
+        self._transcript.record_front_tool_results(
+            session,
+            results=[
+                {"tool_use_id": result.tool_use_id, "status": result.status, "result": result.result}
+                for result in results
+            ],
+        )
         session.clear_pending()
         logger.info("Tool results completed session=%s count=%d", session.session_id, len(results))
         return None, verify_candidates
@@ -2576,8 +2691,8 @@ class QueryEngine:
             return
 
         if settings.verify_syntax_enabled:
-            self._emit(
-                session.session_id,
+            self._record_transcript_event(
+                session,
                 "verify_started",
                 {
                     "tool_use_id": tool_use_id,
@@ -2597,8 +2712,8 @@ class QueryEngine:
                 passed, issues = outcome
                 if not passed:
                     summary = issues[0].message if issues else "语法检查失败"
-                    self._emit(
-                        session.session_id,
+                    self._record_transcript_event(
+                        session,
                         "verify_completed",
                         {
                             "tool_use_id": tool_use_id,
@@ -2638,8 +2753,8 @@ class QueryEngine:
                     )
                     return
 
-        self._emit(
-            session.session_id,
+        self._record_transcript_event(
+            session,
             "verify_started",
             {
                 "tool_use_id": tool_use_id,
@@ -2656,8 +2771,8 @@ class QueryEngine:
             path,
             model_override,
         )
-        self._emit(
-            session.session_id,
+        self._record_transcript_event(
+            session,
             "verify_completed",
             {
                 "tool_use_id": tool_use_id,
@@ -2807,7 +2922,7 @@ class QueryEngine:
 
         discarded = 0
         async with self._store.lock_for(session_id):
-            session = self._store.get_or_create(session_id, self.available_tools)
+            session = self._load_session_seeded(session_id)
             had_pending_plan = session.pending_plan is not None
             session.pending_plan = None
             if session.pending_turn_id is not None:
@@ -2823,6 +2938,13 @@ class QueryEngine:
                         )
                     )
                     discarded += 1
+                self._transcript.record_front_tool_results(
+                    session,
+                    results=[
+                        {"tool_use_id": tool_use_id, "status": "rejected", "result": None}
+                        for tool_use_id in sorted(session.pending_tool_call_ids)
+                    ],
+                )
                 session.clear_pending()
                 self._store.save(session)
                 if self._recovery is not None:
@@ -2850,7 +2972,7 @@ class QueryEngine:
         然后清空 `pending_turn_id`，使会话恢复到可接受新用户消息的状态。
         """
         async with self._store.lock_for(session_id):
-            session = self._store.get_or_create(session_id, self.available_tools)
+            session = self._load_session_seeded(session_id)
             if session.pending_turn_id is None:
                 return ChatErrorResponse(text="当前会话没有等待回传的工具调用")
 
@@ -2866,6 +2988,13 @@ class QueryEngine:
                 )
                 discarded += 1
 
+            self._transcript.record_front_tool_results(
+                session,
+                results=[
+                    {"tool_use_id": tool_use_id, "status": "rejected", "result": None}
+                    for tool_use_id in sorted(session.pending_tool_call_ids)
+                ],
+            )
             session.clear_pending()
             self._store.save(session)
             response = ChatFinalResponse(
@@ -3205,8 +3334,120 @@ class QueryEngine:
         index = create_codebase_index(self._settings, security)
         return await asyncio.to_thread(build_rag_context, index, user_message)
 
+    def _record_transcript_event(
+        self, session: Session, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        """把编排事件转写为权威展示稿条目迁移（取代通用展示事件）。
+
+        Args:
+            session: 当前会话（已持锁）。
+            event_type: `_TRANSCRIPT_ONLY_EVENT_TYPES` 中的事件类型。
+            payload: 编排事件原始载荷。
+        """
+        writer = self._transcript
+        if event_type == "agent_reasoning_delta":
+            writer.update_thought_stream(
+                session,
+                frame_id=str(payload.get("frame_id", "")),
+                message_index=int(payload.get("message_index", -1)),
+                cumulative_text=str(payload.get("text", "")),
+                token_count=payload.get("token_count"),
+            )
+        elif event_type == "agent_text_delta":
+            frame_id = str(payload.get("frame_id", ""))
+            message_index = int(payload.get("message_index", -1))
+            # Thought 的完成结算推迟到原始响应流被完整消费（assistant_stream_end），
+            # 正文开始不再提前结束思考（任务 2.7）。
+            writer.update_assistant_stream(
+                session,
+                frame_id=frame_id,
+                message_index=message_index,
+                cumulative_text=str(payload.get("text", "")),
+                turn_id=session.pending_turn_id,
+            )
+        elif event_type == "assistant_stream_end":
+            # 原始模型响应流完整消费：此刻结算该响应对应的 Thought 条目。
+            writer.complete_thought(
+                session,
+                frame_id=str(payload.get("frame_id", "")),
+                message_index=int(payload.get("message_index", -1)),
+            )
+        elif event_type == "server_tool_start":
+            tool_call_id = str(payload.get("tool_call_id", ""))
+            if tool_call_id:
+                args = payload.get("args", {})
+                writer.start_server_tool(
+                    session,
+                    tool_call_id=tool_call_id,
+                    tool=str(payload.get("tool", "")),
+                    args=args if isinstance(args, dict) else {},
+                    agent=payload.get("agent"),
+                    turn_id=session.pending_turn_id,
+                )
+        elif event_type == "server_tool_result":
+            tool_call_id = str(payload.get("tool_call_id", ""))
+            if tool_call_id:
+                summary = payload.get("result_summary")
+                writer.finish_server_tool(
+                    session,
+                    tool_call_id=tool_call_id,
+                    is_error=bool(payload.get("is_error", False)),
+                    result_summary=summary if isinstance(summary, dict) else None,
+                    result_count=payload.get("result_count"),
+                )
+        elif event_type == "plan_created":
+            raw_steps = payload.get("steps", [])
+            steps = [step for step in raw_steps if isinstance(step, dict)] if isinstance(raw_steps, list) else []
+            writer.record_plan_created(
+                session,
+                summary=str(payload.get("summary", "")),
+                steps=steps,
+                turn_id=session.pending_turn_id,
+            )
+        elif event_type == "plan_step_started":
+            writer.record_plan_step(
+                session,
+                step_index=int(payload.get("step_index", 0)),
+                total_steps=int(payload.get("total_steps", 0)),
+                title=str(payload.get("title", "")),
+                completed=False,
+                turn_id=session.pending_turn_id,
+            )
+        elif event_type == "plan_step_completed":
+            writer.record_plan_step(
+                session,
+                step_index=int(payload.get("step_index", 0)),
+                total_steps=int(payload.get("total_steps", 0)),
+                title=None,
+                completed=True,
+                summary=payload.get("summary"),
+                turn_id=session.pending_turn_id,
+            )
+        elif event_type == "verify_started":
+            writer.start_verification(
+                session,
+                tool_use_id=str(payload.get("tool_use_id", "")),
+                file_path=str(payload.get("file_path", "")),
+                phase=str(payload.get("phase", "")),
+                turn_id=session.pending_turn_id,
+            )
+        elif event_type == "verify_completed":
+            writer.finish_verification(
+                session,
+                tool_use_id=str(payload.get("tool_use_id", "")),
+                phase=str(payload.get("phase", "")),
+                passed=bool(payload.get("passed", False)),
+                issues_count=int(payload.get("issues_count", 0)),
+                summary=str(payload.get("summary", "")),
+            )
+
     def _emit(self, session_id: str, event_type: str, payload: dict[str, Any]) -> int:
-        """记录内部事件；未配置事件存储时返回 0。"""
+        """记录内部事件；未配置事件存储时返回 0。
+
+        事件序号统一以会话持久化的 `event_seq` 为下限：进程重启后
+        `EventStore` 从持久化游标继续编号，保证展示稿快照的
+        `upto_event_seq` 与 WebSocket `after_seq` 始终同一序号空间。
+        """
         log_payload = _event_payload_for_log(payload)
         logger.debug(
             "Event emitted session=%s type=%s payload=%s",
@@ -3214,14 +3455,24 @@ class QueryEngine:
             event_type,
             json.dumps(log_payload, ensure_ascii=False, default=str),
         )
+        session = self._store.get_or_create(session_id, self.available_tools)
         if event_type in _PERSISTED_HISTORY_EVENT_TYPES:
-            session = self._store.get_or_create(session_id, self.available_tools)
             session.record_history_event(event_type, payload)
         if self._events is None:
             return 0
+        self._events.seed(session_id, session.event_seq)
         event = self._events.append(session_id, event_type, payload)
+        if event.seq > session.event_seq:
+            session.event_seq = event.seq
         logger.debug("Event persisted session=%s seq=%d type=%s", session_id, event.seq, event_type)
         return event.seq
+
+    def _load_session_seeded(self, session_id: str) -> Session:
+        """获取会话并把事件序号下限抬到持久化游标。"""
+        session = self._store.get_or_create(session_id, self.available_tools)
+        if self._events is not None:
+            self._events.seed(session_id, session.event_seq)
+        return session
 
     def _record_recovery(self, session: Session, response: ChatResponse) -> None:
         """根据最新响应写入或清理最小恢复指针。"""

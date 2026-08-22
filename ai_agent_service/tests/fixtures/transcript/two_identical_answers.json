@@ -1,0 +1,78 @@
+{
+  "contract_version": 1,
+  "name": "two_identical_answers",
+  "description": "两轮回答产出完全相同正文：必须是两个不同 entry_id 的助手条目并按 ordinal 顺序渲染，任何基于文本指纹的去重都会错误地吞掉第二条。",
+  "session_id": "s1",
+  "steps": [
+    {
+      "action": "patch",
+      "event_id": "s1:1",
+      "seq": 1,
+      "entry": {
+        "entry_id": "e1",
+        "ordinal": 0,
+        "kind": "user",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "输出 DONE", "client_message_id": "m1", "has_context": false }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:2",
+      "seq": 2,
+      "entry": {
+        "entry_id": "e2",
+        "ordinal": 1,
+        "kind": "assistant",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t1",
+        "tool_call_id": null,
+        "payload": { "text": "DONE" }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:3",
+      "seq": 3,
+      "entry": {
+        "entry_id": "e3",
+        "ordinal": 2,
+        "kind": "user",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t2",
+        "tool_call_id": null,
+        "payload": { "text": "再输出一次 DONE", "client_message_id": "m2", "has_context": false }
+      }
+    },
+    {
+      "action": "patch",
+      "event_id": "s1:4",
+      "seq": 4,
+      "entry": {
+        "entry_id": "e4",
+        "ordinal": 3,
+        "kind": "assistant",
+        "state": "complete",
+        "revision": 1,
+        "turn_id": "t2",
+        "tool_call_id": null,
+        "payload": { "text": "DONE" }
+      }
+    }
+  ],
+  "expect": {
+    "session_id": "s1",
+    "entry_count": 4,
+    "entries": [
+      { "entry_id": "e1", "ordinal": 0, "kind": "user", "state": "complete", "revision": 1 },
+      { "entry_id": "e2", "ordinal": 1, "kind": "assistant", "state": "complete", "revision": 1, "text": "DONE" },
+      { "entry_id": "e3", "ordinal": 2, "kind": "user", "state": "complete", "revision": 1 },
+      { "entry_id": "e4", "ordinal": 3, "kind": "assistant", "state": "complete", "revision": 1, "text": "DONE" }
+    ]
+  }
+}
