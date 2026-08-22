@@ -266,7 +266,12 @@ static func replace_bold(text: String) -> String:
 
 
 static func escape_bbcode(text: String) -> String:
-	return text.replace("[", "[lb]").replace("]", "[rb]")
+	# 单趟转义：先用占位符替换原始括号，再还原为目标标签。直接链式
+	# `replace("[", "[lb]").replace("]", "[rb]")` 会把第一步插入的 "[lb]" 里的
+	# "]" 再次替换成 "[rb]"，产出 "[lb[rb]" 这类损坏（显示为 "[lb]..." 乱码）。
+	if not text.contains("[") and not text.contains("]"):
+		return text
+	return text.replace("[", "\u0001").replace("]", "\u0002").replace("\u0001", "[lb]").replace("\u0002", "[rb]")
 
 
 static func highlight_code_line(line: String, lang: String, theme_colors: Dictionary) -> String:

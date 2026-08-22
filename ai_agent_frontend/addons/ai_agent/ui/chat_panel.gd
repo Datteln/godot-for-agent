@@ -19,6 +19,7 @@ const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_rende
 const TranscriptStore = preload("res://addons/ai_agent/transcript/transcript_store.gd")
 const TranscriptProjector = preload("res://addons/ai_agent/transcript/transcript_projector.gd")
 const TranscriptRenderer = preload("res://addons/ai_agent/transcript/transcript_renderer.gd")
+const TransientNoticeHost = preload("res://addons/ai_agent/ui/transient_notice_host.gd")
 
 enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
 
@@ -26,7 +27,6 @@ const PENDING_TOOL_RESULTS_ERROR := "当前会话仍有待回传的工具结果�
 const EVENT_DRAIN_BATCH_SIZE := 24
 const EVENT_DRAIN_TIME_BUDGET_MS := 6
 const MAX_MESSAGE_LIST_CHILDREN := 240
-const MAX_MESSAGE_RENDER_CHARS := 90000
 const INPUT_MIN_HEIGHT := 60
 const INPUT_MAX_HEIGHT := 240
 
@@ -98,6 +98,8 @@ var _force_scroll_once := false
 var _transcript_store: RefCounted
 var _projector: RefCounted
 var _transcript_renderer: RefCounted
+## 本地瞬时提示宿主：等待/命令执行等提示不进入展示稿（任务 3.4）。
+var _transient_host: RefCounted
 ## 当前水合世代；发起一次历史加载前递增，用于拒绝迟到的旧会话/旧世代响应。
 var _hydration_generation := 0
 ## 本轮是否已经通过 transcript_patch 接受了完成态助手条目；HTTP final 只作确认，
@@ -133,12 +135,6 @@ func _process(_delta: float) -> void:
 	if _post_final_scroll_frames > 0:
 		_post_final_scroll_frames -= 1
 		_do_scroll_to_bottom()
-
-
-func _limit_render_text(text: String, max_chars: int) -> String:
-	if max_chars <= 0 or text.length() <= max_chars:
-		return text
-	return text.left(max_chars) + "\n\n... (display truncated)"
 
 
 ## 程序控制滚动到底部，设置抑制标志防止 value_changed 误判
@@ -222,10 +218,17 @@ func _build_ui() -> void:
 	_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	add_child(_scroll)
 
+	# ScrollContainer 只对单个子控件做布局/滚动：转录列表与瞬时提示列表
+	# 必须包在同一个容器里，否则提示层（确认框等）不会跟随滚动显示。
+	var scroll_body := VBoxContainer.new()
+	scroll_body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll_body.add_theme_constant_override("separation", 10)
+	_scroll.add_child(scroll_body)
+
 	_message_list = VBoxContainer.new()
 	_message_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_message_list.add_theme_constant_override("separation", 10)
-	_scroll.add_child(_message_list)
+	scroll_body.add_child(_message_list)
 
 	_file_suggestions_panel = PanelContainer.new()
 	_file_suggestions_panel.visible = false
@@ -315,6 +318,8 @@ func _build_children() -> void:
 	_message_context_popup.add_item("粘贴到输入框", 1)
 	_message_context_popup.add_separator()
 	_message_context_popup.add_item("全选", 2)
+	_message_context_popup.add_separator()
+	_message_context_popup.add_item("复制全文", 3)
 	add_child(_message_context_popup)
 
 	_log_renderer = LogEntryRenderer.new()
@@ -329,6 +334,15 @@ func _build_children() -> void:
 	_transcript_renderer.theme_colors = _theme_colors
 	_transcript_renderer.ui_text = _ui
 	_transcript_renderer.attach(_message_list)
+
+	_transient_host = TransientNoticeHost.new()
+	_transient_host.node_factory = _log_renderer
+	_transient_host.theme_colors = _theme_colors
+	_transient_host.ui_text = _ui
+	# 瞬时提示与 durable transcript 必须在同一时间线中插入：若提示先出现、
+	# 随后才水合历史，提示要保留其触发位置，不能被独立尾置容器排到所有消息后。
+	_transient_host.attach(_message_list)
+	_transcript_renderer.error_retry_requested.connect(_on_transcript_retry_requested)
 
 
 func _connect_signals() -> void:
@@ -376,6 +390,8 @@ func _refresh_live_theme_overrides() -> void:
 		_transcript_renderer.theme_colors = _theme_colors
 	if _log_renderer != null:
 		_log_renderer.theme_colors = _theme_colors
+	if _transient_host != null:
+		_transient_host.theme_colors = _theme_colors
 
 
 func _theme_color(key: String) -> Color:
@@ -411,7 +427,8 @@ func _on_send() -> void:
 	var client_message_id := "cm_%d_%d" % [Time.get_ticks_msec(), _optimistic_counter]
 	_transcript_store.add_optimistic_user_entry(text, client_message_id)
 	_render_optimistic_user_entry(client_message_id, text)
-	_append_message("system", _ui("waiting_model"))
+	_transient_host.show_keyed("waiting", _ui("waiting_model"), "system")
+	_scroll_to_bottom()
 	_set_state(AgentState.WAITING_LLM)
 	if undo_manager != null:
 		undo_manager.begin_batch("AI: " + text.left(40))
@@ -429,6 +446,9 @@ func _render_optimistic_user_entry(client_message_id: String, text: String) -> v
 
 ## 本地结束一轮（final 确认/超时兜底共用）：提交 undo、复位状态与 turn id。
 func _end_turn_locally() -> void:
+	if _transient_host != null:
+		_transient_host.discard_keyed("waiting")
+		_transient_host.discard_keyed("command")
 	if undo_manager != null:
 		undo_manager.commit_batch()
 	_set_state(AgentState.IDLE)
@@ -452,7 +472,7 @@ func _try_run_slash_command(text: String) -> bool:
 	if not raw_args.is_empty():
 		var parsed = JSON.parse_string(raw_args)
 		if not (parsed is Dictionary):
-			_append_message("error", "命令参数必须是 JSON 对象，例如：/rebuild_index {\"incremental\": true}")
+			_show_notice("error", "命令参数必须是 JSON 对象，例如：/rebuild_index {\"incremental\": true}")
 			FrontendLogger.warn(editor_interface, "ChatPanel", "Slash command rejected: invalid JSON args.", {
 				"command": command_name,
 				"args_chars": raw_args.length()
@@ -463,8 +483,9 @@ func _try_run_slash_command(text: String) -> bool:
 	_update_input_height()
 	_auto_scroll = true
 	_force_scroll_once = true
-	_append_message("user", text)
-	_append_message("system", "正在执行命令 /%s …" % command_name)
+	_show_notice("user", text)
+	_transient_host.show_keyed("command", "正在执行命令 /%s …" % command_name, "system")
+	_scroll_to_bottom()
 	_set_state(AgentState.WAITING_LLM)
 	FrontendLogger.info(editor_interface, "ChatPanel", "Running slash command.", {
 		"command": command_name,
@@ -690,6 +711,12 @@ func _on_message_context_action(id: int) -> void:
 		2:
 			if _message_context_source != null and is_instance_valid(_message_context_source):
 				_message_context_source.select_all()
+		3:
+			# 规范复制：取该条目持久化的完整规范文本，与选区/截断无关。
+			if _message_context_source != null and is_instance_valid(_message_context_source) and _transcript_renderer != null:
+				var canonical: String = _transcript_renderer.copy_text_for_node(_message_context_source)
+				if canonical != "":
+					DisplayServer.clipboard_set(canonical)
 
 
 func _on_response(response: Dictionary) -> void:
@@ -708,12 +735,12 @@ func _on_response(response: Dictionary) -> void:
 		_last_doctor_report = response
 		if _extensions_pending:
 			_extensions_pending = false
-			_append_message("system", _format_extensions_report({
+			_show_notice("system", _format_extensions_report({
 				"skills": response.get("skills", []),
 				"warnings": response.get("warnings", [])
 			}))
 		else:
-			_append_message("system", _format_doctor_report(response))
+			_show_notice("system", _format_doctor_report(response))
 		if state_store != null:
 			state_store.set_value("doctor_warnings", response.get("warnings", []))
 		return
@@ -727,7 +754,7 @@ func _on_response(response: Dictionary) -> void:
 		return
 
 	if response.has("items") and response.has("ok"):
-		_append_message("system", _format_memory_report(response))
+		_show_notice("system", _format_memory_report(response))
 		return
 
 	if response.has("ok") and response.has("session_id") and response.size() == 2:
@@ -743,12 +770,14 @@ func _on_response(response: Dictionary) -> void:
 				_commands_btn.disabled = _state != AgentState.IDLE
 				_show_commands_popup()
 		else:
-			_append_message("system", _format_plain_value("数据", value))
+			_show_notice("system", _format_plain_value("数据", value))
 		return
 
 	if response.has("ok") and response.has("text"):
+		if _transient_host != null:
+			_transient_host.discard_keyed("command")
 		var command_text := _format_command_response(response)
-		_append_message("system" if bool(response.get("ok", false)) else "error", command_text)
+		_show_notice("system" if bool(response.get("ok", false)) else "error", command_text)
 		if _state == AgentState.WAITING_LLM:
 			_set_state(AgentState.IDLE)
 		return
@@ -777,7 +806,7 @@ func _on_response(response: Dictionary) -> void:
 			FrontendLogger.debug(editor_interface, "ChatPanel", "[response] -> route: unknown", {
 				"type": str(response.get("type", ""))
 			})
-			_append_message("system", JSON.stringify(response, "\t"))
+			_show_notice("system", JSON.stringify(response, "\t"))
 
 
 func _format_doctor_report(report: Dictionary) -> String:
@@ -940,12 +969,13 @@ func _command_default_args(command: Dictionary) -> Dictionary:
 
 func _run_selected_command(command_name: String, args: Dictionary) -> void:
 	if _state != AgentState.IDLE:
-		_append_message("error", "当前任务尚未结束，暂时不能运行其他命令。")
+		_show_notice("error", "当前任务尚未结束，暂时不能运行其他命令。")
 		return
 	_auto_scroll = true
 	_force_scroll_once = true
-	_append_message("user", "/%s %s" % [command_name, JSON.stringify(args)])
-	_append_message("system", "正在执行命令 /%s …" % command_name)
+	_show_notice("user", "/%s %s" % [command_name, JSON.stringify(args)])
+	_transient_host.show_keyed("command", "正在执行命令 /%s …" % command_name, "system")
+	_scroll_to_bottom()
 	_set_state(AgentState.WAITING_LLM)
 	FrontendLogger.info(editor_interface, "ChatPanel", "Running command selected from dropdown.", {
 		"command": command_name,
@@ -1170,7 +1200,7 @@ func _on_decision(results: Array) -> void:
 		if state_store != null:
 			state_store.set_value("current_turn_id", "")
 		_set_state(AgentState.IDLE)
-		_append_message("system", _ui("rejected_turn_ended"))
+		_show_notice("system", _ui("rejected_turn_ended"))
 		return
 	_set_state(AgentState.WAITING_LLM)
 	_http_client.send_tool_results(results, _request_model())
@@ -1260,11 +1290,11 @@ func _handle_session_history(response: Dictionary) -> void:
 	var saved_auto_scroll := _auto_scroll
 	_auto_scroll = false
 	if pending_turn_id != null:
-		_append_message("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
+		_show_notice("system", _ui("recovered_pending") % [session_id, str(pending_turn_id)])
 		_show_pending_results_notice()
 		_set_state(AgentState.WAITING_CONFIRM)
 	if entry_count == 0 and _message_list.get_child_count() == 0:
-		_append_message("system", _ui("switch_session_empty"))
+		_show_notice("system", _ui("switch_session_empty"))
 	_auto_scroll = saved_auto_scroll
 	_force_scroll_once = true
 	_scroll_to_bottom()
@@ -1288,7 +1318,10 @@ func _on_error(message: String) -> void:
 	if _commands_requested:
 		_commands_requested = false
 		_commands_btn.disabled = _state != AgentState.IDLE
-	_append_message("error", message)
+	if _transient_host != null:
+		_transient_host.discard_keyed("waiting")
+		_transient_host.discard_keyed("command")
+	_show_notice("error", message)
 	if undo_manager != null:
 		undo_manager.abort_batch()
 	if state_store != null:
@@ -1334,7 +1367,7 @@ func _show_pending_results_notice() -> void:
 func _discard_pending_results() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Discarding pending tool results.")
 	_http_client.discard_pending()
-	_append_message("system", _ui("discard_pending"))
+	_show_notice("system", _ui("discard_pending"))
 	_set_state(AgentState.WAITING_LLM)
 
 
@@ -1373,7 +1406,10 @@ func _on_interrupt() -> void:
 		state_store.set_value("pending_calls", [])
 		state_store.set_value("current_turn_id", "")
 	_set_state(AgentState.IDLE)
-	_append_message("system", _ui("interrupted"))
+	if _transient_host != null:
+		_transient_host.discard_keyed("waiting")
+		_transient_host.discard_keyed("command")
+	_show_notice("system", _ui("interrupted"))
 
 
 func _on_new_session() -> void:
@@ -1402,7 +1438,7 @@ func _on_new_session() -> void:
 	_clear_messages()
 	_update_context_usage_status(0, _context_token_limit)
 	_set_state(AgentState.IDLE)
-	_append_message("system", _ui("new_session_started") % session_id)
+	_show_notice("system", _ui("new_session_started") % session_id)
 
 
 func _on_recovery_accepted(pointer: Dictionary) -> void:
@@ -1431,21 +1467,21 @@ func _on_recovery_rejected() -> void:
 	_http_client.reset_session()
 	if state_store != null:
 		state_store.set_value("recovery_pointer", null)
-	_append_message("system", _ui("recovery_dismissed"))
+	_show_notice("system", _ui("recovery_dismissed"))
 
 
 func _on_service_started(base_url: String) -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Service started signal received.", {"base_url": base_url})
 	_fetch_initial_service_data()
 	if service != null and not service.is_running():
-		_append_message("system", _ui("service_manual") % [base_url, str(service.token)])
+		_show_notice("system", _ui("service_manual") % [base_url, str(service.token)])
 
 
 func _on_service_failed(message: String) -> void:
 	FrontendLogger.error(editor_interface, "ChatPanel", "Service failed signal received.", {"message": message})
-	_append_message("error", _ui("service_failed") % message)
+	_show_notice("error", _ui("service_failed") % message)
 	if service != null and str(service.token) != "":
-		_append_message("system", _ui("service_manual_full") % [str(service.base_url), str(service.token)])
+		_show_notice("system", _ui("service_manual_full") % [str(service.base_url), str(service.token)])
 	if _event_socket != null:
 		_event_socket.stop()
 
@@ -1595,7 +1631,7 @@ func _on_extensions() -> void:
 			"skills": _last_doctor_report.get("skills", []),
 			"warnings": _last_doctor_report.get("warnings", [])
 		}
-		_append_message("system", _format_extensions_report(payload))
+		_show_notice("system", _format_extensions_report(payload))
 
 
 func _on_effort_selected(index: int) -> void:
@@ -1785,51 +1821,32 @@ func _set_state(value: int) -> void:
 
 
 
-## 面板级临时消息（系统提示、命令输出、错误）——不属于权威展示稿，重载后消失；
-## 聊天记录只由 transcript 条目渲染。不做任何基于文本的去重。
-func _append_message(role: String, text: String, color = null) -> void:
-	if role != "user" and role != "error":
-		_log_renderer.append_log_stream_message(
-			_message_list,
-			_limit_render_text(text, MAX_MESSAGE_RENDER_CHARS),
-			color,
-			true,
-			false
-		)
-		_scroll_to_bottom()
+## 面板级瞬时本地提示——不属于权威展示稿，重载/水合后消失；聊天记录只由
+## transcript 条目渲染（任务 3.4/4.1）。提示节点由瞬时宿主创建并可被直接丢弃，
+## 绝不从快照、WebSocket 或 Viewport remount 重新渲染。
+func _show_notice(role: String, text: String) -> void:
+	if _transient_host == null:
 		return
-
-	var row := HBoxContainer.new()
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
+	var style := "system"
 	if role == "user":
-		var spacer := Control.new()
-		spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		spacer.size_flags_stretch_ratio = 0.35
-		row.add_child(spacer)
-
-	var panel := _log_renderer.make_message_panel(role)
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	panel.size_flags_stretch_ratio = 0.65 if role == "user" else 1.0
-	panel.custom_minimum_size = Vector2(320, 0) if role == "user" else Vector2(0, 0)
-	row.add_child(panel)
-
-	var body := VBoxContainer.new()
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	panel.add_child(body)
-
-	var rich := _log_renderer.make_rich_text(_limit_render_text(text, MAX_MESSAGE_RENDER_CHARS), color)
-	body.add_child(rich)
-
-	_message_list.add_child(row)
+		style = "user"
+	elif role == "error":
+		style = "error"
+	_transient_host.show_notice(text, style)
 	_scroll_to_bottom()
+
+
+## 错误条目声明可重试时的回调：当前没有通用重试通道，提示用户手动重发。
+func _on_transcript_retry_requested(entry_id: String) -> void:
+	FrontendLogger.info(editor_interface, "ChatPanel", "Retry requested for error entry.", {"entry_id": entry_id})
+	_show_notice("system", "该错误暂不支持自动重试，请重新发送消息。")
 
 
 func _clear_messages() -> void:
 	if _transcript_renderer != null:
 		_transcript_renderer.clear_all()
-	for child in _message_list.get_children():
-		child.queue_free()
+	if _transient_host != null:
+		_transient_host.clear_all()
 
 
 func _scroll_to_bottom() -> void:
@@ -1843,12 +1860,8 @@ func _scroll_to_bottom() -> void:
 
 
 func _trim_message_list() -> void:
-	if _message_list == null:
-		return
-	while _message_list.get_child_count() > MAX_MESSAGE_LIST_CHILDREN:
-		var child := _message_list.get_child(0)
-		_message_list.remove_child(child)
-		child.queue_free()
+	if _transcript_renderer != null:
+		_transcript_renderer.trim_to(MAX_MESSAGE_LIST_CHILDREN)
 
 
 func _on_scroll_value_changed(value: float) -> void:

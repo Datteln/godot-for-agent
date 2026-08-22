@@ -82,6 +82,7 @@ func _run_cross_session_isolation_test() -> void:
 	_check(store.entry_count() == 1, "isolation: active transcript unchanged")
 
 
+
 func _fixture_directory() -> String:
 	var project_root := ProjectSettings.globalize_path("res://")
 	var candidate := project_root.path_join("../ai_agent_service/tests/fixtures/transcript")

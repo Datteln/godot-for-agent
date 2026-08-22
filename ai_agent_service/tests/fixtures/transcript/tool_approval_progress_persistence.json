@@ -61,7 +61,7 @@
         "revision": 1,
         "turn_id": "t1",
         "tool_call_id": "call-edit-1",
-        "payload": { "tool": "apply_text_edit", "args": { "path": "scripts/player.gd" }, "decision": null, "render_kind": "diff" }
+        "payload": { "tool": "apply_text_edit", "args": { "path": "scripts/player.gd" }, "decision": null, "render_kind": "diff", "operation_summary": "修改", "affected_paths": ["scripts/player.gd"], "resolution_summary": null }
       }
     },
     {
@@ -76,7 +76,7 @@
         "revision": 2,
         "turn_id": "t1",
         "tool_call_id": "call-edit-1",
-        "payload": { "tool": "apply_text_edit", "args": { "path": "scripts/player.gd" }, "decision": "approved", "render_kind": "diff" }
+        "payload": { "tool": "apply_text_edit", "args": { "path": "scripts/player.gd" }, "decision": "approved", "render_kind": "diff", "operation_summary": "修改", "affected_paths": ["scripts/player.gd"], "resolution_summary": "已确认" }
       }
     },
     {
@@ -160,7 +160,7 @@
             "revision": 2,
             "turn_id": "t1",
             "tool_call_id": "call-edit-1",
-            "payload": { "tool": "apply_text_edit", "args": { "path": "scripts/player.gd" }, "decision": "approved", "render_kind": "diff" }
+            "payload": { "tool": "apply_text_edit", "args": { "path": "scripts/player.gd" }, "decision": "approved", "render_kind": "diff", "operation_summary": "修改", "affected_paths": ["scripts/player.gd"], "resolution_summary": "已确认" }
           },
           {
             "entry_id": "e4",

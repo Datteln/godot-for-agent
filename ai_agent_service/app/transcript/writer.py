@@ -31,6 +31,94 @@ _ARGS_VALUE_MAX_CHARS = 24_000
 
 EmitCallable = Callable[[str, str, dict[str, Any]], int]
 
+_APPROVAL_PATH_KEYS: tuple[str, ...] = (
+    "path",
+    "target_path",
+    "file_path",
+    "script_path",
+    "resource_path",
+    "scene_path",
+    "material_path",
+    "track_path",
+    "directory",
+)
+"""审批入参中可能携带受影响路径的键名白名单（按展示优先级排序）。"""
+
+_APPROVAL_OPERATION_VERBS: dict[str, str] = {
+    "apply_text_edit": "修改",
+    "propose_script_edit": "修改",
+    "write_file": "写入",
+    "propose_content_file": "创建",
+    "propose_tests": "创建测试",
+    "run_system_command": "执行命令",
+    "execute_gd_script": "执行脚本",
+    "run_tests": "运行测试",
+    "run_headless_self_test": "运行自检",
+    "set_project_setting": "修改项目设置",
+    "batch_rename": "批量重命名",
+    "open_scene": "打开场景",
+    "add_autoload": "添加 Autoload",
+    "remove_autoload": "移除 Autoload",
+    "add_input_action": "添加输入动作",
+    "remove_input_action": "移除输入动作",
+}
+"""审批工具名到可读操作动词的映射；未收录工具回退为工具名本身。"""
+
+
+def approval_operation_summary(tool: str, args: dict[str, Any]) -> str:
+    """由工具名与入参生成审批条目的可读操作摘要。
+
+    摘要只依赖持久化的 typed 字段（工具名/入参），不从 UI 或原始传输猜测。
+    命令与脚本类工具附带一段截断后的目标描述，便于单行权限结果文本表达。
+
+    Args:
+        tool: 待审批工具名。
+        args: 已截断的工具入参字典。
+
+    Returns:
+        一段可读的操作描述，例如 `修改`、`执行命令 ls -la`。
+    """
+    verb = _APPROVAL_OPERATION_VERBS.get(tool, tool)
+    if tool == "run_system_command":
+        command = str(args.get("command", "")).strip()
+        if command:
+            return f"{verb} {command[:120]}"
+    if tool == "execute_gd_script":
+        snippet = str(args.get("script", args.get("code", ""))).strip()
+        if snippet:
+            first_line = snippet.split("\n", 1)[0][:80]
+            return f"{verb} {first_line}"
+    return verb
+
+
+def approval_affected_paths(args: dict[str, Any]) -> list[str]:
+    """从审批入参中提取受影响路径列表（去重、保持出现顺序）。
+
+    只读取白名单键；`paths` 列表键会被展开。找不到任何路径时返回空列表，
+    由渲染端显式标注“未提供”，而不是猜测。
+
+    Args:
+        args: 已截断的工具入参字典。
+
+    Returns:
+        受影响路径的字符串列表。
+    """
+    paths: list[str] = []
+
+    def _add(value: Any) -> None:
+        text = str(value).strip()
+        if text and text not in paths:
+            paths.append(text)
+
+    for key in _APPROVAL_PATH_KEYS:
+        if key in args:
+            _add(args.get(key))
+    raw_paths = args.get("paths")
+    if isinstance(raw_paths, list):
+        for item in raw_paths:
+            _add(item)
+    return paths
+
 
 def visible_assistant_text(raw_text: str) -> str:
     """剥离助手正文首行的 `Thought:` 前缀，返回用户可见正文。
@@ -480,6 +568,11 @@ class TranscriptWriter:
                         "args": args,
                         "decision": None,
                         "render_kind": render_kind,
+                        # 解决后降级为一行权限结果文本所需的持久化字段（任务 3.2）：
+                        # 创建时即写入操作摘要与受影响路径，历史/重连后可直接重建。
+                        "operation_summary": approval_operation_summary(name, args),
+                        "affected_paths": approval_affected_paths(args),
+                        "resolution_summary": None,
                     },
                     turn_id=turn_id,
                     tool_call_id=call_id,
@@ -532,6 +625,14 @@ class TranscriptWriter:
                 entry = self._find_entry(session, approval_entry_id)
                 payload = dict(entry.get("payload", {})) if entry is not None else {}
                 payload["decision"] = decision
+                payload["resolution_summary"] = "已确认" if decision == "approved" else "已拒绝"
+                # 旧版本创建的审批条目可能缺少操作摘要字段：解决时按持久化的
+                # typed 入参补齐，仍不读取 UI 或原始传输。
+                tool = str(payload.get("tool", ""))
+                bounded_args = payload.get("args")
+                args_dict = bounded_args if isinstance(bounded_args, dict) else {}
+                payload.setdefault("operation_summary", approval_operation_summary(tool, args_dict))
+                payload.setdefault("affected_paths", approval_affected_paths(args_dict))
                 updated = self._update_entry(
                     session,
                     approval_entry_id,
@@ -750,13 +851,28 @@ class TranscriptWriter:
         self._publish(session.session_id, updated)
         return str(updated["entry_id"])
 
-    def record_error(self, session: Session, text: str, *, turn_id: str | None = None) -> str:
-        """记录一条错误条目。
+    def record_error(
+        self,
+        session: Session,
+        text: str,
+        *,
+        turn_id: str | None = None,
+        context: str | None = None,
+        modification_status: str | None = None,
+        retryable: bool | None = None,
+    ) -> str:
+        """记录一条错误条目（可携带操作上下文/修改状态/可重试性）。
+
+        结构化字段供错误渲染器展示失败的操作上下文、已知修改状态与是否可重试；
+        均为可空——缺失时渲染端按“未提供/不可重试”处理，绝不猜测。
 
         Args:
             session: 当前会话。
-            text: 错误文本。
+            text: 用户可读的错误原因文本。
             turn_id: 当前轮次 id，可空。
+            context: 失败时的操作/任务上下文描述，可空。
+            modification_status: 已知修改状态（如“部分文件可能已被修改”），可空。
+            retryable: 该错误是否可重试；None 表示未声明（渲染端不显示重试）。
 
         Returns:
             错误条目的 `entry_id`。
@@ -765,7 +881,12 @@ class TranscriptWriter:
             session,
             kind="error",
             state="complete",
-            payload={"text": text},
+            payload={
+                "text": text,
+                "context": context,
+                "modification_status": modification_status,
+                "retryable": retryable,
+            },
             turn_id=turn_id,
         )
         self._publish(session.session_id, entry)

@@ -16,6 +16,11 @@ const _TOOL_DISPLAY_NAMES := {
 	"search_tools": "SearchTools",
 }
 
+## 历史水合时 grep 结果会直接进入 RichTextLabel；必须限制同步布局量。
+const MAX_GREP_RENDERED_MATCHES := 3
+const MAX_GREP_MATCH_PATH_CHARS := 160
+const MAX_GREP_MATCH_TEXT_CHARS := 240
+
 
 static func tool_display_name(name: String) -> String:
 	return str(_TOOL_DISPLAY_NAMES.get(name, name))
@@ -182,16 +187,23 @@ static func format_grep_event_entry(summary: Dictionary) -> String:
 	var count := int(summary.get("match_count", 0))
 	var lines: Array[String] = ["%d match%s" % [count, "" if count == 1 else "es"]]
 	var matches: Array = summary.get("matches", []) if summary.get("matches", []) is Array else []
+	var rendered_matches := 0
 	for item in matches:
+		if rendered_matches >= MAX_GREP_RENDERED_MATCHES:
+			break
 		if not (item is Dictionary):
 			continue
 		var line_val = item.get("line", "")
 		var line_str := str(int(float(str(line_val)))) if str(line_val) != "" else ""
 		lines.append("%s:%s %s" % [
-			str(item.get("path", "")),
+			truncate_text(str(item.get("path", "")), MAX_GREP_MATCH_PATH_CHARS),
 			line_str,
-			str(item.get("text", "")).strip_edges()
+			truncate_text(str(item.get("text", "")), MAX_GREP_MATCH_TEXT_CHARS)
 		])
+		rendered_matches += 1
+	var omitted_matches := max(matches.size() - rendered_matches, count - rendered_matches)
+	if omitted_matches > 0:
+		lines.append("... %d more match(es) omitted ..." % omitted_matches)
 	if bool(summary.get("truncated", false)):
 		lines.append("... truncated ...")
 	return "Grep \"%s\" (in %s)\n%s" % [pattern, include, "\n".join(lines)]

@@ -78,6 +78,15 @@ func apply_patch(patch: Dictionary, event_id: String) -> bool:
 		if event_id != "":
 			_seen_event_ids[event_id] = true
 		return false
+	if not existing.is_empty() \
+			and str(existing.get("kind", "")) == "thought" \
+			and str(existing.get("state", "")) == "complete" \
+			and str(entry.get("state", "")) == "thinking":
+		# Thought 终态单向（渲染契约同款守卫）：即使 revision 更高，
+		# 把已完成 Thought 退回 thinking 的补丁也必须被拒绝。
+		if event_id != "":
+			_seen_event_ids[event_id] = true
+		return false
 	if event_id != "":
 		_seen_event_ids[event_id] = true
 	var is_new := existing.is_empty()
