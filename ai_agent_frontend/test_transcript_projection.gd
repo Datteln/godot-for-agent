@@ -8,7 +8,11 @@ extends SceneTree
 const TranscriptStore = preload("res://addons/ai_agent/transcript/transcript_store.gd")
 const TranscriptProjector = preload("res://addons/ai_agent/transcript/transcript_projector.gd")
 const TranscriptRenderer = preload("res://addons/ai_agent/transcript/transcript_renderer.gd")
+const TranscriptViewport = preload("res://addons/ai_agent/transcript/transcript_viewport.gd")
 const LogEntryRenderer = preload("res://addons/ai_agent/ui/log_entry_renderer.gd")
+const TransientNoticeHost = preload("res://addons/ai_agent/ui/transient_notice_host.gd")
+const AgentDTO = preload("res://addons/ai_agent/dto/agent_dto.gd")
+const TranscriptCopy = preload("res://addons/ai_agent/transcript/transcript_copy.gd")
 
 var _failures := 0
 var _checks := 0
@@ -38,6 +42,7 @@ func _init() -> void:
 		"late_reasoning_after_completion": "late_reasoning_after_completion.json",
 		"empty_content_recovery": "empty_content_recovery.json",
 		"empty_content_unrecoverable": "empty_content_unrecoverable.json",
+		"long_navigation": "long_navigation.json",
 	}
 	for fixture_name in fixtures.keys():
 		var fixture := _load_fixture(fixture_dir + "/" + str(fixtures[fixture_name]))
@@ -46,8 +51,12 @@ func _init() -> void:
 			continue
 		_run_fixture(fixture_name, fixture)
 	_run_cross_session_isolation_test()
+	_run_navigation_store_test(fixture_dir)
+	_run_viewport_window_test()
 	_renderer_smoke_test()
 	_run_thought_renderer_test()
+	_run_transient_host_ownership_test()
+	_run_tool_outcome_semantics_test()
 	print("transcript projection checks: %d, failures: %d" % [_checks, _failures])
 	quit(1 if _failures > 0 else 0)
 
@@ -56,6 +65,8 @@ func _init() -> void:
 func _run_cross_session_isolation_test() -> void:
 	var store := TranscriptStore.new()
 	var projector := TranscriptProjector.new(store)
+	var rejected_reasons: Array = []
+	projector.patch_rejected.connect(func(diagnostic: Dictionary): rejected_reasons.append(str(diagnostic.get("reason", ""))))
 	var generation := projector.begin_hydration("session-b")
 	projector.apply_snapshot({
 		"transcript": {
@@ -79,7 +90,110 @@ func _run_cross_session_isolation_test() -> void:
 		}
 	}, generation)
 	_check(not foreign_applied, "isolation: foreign-session patch rejected")
+	_check(rejected_reasons.has("session_mismatch"), "diagnostics: session mismatch is redacted and observable")
 	_check(store.entry_count() == 1, "isolation: active transcript unchanged")
+	var malformed := projector.apply_event({
+		"event_id": "malformed", "session_id": "session-b", "seq": 10, "type": "transcript_patch", "payload": {"stream_key": ""}
+	}, generation)
+	_check(not malformed and rejected_reasons.has("invalid_payload"), "diagnostics: malformed patch rejected")
+
+
+## 瞬时宿主与虚拟视口共用消息容器时，清理只能释放自身创建的通知。
+func _run_transient_host_ownership_test() -> void:
+	var list := VBoxContainer.new()
+	var viewport_mounts := VBoxContainer.new()
+	list.add_child(viewport_mounts)
+	var host := TransientNoticeHost.new()
+	host.node_factory = LogEntryRenderer.new()
+	host.attach(list)
+	host.show_notice("temporary")
+	host.clear_all()
+	_check(is_instance_valid(viewport_mounts), "transient host: preserves viewport mount container")
+	_check(viewport_mounts.get_parent() == list, "transient host: does not remove durable container")
+	_check(list.get_child_count() == 1, "transient host: removes only owned notices")
+
+
+## 允许后执行失败、显式拒绝和混合批次必须保留不同的持久化语义。
+func _run_tool_outcome_semantics_test() -> void:
+	var call := {"id": "decision-1", "frame_id": "frame-1"}
+	var explicit_reject := AgentDTO.rejected_result(call)
+	_check(str(explicit_reject.get("status", "")) == "rejected", "decision: explicit reject stays rejected")
+	_check(str(explicit_reject.get("decision_source", "")) == "explicit_reject", "decision: explicit reject source recorded")
+	var allowed_error := AgentDTO.tool_result("decision-2", "frame-1", "error", {"message": "invalid path"}, "invalid_path")
+	allowed_error["decision_source"] = "execute"
+	_check(str(allowed_error.get("status", "")) == "error", "decision: allowed validation failure stays error")
+	_check(str(allowed_error.get("decision_source", "")) == "execute", "decision: execution source recorded")
+	var unselected := AgentDTO.rejected_result({"id": "decision-3", "frame_id": "frame-1"})
+	unselected["decision_source"] = "unselected"
+	_check(str(unselected.get("status", "")) == "rejected" and str(unselected.get("decision_source", "")) == "unselected", "decision: mixed batch unselected call is rejected")
+	var approval_error := {"kind": "approval", "state": "error", "payload": {"decision": "error", "error_code": "invalid_path", "operation_summary": "打开场景", "affected_paths": ["res://bad.txt"]}}
+	_check(TranscriptCopy.canonical_text(approval_error).contains("执行失败（invalid_path）"), "decision: approval error is not rendered as rejection")
+	var activity_reject := {"kind": "tool_activity", "state": "resolved", "payload": {"outcome_status": "rejected", "tool": "open_scene", "args": {}}}
+	_check(TranscriptCopy.canonical_text(activity_reject).contains("已拒绝"), "decision: rejected activity is distinct from execution failure")
+
+
+## 长会话分页夹具：重叠旧页不能覆盖更高 revision 的实时尾部；页耗尽后不再请求。
+func _run_navigation_store_test(fixture_dir: String) -> void:
+	var fixture := _load_fixture(fixture_dir + "/long_navigation.json")
+	var initial: Dictionary = fixture.get("initial_snapshot", {}) if fixture.get("initial_snapshot", {}) is Dictionary else {}
+	var older: Dictionary = fixture.get("older_page", {}) if fixture.get("older_page", {}) is Dictionary else {}
+	var store := TranscriptStore.new()
+	var projector := TranscriptProjector.new(store)
+	var generation := projector.begin_hydration("navigation-long")
+	_check(projector.apply_snapshot({"transcript": initial}, generation), "navigation: initial page hydrates")
+	_check(store.history_has_more and store.next_before_ordinal == 40, "navigation: older cursor retained")
+	var live := projector.apply_event({
+		"event_id": "navigation-long:81", "session_id": "navigation-long", "seq": 81,
+		"type": "transcript_patch", "payload": {"stream_key": "e40", "entry": {
+			"entry_id": "e40", "ordinal": 40, "kind": "assistant", "state": "complete", "revision": 3, "payload": {"text": "latest"}
+		}}
+	}, generation)
+	_check(live, "navigation: live tail patch applied")
+	_check(projector.apply_older_page({"transcript": older}, generation), "navigation: older page accepted")
+	_check(store.entry_count() == 3, "navigation: overlap does not duplicate entry")
+	_check(int(store.get_entry("e40").get("revision", 0)) == 3, "navigation: stale page cannot regress live revision")
+	_check(not store.history_has_more, "navigation: exhausted history is represented")
+
+
+## 真实 typed renderer 的窗口验收：Store 保留全部条目而根节点严格受限。
+func _run_viewport_window_test() -> void:
+	var store := TranscriptStore.new()
+	store.session_id = "viewport"
+	store.generation = 1
+	var entries: Array = []
+	for index in range(120):
+		entries.append({
+			"entry_id": "v%d" % index, "ordinal": index, "kind": "assistant", "state": "complete", "revision": 1,
+			"payload": {"text": "row %d\n\n%s" % [index, "x".repeat(40 + (index % 7) * 80)]}
+		})
+	store.replace_snapshot({"entries": entries, "upto_event_seq": 1, "has_more": false}, "viewport", 1)
+	var list := VBoxContainer.new()
+	var scroll := ScrollContainer.new()
+	var renderer := TranscriptRenderer.new()
+	var factory := LogEntryRenderer.new()
+	factory.theme_colors = {}
+	renderer.log_renderer = factory
+	renderer.theme_colors = {}
+	var viewport := TranscriptViewport.new()
+	viewport.max_mounted_roots = 16
+	viewport.overscan = 3
+	viewport.attach(list, renderer, store, scroll)
+	viewport.replace_from_store()
+	_check(store.entry_count() == 120, "viewport: Store retains full transcript")
+	_check(renderer.mounted_count() == 16, "viewport: mounted roots obey hard bound")
+	viewport.suppress_follow()
+	_check(not viewport.is_following(), "viewport: interaction suppresses follow mode")
+	viewport.return_to_latest()
+	_check(viewport.is_following(), "viewport: return action re-enables follow mode")
+	var diagnostics := viewport.navigation_diagnostics()
+	_check(int(diagnostics.get("mounted_root_count", 0)) <= 16, "viewport: diagnostics record bounded roots")
+	_check(diagnostics.has("mounted_rich_text_characters") and diagnostics.has("content_modes"), "viewport: diagnostics record rich-text and modes")
+	# Eviction/remount from durable Store preserves renderer semantics and canonical copy.
+	var first_id := "v0"
+	viewport.notify_scroll(0.0)
+	_check(renderer.is_mounted(first_id), "viewport: earlier row remounts from Store")
+	var canonical := renderer.copy_text_for_node(renderer.mounted_root(first_id))
+	_check(canonical.contains("row 0"), "viewport: remounted copy uses durable canonical text")
 
 
 

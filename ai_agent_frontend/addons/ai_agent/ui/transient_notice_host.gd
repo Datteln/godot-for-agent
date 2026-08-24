@@ -21,6 +21,9 @@ var node_factory: RefCounted
 var _container: VBoxContainer
 ## key -> Control：带键提示（等待/执行中）被同名新提示覆盖。
 var _keyed: Dictionary = {}
+## 仅跟踪本宿主创建的节点。容器同时承载 TranscriptViewport 的 spacer/mount 层，
+## 因此清理瞬时提示时绝不能遍历或释放容器的全部子节点。
+var _notices: Array[Control] = []
 
 
 func attach(container: VBoxContainer) -> void:
@@ -34,6 +37,7 @@ func show_notice(text: String, style := "system") -> Control:
 	var node := _build_notice(text, style)
 	if node != null:
 		_container.add_child(node)
+		_notices.append(node)
 	return node
 
 
@@ -57,11 +61,10 @@ func discard_keyed(key: String) -> void:
 ## 会话切换/水合替换/重置：丢弃全部瞬时提示，且不再重挂载。
 func clear_all() -> void:
 	_keyed.clear()
-	if _container == null:
-		return
-	for child in _container.get_children():
-		_container.remove_child(child)
-		child.queue_free()
+	var notices: Array = _notices.duplicate()
+	for node in notices:
+		_free_node(node)
+	_notices.clear()
 
 
 # ─── 构建 ────────────────────────────────────────────────────────────────────
@@ -115,6 +118,7 @@ func _limit_text(text: String) -> String:
 func _free_node(node: Control) -> void:
 	if node == null or not is_instance_valid(node):
 		return
+	_notices.erase(node)
 	if node.get_parent() != null:
 		node.get_parent().remove_child(node)
 	node.queue_free()

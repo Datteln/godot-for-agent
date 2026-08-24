@@ -1935,7 +1935,9 @@ class QueryEngine:
         """当前工具注册表里的可见工具名集合。"""
         return set(REGISTRY)
 
-    async def session_history(self, session_id: str, limit: int = 200) -> SessionHistoryResponse:
+    async def session_history(
+        self, session_id: str, limit: int = 200, before_ordinal: int | None = None
+    ) -> SessionHistoryResponse:
         """返回权威展示稿快照（含原子游标），不再从 frame/事件重建展示语义。
 
         快照与会话写入共用同一把会话锁：返回时所有
@@ -1944,7 +1946,8 @@ class QueryEngine:
 
         Args:
             session_id: 会话 id。
-            limit: 快照窗口大小（最近 N 个条目）；0 表示不裁剪。
+            limit: 页面大小；0 表示不裁剪。
+            before_ordinal: 请求 strictly earlier than 此 ordinal 的稳定旧页；为空时返回尾页。
 
         Returns:
             携带 `transcript` 快照的历史响应；`items`/`blocks` 保留为空列表。
@@ -1957,13 +1960,25 @@ class QueryEngine:
             for raw_entry in session.transcript_entries:
                 parsed = TranscriptEntryDTO.model_validate(raw_entry)
                 entries.append(parsed)
-            if limit > 0 and len(entries) > limit:
-                entries = entries[-limit:]
+            page_limit = max(1, min(limit, 500)) if limit != 0 else 0
+            candidates = (
+                [entry for entry in entries if entry.ordinal < before_ordinal]
+                if before_ordinal is not None
+                else entries
+            )
+            has_more = page_limit > 0 and len(candidates) > page_limit
+            if page_limit > 0:
+                entries = candidates[-page_limit:]
+            else:
+                entries = candidates
+            next_before_ordinal = entries[0].ordinal if has_more and entries else None
             snapshot = TranscriptSnapshotDTO(
                 session_id=session.session_id,
                 upto_event_seq=session.event_seq,
                 legacy=bool(session.transcript_meta.get("legacy", False)),
                 entries=entries,
+                next_before_ordinal=next_before_ordinal,
+                has_more=has_more,
             )
             events_for_context = _persisted_history_events(session)
             logger.info(
@@ -1983,6 +1998,8 @@ class QueryEngine:
                 items=[],
                 blocks=[],
                 transcript=snapshot,
+                next_before_ordinal=next_before_ordinal,
+                has_more=has_more,
             )
 
     def _ensure_transcript_converted(self, session: Session) -> bool:
@@ -2631,7 +2648,13 @@ class QueryEngine:
         self._transcript.record_front_tool_results(
             session,
             results=[
-                {"tool_use_id": result.tool_use_id, "status": result.status, "result": result.result}
+                {
+                    "tool_use_id": result.tool_use_id,
+                    "status": result.status,
+                    "result": result.result,
+                    "error_code": result.error_code,
+                    "decision_source": result.decision_source,
+                }
                 for result in results
             ],
         )

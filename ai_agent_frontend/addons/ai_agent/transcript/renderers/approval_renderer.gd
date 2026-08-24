@@ -67,7 +67,7 @@ func _rebuild(root: Control, entry: Dictionary, ctx: RefCounted) -> void:
 	if TranscriptCopy.is_approval_resolved(state):
 		# 解决态：一行非交互文本节点，无卡片边框/按钮/可展开详情。
 		var line := TranscriptCopy.approval_result_line(payload)
-		var color_key := "success_text" if state == "approved" else "muted_text"
+		var color_key := "success_text" if state == "approved" else "error_text" if state == "error" else "muted_text"
 		root.add_child(factory.make_log_rich_text(line, ctx.theme_color(color_key)))
 		return
 

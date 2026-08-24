@@ -181,9 +181,19 @@ def create_router(
         )
 
     @router.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)
-    async def session_history(session_id: str, limit: int = 200) -> SessionHistoryResponse:
-        logger.info("HTTP /sessions/%s/history limit=%d", session_id, limit)
-        return await query_engine.session_history(session_id, limit=limit)
+    async def session_history(
+        session_id: str, limit: int = 200, before_ordinal: int | None = None
+    ) -> SessionHistoryResponse:
+        """返回会话展示稿的尾部快照或一个更早的稳定分页。"""
+        logger.info(
+            "HTTP /sessions/%s/history limit=%d before_ordinal=%s",
+            session_id,
+            limit,
+            before_ordinal,
+        )
+        return await query_engine.session_history(
+            session_id, limit=limit, before_ordinal=before_ordinal
+        )
 
     @router.get("/recovery-pointer", response_model=RecoveryPointerResponse)
     async def recovery_pointer() -> RecoveryPointerResponse:

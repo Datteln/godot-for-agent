@@ -1,0 +1,34 @@
+{
+  "session_id": "navigation-long",
+  "scenarios": [
+    "page_overlap_keeps_newer_live_revision",
+    "page_arrives_after_hydration_generation_changes",
+    "oldest_page_exhaustion_and_retry",
+    "streamed_tail_updates_while_reviewing_history",
+    "oversized_preview_to_complete_then_evict_remount",
+    "variable_markdown_heights",
+    "tool_approval_error_remount",
+    "delayed_approval_after_confirmation_disposal"
+  ],
+  "initial_snapshot": {
+    "version": 1,
+    "session_id": "navigation-long",
+    "upto_event_seq": 80,
+    "has_more": true,
+    "next_before_ordinal": 40,
+    "entries": [
+      {"entry_id": "e40", "ordinal": 40, "kind": "assistant", "state": "streaming", "revision": 2, "payload": {"text": "streamed tail"}},
+      {"entry_id": "e41", "ordinal": 41, "kind": "tool_activity", "state": "resolved", "revision": 1, "tool_call_id": "t1", "payload": {"tool": "read_file", "result_summary": {"path": "README.md"}}}
+    ]
+  },
+  "older_page": {
+    "version": 1,
+    "session_id": "navigation-long",
+    "upto_event_seq": 80,
+    "has_more": false,
+    "entries": [
+      {"entry_id": "e39", "ordinal": 39, "kind": "assistant", "state": "complete", "revision": 1, "payload": {"text": "# Old\n\nshort"}},
+      {"entry_id": "e40", "ordinal": 40, "kind": "assistant", "state": "streaming", "revision": 1, "payload": {"text": "stale page copy"}}
+    ]
+  }
+}

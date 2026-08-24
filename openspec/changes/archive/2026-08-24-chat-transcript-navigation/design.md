@@ -45,6 +45,16 @@ The first implementation may free off-window roots after recording measurements.
 
 Navigation introduces hydration, page merging and viewport lifecycle boundaries at which a live `transcript_patch` can legitimately be deferred or rejected. Every such outcome must be recorded as a redacted structured diagnostic: applied and visible, applied without visible revision change, or rejected with a reason such as projector-not-ready, generation/session mismatch, malformed payload, duplicate/non-newer revision or renderer rejection. The record includes event identity, sequence, session and generation where available, but never complete prompts, secrets or unbounded model text.
 
+### 7. Execution-preview controls have one explicit owner during handoff
+
+An execution-before preview initially displayed inside an inline confirmation box is a live `Control`, not durable transcript data. Before a confirmation host is cleared, any preview needed by a later `approval` or `tool_activity` transcript entry must be transferred to renderer ownership (for example by detaching it) or replaced with renderer-owned data from which a new preview can be built. The preview cache must never retain a reference to a child still owned by a host scheduled for `queue_free`.
+
+When a delayed patch reaches an already-mounted approval entry, the renderer may consume a transferred preview exactly once. If a preview is unavailable, it must render the durable summary fallback and discard the missing preview state safely. Renderer and cleanup paths must not perform type checks, parenting operations, or metadata access on a possibly freed Godot instance. Reset, eviction, session switch, interruption, and a replacement confirmation host must release only controls they currently own.
+
+### 8. Tool outcome wording follows the submitted status
+
+The inline confirmation UI has two distinct decisions: per-call execution selection and the batch actions. Its labels MUST make those roles unambiguous (for example, “允许执行” and “执行已允许项”), so an unchecked call is visibly a rejection rather than an execution request. The frontend MUST preserve the executor result status: only an explicit reject action or an unchecked call yields `rejected`; a tool that was allowed and then fails validation or execution yields `error`. The durable approval/tool activity row MUST render `approved`, `rejected`, and `error` as distinct states, with the error reason retained in bounded/redacted form for the model and user. Diagnostics MUST identify the decision source and outcome without recording complete arguments or model text.
+
 ## Risks / Trade-offs
 
 - [Incorrect estimates cause scroll jumps] → continuously replace estimates with measured heights and restore by entry anchor.
@@ -55,6 +65,8 @@ Navigation introduces hydration, page merging and viewport lifecycle boundaries 
 - [Pooling retains callbacks or rich text resources] → use explicit reset contract and begin with freeing roots if validation finds leaks.
 - [Tail streaming forces readers down] → follow requires explicit tail proximity, never inferred from content updates alone.
 - [Server emitted a stream but navigation discarded it silently] → record a redacted, structured outcome for every live patch at hydration/page/window boundaries.
+- [Confirmation host frees a preview still cached for a later approval patch] → require ownership transfer before host disposal, one-time renderer consumption, and a safe durable-summary fallback when transfer cannot occur.
+- [An allowed tool failure is mistaken for a user rejection] → make action labels distinct, preserve `error` separately from `rejected`, and record the decision source plus bounded failure code.
 
 ## Migration Plan
 

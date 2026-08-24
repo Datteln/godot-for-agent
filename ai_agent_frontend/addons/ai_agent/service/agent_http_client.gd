@@ -233,6 +233,12 @@ func fetch_session_history(limit: int = 200) -> void:
 	_enqueue("GET", path, {})
 
 
+## 读取 strictly earlier than `before_ordinal` 的稳定历史页。
+func fetch_older_session_history(before_ordinal: int, limit: int = 200) -> void:
+	var path := "/sessions/%s/history?limit=%d&before_ordinal=%d" % [_session_id().uri_encode(), limit, before_ordinal]
+	_enqueue("GET", path, {})
+
+
 ## 从恢复指针同步本地事件序号与挂起的 turn_id，供恢复提示"接受"分支调用。
 func resume_from_pointer(pointer: Dictionary) -> void:
 	var pending_turn_id = pointer.get("pending_turn_id")

@@ -54,6 +54,7 @@ var _mounted: Dictionary = {}
 ## 工具执行前预渲染的 diff 预览在此登记；条目创建/更新时消费复用，避免在
 ## 文件已被改写后再从磁盘读取 before_text 造成错误 diff。
 var _preview_cache: Dictionary = {}
+var _last_failure_reason := ""
 
 
 func _init() -> void:
@@ -69,6 +70,12 @@ func attach(message_list: VBoxContainer) -> void:
 	_message_list = message_list
 
 
+## Viewport 是唯一的 durable 条目宿主；它可在热重载或外部 UI 重建后重新确认。
+func ensure_mount_container(message_list: VBoxContainer) -> void:
+	if _message_list != message_list:
+		_message_list = message_list
+
+
 ## 注入自定义复制落地通道（如测试捕获）；默认使用系统剪贴板。
 func set_clipboard_sink(sink: Callable) -> void:
 	_ctx.clipboard_set = sink
@@ -76,17 +83,24 @@ func set_clipboard_sink(sink: Callable) -> void:
 
 ## 登记某个 tool_call_id 的执行前预览（含 diff 统计），供条目渲染复用。
 func register_preview(tool_call_id: String, preview: Control, stats: Dictionary) -> void:
-	if tool_call_id == "" or preview == null:
+	if tool_call_id == "" or preview == null or not is_instance_valid(preview):
 		return
+	# 只接受已从确认宿主 detach 的 live Control；否则确认框释放后会留下悬垂引用。
+	if preview.get_parent() != null:
+		return
+	var previous: Dictionary = _preview_cache.get(tool_call_id, {})
+	var previous_preview: Control = previous.get("preview")
+	if previous_preview != null and is_instance_valid(previous_preview):
+		previous_preview.queue_free()
 	_preview_cache[tool_call_id] = {"preview": preview, "stats": stats}
 
 
 ## 清空全部条目节点（快照替换/会话切换时调用）；展开/预览等视图状态随之清除，
 ## 重新挂载一律回到默认折叠/预览形态。
 func clear_all() -> void:
-	for entry_id in _mounted.keys():
-		var record: Dictionary = _mounted[entry_id]
-		var root: Control = record.get("root")
+	for entry_id_value in _mounted.keys():
+		var entry_id := str(entry_id_value)
+		var root: Control = mounted_root(entry_id)
 		if root != null and is_instance_valid(root):
 			_registry.reset(root)
 			if root.get_parent() != null:
@@ -112,24 +126,28 @@ func render_all(ordered_entries: Array) -> void:
 ## 创建或原地更新单个条目节点；返回是否发生了可见变化。
 ## 缺少 entry_id 或 kind 的输入一律拒绝（任务 4.2）。
 func apply_entry(entry: Dictionary, _scroll_hint := true) -> bool:
+	_last_failure_reason = ""
 	if _message_list == null:
+		_last_failure_reason = "mount_container_missing"
 		return false
 	var entry_id := str(entry.get("entry_id", ""))
 	var kind := str(entry.get("kind", ""))
 	if entry_id == "" or kind == "":
+		_last_failure_reason = "invalid_entry_identity_or_kind"
 		return false
 	var revision := int(entry.get("revision", 1))
-	var record: Dictionary = _mounted.get(entry_id, {})
-	if record.is_empty():
+	if not _mounted.has(entry_id):
 		var root: Control = _registry.create(entry, _ctx, _take_extras(entry))
 		if root == null:
+			_last_failure_reason = "renderer_factory_returned_null:" + kind
 			return false
 		_mount(entry_id, root, entry)
 		return true
-	var root: Control = record.get("root")
-	if root == null or not is_instance_valid(root):
-		_mounted.erase(entry_id)
+	var root: Control = mounted_root(entry_id)
+	if root == null:
+		_last_failure_reason = "mounted_root_was_freed"
 		return apply_entry(entry, _scroll_hint)
+	var record: Dictionary = _mounted.get(entry_id, {})
 	if revision <= int(record.get("revision", 1)):
 		# 不高于已接受修订：控件保持不变。
 		return false
@@ -145,16 +163,18 @@ func apply_entry(entry: Dictionary, _scroll_hint := true) -> bool:
 	return true
 
 
+## 最近一次 `apply_entry` 失败的结构化原因，不含正文或 payload。
+func last_failure_reason() -> String:
+	return _last_failure_reason
+
+
 ## 卸载某条目节点（乐观条目被权威条目接管、快照替换后清理孤儿节点用）。
 ## 卸载即 reset + 释放：完整内容节点随之释放，重新挂载回到默认状态。
 func forget_entry(entry_id: String) -> void:
-	var record: Dictionary = _mounted.get(entry_id, {})
-	if record.is_empty():
+	var root: Control = mounted_root(entry_id)
+	if root == null:
 		return
 	_mounted.erase(entry_id)
-	var root: Control = record.get("root")
-	if root == null or not is_instance_valid(root):
-		return
 	_registry.reset(root)
 	if root.get_parent() != null:
 		root.get_parent().remove_child(root)
@@ -189,7 +209,62 @@ func mounted_entry(entry_id: String) -> Dictionary:
 
 
 func is_mounted(entry_id: String) -> bool:
-	return _mounted.has(entry_id)
+	return mounted_root(entry_id) != null
+
+
+## 当前已挂载 entry id 的快照，供 Viewport 判定窗口外 eviction。
+func mounted_entry_ids() -> Array:
+	_prune_freed_mounts()
+	return _mounted.keys()
+
+
+## 当前 renderer 根节点数量（不含 spacer/瞬时提示）。
+func mounted_count() -> int:
+	_prune_freed_mounts()
+	return _mounted.size()
+
+
+## 返回仍由 renderer 拥有的根控件；Viewport 仅用于测量，绝不更改其 parent。
+func mounted_root(entry_id: String) -> Control:
+	var record: Dictionary = _mounted.get(entry_id, {})
+	# Dictionary 可能在父级析构后的同一帧仍保留已释放对象；必须先以 Variant
+	# 读取，不能直接赋给 `Control`（那一步本身会触发“previously freed”错误）。
+	var root_value: Variant = record.get("root", null)
+	# 不要先做 `is Control`：对已释放 Object 的类型判断本身会报错。
+	if root_value != null and is_instance_valid(root_value):
+		return root_value as Control
+	if not record.is_empty():
+		_mounted.erase(entry_id)
+	return null
+
+
+## 统计已挂载富文本字符，供长会话资源诊断；不读取 Store 的完整正文。
+func mounted_rich_text_characters() -> int:
+	var total := 0
+	for entry_id in _mounted.keys():
+		total += _rich_text_characters(mounted_root(str(entry_id)))
+	return total
+
+
+## 每个已挂载条目的预览/完整模式，供诊断与高度缓存键使用。
+func mounted_content_modes() -> Dictionary:
+	var modes := {}
+	for entry_id in _mounted.keys():
+		modes[entry_id] = content_mode_for(str(entry_id))
+	return modes
+
+
+func content_mode_for(entry_id: String) -> String:
+	var root := mounted_root(entry_id)
+	if root == null:
+		return "preview"
+	if root.has_meta("tmr_full_mode") and bool(root.get_meta("tmr_full_mode", false)):
+		return "complete"
+	if root.has_meta("tmr_display_complete") and bool(root.get_meta("tmr_display_complete", false)):
+		return "complete"
+	if root.has_meta("tr_detail_full") and bool(root.get_meta("tr_detail_full", false)):
+		return "complete"
+	return "preview"
 
 
 ## 从任意后代节点解析所属条目 id。
@@ -261,3 +336,19 @@ func _take_extras(entry: Dictionary) -> Dictionary:
 		"preview": cached.get("preview"),
 		"stats": stats_value if stats_value is Dictionary else {},
 	}
+
+
+func _rich_text_characters(node: Node) -> int:
+	if node == null or not is_instance_valid(node):
+		return 0
+	var total: int = node.get_parsed_text().length() if node is RichTextLabel else 0
+	for child in node.get_children():
+		total += _rich_text_characters(child)
+	return total
+
+
+## 清理被外部父节点释放的残留引用；renderer 不再把它们当作可更新挂载项。
+func _prune_freed_mounts() -> void:
+	for entry_id_value in _mounted.keys():
+		var entry_id := str(entry_id_value)
+		mounted_root(entry_id)

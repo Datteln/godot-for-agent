@@ -62,6 +62,7 @@ class ToolResult(BaseModel):
     error_code: str | None = None
     artifact_refs: list[str] = Field(default_factory=list)
     grant_session_allow: bool = False
+    decision_source: Literal["explicit_reject", "unselected", "execute"] | None = None
 
 
 class VerifyIssue(BaseModel):
@@ -414,6 +415,8 @@ class SessionHistoryResponse(BaseModel):
     items: list[SessionHistoryItemDTO] = Field(default_factory=list)
     blocks: list[SessionHistoryBlock] = Field(default_factory=list)
     transcript: TranscriptSnapshotDTO | None = None
+    next_before_ordinal: int | None = None
+    has_more: bool = False
 
 
 class RecoveryPointerDTO(BaseModel):

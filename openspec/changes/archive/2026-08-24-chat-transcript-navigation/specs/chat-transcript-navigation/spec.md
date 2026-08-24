@@ -63,3 +63,25 @@ The viewport SHALL manage only durable typed transcript entries. Waiting, comman
 #### Scenario: Replacing a transcript snapshot while a command notice exists
 - **WHEN** a transient command-running notice is present and history hydration replaces the transcript
 - **THEN** the viewport renders only durable transcript rows and the notice is discarded rather than recreated
+
+### Requirement: Execution-preview control handoff is lifetime-safe
+When an inline tool-confirmation host supplies an execution-before preview for a later `approval` or `tool_activity` transcript entry, the client SHALL establish exactly one current owner for that `Control` before the confirmation host is disposed. The preview cache MUST NOT retain a reference to a control owned by a host scheduled for disposal. A renderer SHALL consume a transferred preview at most once; if it is unavailable, it MUST render from durable entry data without accessing a freed instance. Reset, eviction, interruption, session switch, and confirmation replacement MUST free only controls owned by their respective host or renderer.
+
+#### Scenario: Approval patch follows confirmation disposal
+- **WHEN** the user applies or rejects a workflow tool call and the confirmation host is cleared before the corresponding approval patch is rendered
+- **THEN** the preview is either transferred safely to the approval renderer or omitted in favor of the durable approval summary, and the update produces no access to a previously freed Godot instance
+
+#### Scenario: Delayed approval patch updates an existing entry
+- **WHEN** an approval entry is already mounted and a newer patch later consumes a registered execution-before preview
+- **THEN** the renderer accepts only a live transferred preview, consumes it once, and otherwise retains a valid summary-only entry without a renderer error
+
+### Requirement: Tool confirmation and execution outcomes remain distinct
+The client SHALL use `rejected` only when the user explicitly rejects a pending call or leaves that call unselected when submitting a mixed batch. A call selected for execution SHALL preserve the executor's returned status: validation or execution failure SHALL be `error`, not `rejected`. The confirmation UI MUST use distinct labels for per-call selection, batch execution, and explicit rejection. Durable approval and tool-activity transcript entries MUST present approved, rejected, and error outcomes distinctly, including a bounded error code or summary for an error. Structured diagnostics MUST record a redacted decision source (`explicit_reject`, `unselected`, or `execute`) and outcome status.
+
+#### Scenario: An allowed call fails validation
+- **WHEN** the user selects a pending call and submits the batch execution action, but the frontend tool rejects its input as invalid
+- **THEN** the model and transcript receive `status=error` with the bounded validation reason, and the UI does not label the call as user-rejected
+
+#### Scenario: User explicitly rejects a call
+- **WHEN** the user presses the explicit rejection action, or leaves one call unselected in a mixed batch
+- **THEN** that call receives `status=rejected` and the transcript labels it as user-rejected

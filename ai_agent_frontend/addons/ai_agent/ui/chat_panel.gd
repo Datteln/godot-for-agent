@@ -19,6 +19,7 @@ const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_rende
 const TranscriptStore = preload("res://addons/ai_agent/transcript/transcript_store.gd")
 const TranscriptProjector = preload("res://addons/ai_agent/transcript/transcript_projector.gd")
 const TranscriptRenderer = preload("res://addons/ai_agent/transcript/transcript_renderer.gd")
+const TranscriptViewport = preload("res://addons/ai_agent/transcript/transcript_viewport.gd")
 const TransientNoticeHost = preload("res://addons/ai_agent/ui/transient_notice_host.gd")
 
 enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
@@ -69,6 +70,7 @@ var _commands_requested := false
 var _memory_btn: Button
 var _reset_btn: Button
 var _history_btn: Button
+var _return_to_latest_btn: Button
 var _history_popup: PopupMenu
 var _history_session_ids: Array = []
 var _effort_options: OptionButton
@@ -98,6 +100,7 @@ var _force_scroll_once := false
 var _transcript_store: RefCounted
 var _projector: RefCounted
 var _transcript_renderer: RefCounted
+var _transcript_viewport: RefCounted
 ## 本地瞬时提示宿主：等待/命令执行等提示不进入展示稿（任务 3.4）。
 var _transient_host: RefCounted
 ## 当前水合世代；发起一次历史加载前递增，用于拒绝迟到的旧会话/旧世代响应。
@@ -212,6 +215,10 @@ func _build_ui() -> void:
 	_history_btn = Button.new()
 	_history_btn.text = _ui("history")
 	toolbar.add_child(_history_btn)
+	_return_to_latest_btn = Button.new()
+	_return_to_latest_btn.text = "回到最新"
+	_return_to_latest_btn.visible = false
+	toolbar.add_child(_return_to_latest_btn)
 
 	_scroll = ScrollContainer.new()
 	_scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -333,7 +340,13 @@ func _build_children() -> void:
 	_transcript_renderer.log_renderer = _log_renderer
 	_transcript_renderer.theme_colors = _theme_colors
 	_transcript_renderer.ui_text = _ui
-	_transcript_renderer.attach(_message_list)
+	_transcript_viewport = TranscriptViewport.new()
+	_transcript_viewport.attach(_message_list, _transcript_renderer, _transcript_store, _scroll)
+	_transcript_viewport.older_page_requested.connect(_on_older_page_requested)
+	_transcript_viewport.diagnostics_changed.connect(_on_viewport_diagnostics)
+	_transcript_viewport.follow_mode_changed.connect(_on_viewport_follow_mode_changed)
+	_transcript_viewport.renderer_rejected.connect(_on_transcript_renderer_rejected)
+	_projector.patch_rejected.connect(_on_transcript_patch_rejected)
 
 	_transient_host = TransientNoticeHost.new()
 	_transient_host.node_factory = _log_renderer
@@ -360,6 +373,7 @@ func _connect_signals() -> void:
 	_memory_btn.pressed.connect(func(): _http_client.fetch_memory())
 	_reset_btn.pressed.connect(_on_reset)
 	_history_btn.pressed.connect(_on_show_history)
+	_return_to_latest_btn.pressed.connect(_on_return_to_latest)
 	_history_popup.index_pressed.connect(_on_history_item_selected)
 	_file_suggestions.item_clicked.connect(func(index: int, _position: Vector2, mouse_button: int):
 		if mouse_button == MOUSE_BUTTON_LEFT:
@@ -392,6 +406,8 @@ func _refresh_live_theme_overrides() -> void:
 		_log_renderer.theme_colors = _theme_colors
 	if _transient_host != null:
 		_transient_host.theme_colors = _theme_colors
+	if _transcript_viewport != null:
+		_transcript_viewport.advance_presentation_epoch()
 
 
 func _theme_color(key: String) -> Color:
@@ -687,6 +703,8 @@ func _on_message_rich_input(event: InputEvent, rich: RichTextLabel) -> void:
 	if mouse_event.button_index != MOUSE_BUTTON_RIGHT or not mouse_event.pressed:
 		return
 	_message_context_source = rich
+	if _transcript_viewport != null:
+		_transcript_viewport.suppress_follow()
 	_message_context_popup.set_item_disabled(0, rich.get_selected_text() == "")
 	_message_context_popup.position = DisplayServer.mouse_get_position()
 	_message_context_popup.popup()
@@ -694,6 +712,8 @@ func _on_message_rich_input(event: InputEvent, rich: RichTextLabel) -> void:
 
 
 func _on_message_context_action(id: int) -> void:
+	if _transcript_viewport != null:
+		_transcript_viewport.suppress_follow()
 	match id:
 		0:
 			if _message_context_source != null and is_instance_valid(_message_context_source):
@@ -1258,6 +1278,14 @@ func _handle_session_history(response: Dictionary) -> void:
 	# 水合顺序：先由 Projector 校验（session_id + generation）并原子替换 Store，
 	# 再从 Store 渲染，最后才以快照游标订阅 WebSocket——订阅不得早于替换完成。
 	var generation := _hydration_generation
+	if _projector.is_ready():
+		var transcript: Dictionary = response.get("transcript", {}) if response.get("transcript", {}) is Dictionary else {}
+		var requested_cursor: int = _transcript_store.next_before_ordinal
+		var merged: bool = _projector.apply_older_page(response, generation)
+		_transcript_viewport.complete_older_page(requested_cursor, merged)
+		if merged:
+			_transcript_viewport.merge_older_page()
+		return
 	if not _projector.apply_snapshot(response, generation):
 		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored stale session history snapshot.", {
 			"response_session": str(response.get("session_id", "")),
@@ -1274,7 +1302,7 @@ func _handle_session_history(response: Dictionary) -> void:
 		"legacy": _transcript_store.legacy
 	})
 	_clear_messages()
-	_transcript_renderer.render_all(_ordered_store_entries())
+	_transcript_viewport.replace_from_store()
 	_update_context_usage_status(
 		int(response.get("context_used_tokens", 0)),
 		int(response.get("context_token_limit", 0))
@@ -1542,7 +1570,7 @@ func _handle_transcript_patch(event: Dictionary) -> void:
 		_assistant_completed_this_turn = true
 	if str(stored.get("kind", "")) == "tool_activity" and str(stored.get("state", "")) == "resolved":
 		_remember_server_file_read_from_entry(entry_payload)
-	_transcript_renderer.apply_entry(stored)
+	_transcript_viewport.apply_entry(stored)
 	_scroll_to_bottom()
 
 
@@ -1600,6 +1628,42 @@ func _on_event_history_gap(details: Dictionary) -> void:
 	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket history gap; re-hydrating transcript.", details)
 	_begin_hydration(_current_session_id())
 	_http_client.fetch_session_history()
+
+
+## 视口接近已加载历史的起点时请求一个去重的旧页。
+func _on_older_page_requested(before_ordinal: int) -> void:
+	if _http_client != null:
+		_http_client.fetch_older_session_history(before_ordinal)
+
+
+## 仅记录脱敏导航计数与状态，避免日志写入完整 transcript 文本。
+func _on_viewport_diagnostics(values: Dictionary) -> void:
+	FrontendLogger.debug(editor_interface, "TranscriptViewport", "Navigation diagnostics.", values)
+
+
+func _on_viewport_follow_mode_changed(enabled: bool) -> void:
+	if _return_to_latest_btn != null:
+		_return_to_latest_btn.visible = not enabled
+
+
+func _on_return_to_latest() -> void:
+	if _transcript_viewport != null:
+		_transcript_viewport.return_to_latest()
+
+
+## 投影器只提供脱敏字段；切勿把 payload/正文写入前端日志。
+func _on_transcript_patch_rejected(diagnostic: Dictionary) -> void:
+	FrontendLogger.warn(editor_interface, "TranscriptViewport", "Transcript patch rejected.", diagnostic)
+
+
+func _on_transcript_renderer_rejected(diagnostic: Dictionary) -> void:
+	var entry_id := str(diagnostic.get("entry_id", ""))
+	FrontendLogger.warn(editor_interface, "TranscriptViewport", "Transcript patch rejected.", {
+		"reason": "renderer_rejection",
+		"entry_id": entry_id,
+		"renderer_reason": str(diagnostic.get("renderer_reason", "")),
+		"generation": _hydration_generation,
+	})
 
 
 func _on_event_resync_required(details: Dictionary) -> void:
@@ -1701,7 +1765,7 @@ func _on_inline_apply() -> void:
 		# 确认框里的预览是执行前渲染的，搬给展示稿渲染器，由 approval/tool_activity
 		# 条目在补丁到达时复用，避免执行后再从磁盘读 before_text 产生错误 diff。
 		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-		var preview := _inline_confirm.preview_for(index, is_workflow)
+		var preview := _inline_confirm.take_preview_for(index, is_workflow)
 		var stats := _inline_confirm.diff_stats_for(index, is_workflow)
 		if preview != null:
 			_transcript_renderer.register_preview(str(call.get("id", "")), preview, stats)
@@ -1712,10 +1776,23 @@ func _on_inline_apply() -> void:
 			var result: Dictionary = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
+			result["decision_source"] = "execute"
 			result["grant_session_allow"] = _inline_confirm.grant_session_allow()
+			FrontendLogger.info(editor_interface, "ChatPanel", "Confirmed tool execution completed.", {
+				"tool": str(call.get("name", "")),
+				"status": str(result.get("status", "error")),
+				"decision_source": "execute",
+				"error_code": str(result.get("error_code", "")),
+			})
 			results.append(result)
 		else:
 			var rejected := AgentDTO.rejected_result(call)
+			rejected["decision_source"] = "unselected"
+			FrontendLogger.info(editor_interface, "ChatPanel", "Confirmed tool call left unselected.", {
+				"tool": str(call.get("name", "")),
+				"status": "rejected",
+				"decision_source": "unselected",
+			})
 			results.append(rejected)
 	_inline_confirm.set_busy(false)
 	_on_decision(results)
@@ -1735,9 +1812,15 @@ func _on_inline_reject() -> void:
 		if not (call is Dictionary):
 			continue
 		var rejected := AgentDTO.rejected_result(call)
+		rejected["decision_source"] = "explicit_reject"
+		FrontendLogger.info(editor_interface, "ChatPanel", "Confirmed tool call explicitly rejected.", {
+			"tool": str(call.get("name", "")),
+			"status": "rejected",
+			"decision_source": "explicit_reject",
+		})
 		results.append(rejected)
 		var is_workflow := EventFormatter.is_workflow_tool(str(call.get("name", "")))
-		var preview := _inline_confirm.preview_for(index, is_workflow)
+		var preview := _inline_confirm.take_preview_for(index, is_workflow)
 		var stats := _inline_confirm.diff_stats_for(index, is_workflow)
 		if preview != null:
 			_transcript_renderer.register_preview(str(call.get("id", "")), preview, stats)
@@ -1861,7 +1944,8 @@ func _scroll_to_bottom() -> void:
 
 func _trim_message_list() -> void:
 	if _transcript_renderer != null:
-		_transcript_renderer.trim_to(MAX_MESSAGE_LIST_CHILDREN)
+		# Viewport 维护 renderer 根的严格窗口上限；瞬时提示不计入其中。
+		pass
 
 
 func _on_scroll_value_changed(value: float) -> void:
@@ -1869,6 +1953,8 @@ func _on_scroll_value_changed(value: float) -> void:
 		return
 
 	var bar := _scroll.get_v_scroll_bar()
+	if _transcript_viewport != null:
+		_transcript_viewport.notify_scroll(value)
 	var scroll_max := bar.max_value - bar.page
 	var is_at_bottom := scroll_max <= 0 or value >= scroll_max - 80
 

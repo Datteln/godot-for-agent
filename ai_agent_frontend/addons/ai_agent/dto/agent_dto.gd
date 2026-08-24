@@ -36,10 +36,12 @@ static func error_result(tool_call: Dictionary, message: String, code: String = 
 
 
 static func rejected_result(tool_call: Dictionary) -> Dictionary:
-	return tool_result(
+	var payload := tool_result(
 		str(tool_call.get("id", "")),
 		str(tool_call.get("frame_id", "")),
 		"rejected",
 		{"message": "User rejected this tool call."},
 		"user_rejected"
 	)
+	payload["decision_source"] = "explicit_reject"
+	return payload

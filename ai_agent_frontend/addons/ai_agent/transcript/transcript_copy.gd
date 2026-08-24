@@ -55,7 +55,7 @@ static func has_copy(entry: Dictionary) -> bool:
 
 
 static func is_approval_resolved(state: String) -> bool:
-	return state == "approved" or state == "rejected"
+	return state == "approved" or state == "rejected" or state == "error"
 
 
 ## 解决态审批的一行权限结果文本，例如 `已确认：修改 res://player.gd`。
@@ -87,6 +87,9 @@ static func approval_resolution_text(payload: Dictionary) -> String:
 			return "已确认"
 		"rejected":
 			return "已拒绝"
+		"error":
+			var code := str(payload.get("error_code", "")).strip_edges()
+			return "执行失败（%s）" % code if code != "" else "执行失败"
 		_:
 			return UNAVAILABLE
 
@@ -158,6 +161,8 @@ static func tool_status_text(entry: Dictionary, diff_stats: Dictionary = {}) -> 
 		return "✗ 执行失败"
 	if state != "resolved":
 		return ""
+	if str(payload.get("outcome_status", "")) == "rejected":
+		return "已拒绝"
 	if not diff_stats.is_empty():
 		return "+%d -%d lines" % [int(diff_stats.get("added", 0)), int(diff_stats.get("removed", 0))]
 	var summary_value: Variant = payload.get("result_summary")

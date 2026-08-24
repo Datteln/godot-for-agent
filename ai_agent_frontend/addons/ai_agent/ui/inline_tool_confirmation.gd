@@ -47,7 +47,7 @@ func show(
 		var item := HBoxContainer.new()
 		item.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		var checkbox := CheckBox.new()
-		checkbox.text = str(ui_text.get("apply", "Apply"))
+		checkbox.text = str(ui_text.get("allow_execution", "Allow execution"))
 		checkbox.button_pressed = true
 		_checkboxes.append(checkbox)
 		item.add_child(checkbox)
@@ -72,13 +72,13 @@ func show(
 	body.add_child(actions)
 
 	_apply_btn = Button.new()
-	_apply_btn.text = str(ui_text.get("apply", "Apply"))
+	_apply_btn.text = str(ui_text.get("run_allowed", "Run allowed calls"))
 	if apply_callback.is_valid():
 		_apply_btn.pressed.connect(apply_callback)
 	actions.add_child(_apply_btn)
 
 	_reject_btn = Button.new()
-	_reject_btn.text = str(ui_text.get("reject", "Reject"))
+	_reject_btn.text = str(ui_text.get("reject_all", "Reject all calls"))
 	if reject_callback.is_valid():
 		_reject_btn.pressed.connect(reject_callback)
 	actions.add_child(_reject_btn)
@@ -117,6 +117,17 @@ func preview_for(index: int, is_workflow: bool) -> Control:
 	if not is_workflow or index >= _previews.size():
 		return null
 	return _previews[index]
+
+
+## 将执行前预览从确认宿主剥离并移交给展示稿 renderer；同一预览只能移交一次。
+func take_preview_for(index: int, is_workflow: bool) -> Control:
+	var preview := preview_for(index, is_workflow)
+	if preview == null or not is_instance_valid(preview):
+		return null
+	if preview.get_parent() != null:
+		preview.get_parent().remove_child(preview)
+	_previews[index] = null
+	return preview
 
 
 func diff_stats_for(index: int, is_workflow: bool) -> Dictionary:

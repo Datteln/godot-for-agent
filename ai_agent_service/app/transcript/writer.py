@@ -621,11 +621,22 @@ class TranscriptWriter:
             status = str(result.get("status", ""))
             approval_entry_id = session.transcript_index.get(f"approval:{call_id}")
             if approval_entry_id is not None:
-                decision = "approved" if status == "applied" else "rejected"
+                decision = "approved" if status == "applied" else "error" if status == "error" else "rejected"
                 entry = self._find_entry(session, approval_entry_id)
                 payload = dict(entry.get("payload", {})) if entry is not None else {}
                 payload["decision"] = decision
-                payload["resolution_summary"] = "已确认" if decision == "approved" else "已拒绝"
+                payload["resolution_summary"] = (
+                    "已确认" if decision == "approved" else "执行失败" if decision == "error" else "已拒绝"
+                )
+                payload["decision_source"] = str(result.get("decision_source", ""))
+                if decision == "error":
+                    payload["error_code"] = str(result.get("error_code", "front_tool_failed"))[:160]
+                    raw_error = result.get("result")
+                    if isinstance(raw_error, dict):
+                        message = str(raw_error.get("message", raw_error.get("error", "")))
+                    else:
+                        message = str(raw_error) if raw_error is not None else ""
+                    payload["error_summary"] = message[:320]
                 # 旧版本创建的审批条目可能缺少操作摘要字段：解决时按持久化的
                 # typed 入参补齐，仍不读取 UI 或原始传输。
                 tool = str(payload.get("tool", ""))
@@ -648,8 +659,9 @@ class TranscriptWriter:
             if entry is None:
                 continue
             payload = dict(entry.get("payload", {}))
-            is_error = status != "applied"
+            is_error = status == "error"
             payload["is_error"] = is_error
+            payload["outcome_status"] = status
             raw_result = result.get("result")
             if isinstance(raw_result, dict):
                 payload["result_summary"] = _bounded_args(raw_result)

@@ -41,7 +41,7 @@ VALID_ENTRY_STATES: dict[str, frozenset[str]] = {
     "assistant": frozenset({"streaming", "complete"}),
     "thought": frozenset({"thinking", "complete"}),
     "tool_activity": frozenset({"running", "resolved", "failed"}),
-    "approval": frozenset({"pending", "approved", "rejected"}),
+    "approval": frozenset({"pending", "approved", "rejected", "error"}),
     "plan": frozenset({"complete"}),
     "progress": frozenset({"running", "complete"}),
     "verification": frozenset({"running", "passed", "failed"}),
@@ -59,7 +59,7 @@ TERMINAL_ENTRY_STATES: dict[str, frozenset[str]] = {
     "assistant": frozenset({"complete"}),
     "thought": frozenset({"complete"}),
     "tool_activity": frozenset({"resolved", "failed"}),
-    "approval": frozenset({"approved", "rejected"}),
+    "approval": frozenset({"approved", "rejected", "error"}),
     "plan": frozenset({"complete"}),
     "progress": frozenset({"complete"}),
     "verification": frozenset({"passed", "failed"}),
@@ -128,6 +128,8 @@ class TranscriptSnapshotDTO(BaseModel):
     upto_event_seq: int
     legacy: bool = False
     entries: list[TranscriptEntryDTO] = Field(default_factory=list)
+    next_before_ordinal: int | None = None
+    has_more: bool = False
 
 
 def entry_to_wire(entry: TranscriptEntryDTO) -> dict[str, Any]:

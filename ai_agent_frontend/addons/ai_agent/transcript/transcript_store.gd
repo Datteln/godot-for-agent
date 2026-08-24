@@ -13,6 +13,8 @@ var session_id: String = ""
 var generation: int = 0
 var upto_event_seq: int = 0
 var legacy: bool = false
+var history_has_more: bool = false
+var next_before_ordinal: int = -1
 
 var _entries: Dictionary = {}          # entry_id -> entry Dictionary
 var _order: Array = []                 # entry_id 列表，按 ordinal 升序
@@ -32,6 +34,9 @@ func replace_snapshot(snapshot: Dictionary, snapshot_session_id: String, snapsho
 	_seen_event_ids.clear()
 	upto_event_seq = int(snapshot.get("upto_event_seq", upto_event_seq))
 	legacy = bool(snapshot.get("legacy", false))
+	history_has_more = bool(snapshot.get("has_more", false))
+	var cursor_value: Variant = snapshot.get("next_before_ordinal", -1)
+	next_before_ordinal = int(cursor_value) if cursor_value != null else -1
 	var confirmed_client_ids := {}
 	for raw_entry in entry_list:
 		if not (raw_entry is Dictionary):
@@ -56,6 +61,49 @@ func replace_snapshot(snapshot: Dictionary, snapshot_session_id: String, snapsho
 	_optimistic = pending_optimistic
 	var changed: Array = ordered_entry_ids()
 	entries_changed.emit(changed, true)
+	return changed
+
+
+## 合并 READY 会话的一个更早历史页。页面只能补充未知条目或提升已有 revision；
+## 返回实际变化的 entry_id，空数组表示页已被完全覆盖或不合法。
+func merge_older_page(page: Dictionary, page_session_id: String, page_generation: int) -> Array:
+	if page_session_id != session_id or page_generation != generation:
+		return []
+	var raw_entries: Variant = page.get("entries", [])
+	if not (raw_entries is Array):
+		return []
+	var changed: Array = []
+	for raw_entry in raw_entries:
+		if not (raw_entry is Dictionary):
+			continue
+		var entry: Dictionary = raw_entry
+		var entry_id := str(entry.get("entry_id", ""))
+		if entry_id == "":
+			continue
+		var existing: Dictionary = _entries.get(entry_id, {})
+		if existing.is_empty():
+			_entries[entry_id] = entry
+			_order.append(entry_id)
+			changed.append(entry_id)
+			continue
+		if int(entry.get("ordinal", -1)) != int(existing.get("ordinal", -1)):
+			continue
+		var revision := int(entry.get("revision", 1))
+		if revision <= int(existing.get("revision", 1)):
+			continue
+		if str(existing.get("kind", "")) == "thought" \
+				and str(existing.get("state", "")) == "complete" \
+				and str(entry.get("state", "")) == "thinking":
+			continue
+		_entries[entry_id] = entry
+		changed.append(entry_id)
+	_order.sort_custom(func(a: String, b: String) -> bool:
+		return int(_entries[a].get("ordinal", 0)) < int(_entries[b].get("ordinal", 0))
+	)
+	history_has_more = bool(page.get("has_more", false))
+	next_before_ordinal = int(page.get("next_before_ordinal", -1))
+	if not changed.is_empty():
+		entries_changed.emit(changed, false)
 	return changed
 
 
@@ -138,6 +186,8 @@ func clear() -> void:
 	session_id = ""
 	upto_event_seq = 0
 	legacy = false
+	history_has_more = false
+	next_before_ordinal = -1
 	_entries.clear()
 	_order.clear()
 	_seen_event_ids.clear()

@@ -16,6 +16,8 @@ signal snapshot_replaced(changed_entry_ids: Array)
 signal patch_applied(entry_id: String)
 ## 投影器要求重新水合（gap/resync/会话失效）。
 signal hydration_required(reason: String)
+## 每个实时补丁在导航边界的拒绝原因；不得传入完整正文。
+signal patch_rejected(diagnostic: Dictionary)
 
 var state: int = State.HYDRATING
 var generation: int = 0
@@ -61,16 +63,26 @@ func apply_snapshot(response: Dictionary, response_generation: int) -> bool:
 ## 应用一条 WebSocket 事件包络；只有 READY 状态下的 transcript_patch 会
 ## 改变 Store。返回是否改变了展示态。
 func apply_event(envelope: Dictionary, event_generation: int) -> bool:
-	if state != State.READY or event_generation != generation:
+	if state != State.READY:
+		_reject_patch(envelope, "projector_not_ready")
+		return false
+	if event_generation != generation:
+		_reject_patch(envelope, "generation_mismatch")
 		return false
 	if str(envelope.get("session_id", "")) != _store.session_id:
+		_reject_patch(envelope, "session_mismatch")
 		return false
 	if str(envelope.get("type", "")) != "transcript_patch":
 		return false
 	var payload_value: Variant = envelope.get("payload", {})
 	if not (payload_value is Dictionary):
+		_reject_patch(envelope, "invalid_payload")
 		return false
 	var payload: Dictionary = payload_value
+	var raw_entry: Variant = payload.get("entry", null)
+	if not (raw_entry is Dictionary) or str(raw_entry.get("entry_id", "")) == "":
+		_reject_patch(envelope, "invalid_payload")
+		return false
 	var event_id := str(envelope.get("event_id", ""))
 	var seq := int(envelope.get("seq", 0))
 	var applied: bool = _store.apply_patch(payload, event_id)
@@ -83,10 +95,36 @@ func apply_event(envelope: Dictionary, event_generation: int) -> bool:
 			entry_id = str(entry_value.get("entry_id", ""))
 		patch_applied.emit(entry_id)
 	else:
+		_reject_patch(envelope, "duplicate_or_non_newer_revision")
 		# 即便补丁被去重/拒绝，也要推进游标：该事件已被“处理”，重连时不必重放。
 		if event_id != "" and seq > _store.upto_event_seq:
 			_store.upto_event_seq = seq
 	return applied
+
+
+## 合并同一 READY 世代的旧页；初始水合始终走 apply_snapshot 原子替换。
+func apply_older_page(response: Dictionary, response_generation: int) -> bool:
+	if state != State.READY or response_generation != generation:
+		return false
+	var transcript_value: Variant = response.get("transcript", null)
+	if not (transcript_value is Dictionary):
+		return false
+	var transcript: Dictionary = transcript_value
+	var page_session := str(transcript.get("session_id", ""))
+	transcript["has_more"] = bool(response.get("has_more", transcript.get("has_more", false)))
+	transcript["next_before_ordinal"] = response.get("next_before_ordinal", transcript.get("next_before_ordinal", -1))
+	_store.merge_older_page(transcript, page_session, generation)
+	return page_session == _store.session_id
+
+
+func _reject_patch(envelope: Dictionary, reason: String) -> void:
+	patch_rejected.emit({
+		"reason": reason,
+		"event_id": str(envelope.get("event_id", "")),
+		"seq": int(envelope.get("seq", 0)),
+		"session_id": str(envelope.get("session_id", "")),
+		"generation": generation,
+	})
 
 
 ## gap/resync 到达时停止接受实时补丁，等待重新水合。
