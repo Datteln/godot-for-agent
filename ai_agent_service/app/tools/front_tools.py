@@ -1369,7 +1369,14 @@ def register_front_tools() -> None:
                     "For a legacy TileMap, the response also includes a `layers` array (index/name/enabled) "
                     "listing every layer the node actually has — check it and pick the right map_layer "
                     "explicitly; do not assume map_layer 0 is the visible/collidable foreground layer, many "
-                    "templates put a non-collidable background/decoration layer at index 0."
+                    "templates put a non-collidable background/decoration layer at index 0. "
+                    "Size bound: a single read covers at most 400 cells (width*height*depth). 2D regions "
+                    "larger than that, up to 3200 cells, are auto-partitioned into <=400-cell rectangles and "
+                    "returned whole, with a `partitions` array (x/y/width/height/cells) and `total_cells` so "
+                    "you can verify the pieces reassemble. A request beyond that, or any oversized 3D GridMap "
+                    "region, returns a structured `region_too_large` error carrying `max_cells` and a safe "
+                    "`constraint` (e.g. width<=20 and height<=20); shrink or split the request and retry — the "
+                    "turn is not terminated by this error."
                 ),
                 "parameters": _object_schema(
                     {
@@ -1391,9 +1398,21 @@ def register_front_tools() -> None:
                         "x": {"type": "integer"},
                         "y": {"type": "integer"},
                         "z": {"type": "integer"},
-                        "width": {"type": "integer", "minimum": 1},
-                        "height": {"type": "integer", "minimum": 1},
-                        "depth": {"type": "integer", "minimum": 1},
+                        "width": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Region width in cells; keep width*height*depth <= 400 per read.",
+                        },
+                        "height": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Region height in cells; keep width*height*depth <= 400 per read.",
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "3D GridMap depth in cells; 3D reads are not auto-partitioned.",
+                        },
                     },
                     [],
                 ),

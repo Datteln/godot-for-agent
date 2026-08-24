@@ -98,7 +98,13 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         fallback_model=resolved_settings.llm_fallback_model,
     )
     store = SessionStore(resolved_settings.resolved_session_store_dir())
-    event_store = EventStore(outbound_queue_size=resolved_settings.event_outbound_queue_size)
+    event_store = EventStore(
+        outbound_queue_size=resolved_settings.event_outbound_queue_size,
+        max_outbound_bytes=resolved_settings.event_outbound_max_bytes,
+        coalescing_enabled=resolved_settings.event_stream_coalescing,
+        bounded_stream_payloads=resolved_settings.event_stream_bounded_payloads,
+        stream_preview_max_chars=resolved_settings.event_stream_preview_max_chars,
+    )
     recovery_store = RecoveryPointerStore(
         resolved_settings.resolved_recovery_pointer_path(),
         resolved_settings.project_root,

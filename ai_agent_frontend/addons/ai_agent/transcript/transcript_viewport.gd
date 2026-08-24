@@ -76,6 +76,43 @@ func apply_entry(entry: Dictionary) -> bool:
 	return true
 
 
+## 一个投影窗口内批量应用多个已接受条目（任务 3.3）。
+##
+## 与逐条 `apply_entry` 不同：整批只做一次锚点捕获/恢复、一次窗口推进判定与
+## 一次 `_render_window` 重排，避免每个流式包都触发一次同步回流。终态/非流式
+## 条目仍由调用方走 `apply_entry` 立即应用，保证顺序不被批处理延后。
+func apply_batch(entries: Array) -> int:
+	if entries.is_empty():
+		return 0
+	_capture_anchor()
+	var ids: Array = _store.ordered_entry_ids()
+	var follow_extend := false
+	var rendered := 0
+	for entry_value in entries:
+		if not (entry_value is Dictionary):
+			continue
+		var entry: Dictionary = entry_value
+		var index := ids.find(str(entry.get("entry_id", "")))
+		if index < 0:
+			continue
+		if _follow_mode and index >= _window_end - overscan:
+			follow_extend = true
+		if index >= _window_start and index < _window_end:
+			if _ensure_mounted(entry):
+				rendered += 1
+	if follow_extend:
+		_window_end = ids.size()
+		_window_start = maxi(0, _window_end - max_mounted_roots)
+		# 窗口推进后可能有新条目进入范围，需要再挂载一次。
+		for index in range(_window_start, _window_end):
+			var entry: Dictionary = _store.get_entry(str(ids[index]))
+			if not entry.is_empty():
+				_ensure_mounted(entry)
+	_render_window()
+	_restore_anchor()
+	return rendered
+
+
 ## 合并旧页后保留当前窗口；若窗口尚未建立则从 Store 初始化。
 func merge_older_page() -> void:
 	_capture_anchor()

@@ -24,9 +24,9 @@ from fastapi.testclient import TestClient
 
 from app.agents.bundled import get_agent
 from app.agents.types import Frame
+from app.config import AppSettings
 from app.llm.provider import AssistantTurn, LLMError, ToolCallRequest
 from app.main import create_app
-from app.config import AppSettings
 from app.sessions.store import Session, SessionStore
 from app.transcript.models import VALID_ENTRY_STATES
 from app.transcript.writer import TranscriptWriter, visible_assistant_text
@@ -326,6 +326,76 @@ class ThoughtRegressionTests(unittest.TestCase):
         self.assertEqual(entry["payload"]["content"], "先观察，再检查，最后确认信号")
         self.assertIsNotNone(entry["payload"]["duration_seconds"])
 
+    def test_empty_answer_recovery_defers_thought_completion_across_attempts(self) -> None:
+        """空正文恢复必须只在最终尝试结束时结算同一 Thought。"""
+        session = Session(session_id="s1")
+        emitted: list[tuple[str, dict[str, Any]]] = []
+        writer = TranscriptWriter(
+            lambda sid, etype, payload: emitted.append((etype, payload)) or len(emitted)
+        )
+        with patch("app.transcript.writer.time.time", side_effect=[1_000.0, 1_130.0]):
+            writer.update_thought_stream(
+                session,
+                frame_id="f1",
+                message_index=1,
+                cumulative_text="第一次尝试的 79.33 秒推理。",
+                token_count=5_120,
+                response_attempt_id="attempt-primary",
+            )
+            writer.begin_thought_recovery(
+                session,
+                frame_id="f1",
+                message_index=1,
+                response_attempt_id="attempt-recovery",
+            )
+            writer.update_thought_stream(
+                session,
+                frame_id="f1",
+                message_index=1,
+                cumulative_text="恢复尝试继续推理。",
+                token_count=280,
+                response_attempt_id="attempt-recovery",
+            )
+            # 旧流的迟到累积更新不能抢回 active attempt 或污染恢复内容。
+            writer.update_thought_stream(
+                session,
+                frame_id="f1",
+                message_index=1,
+                cumulative_text="旧流迟到的更长推理。",
+                token_count=6_000,
+                response_attempt_id="attempt-primary",
+            )
+            self.assertIsNone(
+                writer.complete_thought(
+                    session,
+                    frame_id="f1",
+                    message_index=1,
+                    response_attempt_id="attempt-primary",
+                )
+            )
+            self.assertTrue(
+                all(
+                    patch_payload["entry"]["state"] == "thinking"
+                    for _, patch_payload in emitted
+                )
+            )
+            writer.complete_thought(
+                session,
+                frame_id="f1",
+                message_index=1,
+                response_attempt_id="attempt-recovery",
+            )
+
+        entry = session.transcript_entries[0]
+        self.assertEqual(entry["state"], "complete")
+        self.assertEqual(entry["payload"]["duration_seconds"], 130.0)
+        self.assertEqual(entry["payload"]["token_count"], 5_400)
+        self.assertEqual(
+            entry["payload"]["content"], "第一次尝试的 79.33 秒推理。恢复尝试继续推理。"
+        )
+        self.assertEqual(entry["payload"]["response_attempt_id"], "attempt-recovery")
+        self.assertEqual(emitted[-1][1]["entry"]["state"], "complete")
+
     def test_thinking_budget_boundary_followed_by_tool_calls_and_content(self) -> None:
         """思考预算边界后继续产出的工具调用/正文必须被正常接受，且累计推理不丢失。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -391,6 +461,36 @@ class ThoughtRegressionTests(unittest.TestCase):
                     thought = entries[1]
                     self.assertEqual(thought["state"], "complete")
                     self.assertEqual(thought["payload"]["content"], "推理耗尽后没有正文")
+                    self.assertTrue(str(thought["payload"].get("response_attempt_id", "")))
+                    with client.websocket_connect("/chat/events/ws", headers=HEADERS) as socket:
+                        socket.send_json(
+                            {"version": 1, "type": "subscribe", "session_id": "s1", "after_seq": 0}
+                        )
+                        replayed: list[dict[str, Any]] = []
+                        while True:
+                            message = socket.receive_json()
+                            if message.get("type") == "subscribed":
+                                break
+                            replayed.append(message["event"])
+                    thought_patches = [
+                        event["payload"]["entry"]
+                        for event in replayed
+                        if event.get("type") == "transcript_patch"
+                        and event.get("payload", {}).get("entry", {}).get("entry_id")
+                        == thought["entry_id"]
+                    ]
+                    completed_patches = [
+                        patch_entry
+                        for patch_entry in thought_patches
+                        if patch_entry.get("state") == "complete"
+                    ]
+                    self.assertEqual(len(completed_patches), 1)
+                    self.assertTrue(
+                        all(
+                            patch_entry.get("state") == "thinking"
+                            for patch_entry in thought_patches[:-1]
+                        )
+                    )
 
     def test_empty_content_twice_yields_typed_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

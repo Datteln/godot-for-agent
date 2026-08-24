@@ -21,6 +21,24 @@ from pydantic import BaseModel, Field
 TRANSCRIPT_CONTRACT_VERSION = 1
 """当前展示稿契约版本号；不兼容变更必须递增。"""
 
+REALTIME_PATCH_VERSION = 2
+"""实时 `transcript_patch` 载荷表示版本；新增表示必须递增（任务 1.3）。"""
+
+PATCH_FORMAT_FULL = "full"
+"""完整补丁：携带条目完整最新状态；首次可见、结构与终态恒用该表示。"""
+
+PATCH_FORMAT_APPEND_DELTA = "append_delta"
+"""追加增量：仅携带相对 `base_revision` 新增的正文后缀与元数据更新。"""
+
+PATCH_FORMAT_PREVIEW = "preview"
+"""受限预览：携带正文末尾的有界预览与总字符数，供不可追加场景的显示近似。"""
+
+STREAM_TEXT_FIELDS: dict[str, str] = {"assistant": "text", "thought": "content"}
+"""增长型流式条目正文所在的 payload 键；其余条目不参与有界实时表示。"""
+
+GROWING_STREAM_STATES: dict[str, str] = {"assistant": "streaming", "thought": "thinking"}
+"""各增长型条目处于“正文仍在增长”的状态；仅该组合允许增量/预览表示。"""
+
 TranscriptKind = Literal[
     "user",
     "assistant",

@@ -110,8 +110,31 @@ class AppSettings(BaseSettings):
     event_outbound_queue_size: int = Field(
         default=128, ge=8, le=4096, description="单个 WebSocket 订阅的有界事件队列容量。"
     )
+    event_outbound_max_bytes: int = Field(
+        default=512 * 1024,
+        ge=16 * 1024,
+        le=64 * 1024 * 1024,
+        description="单个 WebSocket 订阅待发事件的序列化字节预算；超出转入重同步。",
+    )
+    event_stream_coalescing: bool = Field(
+        default=True,
+        description="启用按条目 latest-wins 合并未发送流式补丁与字节预算；关闭回退纯条数队列。",
+    )
+    event_stream_bounded_payloads: bool = Field(
+        default=True,
+        description="增长型正文实时补丁使用追加增量/受限预览；关闭回退完整补丁。",
+    )
+    event_stream_preview_max_chars: int = Field(
+        default=800, ge=64, le=16_000, description="受限预览表示携带的最大正文字符数。"
+    )
     event_heartbeat_interval_s: float = Field(
         default=20.0, ge=0.1, le=120.0, description="空闲 WebSocket 事件连接的协议心跳间隔。"
+    )
+    turn_keepalive_interval_s: float = Field(
+        default=15.0,
+        ge=1.0,
+        le=120.0,
+        description="活跃轮次无正文流时发送 turn_keepalive 进展事件的间隔；<=0 关闭。",
     )
 
     session_store_dir: Path = Field(

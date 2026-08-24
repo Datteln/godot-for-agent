@@ -20,6 +20,7 @@ const TranscriptStore = preload("res://addons/ai_agent/transcript/transcript_sto
 const TranscriptProjector = preload("res://addons/ai_agent/transcript/transcript_projector.gd")
 const TranscriptRenderer = preload("res://addons/ai_agent/transcript/transcript_renderer.gd")
 const TranscriptViewport = preload("res://addons/ai_agent/transcript/transcript_viewport.gd")
+const TranscriptPatchBatcher = preload("res://addons/ai_agent/transcript/transcript_patch_batcher.gd")
 const TransientNoticeHost = preload("res://addons/ai_agent/ui/transient_notice_host.gd")
 
 enum AgentState { IDLE, WAITING_LLM, WAITING_CONFIRM, EXECUTING, COMPACTING }
@@ -96,6 +97,18 @@ var _event_queue: Array = []
 var _draining_events := false
 var _force_scroll_once := false
 
+## 可合并流式补丁的按条目暂存与投影窗口（任务 3.2 / 3.3）。
+## WebSocket 接收即确认（socket 层已发 ack）；批处理器保序暂存同一条目的
+## 修订并就地合并连续增量，窗口内按序应用——首个完整补丁（建立条目）绝不
+## 会被其后的增量覆盖。非流式/终态补丁立即应用，不延迟超过一个帧边界。
+var _patch_batcher: RefCounted = TranscriptPatchBatcher.new()
+var _projection_window_pending := false
+var _last_projection_window_usec := 0
+## 单个投影窗口内最多应用的条目数；超出部分顺延到下一个窗口，保证每帧有界。
+const PROJECTION_WINDOW_MAX_ENTRIES := 64
+## 相邻两个投影窗口的最小间隔（微秒）；把逐包同步重排降为受限帧率批处理。
+const PROJECTION_WINDOW_INTERVAL_USEC := 30_000
+
 ## 权威展示稿三件套：Store（数据）+ Projector（水合状态机）+ Renderer（按 kind 渲染）。
 var _transcript_store: RefCounted
 var _projector: RefCounted
@@ -105,6 +118,10 @@ var _transcript_viewport: RefCounted
 var _transient_host: RefCounted
 ## 当前水合世代；发起一次历史加载前递增，用于拒绝迟到的旧会话/旧世代响应。
 var _hydration_generation := 0
+## 空闲恢复（任务 4.2/4.3）：HTTP 客户端恢复窗口期间为 true。
+var _idle_recovery_active := false
+## 恢复水合标记：为 true 时允许在活跃轮次中应用历史快照水合。
+var _hydrating_for_recovery := false
 ## 本轮是否已经通过 transcript_patch 接受了完成态助手条目；HTTP final 只作确认，
 ## 若完成补丁始终没有实时到达则回退到重新水合（任务 3.2）。
 var _assistant_completed_this_turn := false
@@ -138,6 +155,10 @@ func _process(_delta: float) -> void:
 	if _post_final_scroll_frames > 0:
 		_post_final_scroll_frames -= 1
 		_do_scroll_to_bottom()
+	# 可合并流式补丁的受限帧率投影窗口（任务 3.3）。
+	if _projection_window_pending \
+			and Time.get_ticks_usec() - _last_projection_window_usec >= PROJECTION_WINDOW_INTERVAL_USEC:
+		_run_projection_window()
 
 
 ## 程序控制滚动到底部，设置抑制标志防止 value_changed 误判
@@ -347,6 +368,7 @@ func _build_children() -> void:
 	_transcript_viewport.follow_mode_changed.connect(_on_viewport_follow_mode_changed)
 	_transcript_viewport.renderer_rejected.connect(_on_transcript_renderer_rejected)
 	_projector.patch_rejected.connect(_on_transcript_patch_rejected)
+	_projector.hydration_required.connect(_on_projector_hydration_required)
 
 	_transient_host = TransientNoticeHost.new()
 	_transient_host.node_factory = _log_renderer
@@ -383,6 +405,9 @@ func _connect_signals() -> void:
 	_message_context_popup.id_pressed.connect(_on_message_context_action)
 	_http_client.response_received.connect(_on_response)
 	_http_client.error_occurred.connect(_on_error)
+	_http_client.idle_recovery_requested.connect(_on_idle_recovery_requested)
+	_http_client.idle_recovery_finished.connect(_on_idle_recovery_finished)
+	_http_client.probe_response_received.connect(_on_probe_response)
 	_event_socket.event_received.connect(_on_event_received)
 	_event_socket.history_gap_received.connect(_on_event_history_gap)
 	_event_socket.resync_required_received.connect(_on_event_resync_required)
@@ -1405,6 +1430,8 @@ func _on_reset() -> void:
 	_interrupted_locally = false
 	_event_queue.clear()
 	_draining_events = false
+	_patch_batcher.clear()
+	_projection_window_pending = false
 	_clear_inline_confirmation()
 	if undo_manager != null:
 		undo_manager.abort_batch()
@@ -1425,6 +1452,10 @@ func _on_interrupt() -> void:
 	_interrupted_locally = true
 	_event_queue.clear()
 	_draining_events = false
+	_patch_batcher.clear()
+	_projection_window_pending = false
+	_idle_recovery_active = false
+	_hydrating_for_recovery = false
 	_clear_inline_confirmation()
 	if undo_manager != null:
 		undo_manager.abort_batch()
@@ -1449,6 +1480,8 @@ func _on_new_session() -> void:
 	_interrupted_locally = false
 	_event_queue.clear()
 	_draining_events = false
+	_patch_batcher.clear()
+	_projection_window_pending = false
 	ConfigMigrations.set_value(editor_interface, "ai_agent/session_id", session_id)
 	_save_session_to_history(session_id)
 	_clear_inline_confirmation()
@@ -1536,6 +1569,8 @@ func _fetch_initial_service_data() -> void:
 func _on_event_received(event: Dictionary) -> void:
 	if _http_client != null:
 		_http_client.note_event_progress()
+		# 恢复窗口内任何新事件都证明活跃轮次仍在推进：立即结束恢复、继续等待。
+		_http_client.note_recovery_progress()
 	if _interrupted_locally:
 		return
 	if state_store != null and state_store.has_method("add_events"):
@@ -1549,18 +1584,67 @@ func _on_event_received(event: Dictionary) -> void:
 
 ## 应用一条 transcript_patch：只有 Projector 校验通过（READY + session +
 ## generation + event_id/revision）才改变 Store 与渲染。
+##
+## 可合并的增长型流式补丁（追加增量/受限预览，或增长中的完整快照）进入按
+## 条目暂存的待投影集，由投影窗口统一应用；非流式与终态补丁立即应用，且
+## 会清掉同条目已被取代的暂存补丁，避免终态之后回退到流式中间态。
 func _handle_transcript_patch(event: Dictionary) -> void:
-	if not _projector.apply_event(event, _hydration_generation):
-		return
 	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+	var patch_format := str(payload.get("patch_format", "full"))
+	if _is_replaceable_stream_patch(payload, patch_format):
+		var entry_id := str(payload.get("entry_id", ""))
+		if entry_id == "":
+			var entry_value: Variant = payload.get("entry", {})
+			if entry_value is Dictionary:
+				entry_id = str((entry_value as Dictionary).get("entry_id", ""))
+		if entry_id != "":
+			_patch_batcher.enqueue(entry_id, event)
+			if _patch_batcher.overflowed:
+				# 单条目暂存异常堆积（正常流下增量会就地合并）：保守重同步。
+				_patch_batcher.clear()
+				_projector.request_resync("pending_overflow")
+				return
+			_schedule_projection_window()
+			return
+	# 非流式/终态补丁立即应用（不延迟超过一个帧边界），并丢弃同条目仍在
+	# 暂存的中间修订，防止终态之后被迟到的流式修订回退。
+	var immediate: Dictionary = _apply_transcript_patch_now(event)
+	if not immediate.is_empty():
+		_patch_batcher.discard(str(immediate.get("entry_id", "")))
+		_transcript_viewport.apply_entry(immediate)
+		_scroll_to_bottom()
+
+
+## 判断补丁是否为可合并的增长型流式修订（正文仍在增长的 Thought/assistant）。
+func _is_replaceable_stream_patch(payload: Dictionary, patch_format: String) -> bool:
+	if patch_format == "append_delta" or patch_format == "preview":
+		return true
+	if patch_format != "full":
+		return false
 	var entry_value: Variant = payload.get("entry", {})
 	if not (entry_value is Dictionary):
-		return
+		return false
 	var entry: Dictionary = entry_value
-	var entry_id := str(entry.get("entry_id", ""))
+	var kind := str(entry.get("kind", ""))
+	var state := str(entry.get("state", ""))
+	return (kind == "assistant" and state == "streaming") or (kind == "thought" and state == "thinking")
+
+
+## 立即应用一条补丁（终态/结构态路径，或投影窗口到点后逐条应用）。
+## 返回被投影器接受并改变 Store 的条目字典；未改变时返回空字典。
+func _apply_transcript_patch_now(event: Dictionary) -> Dictionary:
+	if not _projector.apply_event(event, _hydration_generation):
+		return {}
+	var payload: Dictionary = event.get("payload", {}) if event.get("payload", {}) is Dictionary else {}
+	var entry_id := ""
+	var entry_value: Variant = payload.get("entry", {})
+	if entry_value is Dictionary:
+		entry_id = str((entry_value as Dictionary).get("entry_id", ""))
+	if entry_id == "":
+		entry_id = str(payload.get("entry_id", ""))
 	var stored: Dictionary = _transcript_store.get_entry(entry_id)
 	if stored.is_empty():
-		return
+		return {}
 	var entry_payload: Dictionary = stored.get("payload", {}) if stored.get("payload", {}) is Dictionary else {}
 	# 服务端用户条目到达：移除同 client_message_id 的乐观节点，由权威条目接管。
 	var client_message_id := str(entry_payload.get("client_message_id", ""))
@@ -1570,8 +1654,55 @@ func _handle_transcript_patch(event: Dictionary) -> void:
 		_assistant_completed_this_turn = true
 	if str(stored.get("kind", "")) == "tool_activity" and str(stored.get("state", "")) == "resolved":
 		_remember_server_file_read_from_entry(entry_payload)
-	_transcript_viewport.apply_entry(stored)
-	_scroll_to_bottom()
+	return stored
+
+
+## 到点应用暂存的可合并补丁：每条目只投影最新修订，视口批量更新，
+## 整个窗口最多触发一次自动滚动（任务 3.3）。
+func _schedule_projection_window() -> void:
+	_projection_window_pending = true
+
+
+func _run_projection_window() -> void:
+	_projection_window_pending = false
+	_last_projection_window_usec = Time.get_ticks_usec()
+	if _patch_batcher.is_empty():
+		return
+	var window_start_usec := Time.get_ticks_usec()
+	var batches: Array = _patch_batcher.take(PROJECTION_WINDOW_MAX_ENTRIES)
+	var changed: Array = []
+	var applied_events := 0
+	for batch_value in batches:
+		if not (batch_value is Dictionary):
+			continue
+		var batch: Dictionary = batch_value
+		var events_value: Variant = batch.get("events", [])
+		if not (events_value is Array):
+			continue
+		var last_stored: Dictionary = {}
+		# 严格按到达顺序应用同一条目的修订：首个完整补丁先建立条目，
+		# 其后的增量/预览才能找到依赖的基础修订。
+		for event_value in events_value:
+			if not (event_value is Dictionary):
+				continue
+			applied_events += 1
+			var stored: Dictionary = _apply_transcript_patch_now(event_value)
+			if not stored.is_empty():
+				last_stored = stored
+		if not last_stored.is_empty():
+			changed.append(last_stored)
+	if not changed.is_empty():
+		_transcript_viewport.apply_batch(changed)
+		_scroll_to_bottom()
+	if not _patch_batcher.is_empty():
+		# 超出单窗口条目上限的部分顺延到下一个窗口。
+		_projection_window_pending = true
+	FrontendLogger.debug(editor_interface, "ChatPanel", "Projection window applied.", {
+		"entries": batches.size(),
+		"events": applied_events,
+		"changed": changed.size(),
+		"duration_ms": float(Time.get_ticks_usec() - window_start_usec) / 1000.0,
+	})
 
 
 ## 已读文件缓存钩子：由 resolved 的 read_file/read_script 条目驱动。
@@ -1618,6 +1749,13 @@ func _handle_transport_event(event: Dictionary) -> void:
 		"compact_boundary":
 			if _state == AgentState.COMPACTING:
 				_set_state(_state_before_compact)
+		"turn_keepalive":
+			# 活跃轮次进展信号（任务 4.1）：只说明服务端仍持有活跃轮次，
+			# 与传输心跳语义不同；不产生聊天记录，仅驱动空闲续期/恢复判定。
+			FrontendLogger.debug(editor_interface, "ChatPanel", "Turn keepalive received.", {
+				"last_event_seq": int(payload.get("last_event_seq", 0)),
+				"phase": str(payload.get("phase", ""))
+			})
 		_:
 			FrontendLogger.debug(editor_interface, "ChatPanel", "Transport event ignored for display.", {
 				"type": event_type
@@ -1627,7 +1765,7 @@ func _handle_transport_event(event: Dictionary) -> void:
 func _on_event_history_gap(details: Dictionary) -> void:
 	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket history gap; re-hydrating transcript.", details)
 	_begin_hydration(_current_session_id())
-	_http_client.fetch_session_history()
+	_request_hydration_history()
 
 
 ## 视口接近已加载历史的起点时请求一个去重的旧页。
@@ -1669,7 +1807,90 @@ func _on_transcript_renderer_rejected(diagnostic: Dictionary) -> void:
 func _on_event_resync_required(details: Dictionary) -> void:
 	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket resync required; re-hydrating transcript.", details)
 	_begin_hydration(_current_session_id())
+	_request_hydration_history()
+
+
+## 请求一次历史水合。活跃轮次中主请求队列被 /chat 占用、且 `_handle_session_history`
+## 会拒绝非 IDLE 状态下的历史响应，因此改走旁路探针通道并在探针响应中完成水合，
+## 避免投影器在整个轮次内卡在 HYDRATING（任务 3.1 / 4.2）。
+func _request_hydration_history() -> void:
+	if _http_client == null:
+		return
+	if _state != AgentState.IDLE or _http_client.is_idle_recovery_active():
+		_hydrating_for_recovery = true
+		_http_client.probe_get("/sessions/%s/history?limit=200" % _current_session_id().uri_encode())
+		return
 	_http_client.fetch_session_history()
+
+
+## 空闲恢复开始（任务 4.2）：从已确认游标重连事件流，并用探针确认活跃轮次。
+func _on_idle_recovery_requested(details: Dictionary) -> void:
+	_idle_recovery_active = true
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Idle recovery requested.", {
+		"turn_id": str(details.get("turn_id", "")),
+		"window_s": float(details.get("window_s", 0.0)),
+		"socket_seq": _transcript_store.upto_event_seq
+	})
+	if _event_socket != null:
+		_event_socket.recover_from_acknowledged_cursor()
+	# 主队列被 /chat 占用，活跃轮次确认走旁路探针。
+	if _http_client != null:
+		_http_client.probe_get("/recovery-pointer")
+
+
+## 空闲恢复结束：失败时向用户明确展示原因（任务 4.3）。
+func _on_idle_recovery_finished(result: Dictionary) -> void:
+	_idle_recovery_active = false
+	_hydrating_for_recovery = false
+	var success := bool(result.get("success", false))
+	var detail := str(result.get("detail", ""))
+	if success:
+		FrontendLogger.info(editor_interface, "ChatPanel", "Idle recovery restored event flow.", {"detail": detail})
+		return
+	FrontendLogger.error(editor_interface, "ChatPanel", "Idle recovery failed; turn interrupted.", {"detail": detail})
+	_show_notice("error", _ui("idle_recovery_failed") % detail)
+
+
+## 恢复探针响应：只处理恢复指针与恢复期历史水合（任务 4.2）。
+func _on_probe_response(response: Dictionary) -> void:
+	if not _idle_recovery_active and not _hydrating_for_recovery:
+		return
+	if response.has("exists"):
+		# 活跃轮次确认：恢复指针存在即说明服务端仍持有 pending turn。
+		if bool(response.get("exists", false)):
+			if _http_client != null:
+				_http_client.finish_idle_recovery(true, "active_turn_confirmed")
+		return
+	if response.has("transcript"):
+		# 恢复窗口内的历史水合：允许在活跃轮次中替换 Store。
+		_apply_recovery_history(response)
+		return
+
+
+## 恢复期历史水合：应用快照并从快照游标重新订阅（任务 4.2）。
+func _apply_recovery_history(response: Dictionary) -> void:
+	var generation := _hydration_generation
+	if not _projector.apply_snapshot(response, generation):
+		FrontendLogger.info(editor_interface, "ChatPanel", "Ignored stale recovery snapshot.", {})
+		return
+	_hydrating_for_recovery = false
+	_clear_messages()
+	_transcript_viewport.replace_from_store()
+	FrontendLogger.info(editor_interface, "ChatPanel", "Recovery hydration applied.", {
+		"entries": _transcript_store.entry_count(),
+		"upto_event_seq": _transcript_store.upto_event_seq
+	})
+	if _event_socket != null:
+		_event_socket.start(_current_session_id(), _transcript_store.upto_event_seq)
+	if _http_client != null:
+		_http_client.finish_idle_recovery(true, "hydrated_after_gap")
+
+
+## 投影器检测到修订/表示缺口时请求重新水合（任务 3.1）。
+func _on_projector_hydration_required(reason: String) -> void:
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Projector requested re-hydration.", {"reason": reason})
+	_begin_hydration(_current_session_id())
+	_request_hydration_history()
 
 
 func _on_event_protocol_error(details: Dictionary) -> void:
@@ -1682,6 +1903,8 @@ func _begin_hydration(session_id: String) -> int:
 	_assistant_completed_this_turn = false
 	_event_queue.clear()
 	_draining_events = false
+	_patch_batcher.clear()
+	_projection_window_pending = false
 	return _hydration_generation
 
 
@@ -2098,6 +2321,8 @@ func _switch_to_session(session_id: String) -> void:
 	_interrupted_locally = false
 	_event_queue.clear()
 	_draining_events = false
+	_patch_batcher.clear()
+	_projection_window_pending = false
 	_clear_inline_confirmation()
 	if undo_manager != null:
 		undo_manager.abort_batch()

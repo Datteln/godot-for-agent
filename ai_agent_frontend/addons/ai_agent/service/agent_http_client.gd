@@ -3,6 +3,12 @@ extends Node
 
 signal response_received(response: Dictionary)
 signal error_occurred(message: String)
+## `/chat` 空闲超时后进入有界恢复：ChatPanel 应重连事件流并回传恢复结果。
+signal idle_recovery_requested(details: Dictionary)
+## 恢复结束（成功续等或失败转中断）；携带脱敏原因，供 UI/日志展示。
+signal idle_recovery_finished(result: Dictionary)
+## 恢复期间通过旁路探针取得的响应（不占用主请求队列）。
+signal probe_response_received(response: Dictionary)
 
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
@@ -17,13 +23,16 @@ const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd
 ## 工具执行……），不能套用和 `/doctor`、`/memory` 这类本该秒回的轻量端点一样
 ## 的短超时，所以 `/chat` 用单独的、更宽松的超时设置。
 const DEFAULT_REQUEST_TIMEOUT_S := 30.0
-const DEFAULT_CHAT_REQUEST_TIMEOUT_S := 300.0
+const DEFAULT_CHAT_REQUEST_TIMEOUT_S := 360.0
 ## 上面那个超时现在按"空闲"语义续期：只要事件 WebSocket 仍在投递
 ## 流式文本、delegate、工具调用等进展，
 ## 就说明后端没卡死，超时计时器会被重置而不是任由它在固定总时长后到期。
 ## 这个硬上限是兜底：哪怕事件一直在零星地来、后端实际已经死循环/卡死，
 ## 单条 `/chat` 请求也不会无限续期下去。
 const DEFAULT_CHAT_REQUEST_HARD_CAP_S := 1800.0
+## 空闲超时触发后的有界恢复窗口（任务 4.2）：在此期间重连事件流并等待
+## 进展信号恢复；窗口耗尽仍无进展才允许取消后端轮次。
+const DEFAULT_IDLE_RECOVERY_WINDOW_S := 30.0
 
 var editor_interface: EditorInterface
 var service: Node
@@ -41,6 +50,13 @@ var _request_timeout_timer: Timer
 var _timeout_generation := -1
 var _inflight_started_at_msec := 0
 
+# 恢复优先、取消最后（任务 4.2 / 4.3）：空闲超时先尝试一次有界恢复，
+# 只有恢复失败、活跃轮次不存在或硬上限到期才中断后端轮次。
+var _idle_recovery_active := false
+var _idle_recovery_timer: Timer
+var _last_timeout_reason := ""
+var _probe_http: HTTPRequest = null
+
 
 func _ready() -> void:
 	_create_chat_http()
@@ -49,6 +65,11 @@ func _ready() -> void:
 	_request_timeout_timer.one_shot = true
 	add_child(_request_timeout_timer)
 	_request_timeout_timer.timeout.connect(_on_request_timeout)
+
+	_idle_recovery_timer = Timer.new()
+	_idle_recovery_timer.one_shot = true
+	add_child(_idle_recovery_timer)
+	_idle_recovery_timer.timeout.connect(_on_idle_recovery_timeout)
 
 
 func _create_chat_http() -> void:
@@ -140,6 +161,7 @@ func start_new_session(previous_session_id: String, new_session_id: String) -> v
 	_replace_chat_http()
 	_busy = false
 	_request_timeout_timer.stop()
+	_cancel_idle_recovery()
 	current_turn_id = ""
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != new_session_id:
@@ -159,6 +181,7 @@ func interrupt_current() -> void:
 	# 迟到的信号会被 `_on_request_completed` 的生成号检查丢弃。
 	_busy = false
 	_request_timeout_timer.stop()
+	_cancel_idle_recovery()
 	current_turn_id = ""
 	# 仅断开本地连接还不够：后端的 agent 循环（自动执行的静默工具）会继续跑完
 	# 整轮并持续写入新事件，等下一条用户消息发出后这些旧事件会被一起拉取、
@@ -176,6 +199,7 @@ func switch_to_session(previous_session_id: String) -> void:
 	_replace_chat_http()
 	_busy = false
 	_request_timeout_timer.stop()
+	_cancel_idle_recovery()
 	current_turn_id = ""
 	_suppress_events = false
 	if previous_session_id.strip_edges() != "" and previous_session_id != _session_id():
@@ -340,19 +364,161 @@ func note_event_progress() -> void:
 	_maybe_extend_request_timeout()
 
 
+## 恢复期间事件流恢复投递时由 ChatPanel 调用：把“收到新事件”视为恢复成功，
+## 立即结束恢复窗口并继续等待原请求（任务 4.2）。
+func note_recovery_progress() -> void:
+	if _idle_recovery_active:
+		finish_idle_recovery(true, "event_flow_restored")
+
+
+## 是否正处于空闲恢复窗口内。
+func is_idle_recovery_active() -> bool:
+	return _idle_recovery_active
+
+
+## 恢复探针：绕过被 `/chat` 占用的主串行队列，直接发一个只读 GET。
+##
+## 用于恢复窗口内读取 `/recovery-pointer` 等轻量状态——主队列此刻被仍在跑的
+## `/chat` 请求占住，正常 `_enqueue` 永远排不出去。探针不复用 `_http`、
+## 不改 `_busy`/生成号，响应经 `probe_response_received` 单独分发。
+func probe_get(path: String) -> void:
+	if _probe_http == null:
+		_probe_http = HTTPRequest.new()
+		_probe_http.name = "RecoveryProbeHttp"
+		add_child(_probe_http)
+		_probe_http.request_completed.connect(_on_probe_completed)
+	if _probe_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+		_probe_http.cancel_request()
+	var err := _probe_http.request(_url(path), _headers(), HTTPClient.METHOD_GET, "")
+	if err != OK:
+		FrontendLogger.warn(editor_interface, "HTTP", "Recovery probe failed to start.", {
+			"path": path,
+			"error": err
+		})
+
+
+func _on_probe_completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
+		FrontendLogger.warn(editor_interface, "HTTP", "Recovery probe failed.", {
+			"code": code,
+			"result": result
+		})
+		return
+	var parsed := JSON.parse_string(body.get_string_from_utf8())
+	if parsed is Dictionary:
+		probe_response_received.emit(parsed)
+
+
 func _on_request_timeout() -> void:
 	# 同样靠生成号识别"迟到的"超时回调：如果它不属于当前这一代请求，说明
 	# `_busy` 早被别的更新的请求（或一次显式 reset/interrupt）重新占用了，
 	# 这里绝不能再去碰它。
 	if not _busy or _timeout_generation != _request_generation:
 		return
-	var timed_out_path := _inflight_path
-	var timed_out_session_id := _inflight_session_id
+	# 恢复窗口到期仍无进展：按恢复失败收口（任务 4.3）。
+	if _idle_recovery_active:
+		finish_idle_recovery(false, "recovery_window_expired")
+		return
+	# 恢复优先、取消最后（任务 4.2）：`/chat` 空闲超时先尝试一次有界恢复，
+	# 而不是直接中断可能仍在健康运行的后端轮次。
+	if _inflight_path == "/chat" and _should_attempt_idle_recovery():
+		_begin_idle_recovery()
+		return
+	_finalize_timeout(_inflight_path, _inflight_session_id, _idle_or_timeout_reason())
+
+
+## 空闲超时是否还有资格进入恢复：已达硬上限的请求必须直接收口。
+func _should_attempt_idle_recovery() -> bool:
+	var hard_cap := _hard_cap_for_path(_inflight_path)
+	if hard_cap <= 0.0:
+		return true
+	var elapsed_s := float(Time.get_ticks_msec() - _inflight_started_at_msec) / 1000.0
+	return elapsed_s < hard_cap
+
+
+## 超时原因的脱敏分类：区分服务无进展、恢复失败与硬上限到期（任务 1.1/4.3）。
+func _idle_or_timeout_reason() -> String:
+	if _last_timeout_reason != "":
+		return _last_timeout_reason
+	if _inflight_path == "/chat":
+		var hard_cap := _hard_cap_for_path(_inflight_path)
+		var elapsed_s := float(Time.get_ticks_msec() - _inflight_started_at_msec) / 1000.0
+		if hard_cap > 0.0 and elapsed_s >= hard_cap:
+			return "hard_cap_expired"
+		return "no_service_progress"
+	return "request_timeout"
+
+
+## 进入有界恢复：不动主请求、不清队列，只等待事件流/活跃轮次信号恢复。
+func _begin_idle_recovery() -> void:
+	_idle_recovery_active = true
+	var window := float(_setting("ai_agent/chat_idle_recovery_window_sec"))
+	if window <= 0.0:
+		window = DEFAULT_IDLE_RECOVERY_WINDOW_S
+	_idle_recovery_timer.start(window)
+	FrontendLogger.warn(editor_interface, "HTTP", "Idle timeout; attempting bounded recovery before interrupt.", {
+		"path": _inflight_path,
+		"elapsed_s": float(Time.get_ticks_msec() - _inflight_started_at_msec) / 1000.0,
+		"window_s": window,
+		"turn_id": current_turn_id
+	})
+	idle_recovery_requested.emit({
+		"path": _inflight_path,
+		"session_id": _inflight_session_id,
+		"turn_id": current_turn_id,
+		"window_s": window
+	})
+
+
+## ChatPanel 回传恢复结果：成功则继续等待，失败则按超时中断收口。
+func finish_idle_recovery(success: bool, detail: String) -> void:
+	if not _idle_recovery_active:
+		return
+	_idle_recovery_active = false
+	_idle_recovery_timer.stop()
+	if success:
+		FrontendLogger.info(editor_interface, "HTTP", "Idle recovery succeeded; continuing to wait.", {
+			"detail": detail,
+			"path": _inflight_path,
+			"turn_id": current_turn_id
+		})
+		idle_recovery_finished.emit({"success": true, "detail": detail})
+		_request_timeout_timer.start(_timeout_for_path(_inflight_path))
+		return
+	FrontendLogger.error(editor_interface, "HTTP", "Idle recovery failed; interrupting turn.", {
+		"detail": detail,
+		"path": _inflight_path,
+		"turn_id": current_turn_id
+	})
+	idle_recovery_finished.emit({"success": false, "detail": detail})
+	_last_timeout_reason = detail
+	_finalize_timeout(_inflight_path, _inflight_session_id, detail)
+
+
+## 恢复窗口计时器到期：仍无进展视为恢复失败。
+func _on_idle_recovery_timeout() -> void:
+	if _idle_recovery_active:
+		finish_idle_recovery(false, "recovery_window_expired")
+
+
+## 请求被正常完成/显式中断/会话切换时静默撤销恢复窗口（不算失败）。
+func _cancel_idle_recovery() -> void:
+	if not _idle_recovery_active:
+		return
+	_idle_recovery_active = false
+	_idle_recovery_timer.stop()
+
+
+## 真正的超时收口：复位请求状态，并对 `/chat` 显式中断后端轮次。
+func _finalize_timeout(timed_out_path: String, timed_out_session_id: String, reason: String) -> void:
 	FrontendLogger.error(editor_interface, "HTTP", "Request timed out; unblocking queue.", {
 		"path": timed_out_path,
 		"timeout_s": _timeout_for_path(timed_out_path),
-		"queue_size": _queue.size()
+		"queue_size": _queue.size(),
+		"reason": reason
 	})
+	_idle_recovery_active = false
+	_idle_recovery_timer.stop()
 	_request_generation += 1
 	_replace_chat_http()
 	_busy = false
@@ -369,7 +535,7 @@ func _on_request_timeout() -> void:
 			"session_id": timed_out_session_id if timed_out_session_id != "" else _session_id()
 		})
 		interrupt_enqueued = true
-	error_occurred.emit("HTTP request timed out: " + timed_out_path)
+	error_occurred.emit("HTTP request timed out: %s (reason=%s)" % [timed_out_path, reason])
 	if not interrupt_enqueued:
 		_pump()
 
@@ -389,6 +555,7 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 		})
 		return
 	_request_timeout_timer.stop()
+	_cancel_idle_recovery()
 	_busy = false
 	var text := body.get_string_from_utf8()
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:

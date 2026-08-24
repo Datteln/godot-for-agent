@@ -368,7 +368,7 @@ func _run_thought_renderer_test() -> void:
 
 	var thinking := {
 		"entry_id": "t1", "ordinal": 0, "kind": "thought", "state": "thinking", "revision": 1,
-		"payload": {"content": "先看参数", "token_count": 12, "duration_seconds": null}
+		"payload": {"content": "先看参数", "token_count": 12, "duration_seconds": null, "response_attempt_id": "attempt-primary"}
 	}
 	renderer.apply_entry(thinking)
 	_check(list.get_child_count() == 1, "thought: node created")
@@ -377,30 +377,31 @@ func _run_thought_renderer_test() -> void:
 	_check(toggle != null and toggle.text.contains("Thinking 12 Tokens"), "thought: active header shows token count (got: %s)" % (toggle.text if toggle != null else "<null>"))
 	_check(detail != null and not detail.visible, "thought: collapsed by default")
 
-	# 用户展开后，revision 更新必须保持展开状态与头部刷新。
+	# 空正文恢复仍是同一个未完成 Thought：新的 response attempt 到来时不显示
+	# 中间的 Thought for 79.33s，而继续显示 Thinking 与累计 token。
 	if toggle != null:
 		toggle.pressed.emit()
 	_check(detail != null and detail.visible, "thought: user expanded")
 	var thinking2 := {
 		"entry_id": "t1", "ordinal": 0, "kind": "thought", "state": "thinking", "revision": 2,
-		"payload": {"content": "先看参数，再调整重力", "token_count": 30, "duration_seconds": null}
+		"payload": {"content": "先看参数，再调整重力", "token_count": 30, "duration_seconds": null, "response_attempt_id": "attempt-recovery"}
 	}
 	renderer.apply_entry(thinking2)
 	_check(list.get_child_count() == 1, "thought: revision replaces node in place")
 	var toggle2: Button = _find_descendant_button(list.get_child(0))
 	var detail2: RichTextLabel = _find_descendant_rich(list.get_child(0))
-	_check(toggle2 != null and toggle2.text.contains("Thinking 30 Tokens"), "thought: header token count updated")
+	_check(toggle2 != null and toggle2.text.contains("Thinking 30 Tokens") and not toggle2.text.contains("Thought for"), "thought: recovery remains non-terminal")
 	_check(detail2 != null and detail2.visible, "thought: expanded state preserved across revisions")
 
-	# 完成后头部切换为耗时；内容与展开状态保留。
+	# 只有恢复最终结束后头部才切换为完整逻辑生命周期的权威耗时。
 	var completed := {
 		"entry_id": "t1", "ordinal": 0, "kind": "thought", "state": "complete", "revision": 3,
-		"payload": {"content": "先看参数，再调整重力", "token_count": 30, "duration_seconds": 3.5}
+		"payload": {"content": "先看参数，再调整重力", "token_count": 30, "duration_seconds": 130.0, "response_attempt_id": "attempt-recovery"}
 	}
 	renderer.apply_entry(completed)
 	var toggle3: Button = _find_descendant_button(list.get_child(0))
 	var detail3: RichTextLabel = _find_descendant_rich(list.get_child(0))
-	_check(toggle3 != null and toggle3.text.contains("Thought for 3.50s"), "thought: completed header shows duration (got: %s)" % (toggle3.text if toggle3 != null else "<null>"))
+	_check(toggle3 != null and toggle3.text.contains("Thought for 130.00s"), "thought: completed header shows final duration (got: %s)" % (toggle3.text if toggle3 != null else "<null>"))
 	_check(detail3 != null and detail3.visible, "thought: expanded state preserved after completion")
 
 	# 历史水合整体重建：默认折叠，但持久化内容完整可展开。
@@ -409,7 +410,7 @@ func _run_thought_renderer_test() -> void:
 	var hydrated: Node = list.get_child(list.get_child_count() - 1)
 	var toggle4: Button = _find_descendant_button(hydrated)
 	var detail4: RichTextLabel = _find_descendant_rich(hydrated)
-	_check(toggle4 != null and toggle4.text.contains("Thought for 3.50s"), "thought: hydrated header rebuilt from persisted duration")
+	_check(toggle4 != null and toggle4.text.contains("Thought for 130.00s"), "thought: hydrated header rebuilt from persisted duration")
 	_check(detail4 != null and not detail4.visible, "thought: hydrated card collapsed by default")
 	_check(detail4 != null and detail4.get_parsed_text().contains("先看参数"), "thought: hydrated content preserved and expandable")
 

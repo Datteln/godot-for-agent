@@ -8,6 +8,7 @@
 - 按 `entry_id` 合并尚未发送的流式补丁，并对慢订阅者采用显式重同步，避免无界堆积旧的累计快照。
 - 前端把 WebSocket 接收、Store 投影和视图渲染解耦；同一条目在一个渲染窗口内仅应用最新修订，避免每个包都同步重排并滚动。
 - 将活跃 turn 的轻量进展信号与 WebSocket 传输心跳区分；请求空闲超时先尝试重连/快照恢复，只有恢复失败或达到硬上限才取消后端 turn。
+- 将空正文模型恢复视为同一逻辑 Thought 的连续尝试：中间尝试不得提前固化 Thought 时长，恢复流也不得向已完成的 Thought 追加内容并保留过期耗时。
 - 增加红脱敏的端到端诊断指标：补丁字节数、合并/重同步、队列深度、socket 交付与渲染延迟、超时的恢复结果。
 - 为 `describe_map_region` 暴露 400-cell 范围约束或安全分块，减少可恢复的前端工具参数失败。
 
@@ -26,6 +27,6 @@
 
 ## Impact
 
-- 后端：`app/transcript/writer.py`、`app/events/store.py`、`app/events/websocket.py`、`app/query/engine.py`、工具 schema/说明和相关测试。
+- 后端：`app/orchestrator/agent.py`、`app/transcript/writer.py`、`app/events/store.py`、`app/events/websocket.py`、`app/query/engine.py`、工具 schema/说明和相关测试。
 - Godot 前端：`agent_http_client.gd`、`chat_event_socket.gd`、`chat_panel.gd`、transcript projector/renderer/viewport 及测试。
 - 协议：WebSocket 流式正文补丁扩展为增量或受限预览；历史快照保持完整条目，现有 resume 游标和单调 revision 不变。

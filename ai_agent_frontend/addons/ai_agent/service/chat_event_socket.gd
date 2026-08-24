@@ -32,6 +32,16 @@ var _stopped := true
 var _awaiting_history_hydration := false
 var _subscribe_sent := false
 
+# 脱敏传输诊断（任务 1.1）：只记录序号、计数、字节数与时间戳，不含正文。
+var _diag_events_received := 0
+var _diag_bytes_received := 0
+var _diag_acks_sent := 0
+var _diag_last_received_seq := 0
+var _diag_last_received_msec := 0
+var _diag_last_ack_msec := 0
+var _diag_resync_count := 0
+var _diag_gap_count := 0
+
 
 func start(session_id: String, after_seq: int = 0) -> void:
 	# 事件序号按会话独立计数：切换到不同会话时必须清零并清空去重表，
@@ -124,7 +134,9 @@ func _connect() -> void:
 
 func _read_packets() -> void:
 	while _socket.get_available_packet_count() > 0:
-		var parsed: Variant = JSON.parse_string(_socket.get_packet().get_string_from_utf8())
+		var packet: PackedByteArray = _socket.get_packet()
+		_diag_bytes_received += packet.size()
+		var parsed: Variant = JSON.parse_string(packet.get_string_from_utf8())
 		if not (parsed is Dictionary):
 			_emit_protocol_error({"code": "invalid_server_message"})
 			continue
@@ -166,6 +178,7 @@ func _handle_event(raw_event: Variant) -> void:
 	if _seen_event_ids.has(event_id) or seq <= _highest_contiguous_seq:
 		return
 	if seq != _highest_contiguous_seq + 1:
+		_diag_gap_count += 1
 		_begin_history_hydration({
 			"type": "history_gap",
 			"session_id": _session_id,
@@ -175,7 +188,12 @@ func _handle_event(raw_event: Variant) -> void:
 		return
 	_seen_event_ids[event_id] = true
 	_highest_contiguous_seq = seq
+	_diag_events_received += 1
+	_diag_last_received_seq = seq
+	_diag_last_received_msec = Time.get_ticks_msec()
 	_send({"version": PROTOCOL_VERSION, "type": "ack", "seq": _highest_contiguous_seq})
+	_diag_acks_sent += 1
+	_diag_last_ack_msec = Time.get_ticks_msec()
 	event_received.emit(event)
 
 
@@ -189,7 +207,39 @@ func _begin_history_hydration(details: Dictionary, is_gap: bool) -> void:
 	if is_gap:
 		history_gap_received.emit(details)
 	else:
+		_diag_resync_count += 1
 		resync_required_received.emit(details)
+
+
+## 空闲恢复入口（任务 4.2）：从已确认游标强制重连并重新订阅。
+##
+## 不清零 `_highest_contiguous_seq`——恢复的语义正是“从客户端已连续确认的
+## 位置续订”，服务端重放该游标之后的事件。重置重连退避以便立刻尝试。
+func recover_from_acknowledged_cursor() -> void:
+	if _stopped or _session_id.strip_edges().is_empty():
+		return
+	_awaiting_history_hydration = false
+	if _socket.get_ready_state() != WebSocketPeer.STATE_CLOSED:
+		_socket.close()
+	_reconnect_delay_s = 1.0
+	_next_reconnect_at_msec = 0
+	_connect()
+
+
+## 返回脱敏传输诊断快照（任务 1.1）；只含序号/计数/字节/时间戳。
+func transport_diagnostics() -> Dictionary:
+	return {
+		"state": _state,
+		"highest_contiguous_seq": _highest_contiguous_seq,
+		"events_received": _diag_events_received,
+		"bytes_received": _diag_bytes_received,
+		"acks_sent": _diag_acks_sent,
+		"last_received_seq": _diag_last_received_seq,
+		"last_received_msec": _diag_last_received_msec,
+		"last_ack_msec": _diag_last_ack_msec,
+		"resync_count": _diag_resync_count,
+		"gap_count": _diag_gap_count,
+	}
 
 
 func _schedule_reconnect() -> void:

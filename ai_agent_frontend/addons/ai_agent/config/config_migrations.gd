@@ -24,8 +24,9 @@ const DEFAULTS := {
 	"ai_agent/compact_summary_use_llm": "default",
 	"ai_agent/compact_summary_model": "",
 	"ai_agent/request_timeout_sec": 30.0,
-	"ai_agent/chat_request_timeout_sec": 300.0,
+	"ai_agent/chat_request_timeout_sec": 360.0,
 	"ai_agent/chat_request_hard_cap_sec": 1800.0,
+	"ai_agent/chat_idle_recovery_window_sec": 30.0,
 	"ai_agent/embedding_provider": "disabled",
 	"ai_agent/embedding_model": "text-embedding-3-small",
 	"ai_agent/embedding_endpoint": "https://api.openai.com/v1",
@@ -79,6 +80,10 @@ const PERMISSION_MODES := {
 	"read_only": true,
 }
 
+## 旧版默认的聊天空闲阈值为 180 秒。保留用户自定义值，仅将这个已知旧默认值
+## 升级为新的 360 秒默认值，避免长 Thought 因无事件窗口过短而被过早恢复/中断。
+const LEGACY_CHAT_REQUEST_TIMEOUT_S := 180.0
+
 const PROPERTY_HINTS := {
 	"ai_agent/permission_mode": {
 		"hint": PROPERTY_HINT_ENUM,
@@ -115,6 +120,10 @@ const PROPERTY_HINTS := {
 	"ai_agent/chat_request_hard_cap_sec": {
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "60,7200,10,suffix:s"
+	},
+	"ai_agent/chat_idle_recovery_window_sec": {
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "5,300,1,suffix:s"
 	},
 	"ai_agent/embedding_provider": {
 		"hint": PROPERTY_HINT_ENUM,
@@ -224,6 +233,10 @@ static func apply_defaults(editor_interface: EditorInterface) -> void:
 			var normalized_mode := normalize_permission_mode(settings.get_setting(key))
 			if settings.get_setting(key) != normalized_mode:
 				settings.set_setting(key, normalized_mode)
+		elif key == "ai_agent/chat_request_timeout_sec" and is_equal_approx(
+			float(settings.get_setting(key)), LEGACY_CHAT_REQUEST_TIMEOUT_S
+		):
+			settings.set_setting(key, DEFAULTS[key])
 		_add_property_info(settings, key, DEFAULTS[key])
 
 

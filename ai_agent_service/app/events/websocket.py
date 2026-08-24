@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import secrets
+import time
 from contextlib import suppress
 from typing import Any
 
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
 _SUBSCRIBE_TIMEOUT_S = 15.0
+_SLOW_SEND_THRESHOLD_S = 0.5
 
 
 def install_event_websocket_route(
@@ -117,6 +119,7 @@ async def _run_subscription(
         if outbound_task in done:
             item = outbound_task.result()
             if isinstance(item, ResyncRequired):
+                # 背压重同步：只携带脱敏诊断，不阻塞其他订阅，也不取消活跃轮次。
                 await websocket.send_json(
                     {
                         "version": PROTOCOL_VERSION,
@@ -124,7 +127,14 @@ async def _run_subscription(
                         "session_id": item.session_id,
                         "after_seq": item.after_seq,
                         "reason": item.reason,
+                        "diagnostics": subscription.diagnostics(),
                     }
+                )
+                logger.info(
+                    "Subscriber resync issued session=%s reason=%s %s",
+                    item.session_id,
+                    item.reason,
+                    subscription.diagnostics(),
                 )
                 return
             await _send_event(websocket, item)
@@ -184,8 +194,19 @@ def _is_authorized(websocket: WebSocket, expected_token: str | None) -> bool:
 
 
 async def _send_event(websocket: WebSocket, event: Event) -> None:
-    """发送带版本号的规范事件消息。"""
+    """发送带版本号的规范事件消息，并记录脱敏发送耗时。"""
+    started = time.monotonic()
     await websocket.send_json({"version": PROTOCOL_VERSION, "type": "event", "event": event.to_wire()})
+    elapsed = time.monotonic() - started
+    if elapsed >= _SLOW_SEND_THRESHOLD_S:
+        # 仅记录序号/类型/耗时等脱敏字段，绝不写入正文。
+        logger.warning(
+            "Slow socket send session=%s seq=%d type=%s elapsed_s=%.3f",
+            event.session_id,
+            event.seq,
+            event.type,
+            elapsed,
+        )
 
 
 async def _send_protocol_error(websocket: WebSocket, code: str, message: str) -> None:

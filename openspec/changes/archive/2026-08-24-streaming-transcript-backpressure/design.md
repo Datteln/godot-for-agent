@@ -51,6 +51,16 @@ WebSocket 客户端解析并验证连续 seq 后立即确认交付。`ChatPanel`
 
 服务端记录实时 payload 字节数、合并次数、队列条数/字节峰值、进入重同步的原因与 socket send 耗时。客户端记录最后接收/确认/投影/渲染的 seq 与时间、每帧合并数、渲染耗时以及超时后恢复结果。日志不得记录全文、提示词或工具结果；测试可通过这些结构化数值断言系统行为。
 
+### 6. 空正文恢复须保持一个未终结的逻辑 Thought
+
+一次用户可见的 Thought 可以跨越多个原始模型响应尝试。每个模型调用都生成唯一的 `response_attempt_id`，并随 reasoning/text delta、流结束及其 transcript 元数据传递；`frame_id + message_index` 不能单独作为原始响应或流式 Thought 的身份。
+
+当某次尝试只产生 reasoning 而没有可交付正文，编排器若决定立即发起空正文恢复，必须先判定该次流结束为 **provisional**：不得向前端发布该逻辑 Thought 的 `complete` patch，也不得写入 `duration_seconds`。恢复尝试在同一逻辑 Thought 下继续，保留最初 `started_at`，并把 token 计数按尝试累积或以明确的权威总数更新。只有逻辑响应最终成功、不可恢复地失败、被取消或被显式中断时，才发布唯一的终态 Thought 和最终耗时。
+
+`TranscriptWriter` 必须验证增量的 `response_attempt_id` 是否属于当前逻辑 Thought；已结束尝试的迟到增量不得覆盖恢复尝试的内容、token 计数、状态或时长。若未来选择把恢复尝试展示为独立 Thought，必须创建新 entry，而不能把它并入一个已完成 entry。本变更采用连续展示语义，因此空正文恢复后的最终 `Thought for Xs` 从首次 Thinking 开始计算，并在最终尝试终止时一次性固化。
+
+选择此方案而不是在前端修正显示，因为 79.33 秒等错误值已作为服务端权威 `duration_seconds` 持久化；前端没有足够的尝试边界来可靠重算。也不允许 `complete → thinking → complete` 的可见状态回退：这样会违背终态排序保证，并可能让慢客户端以过期 complete patch 覆盖恢复中的状态。
+
 ## Risks / Trade-offs
 
 - [增量协议兼容性] → 以版本化载荷表示，保留完整 patch 接收路径；未知 delta 或 revision 缺口统一走快照恢复。
@@ -66,9 +76,11 @@ WebSocket 客户端解析并验证连续 seq 后立即确认交付。`ChatPanel`
 3. 启用恢复优先的超时路径，验证 WebSocket 断连、队列溢出与真实后端卡死三类场景。
 4. 将地图范围约束纳入 schema/工具适配，并保留原始 `region_too_large` 作为无法安全分块时的结构化错误。
 5. 任一阶段出现恢复错误时，关闭增量/合并特性，回退到完整 patch + 现有快照重同步；不迁移或修改既有会话历史。
+6. 在启用空正文恢复前，加入跨尝试 Thought fixture；断言单个逻辑 Thought 不会在恢复开始时冻结时长，且迟到旧尝试不会覆盖恢复尝试。
 
 ## Open Questions
 
 - 实时正文选择纯 append delta，还是以固定上限 latest-preview 兼容旧渲染器；实施前以现有 WebSocket 兼容测试决定。
 - 每订阅的字节预算、流式发布间隔和前端批次窗口应从压测基线确定，而非硬编码为本变更的固定常量。
 - `describe_map_region` 的自动分块是否需要对不同 map 类型施加不同深度/维度限制；先以 2D TileMap 与 legacy TileMap 覆盖为准。
+- 对于非空但被策略性重试的模型响应，是否也延续同一逻辑 Thought；本变更先覆盖“空正文后立即恢复”，其他重试须显式选择连续或独立展示语义。

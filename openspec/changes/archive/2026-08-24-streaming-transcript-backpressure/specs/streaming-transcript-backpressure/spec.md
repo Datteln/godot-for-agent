@@ -28,6 +28,17 @@ The service and client SHALL record structured diagnostics for realtime payload 
 - **WHEN** the client ultimately interrupts a timed-out chat request
 - **THEN** diagnostics identify whether the cause was missing service progress, socket delivery failure, resynchronization failure, or the hard-cap expiry
 
+### Requirement: Recoverable model attempts preserve one logical Thought lifecycle
+For a user-visible Thought that spans an empty-final-answer recovery, the service SHALL assign a unique response-attempt identity to every underlying model stream while retaining one logical Thought identity. It MUST NOT publish or persist a completed Thought merely because an intermediate attempt has ended when the orchestrator will immediately recover that attempt. The final persisted `duration_seconds` MUST span from the logical Thought's first visible Thinking update through its final logical terminal outcome, and no late patch from an earlier attempt may change that terminal entry.
+
+#### Scenario: Empty final answer starts a recovery attempt
+- **WHEN** a model attempt produces visible reasoning but ends without assistant text and the orchestrator starts its no-thinking recovery
+- **THEN** the existing Thought remains non-terminal, the recovery deltas are associated with a new response-attempt identity, and exactly one final Thought patch contains the duration measured from the first Thinking update to the recovery outcome
+
+#### Scenario: Older attempt emits a delayed patch after recovery begins
+- **WHEN** a delayed delta or terminal notification from an earlier response attempt arrives after a recovery attempt is active
+- **THEN** it does not overwrite the active recovery content, token count, state, or final duration
+
 ### Requirement: Map region reads expose their cardinality limit
 The `describe_map_region` interface SHALL make its maximum readable cell count discoverable to the model. For a request exceeding that limit, it MUST either perform a semantics-preserving bounded partition and identify the partitions in its result, or return a structured `region_too_large` error that includes the applicable limit and a safe smaller-request constraint.
 

@@ -25,6 +25,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from app.agents.bundled import get_agent
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
@@ -523,12 +524,13 @@ async def _recover_empty_final_answer(
     event_callback: Callable[[str, dict[str, Any]], None] | None,
     loop: int,
     message_index: int,
+    response_attempt_id: str,
 ) -> AssistantTurn | None:
     """对空最终答复执行恰好一次挽救调用（任务 2.8）。
 
     挽救调用关闭 thinking（`thinking_budget=0`）且不提供任何工具，只要求模型
-    基于当前上下文直接给出最终正文；增量仍走原事件回调，身份沿用原响应的
-    `(frame_id, message_index)`，因此挽救出的正文与既有展示稿条目同身份。
+    基于当前上下文直接给出最终正文；增量沿用原响应的逻辑 Thought 身份，但
+    使用新的 `response_attempt_id`，防止恢复流写回已结束的原始模型尝试。
 
     Args:
         llm: 大模型 provider。
@@ -540,6 +542,7 @@ async def _recover_empty_final_answer(
         event_callback: 编排事件回调。
         loop: 当前循环序号（从 1 开始）。
         message_index: 助手消息在 `frame.messages` 中的位置（与原响应一致）。
+        response_attempt_id: 本次恢复模型调用的唯一身份。
 
     Returns:
         携带非空正文的 `AssistantTurn`；挽救仍为空或调用失败时返回 None。
@@ -564,6 +567,7 @@ async def _recover_empty_final_answer(
                     if frame.history_anchor_message_index is not None
                     else len(frame.messages)
                 ),
+                response_attempt_id,
             ),
         )
     except LLMError as exc:
@@ -1208,6 +1212,7 @@ def _delta_callback(
     message_index: int,
     timeline_frame_id: str,
     timeline_message_index: int,
+    response_attempt_id: str,
 ) -> Callable[[str, str, int | None], None] | None:
     """构造传给 `LLMProvider.chat` 的流式增量回调，转发为编排事件。
 
@@ -1234,6 +1239,7 @@ def _delta_callback(
             "message_index": message_index,
             "timeline_frame_id": timeline_frame_id,
             "timeline_message_index": timeline_message_index,
+            "response_attempt_id": response_attempt_id,
             "text": text,
         }
         if kind == "reasoning":
@@ -1488,6 +1494,7 @@ async def run_turn(
                     ),
                 )
 
+            response_attempt_id = uuid4().hex
             turn = await llm.chat(
                 frame.messages,
                 visible_tools,
@@ -1505,6 +1512,7 @@ async def run_turn(
                         if frame.history_anchor_message_index is not None
                         else len(frame.messages)
                     ),
+                    response_attempt_id,
                 ),
                 on_fallback=_fallback_callback(event_callback, frame.id, loop_index + 1),
                 cache_breakpoints=(
@@ -1522,20 +1530,10 @@ async def run_turn(
             )
             return ErrorResult(text=str(exc))
 
-        # 原始响应流在此刻被完整消费（任务 2.7）：Thought 的完成结算推迟到这里，
-        # 而不是首个正文增量或工具边界；思考预算边界之后继续产出的正文/工具调用
-        # 不影响已累计的推理内容。
+        # 空正文恢复会继续同一个逻辑 Thought。首次原始流结束仅是 provisional，
+        # 不能提前完成 Thought；只有最终尝试结束后才结算可见时长。
         assistant_message_index = len(frame.messages)
-        _emit_orchestration_event(
-            event_callback,
-            "assistant_stream_end",
-            {
-                "frame_id": frame.id,
-                "loop": loop_index + 1,
-                "message_index": assistant_message_index,
-                **_history_timeline_payload(frame),
-            },
-        )
+        terminal_attempt_id = response_attempt_id
 
         # 根帧的无工具空响应：不把它当作成功的最终答复（任务 2.8/3.6）。在原始流
         # 结束后执行恰好一次"关闭 thinking、不提供工具"的最终答复挽救；仍为空则
@@ -1550,6 +1548,19 @@ async def run_turn(
                 session.session_id,
                 frame.id,
             )
+            recovery_attempt_id = uuid4().hex
+            _emit_orchestration_event(
+                event_callback,
+                "assistant_stream_recovery_started",
+                {
+                    "frame_id": frame.id,
+                    "loop": loop_index + 1,
+                    "message_index": assistant_message_index,
+                    "previous_response_attempt_id": response_attempt_id,
+                    "response_attempt_id": recovery_attempt_id,
+                    **_history_timeline_payload(frame),
+                },
+            )
             recovered = await _recover_empty_final_answer(
                 llm,
                 frame,
@@ -1560,10 +1571,37 @@ async def run_turn(
                 event_callback,
                 loop_index + 1,
                 assistant_message_index,
+                recovery_attempt_id,
             )
+            terminal_attempt_id = recovery_attempt_id
             if recovered is None:
-                return ErrorResult(text="模型两次返回空内容（已进行一次无思考重试），请重试或简化问题。")
+                _emit_orchestration_event(
+                    event_callback,
+                    "assistant_stream_end",
+                    {
+                        "frame_id": frame.id,
+                        "loop": loop_index + 1,
+                        "message_index": assistant_message_index,
+                        "response_attempt_id": terminal_attempt_id,
+                        **_history_timeline_payload(frame),
+                    },
+                )
+                return ErrorResult(
+                    text="模型两次返回空内容（已进行一次无思考重试），请重试或简化问题。"
+                )
             turn = recovered
+
+        _emit_orchestration_event(
+            event_callback,
+            "assistant_stream_end",
+            {
+                "frame_id": frame.id,
+                "loop": loop_index + 1,
+                "message_index": assistant_message_index,
+                "response_attempt_id": terminal_attempt_id,
+                **_history_timeline_payload(frame),
+            },
+        )
 
         frame.messages.append(turn.raw_message)
         _record_cache_metrics(cache_metrics, cache_decision, turn)

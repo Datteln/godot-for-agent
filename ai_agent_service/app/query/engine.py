@@ -15,6 +15,8 @@ import copy
 import hashlib
 import json
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -358,6 +360,7 @@ _TRANSCRIPT_ONLY_EVENT_TYPES = frozenset(
     {
         "agent_text_delta",
         "agent_reasoning_delta",
+        "assistant_stream_recovery_started",
         "assistant_stream_end",
         "server_tool_start",
         "server_tool_result",
@@ -2290,27 +2293,28 @@ class QueryEngine:
                 return
             self._emit(session.session_id, event_type, payload)
 
-        step = await run_turn(
-            session=session,
-            llm=self._llm,
-            security=security,
-            tool_ctx=ToolContext(
+        async with self._turn_keepalive(session.session_id):
+            step = await run_turn(
+                session=session,
+                llm=self._llm,
                 security=security,
-                session_id=session.session_id,
-                skill_catalog=self._skill_catalog,
-                rag_index_path=self._settings.resolved_rag_index_path(),
-            ),
-            max_turns=self._settings.max_turns,
-            session_allow=session.session_allow,
-            agent_prompt_factory=build_child_agent_prompt,
-            model_selector=self._model_for_effort,
-            model_override=model_override,
-            thinking_budget_selector=self._thinking_budget_for_effort,
-            event_callback=emit_turn_event,
-            cache_engine=self._cache_engine,
-            cache_metrics=self._cache_metrics,
-            context_token_limit=self._settings.auto_compact_token_threshold,
-        )
+                tool_ctx=ToolContext(
+                    security=security,
+                    session_id=session.session_id,
+                    skill_catalog=self._skill_catalog,
+                    rag_index_path=self._settings.resolved_rag_index_path(),
+                ),
+                max_turns=self._settings.max_turns,
+                session_allow=session.session_allow,
+                agent_prompt_factory=build_child_agent_prompt,
+                model_selector=self._model_for_effort,
+                model_override=model_override,
+                thinking_budget_selector=self._thinking_budget_for_effort,
+                event_callback=emit_turn_event,
+                cache_engine=self._cache_engine,
+                cache_metrics=self._cache_metrics,
+                context_token_limit=self._settings.auto_compact_token_threshold,
+            )
         response = _step_to_response(step)
         if isinstance(response, ChatFinalResponse) and session.pending_verify_candidates:
             final_frame = session.top_frame()
@@ -2328,27 +2332,28 @@ class QueryEngine:
                 await self._run_verify(
                     session, security, list(latest_by_path.values()), model_override
                 )
-                step = await run_turn(
-                    session=session,
-                    llm=self._llm,
-                    security=security,
-                    tool_ctx=ToolContext(
+                async with self._turn_keepalive(session.session_id):
+                    step = await run_turn(
+                        session=session,
+                        llm=self._llm,
                         security=security,
-                        session_id=session.session_id,
-                        skill_catalog=self._skill_catalog,
-                        rag_index_path=self._settings.resolved_rag_index_path(),
-                    ),
-                    max_turns=self._settings.max_turns,
-                    session_allow=session.session_allow,
-                    agent_prompt_factory=build_child_agent_prompt,
-                    model_selector=self._model_for_effort,
-                    model_override=model_override,
-                    thinking_budget_selector=self._thinking_budget_for_effort,
-                    event_callback=emit_verify_turn_event,
-                    cache_engine=self._cache_engine,
-                    cache_metrics=self._cache_metrics,
-                    context_token_limit=self._settings.auto_compact_token_threshold,
-                )
+                        tool_ctx=ToolContext(
+                            security=security,
+                            session_id=session.session_id,
+                            skill_catalog=self._skill_catalog,
+                            rag_index_path=self._settings.resolved_rag_index_path(),
+                        ),
+                        max_turns=self._settings.max_turns,
+                        session_allow=session.session_allow,
+                        agent_prompt_factory=build_child_agent_prompt,
+                        model_selector=self._model_for_effort,
+                        model_override=model_override,
+                        thinking_budget_selector=self._thinking_budget_for_effort,
+                        event_callback=emit_verify_turn_event,
+                        cache_engine=self._cache_engine,
+                        cache_metrics=self._cache_metrics,
+                        context_token_limit=self._settings.auto_compact_token_threshold,
+                    )
                 response = _step_to_response(step)
         # 轮次收尾：仍在思考中的 Thought 条目一律完成（耗时以收尾时刻计）。
         self._transcript.complete_open_thoughts(session)
@@ -3375,6 +3380,7 @@ class QueryEngine:
                 message_index=int(payload.get("message_index", -1)),
                 cumulative_text=str(payload.get("text", "")),
                 token_count=payload.get("token_count"),
+                response_attempt_id=str(payload.get("response_attempt_id", "")),
             )
         elif event_type == "agent_text_delta":
             frame_id = str(payload.get("frame_id", ""))
@@ -3388,12 +3394,20 @@ class QueryEngine:
                 cumulative_text=str(payload.get("text", "")),
                 turn_id=session.pending_turn_id,
             )
+        elif event_type == "assistant_stream_recovery_started":
+            writer.begin_thought_recovery(
+                session,
+                frame_id=str(payload.get("frame_id", "")),
+                message_index=int(payload.get("message_index", -1)),
+                response_attempt_id=str(payload.get("response_attempt_id", "")),
+            )
         elif event_type == "assistant_stream_end":
-            # 原始模型响应流完整消费：此刻结算该响应对应的 Thought 条目。
+            # 只有逻辑响应的最终流结束才会到达这里；空正文首次结束会先进入恢复。
             writer.complete_thought(
                 session,
                 frame_id=str(payload.get("frame_id", "")),
                 message_index=int(payload.get("message_index", -1)),
+                response_attempt_id=str(payload.get("response_attempt_id", "")),
             )
         elif event_type == "server_tool_start":
             tool_call_id = str(payload.get("tool_call_id", ""))
@@ -3489,6 +3503,46 @@ class QueryEngine:
             session.event_seq = event.seq
         logger.debug("Event persisted session=%s seq=%d type=%s", session_id, event.seq, event_type)
         return event.seq
+
+    @asynccontextmanager
+    async def _turn_keepalive(self, session_id: str) -> AsyncIterator[None]:
+        """在一次 agent 循环执行期间周期性发布 `turn_keepalive` 进展事件。
+
+        keepalive 与 WebSocket 传输心跳是两种语义：传输心跳只说明 socket 存活，
+        而 `turn_keepalive` 说明服务端仍持有活跃轮次、并在没有正文流时继续向前
+        推进。载荷只含轮次/会话进展元数据（turn_id、阶段、最后已持久化序号），
+        不含任何正文、提示词或工具结果（任务 4.1）。
+
+        Args:
+            session_id: 当前会话 id。
+        """
+        interval = self._settings.turn_keepalive_interval_s
+        if interval <= 0 or self._events is None:
+            yield
+            return
+
+        session = self._store.get_or_create(session_id, self.available_tools)
+
+        async def _emit_keepalives() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                self._emit(
+                    session_id,
+                    "turn_keepalive",
+                    {
+                        "turn_id": session.pending_turn_id,
+                        "phase": "active_turn",
+                        "last_event_seq": self._events.last_seq(session_id),
+                    },
+                )
+
+        task = asyncio.create_task(_emit_keepalives(), name="turn-keepalive")
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     def _load_session_seeded(self, session_id: str) -> Session:
         """获取会话并把事件序号下限抬到持久化游标。"""

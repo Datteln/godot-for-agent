@@ -12,6 +12,12 @@
 Writer 只做两件事：变更 `Session.transcript_*` 内存态，并通过注入的
 `emit` 回调发布 `transcript_patch` 事件（持久化仍由调用方的
 `SessionStore.save` 统一负责）。
+
+实时背压分工（streaming-transcript-backpressure 任务 2.1）：Writer 发布的
+补丁始终携带条目的完整权威状态；把增长中 Thought/assistant 正文转换为
+有界实时表示（追加增量/受限预览）是 `EventStore` 发布通道的职责。完整条目
+永远保留在 `Session.transcript_entries` 与历史快照中，实时表示只是传输优化，
+因此任何表示退化都可以回落到快照重同步而不丢失内容。
 """
 
 from __future__ import annotations
@@ -19,7 +25,8 @@ from __future__ import annotations
 import copy
 import logging
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from app.sessions.store import Session
 from app.transcript.models import VALID_ENTRY_STATES
@@ -322,6 +329,7 @@ class TranscriptWriter:
         message_index: int,
         cumulative_text: str,
         token_count: int | None,
+        response_attempt_id: str = "",
     ) -> str:
         """创建/更新一个 `kind=thought` 条目的思考中状态。
 
@@ -334,11 +342,13 @@ class TranscriptWriter:
             message_index: 该轮响应在 `frame.messages` 中的位置。
             cumulative_text: 到本次增量为止的累计思考内容。
             token_count: 当前思考 token 计数；None 时保留上次计数。
+            response_attempt_id: 原始模型流的唯一身份；空值兼容旧事件。
 
         Returns:
             该 Thought 条目的 `entry_id`。
         """
         key = f"thought:{frame_id}:{message_index}"
+        attempt_id = response_attempt_id or "legacy"
         entry_id = session.transcript_index.get(key)
         if entry_id is None:
             entry = self._create_entry(
@@ -350,6 +360,9 @@ class TranscriptWriter:
                     "token_count": int(token_count) if token_count is not None else 0,
                     "started_at": time.time(),
                     "duration_seconds": None,
+                    "response_attempt_id": attempt_id,
+                    "attempt_content_offset": 0,
+                    "attempt_token_offset": 0,
                 },
                 index_key=key,
             )
@@ -357,6 +370,15 @@ class TranscriptWriter:
         else:
             existing = self._find_entry(session, entry_id)
             payload = dict(existing.get("payload", {})) if existing is not None else {}
+            active_attempt_id = str(payload.get("response_attempt_id", "legacy"))
+            if active_attempt_id != attempt_id:
+                logger.warning(
+                    "Ignoring stale Thought delta entry=%s active_attempt=%s delta_attempt=%s",
+                    entry_id,
+                    active_attempt_id,
+                    attempt_id,
+                )
+                return str(entry_id)
             if existing is not None and str(existing.get("state", "")) == "complete":
                 # `complete` 是单向的（任务 2.7）：完成后的迟到增量不得把条目退回
                 # `thinking`；仅在累计内容更长时保留更完整的推理内容。
@@ -371,12 +393,42 @@ class TranscriptWriter:
                 entry = self._update_entry(session, entry_id, state="complete", payload=payload)
                 self._publish(session.session_id, entry)
                 return str(entry["entry_id"])
-            payload["content"] = cumulative_text
+            content_offset = int(payload.get("attempt_content_offset", 0))
+            existing_content = str(payload.get("content", ""))
+            payload["content"] = existing_content[:content_offset] + cumulative_text
             if token_count is not None:
-                payload["token_count"] = int(token_count)
+                token_offset = int(payload.get("attempt_token_offset", 0))
+                payload["token_count"] = token_offset + max(int(token_count), 0)
             entry = self._update_entry(session, entry_id, state="thinking", payload=payload)
         self._publish(session.session_id, entry)
         return str(entry["entry_id"])
+
+    def begin_thought_recovery(
+        self,
+        session: Session,
+        *,
+        frame_id: str,
+        message_index: int,
+        response_attempt_id: str,
+    ) -> str | None:
+        """把开放 Thought 切换到空正文恢复尝试，保留原始计时起点。"""
+        if not response_attempt_id:
+            return None
+        entry_id = session.transcript_index.get(f"thought:{frame_id}:{message_index}")
+        if entry_id is None:
+            return None
+        entry = self._find_entry(session, entry_id)
+        if entry is None or str(entry.get("state", "")) != "thinking":
+            return None
+        payload = dict(entry.get("payload", {}))
+        if str(payload.get("response_attempt_id", "")) == response_attempt_id:
+            return str(entry_id)
+        payload["response_attempt_id"] = response_attempt_id
+        payload["attempt_content_offset"] = len(str(payload.get("content", "")))
+        payload["attempt_token_offset"] = max(int(payload.get("token_count", 0)), 0)
+        updated = self._update_entry(session, entry_id, state="thinking", payload=payload)
+        self._publish(session.session_id, updated)
+        return str(updated["entry_id"])
 
     def complete_thought(
         self,
@@ -384,6 +436,7 @@ class TranscriptWriter:
         *,
         frame_id: str,
         message_index: int | None = None,
+        response_attempt_id: str = "",
     ) -> str | None:
         """把进行中的 Thought 条目原地迁移到 `complete`，写入规范耗时。
 
@@ -394,6 +447,7 @@ class TranscriptWriter:
             session: 当前会话。
             frame_id: Thought 所属帧 id。
             message_index: 响应位置；为 None 时结束该帧当前打开的 Thought。
+            response_attempt_id: 终结该逻辑 Thought 的模型尝试；空值兼容旧调用。
 
         Returns:
             Thought 条目的 `entry_id`；不存在对应 Thought 时返回 None。
@@ -412,6 +466,15 @@ class TranscriptWriter:
         if str(entry.get("state", "")) == "complete":
             return str(entry["entry_id"])
         payload = dict(entry.get("payload", {}))
+        active_attempt_id = str(payload.get("response_attempt_id", "legacy"))
+        if response_attempt_id and active_attempt_id != response_attempt_id:
+            logger.warning(
+                "Ignoring stale Thought completion entry=%s active_attempt=%s completion_attempt=%s",
+                entry_id,
+                active_attempt_id,
+                response_attempt_id,
+            )
+            return None
         started_at = payload.get("started_at")
         duration = 0.0
         if isinstance(started_at, (int, float)) and started_at > 0:

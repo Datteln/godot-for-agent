@@ -5,6 +5,9 @@ const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 
 const MAX_EDITED_CELLS := 100000
 const MAX_DESCRIBED_CELLS := 400
+## 2D 区域读取允许自动分块的上限（任务 5.2）：超过该总单元数不再分块，
+## 直接返回带约束的 `region_too_large`。3D GridMap 不参与自动分块。
+const MAX_PARTITIONED_CELLS := 3200
 
 
 static func describe_selection(editor_interface: EditorInterface) -> Dictionary:
@@ -119,12 +122,13 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	var width := max(1, int(input.get("width", 1)))
 	var height := max(1, int(input.get("height", 1)))
 	var depth := max(1, int(input.get("depth", 1))) if dimension == 3 else 1
-	if width * height * depth > MAX_DESCRIBED_CELLS:
-		return {
-			"ok": false,
-			"message": "requested region exceeds the %d-cell read limit; query a smaller region" % MAX_DESCRIBED_CELLS,
-			"error_code": "region_too_large",
-		}
+	var total_cells: int = width * height * depth
+	# 3D GridMap 暂不支持安全分块：保持严格 400 单元上限与结构化错误（任务 5.2）。
+	if dimension == 3 and total_cells > MAX_DESCRIBED_CELLS:
+		return _region_too_large_error(total_cells)
+	# 2D 区域超出单块上限时做有界分块；超出可分块总上限仍返回结构化错误。
+	if dimension == 2 and total_cells > MAX_PARTITIONED_CELLS:
+		return _region_too_large_error(total_cells)
 
 	var cells: Array = []
 	for z_offset in range(depth):
@@ -141,6 +145,13 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		"map_layer": map_layer if target.get_class() == "TileMap" else null,
 		"cells": cells,
 	}
+	if dimension == 2 and total_cells > MAX_DESCRIBED_CELLS:
+		# 语义保持的分块：cells 仍按全局行优先顺序一次性读取，分块只标注边界，
+		# 调用方可凭 partitions 与 total_cells 核对拼回完整区域（任务 5.2）。
+		result["partitioned"] = true
+		result["total_cells"] = total_cells
+		result["max_cells_per_partition"] = MAX_DESCRIBED_CELLS
+		result["partitions"] = _partition_region_2d(origin.x, origin.y, width, height)
 	if target is Node2D:
 		var position_2d := (target as Node2D).position
 		result["node_position"] = {"x": position_2d.x, "y": position_2d.y}
@@ -156,6 +167,52 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	if target.get_class() == "TileMap":
 		result["layers"] = _describe_tilemap_layers(target)
 	return result
+
+
+## 结构化 `region_too_large` 错误（任务 5.1）：携带上限与可安全缩小的约束，
+## 让模型无需猜测就能把请求改到可接受范围。
+static func _region_too_large_error(total_cells: int) -> Dictionary:
+	var side_limit := int(floor(sqrt(float(MAX_DESCRIBED_CELLS))))
+	return {
+		"ok": false,
+		"message": "requested region of %d cells exceeds the %d-cell read limit; reduce width*height to at most %d (e.g. width<=%d and height<=%d) or split into adjacent regions" % [
+			total_cells, MAX_DESCRIBED_CELLS, MAX_DESCRIBED_CELLS, side_limit, side_limit
+		],
+		"error_code": "region_too_large",
+		"max_cells": MAX_DESCRIBED_CELLS,
+		"requested_cells": total_cells,
+		"constraint": {
+			"max_total_cells": MAX_DESCRIBED_CELLS,
+			"safe_width": side_limit,
+			"safe_height": side_limit,
+		},
+	}
+
+
+## 把 2D 区域切分为若干“单元数不超过上限”的矩形（任务 5.2）。
+##
+## 分块只用于标注与限制单次读取规模：实际单元仍按全局行优先顺序读取，
+## 因此各分块按返回顺序拼接即可无重叠、无遗漏地还原完整区域。
+static func _partition_region_2d(origin_x: int, origin_y: int, width: int, height: int) -> Array:
+	var partitions: Array = []
+	var y := origin_y
+	while y < origin_y + height:
+		var max_rows := maxi(1, MAX_DESCRIBED_CELLS / width)
+		var rows := mini(max_rows, origin_y + height - y)
+		var x := origin_x
+		while x < origin_x + width:
+			var cols_allowed := maxi(1, MAX_DESCRIBED_CELLS / rows)
+			var cols := mini(cols_allowed, origin_x + width - x)
+			partitions.append({
+				"x": x,
+				"y": y,
+				"width": cols,
+				"height": rows,
+				"cells": cols * rows,
+			})
+			x += cols
+		y += rows
+	return partitions
 
 
 ## 一个 legacy TileMap 节点可能同时挂多个图层（比如 "Background"/"Mid"），

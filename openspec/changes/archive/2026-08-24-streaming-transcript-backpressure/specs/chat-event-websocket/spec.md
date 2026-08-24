@@ -11,6 +11,10 @@ The service MUST rate-limit streaming publication before assigning event sequenc
 - **WHEN** a subscriber has not yet received several replaceable patches for one growing assistant entry and that entry completes
 - **THEN** the service delivers a replayable terminal patch after any required latest stream state without replacing the terminal state with a later streaming update
 
+#### Scenario: Provisional model-stream end before empty-answer recovery
+- **WHEN** an underlying model stream ends without assistant text and its orchestrator begins a recovery stream for the same logical Thought
+- **THEN** the service does not publish a terminal transcript patch for the provisional stream end, and subsequent patches identify the recovery response attempt without violating entry revision order
+
 ## ADDED Requirements
 
 ### Requirement: Realtime transcript payloads remain reconstructable and bounded
