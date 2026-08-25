@@ -50,6 +50,9 @@ def install_event_websocket_route(
             if after_seq > last_seq or (
                 after_seq > 0 and earliest_seq is not None and after_seq < earliest_seq - 1
             ):
+                # 类型化缺口信号（任务 1.3）：客户端必须能区分游标领先于
+                # 最新序号与落在保留窗口之前，二者恢复路径不同。
+                reason = "ahead_of_last" if after_seq > last_seq else "retention_gap"
                 await websocket.send_json(
                     {
                         "version": PROTOCOL_VERSION,
@@ -58,6 +61,7 @@ def install_event_websocket_route(
                         "after_seq": after_seq,
                         "earliest_seq": earliest_seq,
                         "last_seq": last_seq,
+                        "reason": reason,
                     }
                 )
                 return
@@ -65,17 +69,20 @@ def install_event_websocket_route(
             replay, subscription = event_store.subscribe(session_id, after_seq)
             for event in replay:
                 await _send_event(websocket, event)
+            visible_seq, visible_updated_at = event_store.visible_progress(session_id)
             await websocket.send_json(
                 {
                     "version": PROTOCOL_VERSION,
                     "type": "subscribed",
                     "session_id": session_id,
                     "last_seq": last_seq,
+                    "visible_seq": visible_seq,
+                    "visible_updated_at": visible_updated_at,
                 }
             )
             incoming: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
             receiver = asyncio.create_task(_receive_messages(websocket, incoming), name="chat-event-websocket-receiver")
-            await _run_subscription(websocket, subscription, incoming, heartbeat_interval_s)
+            await _run_subscription(websocket, event_store, subscription, incoming, heartbeat_interval_s)
         except asyncio.TimeoutError:
             await _send_protocol_error(websocket, "subscribe_timeout", "未在规定时间内收到 subscribe 请求")
         except WebSocketDisconnect:
@@ -91,6 +98,7 @@ def install_event_websocket_route(
 
 async def _run_subscription(
     websocket: WebSocket,
+    event_store: EventStore,
     subscription: EventSubscription,
     incoming: asyncio.Queue[dict[str, Any] | None],
     heartbeat_interval_s: float,
@@ -108,7 +116,16 @@ async def _run_subscription(
             with suppress(asyncio.CancelledError):
                 await task
         if not done:
-            await websocket.send_json({"version": PROTOCOL_VERSION, "type": "heartbeat"})
+            visible_seq, visible_updated_at = event_store.visible_progress(subscription.session_id)
+            await websocket.send_json(
+                {
+                    "version": PROTOCOL_VERSION,
+                    "type": "heartbeat",
+                    "last_seq": event_store.last_seq(subscription.session_id),
+                    "visible_seq": visible_seq,
+                    "visible_updated_at": visible_updated_at,
+                }
+            )
             continue
         if incoming_task in done:
             message = incoming_task.result()

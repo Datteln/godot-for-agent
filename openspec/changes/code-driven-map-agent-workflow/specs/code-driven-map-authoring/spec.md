@@ -13,7 +13,7 @@ The system SHALL route map and level authoring requests to a dedicated map-agent
 
 #### Scenario: Hand-painted map has no authoring source
 - **WHEN** the selected TileMap, TileMapLayer, or GridMap has no readable generator or layout configuration
-- **THEN** the map agent MUST propose a bootstrap batch that creates a `@tool` builder and readable layout source, targets a generated-only layer, and preserves the existing hand-painted layer until an explicit later migration is approved
+- **THEN** the map agent MUST emit the first ordinary approval-gated bootstrap edit that creates a `@tool` builder or readable layout source, targets a generated-only layer, and preserves the existing hand-painted layer until an explicit later migration is approved; it MUST NOT end with a prose-only request for additional confirmation because the edit's inline approval card is the user confirmation
 
 ### Requirement: Map observation remains generally available and map authoring uses authoritative facts
 The system SHALL retain `describe_tilemap_selection` and `describe_map_region` as general read-only observation tools. Any agent whose effective read-only tool set includes these tools MUST be able to use them without map-write authority. Before source changes that depend on an existing map target, layer, coordinates, existing cells, or tile identity, the map-agent workflow MUST obtain those facts through the inspection tools and MUST NOT infer them from screenshots or source text alone.

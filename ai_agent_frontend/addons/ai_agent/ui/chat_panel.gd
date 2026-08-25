@@ -18,6 +18,7 @@ const ToolExecutor = preload("res://addons/ai_agent/tools/tool_executor.gd")
 const ToolPreviewRenderer = preload("res://addons/ai_agent/ui/tool_preview_renderer.gd")
 const TranscriptStore = preload("res://addons/ai_agent/transcript/transcript_store.gd")
 const TranscriptProjector = preload("res://addons/ai_agent/transcript/transcript_projector.gd")
+const TranscriptRecovery = preload("res://addons/ai_agent/transcript/transcript_recovery.gd")
 const TranscriptRenderer = preload("res://addons/ai_agent/transcript/transcript_renderer.gd")
 const TranscriptViewport = preload("res://addons/ai_agent/transcript/transcript_viewport.gd")
 const TranscriptPatchBatcher = preload("res://addons/ai_agent/transcript/transcript_patch_batcher.gd")
@@ -112,6 +113,17 @@ const PROJECTION_WINDOW_INTERVAL_USEC := 30_000
 ## 权威展示稿三件套：Store（数据）+ Projector（水合状态机）+ Renderer（按 kind 渲染）。
 var _transcript_store: RefCounted
 var _projector: RefCounted
+var _recovery: RefCounted
+## 已渲染水位（任务 2.1）：视口已接受渲染的最大 projected 游标。
+var _rendered_upto_event_seq := 0
+var _last_stall_check_msec := 0
+## 半开订阅新鲜度检测（任务 2.10）：服务端协议心跳默认 20s、活跃轮次
+## keepalive 15s；静默超过两倍心跳窗口即可疑。探针响应有界，超时后
+## 允许下一个静默回合重新探测。
+const SOCKET_SILENCE_THRESHOLD_MS := 45_000
+const SOCKET_PROBE_TIMEOUT_MS := 15_000
+## 在途静默探针的发起时间（毫秒）；0 表示没有在途探针。
+var _socket_silence_probe_msec := 0
 var _transcript_renderer: RefCounted
 var _transcript_viewport: RefCounted
 ## 本地瞬时提示宿主：等待/命令执行等提示不进入展示稿（任务 3.4）。
@@ -159,6 +171,10 @@ func _process(_delta: float) -> void:
 	if _projection_window_pending \
 			and Time.get_ticks_usec() - _last_projection_window_usec >= PROJECTION_WINDOW_INTERVAL_USEC:
 		_run_projection_window()
+	# 可见停滞看门狗（任务 2.3）：每秒检查一次，仅在活跃轮次中生效。
+	if selection_now - _last_stall_check_msec >= 1000:
+		_last_stall_check_msec = selection_now
+		_check_visible_stall()
 
 
 ## 程序控制滚动到底部，设置抑制标志防止 value_changed 误判
@@ -357,12 +373,20 @@ func _build_children() -> void:
 
 	_transcript_store = TranscriptStore.new()
 	_projector = TranscriptProjector.new(_transcript_store)
+	_recovery = TranscriptRecovery.new()
+	_recovery.notify_visible_progress()
+	_recovery.recovery_started.connect(_on_recovery_started)
+	_recovery.recovery_escalated.connect(_on_recovery_escalated)
+	_recovery.recovery_finished.connect(_on_recovery_finished)
+	_recovery.recovery_exhausted.connect(_on_recovery_exhausted)
 	_transcript_renderer = TranscriptRenderer.new()
 	_transcript_renderer.log_renderer = _log_renderer
 	_transcript_renderer.theme_colors = _theme_colors
 	_transcript_renderer.ui_text = _ui
 	_transcript_viewport = TranscriptViewport.new()
-	_transcript_viewport.attach(_message_list, _transcript_renderer, _transcript_store, _scroll)
+	var transient_mount := VBoxContainer.new()
+	transient_mount.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_transcript_viewport.attach(_message_list, _transcript_renderer, _transcript_store, _scroll, transient_mount)
 	_transcript_viewport.older_page_requested.connect(_on_older_page_requested)
 	_transcript_viewport.diagnostics_changed.connect(_on_viewport_diagnostics)
 	_transcript_viewport.follow_mode_changed.connect(_on_viewport_follow_mode_changed)
@@ -374,9 +398,9 @@ func _build_children() -> void:
 	_transient_host.node_factory = _log_renderer
 	_transient_host.theme_colors = _theme_colors
 	_transient_host.ui_text = _ui
-	# 瞬时提示与 durable transcript 必须在同一时间线中插入：若提示先出现、
-	# 随后才水合历史，提示要保留其触发位置，不能被独立尾置容器排到所有消息后。
-	_transient_host.attach(_message_list)
+	# 瞬时提示不进入 Store，却必须位于已挂载条目与虚拟 bottom spacer 之间；
+	# 直接追加到 _message_list 会使错误/报告提示被未挂载历史的 spacer 隔开。
+	_transient_host.attach(transient_mount)
 	_transcript_renderer.error_retry_requested.connect(_on_transcript_retry_requested)
 
 
@@ -411,6 +435,8 @@ func _connect_signals() -> void:
 	_event_socket.event_received.connect(_on_event_received)
 	_event_socket.history_gap_received.connect(_on_event_history_gap)
 	_event_socket.resync_required_received.connect(_on_event_resync_required)
+	_event_socket.sequence_gap_detected.connect(_on_event_sequence_gap)
+	_event_socket.oversized_packet_rejected.connect(_on_event_oversized_packet)
 	_event_socket.protocol_error_received.connect(_on_event_protocol_error)
 	_recovery_prompt.accepted_recovery.connect(_on_recovery_accepted)
 	_recovery_prompt.rejected_recovery.connect(_on_recovery_rejected)
@@ -1208,9 +1234,10 @@ func _handle_tool_calls(response: Dictionary) -> void:
 				var stats := ToolPreviewRenderer.diff_stats(call)
 				_transcript_renderer.register_preview(str(call.get("id", "")), preview, stats)
 			_set_state(AgentState.EXECUTING)
-			var result: Dictionary = await _tool_executor.execute(call)
+			var raw_result: Variant = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
+			var result := AgentDTO.normalize_execution_result(call, raw_result)
 			results.append(result)
 
 	if not confirm.is_empty():
@@ -1251,8 +1278,7 @@ func _on_decision(results: Array) -> void:
 	_http_client.send_tool_results(results, _request_model())
 
 
-## HTTP final 只是命令确认：正文必须经由 transcript_patch（或快照）呈现。
-## 若本轮的完成补丁始终无法被实时接受，则回退到重新水合历史快照（任务 3.2）。
+## HTTP final 优先作为展示稿补丁的兜底，避免水合/投影异常使整轮正文不可见。
 func _handle_final(response: Dictionary) -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Received final response (confirmation-only).", {
 		"chars": str(response.get("text", "")).length(),
@@ -1276,8 +1302,8 @@ func _handle_final(response: Dictionary) -> void:
 			_begin_hydration(_current_session_id())
 			_http_client.fetch_session_history()
 		return
-	# 完成补丁未到达，或水合因 gap/resync 停在 HYDRATING（例如间隙发生在活跃
-	# 轮次中间、历史响应因状态非 IDLE 被暂缓）时，都回退到重新水合。
+	# 完成补丁未到达或投影器未就绪时，先显示 HTTP final 兜底；随后在本轮
+	# 已结束的下一帧再水合，避免 history 响应因仍处于 WAITING_LLM 被忽略。
 	var projector_ready: bool = _projector.is_ready()
 	var needs_resync: bool = (not _assistant_completed_this_turn) or (not projector_ready)
 	if needs_resync and _state == AgentState.WAITING_LLM:
@@ -1285,13 +1311,20 @@ func _handle_final(response: Dictionary) -> void:
 			"assistant_completed_by_patch": _assistant_completed_this_turn,
 			"projector_ready": projector_ready
 		})
-		_begin_hydration(_current_session_id())
-		_http_client.fetch_session_history()
+		_show_notice("report", text)
 	_auto_scroll = true
 	_force_scroll_once = true
 	_do_scroll_to_bottom()
 	_post_final_scroll_frames = 10
 	_end_turn_locally()
+	if needs_resync:
+		call_deferred("_hydrate_after_final")
+
+
+## 在轮次状态已复位后水合权威展示稿，避免活跃轮次的 history 响应被丢弃。
+func _hydrate_after_final() -> void:
+	_begin_hydration(_current_session_id())
+	_request_hydration_history(true)
 
 
 func _handle_session_history(response: Dictionary) -> void:
@@ -1328,6 +1361,9 @@ func _handle_session_history(response: Dictionary) -> void:
 	})
 	_clear_messages()
 	_transcript_viewport.replace_from_store()
+	_advance_rendered_watermark()
+	_notify_visible_progress()
+	_recovery.finish("snapshot_hydrated")
 	_update_context_usage_status(
 		int(response.get("context_used_tokens", 0)),
 		int(response.get("context_token_limit", 0))
@@ -1424,10 +1460,17 @@ func _discard_pending_results() -> void:
 	_set_state(AgentState.WAITING_LLM)
 
 
+## Reset 中断屏障（任务 2.11）：先抑制旧轮次的迟到响应/事件，取消在途与
+## 排队的聊天/工具结果请求并请求服务端中断，再重置会话、水合新快照。
+## 旧轮次数据由会话/世代/请求世代三重校验拒绝（HTTP 生成号 + Projector
+## generation + 会话 id 比对）。
 func _on_reset() -> void:
 	FrontendLogger.info(editor_interface, "ChatPanel", "Reset requested.", {"state": _status.text})
 	_auto_scroll = true
-	_interrupted_locally = false
+	_interrupted_locally = true
+	_idle_recovery_active = false
+	_hydrating_for_recovery = false
+	_socket_silence_probe_msec = 0
 	_event_queue.clear()
 	_draining_events = false
 	_patch_batcher.clear()
@@ -1438,6 +1481,7 @@ func _on_reset() -> void:
 	_clear_messages()
 	if _event_socket != null:
 		_event_socket.stop()
+	_recovery.reset()
 	_http_client.reset_session()
 	_begin_hydration(_current_session_id())
 	_http_client.fetch_session_history()
@@ -1456,6 +1500,7 @@ func _on_interrupt() -> void:
 	_projection_window_pending = false
 	_idle_recovery_active = false
 	_hydrating_for_recovery = false
+	_recovery.reset()
 	_clear_inline_confirmation()
 	if undo_manager != null:
 		undo_manager.abort_batch()
@@ -1489,6 +1534,7 @@ func _on_new_session() -> void:
 		undo_manager.abort_batch()
 	if _http_client != null:
 		_http_client.start_new_session(previous_session_id, session_id)
+		_recovery.reset()
 		_begin_hydration(session_id)
 		_http_client.fetch_session_history()
 	if _event_socket != null:
@@ -1512,6 +1558,7 @@ func _on_recovery_accepted(pointer: Dictionary) -> void:
 	if _event_socket != null:
 		_event_socket.stop()
 	_http_client.resume_from_pointer(pointer)
+	_recovery.reset()
 	_begin_hydration(str(pointer.get("session_id", "default")))
 	_http_client.fetch_session_history()
 	if state_store != null:
@@ -1571,7 +1618,16 @@ func _on_event_received(event: Dictionary) -> void:
 		_http_client.note_event_progress()
 		# 恢复窗口内任何新事件都证明活跃轮次仍在推进：立即结束恢复、继续等待。
 		_http_client.note_recovery_progress()
+	# 中断屏障（任务 2.11）：Reset/Stop 之后旧轮次的迟到事件一律不得进入展示态。
 	if _interrupted_locally:
+		return
+	# 事件按会话关联（任务 2.11）：拒绝旧会话/串会话的事件，防止污染当前转录。
+	var event_session := str(event.get("session_id", ""))
+	if event_session != "" and event_session != _current_session_id():
+		FrontendLogger.debug(editor_interface, "ChatPanel", "Rejected event from another session.", {
+			"event_session": event_session,
+			"current_session": _current_session_id(),
+		})
 		return
 	if state_store != null and state_store.has_method("add_events"):
 		state_store.add_events([event])
@@ -1580,6 +1636,14 @@ func _on_event_received(event: Dictionary) -> void:
 		_handle_transcript_patch(event)
 		return
 	_handle_transport_event(event)
+	# 非展示稿事件不产生可渲染条目：处理完成即视为已呈现，可提交（任务 2.12）。
+	_commit_event_seq(event)
+
+
+## 提交事件序号（任务 2.12）：仅在对应修订已被 Store 与视口接受后调用。
+func _commit_event_seq(event: Dictionary) -> void:
+	if _event_socket != null:
+		_event_socket.commit_seq(int(event.get("seq", 0)))
 
 
 ## 应用一条 transcript_patch：只有 Projector 校验通过（READY + session +
@@ -1611,8 +1675,22 @@ func _handle_transcript_patch(event: Dictionary) -> void:
 	var immediate: Dictionary = _apply_transcript_patch_now(event)
 	if not immediate.is_empty():
 		_patch_batcher.discard(str(immediate.get("entry_id", "")))
-		_transcript_viewport.apply_entry(immediate)
-		_scroll_to_bottom()
+		var presented: bool = _transcript_viewport.apply_entry(immediate)
+		if presented:
+			# 已渲染水位只在视口真正接受后推进（任务 2.8）。
+			_advance_rendered_watermark()
+			_notify_visible_progress()
+			_scroll_to_bottom()
+			# 提交判定（任务 2.12）：仅当 Store 与视口都接受才提交。
+			_commit_event_seq(event)
+		# 视口/渲染器拒绝绝不提交：renderer_rejected 已路由恢复，
+		# 未提交序号由从提交游标的续传重放弥补。
+		return
+	# Store 未改变展示态：若该事件已被 Store 处理过（重复投递/修订未前进的
+	# 无害去重），可见状态已一致，可提交以推进连续游标；投影器早期拒绝
+	# （未见过的事件）绝不提交（任务 2.12）。
+	if _transcript_store.has_seen_event(str(event.get("event_id", ""))):
+		_commit_event_seq(event)
 
 
 ## 判断补丁是否为可合并的增长型流式修订（正文仍在增长的 Thought/assistant）。
@@ -1671,6 +1749,8 @@ func _run_projection_window() -> void:
 	var window_start_usec := Time.get_ticks_usec()
 	var batches: Array = _patch_batcher.take(PROJECTION_WINDOW_MAX_ENTRIES)
 	var changed: Array = []
+	## 待提交序号（任务 2.12）：只有视口整批接受后才真正提交。
+	var commit_seqs: Array = []
 	var applied_events := 0
 	for batch_value in batches:
 		if not (batch_value is Dictionary):
@@ -1686,14 +1766,31 @@ func _run_projection_window() -> void:
 			if not (event_value is Dictionary):
 				continue
 			applied_events += 1
-			var stored: Dictionary = _apply_transcript_patch_now(event_value)
+			var event: Dictionary = event_value
+			var stored: Dictionary = _apply_transcript_patch_now(event)
 			if not stored.is_empty():
 				last_stored = stored
+				commit_seqs.append(int(event.get("seq", 0)))
+			elif _transcript_store.has_seen_event(str(event.get("event_id", ""))):
+				# 被 Store 去重/修订未前进：该事件此前已呈现，提交以保持
+				# 提交游标连续（任务 2.12）；投影器拒绝的绝不提交。
+				commit_seqs.append(int(event.get("seq", 0)))
 		if not last_stored.is_empty():
 			changed.append(last_stored)
 	if not changed.is_empty():
-		_transcript_viewport.apply_batch(changed)
+		var accepted_ids: Array = _transcript_viewport.apply_batch(changed)
+		_advance_rendered_watermark()
+		_notify_visible_progress()
 		_scroll_to_bottom()
+		if accepted_ids.size() == changed.size():
+			for seq_value in commit_seqs:
+				_commit_event_by_seq(int(seq_value))
+		# 有条目被视口拒绝时不提交：renderer_rejected 已路由恢复（任务 2.2），
+		# 水合会重建全部游标；未提交序号由从提交游标的重放弥补。
+	elif not commit_seqs.is_empty():
+		# 整批均为去重/未前进补丁：没有新的呈现内容需要视口确认，直接提交。
+		for seq_value in commit_seqs:
+			_commit_event_by_seq(int(seq_value))
 	if not _patch_batcher.is_empty():
 		# 超出单窗口条目上限的部分顺延到下一个窗口。
 		_projection_window_pending = true
@@ -1701,8 +1798,15 @@ func _run_projection_window() -> void:
 		"entries": batches.size(),
 		"events": applied_events,
 		"changed": changed.size(),
+		"committed": commit_seqs.size(),
 		"duration_ms": float(Time.get_ticks_usec() - window_start_usec) / 1000.0,
 	})
+
+
+## 按序号提交（窗口批处理路径不持有事件字典时使用）。
+func _commit_event_by_seq(seq: int) -> void:
+	if _event_socket != null:
+		_event_socket.commit_seq(seq)
 
 
 ## 已读文件缓存钩子：由 resolved 的 read_file/read_script 条目驱动。
@@ -1763,9 +1867,9 @@ func _handle_transport_event(event: Dictionary) -> void:
 
 
 func _on_event_history_gap(details: Dictionary) -> void:
-	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket history gap; re-hydrating transcript.", details)
-	_begin_hydration(_current_session_id())
-	_request_hydration_history()
+	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket history gap; routing to recovery.", details)
+	# 服务端类型化缺口信号：保留窗口无法闭合，直接走权威快照（任务 2.4）。
+	_route_recovery(str(details.get("reason", "retention_gap")), "hydrate", details)
 
 
 ## 视口接近已加载历史的起点时请求一个去重的旧页。
@@ -1796,31 +1900,38 @@ func _on_transcript_patch_rejected(diagnostic: Dictionary) -> void:
 
 func _on_transcript_renderer_rejected(diagnostic: Dictionary) -> void:
 	var entry_id := str(diagnostic.get("entry_id", ""))
-	FrontendLogger.warn(editor_interface, "TranscriptViewport", "Transcript patch rejected.", {
+	# 渲染路由失败也是可恢复的同步失败（任务 2.2）：脱敏诊断 + 统一恢复入口。
+	var redacted := {
 		"reason": "renderer_rejection",
 		"entry_id": entry_id,
 		"renderer_reason": str(diagnostic.get("renderer_reason", "")),
 		"generation": _hydration_generation,
-	})
+	}
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Transcript render failed; routing to recovery.", redacted)
+	_route_recovery("renderer_rejection", "hydrate", redacted)
 
 
 func _on_event_resync_required(details: Dictionary) -> void:
-	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket resync required; re-hydrating transcript.", details)
-	_begin_hydration(_current_session_id())
-	_request_hydration_history()
+	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket resync required; routing to recovery.", details)
+	# 背压重同步：订阅缓冲已丢弃未发送事件，直接走权威快照（任务 2.4）。
+	_route_recovery("resync_required", "hydrate", details)
 
 
 ## 请求一次历史水合。活跃轮次中主请求队列被 /chat 占用、且 `_handle_session_history`
 ## 会拒绝非 IDLE 状态下的历史响应，因此改走旁路探针通道并在探针响应中完成水合，
 ## 避免投影器在整个轮次内卡在 HYDRATING（任务 3.1 / 4.2）。
-func _request_hydration_history() -> void:
+##
+## `full_snapshot` 为真时请求 `limit=0` 的完整快照：恢复路径必须原子包含所有
+## 已持久化可见条目（任务 1.4），不受分页裁剪影响。
+func _request_hydration_history(full_snapshot := false) -> void:
 	if _http_client == null:
 		return
+	var limit := 0 if full_snapshot else 200
 	if _state != AgentState.IDLE or _http_client.is_idle_recovery_active():
 		_hydrating_for_recovery = true
-		_http_client.probe_get("/sessions/%s/history?limit=200" % _current_session_id().uri_encode())
+		_http_client.probe_get("/sessions/%s/history?limit=%d" % [_current_session_id().uri_encode(), limit])
 		return
-	_http_client.fetch_session_history()
+	_http_client.fetch_session_history(limit)
 
 
 ## 空闲恢复开始（任务 4.2）：从已确认游标重连事件流，并用探针确认活跃轮次。
@@ -1851,20 +1962,48 @@ func _on_idle_recovery_finished(result: Dictionary) -> void:
 	_show_notice("error", _ui("idle_recovery_failed") % detail)
 
 
-## 恢复探针响应：只处理恢复指针与恢复期历史水合（任务 4.2）。
+## 恢复探针响应：恢复指针确认、静默连接探针与恢复期历史水合（任务 4.2 / 2.10）。
 func _on_probe_response(response: Dictionary) -> void:
-	if not _idle_recovery_active and not _hydrating_for_recovery:
-		return
 	if response.has("exists"):
+		if _socket_silence_probe_msec > 0:
+			_handle_silence_probe_response(response)
+			return
+		if not _idle_recovery_active and not _hydrating_for_recovery:
+			return
 		# 活跃轮次确认：恢复指针存在即说明服务端仍持有 pending turn。
 		if bool(response.get("exists", false)):
 			if _http_client != null:
 				_http_client.finish_idle_recovery(true, "active_turn_confirmed")
 		return
+	if not _idle_recovery_active and not _hydrating_for_recovery:
+		return
 	if response.has("transcript"):
 		# 恢复窗口内的历史水合：允许在活跃轮次中替换 Store。
 		_apply_recovery_history(response)
 		return
+
+
+## 静默连接探针结果（任务 2.10）：服务端活跃且游标领先 → 从已提交游标续传；
+## 活跃但游标未领先 → 仅重连订阅；无活跃轮次 → 交给 HTTP 空闲超时机制。
+## 全程只触发只读探测与订阅重连，绝不重放命令。
+func _handle_silence_probe_response(response: Dictionary) -> void:
+	_socket_silence_probe_msec = 0
+	var pointer_value: Variant = response.get("pointer", {})
+	var pointer: Dictionary = pointer_value if pointer_value is Dictionary else {}
+	var server_seq := int(pointer.get("last_event_seq", 0))
+	var committed: int = _event_socket.committed_seq() if _event_socket != null else 0
+	var details := transcript_watermarks()
+	details["probe_last_event_seq"] = server_seq
+	if bool(response.get("exists", false)):
+		if server_seq > committed:
+			FrontendLogger.warn(editor_interface, "ChatPanel", "Silent socket: server ahead of committed cursor; recovering.", details)
+			_route_recovery("socket_silent_server_ahead", "resume", details)
+		else:
+			FrontendLogger.warn(editor_interface, "ChatPanel", "Silent socket: active turn confirmed; resubscribing.", details)
+			if _event_socket != null:
+				_event_socket.recover_from_acknowledged_cursor()
+	else:
+		FrontendLogger.warn(editor_interface, "ChatPanel", "Silent socket: no active turn on server; deferring to idle timeout.", details)
 
 
 ## 恢复期历史水合：应用快照并从快照游标重新订阅（任务 4.2）。
@@ -1876,6 +2015,9 @@ func _apply_recovery_history(response: Dictionary) -> void:
 	_hydrating_for_recovery = false
 	_clear_messages()
 	_transcript_viewport.replace_from_store()
+	_advance_rendered_watermark()
+	_notify_visible_progress()
+	_recovery.finish("snapshot_hydrated")
 	FrontendLogger.info(editor_interface, "ChatPanel", "Recovery hydration applied.", {
 		"entries": _transcript_store.entry_count(),
 		"upto_event_seq": _transcript_store.upto_event_seq
@@ -1889,12 +2031,215 @@ func _apply_recovery_history(response: Dictionary) -> void:
 ## 投影器检测到修订/表示缺口时请求重新水合（任务 3.1）。
 func _on_projector_hydration_required(reason: String) -> void:
 	FrontendLogger.warn(editor_interface, "ChatPanel", "Projector requested re-hydration.", {"reason": reason})
-	_begin_hydration(_current_session_id())
-	_request_hydration_history()
+	# 修订/表示缺口无法靠重放同一条补丁闭合：直接权威快照（任务 2.4）。
+	_route_recovery("projector_" + reason, "hydrate", {"projector_reason": reason})
 
 
 func _on_event_protocol_error(details: Dictionary) -> void:
 	FrontendLogger.warn(editor_interface, "ChatPanel", "WebSocket protocol error.", details)
+
+
+## 客户端检测到序列缺口（任务 2.2）：先按连续游标续传；续传无法闭合时
+## 由恢复状态机自动升级为权威快照水合（任务 2.4）。
+func _on_event_sequence_gap(details: Dictionary) -> void:
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Transcript sequence gap detected.", details)
+	_route_recovery("sequence_gap", "resume", details)
+
+
+## 客户端在解析前拒收了超尺寸报文（任务 5.3）：未提交游标不受影响，先按
+## 已提交游标续传；重放仍无法闭合时由状态机升级为权威快照水合——快照条目
+## 已在服务端净化，不会再次携带超尺寸载荷。
+func _on_event_oversized_packet(details: Dictionary) -> void:
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Oversized WebSocket packet rejected before parsing.", details)
+	_route_recovery("oversized_packet", "resume", details)
+
+
+## 统一恢复路由（任务 2.4）：所有可见转录断档入口都收敛到这里。
+##
+## 恢复只触发订阅重连与只读历史水合，绝不重新提交聊天、审批或中断命令
+## （任务 2.5）；快照由 Projector 按 session_id + generation 校验，旧会话
+## 或旧世代响应无法覆盖当前活跃转录。
+func _route_recovery(trigger: String, preferred: String, details: Dictionary) -> void:
+	var action: String = _recovery.begin(trigger, preferred, transcript_watermarks())
+	match action:
+		"resume":
+			FrontendLogger.info(editor_interface, "ChatPanel", "Recovery: resuming from committed cursor.", {"trigger": trigger})
+			# 未投影暂存会由重放从已提交游标重新送达：先清空，避免重放的
+			# 增量与旧暂存重复合并（任务 2.12）。
+			_patch_batcher.clear()
+			_projection_window_pending = false
+			if _event_socket != null:
+				_event_socket.recover_from_acknowledged_cursor()
+		"hydrate":
+			FrontendLogger.info(editor_interface, "ChatPanel", "Recovery: hydrating authoritative snapshot.", {"trigger": trigger})
+			_begin_hydration(_current_session_id())
+			_request_hydration_history(true)
+		_:
+			# 已在恢复中或预算耗尽：保持当前动作，不叠加新的恢复。
+			pass
+
+
+## 可见停滞看门狗（任务 2.3 / 2.8）：服务端可见水位领先于客户端
+## 接收/提交/投影/渲染四级水位的最小值，且活跃轮次超过停滞阈值没有任何
+## 可见进度时触发有界恢复。接收水位只证明传输层到达；心跳与非可见的传输
+## 流量不算进度，避免把工具执行等待误判为健康。
+func _check_visible_stall() -> void:
+	if _recovery == null:
+		return
+	# 水合超时兜底（任务 2.4）：探针/历史请求失败或响应迟到时不允许永久
+	# 停在 HYDRATING；在预算内重试快照请求，预算耗尽则留下脱敏诊断。
+	if _recovery.state == TranscriptRecovery.State.HYDRATING:
+		var hydrate_timeout_ms := int(_recovery.stall_threshold_s * 1000.0)
+		if _recovery.time_in_state_msec(Time.get_ticks_msec()) >= hydrate_timeout_ms:
+			if _recovery.retry_hydration("hydration_timeout", transcript_watermarks()) == "hydrate":
+				FrontendLogger.warn(editor_interface, "ChatPanel", "Recovery: retrying snapshot hydration.", transcript_watermarks())
+				_request_hydration_history(true)
+		return
+	if _recovery.state != TranscriptRecovery.State.IDLE:
+		return
+	if _state == AgentState.IDLE:
+		return
+	if _event_socket == null:
+		return
+	var now_msec := Time.get_ticks_msec()
+	_check_projection_backlog()
+	if _recovery.state != TranscriptRecovery.State.IDLE:
+		# 投影积压已触发恢复：本帧不再叠加其他触发，交由状态机推进。
+		return
+	_check_socket_freshness(now_msec)
+	var progress: Dictionary = _event_socket.server_progress()
+	_recovery.notify_server_progress(int(progress.get("visible_seq", 0)))
+	# 以最慢的可见水位判定同步健康（任务 2.8）：
+	# min(received, committed, projected, rendered)。
+	var received: int = _event_socket.highest_contiguous_seq()
+	var committed: int = _event_socket.committed_seq()
+	var projected: int = _transcript_store.upto_event_seq if _transcript_store != null else 0
+	var rendered: int = _rendered_upto_event_seq
+	var floor_seq := mini(mini(received, committed), mini(projected, rendered))
+	if not _recovery.server_ahead_of(floor_seq):
+		return
+	if not _recovery.stalled(now_msec):
+		return
+	var watermarks := transcript_watermarks()
+	FrontendLogger.warn(
+		editor_interface, "ChatPanel",
+		"Visible transcript stall detected (lagging stage: %s); starting bounded recovery." % str(watermarks.get("lagging_stage", "")),
+		watermarks
+	)
+	_route_recovery("visible_stall", "resume", watermarks)
+
+
+## 投影积压看门狗（任务 2.9）：暂存队首补丁等待超过停滞阈值仍未被投影窗口
+## 应用时，路由到既有恢复状态机，绝不让已接收的补丁无限期不可见。
+func _check_projection_backlog() -> void:
+	if _patch_batcher.is_empty():
+		return
+	var oldest_usec: int = _patch_batcher.oldest_pending_usec()
+	if oldest_usec <= 0:
+		return
+	var age_msec := float(Time.get_ticks_usec() - oldest_usec) / 1000.0
+	if age_msec < _recovery.stall_threshold_s * 1000.0:
+		return
+	var watermarks := transcript_watermarks()
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Projection backlog stall; routing to bounded recovery.", watermarks)
+	_route_recovery("projection_backlog", "resume", watermarks)
+
+
+## 半开订阅新鲜度检测（任务 2.10）：活跃轮次中连接保持 Open 但超过
+## 新鲜度窗口没有收到任何心跳/事件时，用旁路探针确认服务端状态；
+## 探针表明服务端领先或无法确认时走续传/快照恢复，绝不重放命令。
+func _check_socket_freshness(now_msec: int) -> void:
+	if not _event_socket.is_subscribed():
+		_socket_silence_probe_msec = 0
+		return
+	var last_packet: int = _event_socket.last_packet_msec()
+	if last_packet > 0 and now_msec - last_packet < SOCKET_SILENCE_THRESHOLD_MS:
+		# 新报文到达说明连接恢复健康：撤销在途探针标记。
+		if _socket_silence_probe_msec > 0 and last_packet > _socket_silence_probe_msec:
+			_socket_silence_probe_msec = 0
+		return
+	if _socket_silence_probe_msec > 0:
+		# 探针有界：响应超时后允许下一个静默回合重新探测。
+		if now_msec - _socket_silence_probe_msec < SOCKET_PROBE_TIMEOUT_MS:
+			return
+		_socket_silence_probe_msec = 0
+	_socket_silence_probe_msec = now_msec
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Socket silent beyond freshness window; probing recovery pointer.", {
+		"silent_ms": maxi(0, now_msec - last_packet),
+		"watermarks": transcript_watermarks(),
+	})
+	if _http_client != null:
+		_http_client.probe_get("/recovery-pointer")
+
+
+## 可见进度推进（任务 2.1）：任何被 Store 接受的可见条目都会刷新停滞计时，
+## 并在恢复进行中把预算重置（缺口已被闭合）。
+func _notify_visible_progress() -> void:
+	if _recovery == null:
+		return
+	var server_seq := -1
+	if _event_socket != null:
+		server_seq = int(_event_socket.server_progress().get("visible_seq", 0))
+	_recovery.notify_visible_progress(server_seq)
+
+
+## 已渲染水位跟随 projected 水位：视口已从 Store 接受整批条目的渲染
+## （任务 2.1）。单个条目渲染失败由 renderer_rejected 走恢复入口。
+func _advance_rendered_watermark() -> void:
+	if _transcript_store != null:
+		_rendered_upto_event_seq = maxi(_rendered_upto_event_seq, _transcript_store.upto_event_seq)
+
+
+## received/committed/projected/rendered 四级水位与恢复状态（任务 2.1 / 2.8 / 2.12）。
+## 仅用于脱敏诊断；调用方不得写入条目正文。
+func transcript_watermarks() -> Dictionary:
+	var received: int = _event_socket.highest_contiguous_seq() if _event_socket != null else 0
+	var committed: int = _event_socket.committed_seq() if _event_socket != null else 0
+	var projected: int = _transcript_store.upto_event_seq if _transcript_store != null else 0
+	var rendered: int = _rendered_upto_event_seq
+	return {
+		"received_seq": received,
+		"committed_seq": committed,
+		"projected_seq": projected,
+		"rendered_seq": rendered,
+		"visible_floor_seq": mini(mini(received, committed), mini(projected, rendered)),
+		"lagging_stage": _lagging_stage(received, committed, projected, rendered),
+		"pending_patch_count": _patch_batcher.pending_event_count(),
+		"oldest_pending_usec": _patch_batcher.oldest_pending_usec(),
+		"recovery_state": _recovery.state_name() if _recovery != null else "idle",
+	}
+
+
+## 水位最低的可见阶段（任务 2.8 脱敏诊断）：同级时报告更上游的阶段——
+## 上游水位不前时，下游（如渲染）也不可能推进，瓶颈在最早卡住的一环。
+func _lagging_stage(received: int, committed: int, projected: int, rendered: int) -> String:
+	var floor_seq := mini(mini(received, committed), mini(projected, rendered))
+	if received == floor_seq:
+		return "received"
+	if committed == floor_seq:
+		return "committed"
+	if projected == floor_seq:
+		return "projected"
+	return "rendered"
+
+
+func _on_recovery_started(action: String, details: Dictionary) -> void:
+	var log_details := details.duplicate(true)
+	log_details["action"] = action
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Transcript recovery started.", log_details)
+
+
+func _on_recovery_escalated(details: Dictionary) -> void:
+	FrontendLogger.warn(editor_interface, "ChatPanel", "Transcript recovery escalated to snapshot hydration.", details)
+
+
+func _on_recovery_finished(detail: String) -> void:
+	FrontendLogger.info(editor_interface, "ChatPanel", "Transcript recovery finished.", {"detail": detail, "watermarks": transcript_watermarks()})
+
+
+func _on_recovery_exhausted(details: Dictionary) -> void:
+	# 有界预算耗尽：保持静默不打扰用户（任务 Why），只留下可定位的脱敏诊断。
+	FrontendLogger.error(editor_interface, "ChatPanel", "Transcript recovery budget exhausted.", details)
 
 
 ## 开始一次水合：递增 generation、清空 Store、停止接受实时补丁。
@@ -1905,6 +2250,8 @@ func _begin_hydration(session_id: String) -> int:
 	_draining_events = false
 	_patch_batcher.clear()
 	_projection_window_pending = false
+	# 呈现水位随 Store 清零重置；快照应用后由视口重建重新抬升。
+	_rendered_upto_event_seq = 0
 	return _hydration_generation
 
 
@@ -1996,9 +2343,10 @@ func _on_inline_apply() -> void:
 			if _interrupted_locally:
 				return
 			_set_state(AgentState.EXECUTING)
-			var result: Dictionary = await _tool_executor.execute(call)
+			var raw_result: Variant = await _tool_executor.execute(call)
 			if _interrupted_locally:
 				return
+			var result := AgentDTO.normalize_execution_result(call, raw_result)
 			result["decision_source"] = "execute"
 			result["grant_session_allow"] = _inline_confirm.grant_session_allow()
 			FrontendLogger.info(editor_interface, "ChatPanel", "Confirmed tool execution completed.", {
@@ -2138,6 +2486,8 @@ func _show_notice(role: String, text: String) -> void:
 		style = "user"
 	elif role == "error":
 		style = "error"
+	elif role == "report":
+		style = "report"
 	_transient_host.show_notice(text, style)
 	_scroll_to_bottom()
 

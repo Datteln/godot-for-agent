@@ -198,7 +198,7 @@ static func format_grep_event_entry(summary: Dictionary) -> String:
 		lines.append("%s:%s %s" % [
 			truncate_text(str(item.get("path", "")), MAX_GREP_MATCH_PATH_CHARS),
 			line_str,
-			truncate_text(str(item.get("text", "")), MAX_GREP_MATCH_TEXT_CHARS)
+			truncate_text(str(item.get("excerpt", item.get("text", ""))), MAX_GREP_MATCH_TEXT_CHARS)
 		])
 		rendered_matches += 1
 	var omitted_matches := max(matches.size() - rendered_matches, count - rendered_matches)

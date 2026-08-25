@@ -141,6 +141,9 @@ static func tool_plain_text(entry: Dictionary, diff_stats: Dictionary = {}) -> S
 
 static func tool_header(entry: Dictionary) -> String:
 	var payload := payload_of(entry)
+	if str(payload.get("tool", "")) == "read_class_docs":
+		var args: Dictionary = payload.get("args", {}) if payload.get("args", {}) is Dictionary else {}
+		return "ClassInfo " + str(args.get("class_name", ""))
 	var args_value: Variant = payload.get("args", {})
 	var call := {
 		"id": str(entry.get("tool_call_id", "")),

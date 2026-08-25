@@ -127,6 +127,15 @@ class AppSettings(BaseSettings):
     event_stream_preview_max_chars: int = Field(
         default=800, ge=64, le=16_000, description="受限预览表示携带的最大正文字符数。"
     )
+    event_terminal_patch_max_bytes: int = Field(
+        default=32 * 1024,
+        ge=4096,
+        le=1024 * 1024,
+        description=(
+            "终态非流式展示稿补丁的序列化字节预算（任务 5.2）；超预算时只发布"
+            "无正文安全摘要，不发送原始载荷。该预算不是所有工具结果的统一上限。"
+        ),
+    )
     event_heartbeat_interval_s: float = Field(
         default=20.0, ge=0.1, le=120.0, description="空闲 WebSocket 事件连接的协议心跳间隔。"
     )

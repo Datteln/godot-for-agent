@@ -15,8 +15,7 @@ const GIT_COMMAND_TIMEOUT_MS := 15000
 const MAX_READ_SCAN_LINES := 200000
 const DEFAULT_READ_LIMIT_LINES := 2000
 const MAX_READ_LIMIT_LINES := 20000
-const MAP_AUTHORING_EXTENSIONS := PackedStringArray(["gd", "tscn", "tres", "cfg", "json", "csv", "txt"])
-const SERIALIZED_MAP_MARKERS := PackedStringArray(["tile_map_data", "cell_data", "grid_map_data"])
+const MAP_AUTHORING_EXTENSIONS := ["gd", "tscn", "tres", "cfg", "json", "csv", "txt"]
 
 
 static func read_file(input: Dictionary, file_state_cache: Node = null) -> Dictionary:
@@ -283,7 +282,9 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 	}
 
 
-## 验证 code-driven map 工作流的可编辑文本目标，并拒绝直接改动序列化格子数据。
+## 验证 code-driven map 工作流的可编辑文本目标。
+## 手工 TileMap/GridMap 的作者入口由 map-agent 的 `@tool` bootstrap 计划建立；
+## 此处仅保留文件类型和通用写入边界，不把序列化标记变成终止性错误。
 static func _validate_map_authoring_target(input: Dictionary, path: String, before_text: String, after_text: String) -> Dictionary:
 	if str(input.get("workflow", "")) != "code_driven_map":
 		return {"ok": true}
@@ -296,15 +297,6 @@ static func _validate_map_authoring_target(input: Dictionary, path: String, befo
 			"path": path,
 			"supported_extensions": MAP_AUTHORING_EXTENSIONS,
 		}
-	for marker in SERIALIZED_MAP_MARKERS:
-		if marker in before_text or marker in after_text:
-			return {
-				"ok": false,
-				"error_code": "unsupported_map_authoring_target",
-				"message": "Direct TileMap/GridMap serialized cell-data edits are unsupported; edit a generator or readable configuration target instead.",
-				"path": path,
-				"marker": marker,
-			}
 	return {"ok": true}
 
 

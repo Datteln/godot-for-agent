@@ -212,6 +212,14 @@ func get_entry(entry_id: String) -> Dictionary:
 	return entry
 
 
+## 该 event_id 是否已被 Store 处理过（幂等去重表；任务 2.12）。
+##
+## 供提交判定区分“补丁被去重/修订未前进”（已呈现，可提交）与
+## “补丁被投影器拒绝”（未呈现，绝不能提交）。
+func has_seen_event(event_id: String) -> bool:
+	return event_id != "" and _seen_event_ids.has(event_id)
+
+
 ## 当前是否存在处于 complete 状态的助手条目（供 final 确认兜底判断）。
 func has_complete_assistant_entry() -> bool:
 	for entry_id in _order:

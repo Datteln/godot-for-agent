@@ -35,6 +35,34 @@ static func error_result(tool_call: Dictionary, message: String, code: String = 
 	)
 
 
+## 将执行器返回值规范化为可提交的工具结果，避免缺少关联字段时触发 HTTP 422。
+static func normalize_execution_result(tool_call: Dictionary, candidate: Variant) -> Dictionary:
+	if candidate is Dictionary:
+		var result: Dictionary = candidate
+		var status := str(result.get("status", ""))
+		if (
+			str(result.get("tool_use_id", "")) != ""
+			and str(result.get("frame_id", "")) != ""
+			and status in ["applied", "rejected", "error"]
+		):
+			return result
+	var received_keys: Array[String] = []
+	if candidate is Dictionary:
+		for key in (candidate as Dictionary).keys():
+			received_keys.append(str(key))
+	var fallback := error_result(
+		tool_call,
+		"The frontend produced an incomplete tool result; no project change is assumed.",
+		"front_tool_result_protocol_invalid"
+	)
+	fallback["result"] = {
+		"message": "The frontend produced an incomplete tool result; no project change is assumed.",
+		"received_keys": received_keys,
+		"tool": str(tool_call.get("name", "")),
+	}
+	return fallback
+
+
 static func rejected_result(tool_call: Dictionary) -> Dictionary:
 	var payload := tool_result(
 		str(tool_call.get("id", "")),

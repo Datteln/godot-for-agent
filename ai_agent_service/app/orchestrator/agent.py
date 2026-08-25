@@ -31,12 +31,14 @@ from app.agents.bundled import get_agent
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
 from app.llm.cache_decision_engine import CacheDecision, CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnapshot
+from app.llm.class_docs import sanitize_class_docs_messages
 from app.llm.provider import AssistantTurn, LLMError, LLMProvider
 from app.permissions.engine import PermissionContext, SessionAllowGrant, check
 from app.security.settings import SecuritySettings
 from app.sessions.store import Session
 from app.tools.context import ToolContext
 from app.tools.registry import REGISTRY, ToolDef, tools_for
+from app.tools.server_tools.grep_code import MATCH_EXCERPT_MAX_CHARS
 
 MAX_AGENT_DEPTH = 4
 EVENT_TEXT_PREVIEW_CHARS = 24_000
@@ -570,6 +572,8 @@ async def _recover_empty_final_answer(
                 response_attempt_id,
             ),
         )
+        # 挽救调用同样消费了帧消息：read_class_docs 事实随之过期（任务 4.3）。
+        sanitize_class_docs_messages(frame.messages)
     except LLMError as exc:
         logger.warning("Empty-final recovery call failed frame=%s error=%s", frame.id, exc)
         return None
@@ -1145,22 +1149,31 @@ def _event_result_summary(tool_name: str, result: Any, is_error: bool) -> dict[s
 
 
 def _event_match_items(result: dict[str, Any]) -> list[dict[str, Any]]:
-    """Normalize search-like result rows for the frontend workflow list."""
+    """规范化检索类结果行：路径、行号、受限摘录与截断标记（任务 5.1）。
+
+    新契约下检索工具在工具边界即产出 `excerpt`；旧格式 `text`/`preview`
+    兼容读取并在源头裁剪到摘录上限，确保未受限整行不会经由事件摘要
+    进入展示稿或事件流。
+    """
     raw_items = result.get("matches", result.get("results", result.get("files", [])))
     if not isinstance(raw_items, list):
         return []
     normalized: list[dict[str, Any]] = []
     for item in raw_items:
         if isinstance(item, dict):
+            raw_text = str(item.get("excerpt", item.get("text", item.get("preview", ""))))
+            excerpt = raw_text[:MATCH_EXCERPT_MAX_CHARS]
             normalized.append(
                 {
                     "path": str(item.get("path", item.get("file", ""))),
                     "line": item.get("line", item.get("line_no", "")),
-                    "text": str(item.get("text", item.get("preview", ""))),
+                    "excerpt": excerpt,
+                    "line_truncated": bool(item.get("line_truncated", False))
+                    or len(raw_text) > MATCH_EXCERPT_MAX_CHARS,
                 }
             )
         else:
-            normalized.append({"path": str(item), "line": "", "text": ""})
+            normalized.append({"path": str(item), "line": "", "excerpt": "", "line_truncated": False})
     return normalized
 
 
@@ -1525,6 +1538,11 @@ async def run_turn(
             )
             return ErrorResult(text=str(exc))
 
+        # read_class_docs 短暂事实（任务 4.3）：模型已消费本次请求，文档事实
+        # 立即过期——后续步骤、会话持久化与压缩都只能看到受限占位符，
+        # 完整 ClassDB/API 文本绝不留在会话帧里。
+        sanitize_class_docs_messages(frame.messages)
+
         # 空正文恢复会继续同一个逻辑 Thought。首次原始流结束仅是 provisional，
         # 不能提前完成 Thought；只有最终尝试结束后才结算可见时长。
         assistant_message_index = len(frame.messages)
@@ -1673,7 +1691,7 @@ async def run_turn(
             assert args is not None
 
             # 地图 agent 仍复用普通文本编辑工具；服务端而非模型负责绑定该标记，
-            # 使前端可以启用地图作者目标白名单与序列化地图数据保护。
+            # 使前端可应用地图作者目标白名单与普通审批路径。
             if frame.agent.name == "map-agent" and tool.name in {
                 "apply_text_edit",
                 "propose_script_edit",
@@ -1803,7 +1821,7 @@ async def run_turn(
             assert args is not None
 
             # 地图 agent 仍复用普通文本编辑工具；服务端而非模型负责绑定该标记，
-            # 使前端可以启用地图作者目标白名单与序列化地图数据保护。
+            # 使前端可应用地图作者目标白名单与普通审批路径。
             if frame.agent.name == "map-agent" and tool.name in {
                 "apply_text_edit",
                 "propose_script_edit",

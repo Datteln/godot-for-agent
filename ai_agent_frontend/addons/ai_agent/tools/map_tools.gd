@@ -2,9 +2,10 @@
 extends RefCounted
 
 const MAX_DESCRIBED_CELLS := 400
-## 2D 区域读取允许自动分块的上限（任务 5.2）：超过该总单元数不再分块，
-## 直接返回带约束的 `region_too_large`。3D GridMap 不参与自动分块。
-const MAX_PARTITIONED_CELLS := 3200
+## 单次观察最多扫描的 cell 数；超出时仅观察一个有界前缀并明确标记截断。
+const MAX_OBSERVED_CELLS := 3200
+## 紧凑行程摘要同样有独立上限，避免每个 cell 都不同时撑爆模型上下文。
+const MAX_SUMMARY_RUNS := 256
 
 
 static func describe_selection(editor_interface: EditorInterface) -> Dictionary:
@@ -60,19 +61,37 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	var height := max(1, int(input.get("height", 1)))
 	var depth := max(1, int(input.get("depth", 1))) if dimension == 3 else 1
 	var total_cells: int = width * height * depth
-	# 3D GridMap 暂不支持安全分块：保持严格 400 单元上限与结构化错误（任务 5.2）。
-	if dimension == 3 and total_cells > MAX_DESCRIBED_CELLS:
-		return _region_too_large_error(total_cells)
-	# 2D 区域超出单块上限时做有界分块；超出可分块总上限仍返回结构化错误。
-	if dimension == 2 and total_cells > MAX_PARTITIONED_CELLS:
-		return _region_too_large_error(total_cells)
-
+	var observed_extent := _bounded_observed_extent(width, height, depth, dimension)
+	var observed_width := int(observed_extent["width"])
+	var observed_height := int(observed_extent["height"])
+	var observed_depth := int(observed_extent["depth"])
 	var cells: Array = []
-	for z_offset in range(depth):
-		for y_offset in range(height):
-			for x_offset in range(width):
+	var row_runs: Array = []
+	var summary_truncated := false
+	for z_offset in range(observed_depth):
+		for y_offset in range(observed_height):
+			var current_run := {}
+			for x_offset in range(observed_width):
 				var coords := origin + Vector3i(x_offset, y_offset, z_offset)
-				cells.append(_describe_safe_cell(_read_map_cell(target, coords, dimension, map_layer), dimension))
+				var raw_cell := _read_map_cell(target, coords, dimension, map_layer)
+				if cells.size() < MAX_DESCRIBED_CELLS:
+					cells.append(_describe_safe_cell(raw_cell, dimension))
+				var run_key := _cell_run_key(raw_cell, dimension)
+				if current_run.is_empty() or str(current_run.get("key", "")) != run_key:
+					if not current_run.is_empty():
+						summary_truncated = _append_row_run(row_runs, current_run) or summary_truncated
+					current_run = {
+						"key": run_key,
+						"cell": raw_cell,
+						"x_start": coords.x,
+						"x_end": coords.x,
+						"y": coords.y,
+						"z": coords.z,
+					}
+				else:
+					current_run["x_end"] = coords.x
+			if not current_run.is_empty():
+				summary_truncated = _append_row_run(row_runs, current_run) or summary_truncated
 
 	var result := {
 		"ok": true,
@@ -81,14 +100,29 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 		"dimension": dimension,
 		"map_layer": map_layer if target.get_class() == "TileMap" else null,
 		"cells": cells,
+		"row_runs": row_runs,
+		"requested_cells": total_cells,
+		"observed_cells": observed_width * observed_height * observed_depth,
+		"detail_limit": MAX_DESCRIBED_CELLS,
+		"summary_run_limit": MAX_SUMMARY_RUNS,
+		"requested_bounds": _bounds_dictionary(origin, width, height, depth, dimension),
+		"observed_bounds": _bounds_dictionary(origin, observed_width, observed_height, observed_depth, dimension),
 	}
-	if dimension == 2 and total_cells > MAX_DESCRIBED_CELLS:
-		# 语义保持的分块：cells 仍按全局行优先顺序一次性读取，分块只标注边界，
-		# 调用方可凭 partitions 与 total_cells 核对拼回完整区域（任务 5.2）。
-		result["partitioned"] = true
-		result["total_cells"] = total_cells
-		result["max_cells_per_partition"] = MAX_DESCRIBED_CELLS
-		result["partitions"] = _partition_region_2d(origin.x, origin.y, width, height)
+	var observation_truncated := total_cells > int(result["observed_cells"])
+	var detail_truncated := total_cells > MAX_DESCRIBED_CELLS
+	result["truncated"] = observation_truncated or detail_truncated or summary_truncated
+	if bool(result["truncated"]):
+		result["next_query"] = _next_query_hint(
+			origin,
+			width,
+			height,
+			depth,
+			observed_width,
+			observed_height,
+			observed_depth,
+			dimension,
+			map_layer
+		)
 	if target is Node2D:
 		var position_2d := (target as Node2D).position
 		result["node_position"] = {"x": position_2d.x, "y": position_2d.y}
@@ -104,6 +138,87 @@ static func describe_map_region(input: Dictionary, editor_interface: EditorInter
 	if target.get_class() == "TileMap":
 		result["layers"] = _describe_tilemap_layers(target)
 	return result
+
+
+## 将请求范围收敛到可扫描预算，始终返回起点连续的已观察矩形/体积。
+static func _bounded_observed_extent(width: int, height: int, depth: int, dimension: int) -> Dictionary:
+	if width * height * depth <= MAX_OBSERVED_CELLS:
+		return {"width": width, "height": height, "depth": depth}
+	if dimension == 3:
+		var bounded_depth := mini(depth, maxi(1, MAX_OBSERVED_CELLS / (width * height)))
+		return {"width": width, "height": height, "depth": bounded_depth}
+	if width <= MAX_OBSERVED_CELLS:
+		return {"width": width, "height": mini(height, maxi(1, MAX_OBSERVED_CELLS / width)), "depth": 1}
+	return {"width": MAX_OBSERVED_CELLS, "height": 1, "depth": 1}
+
+
+static func _bounds_dictionary(origin: Vector3i, width: int, height: int, depth: int, dimension: int) -> Dictionary:
+	var result := {
+		"x": origin.x,
+		"y": origin.y,
+		"width": width,
+		"height": height,
+	}
+	if dimension == 3:
+		result["z"] = origin.z
+		result["depth"] = depth
+	return result
+
+
+static func _next_query_hint(
+	origin: Vector3i,
+	requested_width: int,
+	requested_height: int,
+	requested_depth: int,
+	observed_width: int,
+	observed_height: int,
+	observed_depth: int,
+	dimension: int,
+	map_layer: int
+) -> Dictionary:
+	var hint := {
+		"x": origin.x,
+		"y": origin.y,
+		"width": observed_width,
+		"height": observed_height,
+	}
+	if observed_width < requested_width:
+		hint["x"] = origin.x + observed_width
+	elif observed_height < requested_height:
+		hint["y"] = origin.y + observed_height
+	elif dimension == 3 and observed_depth < requested_depth:
+		hint["z"] = origin.z + observed_depth
+	else:
+		# 仅详细 cell/摘要超限时，建议针对同一范围继续聚焦查询。
+		hint["focus"] = "narrow the requested bounds around the needed boundary"
+	if dimension == 3:
+		hint["z"] = int(hint.get("z", origin.z))
+		hint["depth"] = observed_depth
+	else:
+		hint["map_layer"] = map_layer
+	return hint
+
+
+static func _cell_run_key(cell: Dictionary, dimension: int) -> String:
+	if dimension == 3:
+		return "%d:%d" % [int(cell.get("item", -1)), int(cell.get("orientation", -1))]
+	var atlas: Vector2i = cell.get("atlas_coords", Vector2i(-1, -1))
+	return "%d:%d:%d:%d" % [int(cell.get("source_id", -1)), atlas.x, atlas.y, int(cell.get("alternative_tile", -1))]
+
+
+static func _append_row_run(row_runs: Array, current_run: Dictionary) -> bool:
+	if row_runs.size() >= MAX_SUMMARY_RUNS:
+		return true
+	var cell: Dictionary = current_run["cell"]
+	var summary := _describe_safe_cell(cell, 3 if cell.has("item") else 2)
+	summary.erase("coords")
+	summary["x_start"] = current_run["x_start"]
+	summary["x_end"] = current_run["x_end"]
+	summary["y"] = current_run["y"]
+	if cell.has("item"):
+		summary["z"] = current_run["z"]
+	row_runs.append(summary)
+	return false
 
 
 ## 结构化 `region_too_large` 错误（任务 5.1）：携带上限与可安全缩小的约束，

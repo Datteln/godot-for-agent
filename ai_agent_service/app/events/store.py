@@ -27,8 +27,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.transcript.models import (
+    LEGACY_ONLY_KINDS,
     PATCH_FORMAT_APPEND_DELTA,
+    PATCH_FORMAT_FULL,
     PATCH_FORMAT_PREVIEW,
+    STREAM_TEXT_FIELDS,
     TERMINAL_ENTRY_STATES,
 )
 from app.transcript.realtime import LastPublishedStream, build_realtime_patch
@@ -40,6 +43,10 @@ _STREAM_EVENT_TYPES = frozenset({"agent_text_delta", "agent_reasoning_delta", "t
 _STREAM_PUBLICATION_INTERVAL_S = 0.05
 _DEFAULT_OUTBOUND_BYTE_BUDGET = 512 * 1024
 _DEFAULT_STREAM_PREVIEW_MAX_CHARS = 800
+## 终态非流式展示稿补丁的序列化字节预算（任务 5.2）：超预算的补丁不发送
+## 原始载荷，替换为不含正文的安全摘要。流式条目（Thought/assistant）的终态
+## 补丁属于流式表示契约，不适用该预算。
+_DEFAULT_TERMINAL_PATCH_MAX_BYTES = 32 * 1024
 
 REASON_ITEM_BUDGET = "outbound_item_budget"
 REASON_BYTE_BUDGET = "outbound_byte_budget"
@@ -330,6 +337,7 @@ class EventStore:
         coalescing_enabled: bool = True,
         bounded_stream_payloads: bool = True,
         stream_preview_max_chars: int = _DEFAULT_STREAM_PREVIEW_MAX_CHARS,
+        terminal_patch_max_bytes: int = _DEFAULT_TERMINAL_PATCH_MAX_BYTES,
     ) -> None:
         """初始化事件保留区、订阅注册表和流式发布限速器。
 
@@ -340,6 +348,8 @@ class EventStore:
             coalescing_enabled: 是否启用条目键 latest-wins 合并与字节预算。
             bounded_stream_payloads: 是否把增长型正文补丁转换为增量/预览表示。
             stream_preview_max_chars: 受限预览的最大字符数。
+            terminal_patch_max_bytes: 终态非流式展示稿补丁的序列化字节预算
+                （任务 5.2）；超预算补丁替换为无正文安全摘要后再发布。
         """
         self._events: dict[str, list[Event]] = {}
         self._seq: dict[str, int] = {}
@@ -350,12 +360,17 @@ class EventStore:
         self._coalescing_enabled = coalescing_enabled
         self._bounded_stream_payloads = bounded_stream_payloads
         self._stream_preview_max_chars = stream_preview_max_chars
+        self._terminal_patch_max_bytes = terminal_patch_max_bytes
         self._last_stream_publication: dict[tuple[str, str, str, str], float] = {}
         self._pending_streams: dict[tuple[str, str, str, str], tuple[str, dict[str, Any]]] = {}
         self._last_realtime: dict[tuple[str, str, str, str], LastPublishedStream] = {}
         self._wire_sizes: dict[str, int] = {}
+        # 可见进度水位（任务 1.2）：只有用户可见条目的展示稿补丁才会推进。
+        self._visible_seq: dict[str, int] = {}
+        self._visible_updated_at: dict[str, float] = {}
         self._diag_stream_events = 0
         self._diag_stream_bytes = 0
+        self._diag_terminal_over_budget = 0
 
     def append(self, session_id: str, event_type: str, payload: dict[str, Any]) -> Event:
         """追加事件；高频流式快照会在分配序号前限速并于边界处刷新。"""
@@ -378,6 +393,11 @@ class EventStore:
         """
         if seq_floor > self._seq.get(session_id, 0):
             self._seq[session_id] = seq_floor
+        if seq_floor > self._visible_seq.get(session_id, 0):
+            # 重启后把可见水位抬到持久化游标：客户端水合后
+            # upto_event_seq == session.event_seq，避免误判停滞。
+            self._visible_seq[session_id] = seq_floor
+            self._visible_updated_at[session_id] = time.time()
 
     def flush_pending_streams(self, session_id: str) -> None:
         """立即发布该会话暂存的流式快照，用于轮次收尾等边界。"""
@@ -421,11 +441,26 @@ class EventStore:
         if not subscribers:
             self._subscriptions.pop(subscription.session_id, None)
 
+    def visible_progress(self, session_id: str) -> tuple[int, float]:
+        """返回会话最近一次已发布可见条目的序号与墙钟时间戳。
+
+        进度字段只含标识符/计数/时间戳，绝不含正文；客户端据此在
+        活跃请求中检测可见转录停滞（任务 1.2）。
+
+        Args:
+            session_id: 会话 id。
+
+        Returns:
+            ``(visible_seq, visible_updated_at)``；无可见事件时为 ``(0, 0.0)``。
+        """
+        return self._visible_seq.get(session_id, 0), self._visible_updated_at.get(session_id, 0.0)
+
     def diagnostics(self) -> dict[str, int]:
         """返回存储级脱敏发布诊断（只含计数与字节数）。"""
         return {
             "stream_events_published": self._diag_stream_events,
             "stream_payload_bytes": self._diag_stream_bytes,
+            "terminal_patches_over_budget": self._diag_terminal_over_budget,
             "active_subscriptions": sum(len(subs) for subs in self._subscriptions.values()),
         }
 
@@ -440,6 +475,10 @@ class EventStore:
         wire_payload = payload
         if event_type == "transcript_patch" and self._bounded_stream_payloads:
             wire_payload = self._bounded_realtime_payload(stream_key, payload)
+        if event_type == "transcript_patch":
+            # 终态非流式补丁的入站字节预算（任务 5.2）：在分配序号与扇出前
+            # 衡量序列化字节，超预算替换为无正文安全摘要。
+            wire_payload = self._bounded_terminal_patch(wire_payload)
         seq = self._seq.get(session_id, 0) + 1
         self._seq[session_id] = seq
         immutable_payload = copy.deepcopy(wire_payload)
@@ -459,6 +498,9 @@ class EventStore:
             self._last_stream_publication[stream_key] = time.monotonic()
             self._diag_stream_events += 1
             self._diag_stream_bytes += self._wire_size(event)
+        if self._is_visible_transcript_event(event_type, wire_payload):
+            self._visible_seq[session_id] = seq
+            self._visible_updated_at[session_id] = time.time()
         self._fan_out(event)
         logger.debug("Event published session=%s seq=%d type=%s", session_id, seq, event_type)
         return event
@@ -483,6 +525,73 @@ class EventStore:
         else:
             self._last_realtime[stream_key] = new_state
         return wire_payload
+
+    def _bounded_terminal_patch(self, wire_payload: dict[str, Any]) -> dict[str, Any]:
+        """对终态非流式展示稿补丁施加序列化字节预算（任务 5.2）。
+
+        正常路径发布的工具摘要已受工具语义约束；若兼容数据或未知工具仍使
+        终态补丁超出预算，绝不发送原始载荷——替换为只含工具名、状态、计数
+        与超限标志的无正文安全摘要，客户端随后仍可通过权威快照取得已净化
+        的完整条目。流式条目（Thought/assistant）的终态补丁属于流式表示
+        契约，不适用本预算。
+
+        Args:
+            wire_payload: 已选择实时表示的展示稿补丁载荷。
+
+        Returns:
+            预算内的原载荷，或替换后的安全摘要载荷。
+        """
+        entry = wire_payload.get("entry")
+        if not isinstance(entry, dict):
+            return wire_payload
+        kind = str(entry.get("kind", ""))
+        state = str(entry.get("state", ""))
+        if state not in TERMINAL_ENTRY_STATES.get(kind, frozenset()):
+            return wire_payload
+        if kind in STREAM_TEXT_FIELDS:
+            # Thought/assistant 的终态完整补丁由流式表示契约约束，不在此裁剪。
+            return wire_payload
+        if str(wire_payload.get("patch_format", PATCH_FORMAT_FULL)) != PATCH_FORMAT_FULL:
+            return wire_payload
+        serialized = len(json.dumps(wire_payload, ensure_ascii=False).encode("utf-8"))
+        if serialized <= self._terminal_patch_max_bytes:
+            return wire_payload
+
+        self._diag_terminal_over_budget += 1
+        source_payload = entry.get("payload")
+        source_payload = source_payload if isinstance(source_payload, dict) else {}
+        safe_entry_payload: dict[str, Any] = {
+            "oversized": True,
+            "reason": "terminal_patch_byte_budget",
+            "original_bytes": serialized,
+        }
+        for key in ("tool", "agent", "is_error", "outcome_status", "result_count", "render_kind"):
+            if key in source_payload:
+                safe_entry_payload[key] = source_payload[key]
+        safe_entry = {
+            "entry_id": entry.get("entry_id"),
+            "ordinal": entry.get("ordinal"),
+            "kind": kind,
+            "state": state,
+            "revision": entry.get("revision"),
+            "turn_id": entry.get("turn_id"),
+            "tool_call_id": entry.get("tool_call_id"),
+            "payload": safe_entry_payload,
+        }
+        logger.warning(
+            "Terminal transcript patch exceeded byte budget; emitting safe summary "
+            "session_kind=%s state=%s original_bytes=%d budget=%d",
+            kind,
+            state,
+            serialized,
+            self._terminal_patch_max_bytes,
+        )
+        return {
+            "entry": safe_entry,
+            "stream_key": wire_payload.get("stream_key"),
+            "patch_format": PATCH_FORMAT_FULL,
+            "patch_version": wire_payload.get("patch_version"),
+        }
 
     def _flush_pending_streams(self, session_id: str) -> None:
         """在非流式边界前发布该会话待发送的最新流式快照。"""
@@ -553,6 +662,26 @@ class EventStore:
             if len(self._wire_sizes) > 4096:
                 self._wire_sizes.clear()
         return cached
+
+    @staticmethod
+    def _is_visible_transcript_event(event_type: str, payload: dict[str, Any]) -> bool:
+        """判断事件是否为用户可见条目的展示稿补丁。
+
+        完整补丁从 ``entry`` 读取 kind；``append_delta``/``preview`` 表示在
+        载荷顶层携带 kind，缺失时保守视为可见（增长型流只有 thought/assistant）。
+
+        Args:
+            event_type: 事件类型。
+            payload: 已转换为线上表示的载荷。
+
+        Returns:
+            True 表示该事件应推进会话的可见进度水位。
+        """
+        if event_type != "transcript_patch":
+            return False
+        entry = payload.get("entry")
+        kind = str(entry.get("kind", "")) if isinstance(entry, dict) else str(payload.get("kind", ""))
+        return kind == "" or kind not in LEGACY_ONLY_KINDS
 
     @staticmethod
     def _optional_payload_id(payload: dict[str, Any], key: str) -> str | None:

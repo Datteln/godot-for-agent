@@ -142,12 +142,38 @@ func _compact_summary_use_llm_override() -> Variant:
 			return null
 
 
+## Reset 中断屏障（任务 2.11）：不是单纯清空 UI 的命令，而是会话边界——
+## 1) 取消在途请求并清空排队的聊天/工具结果请求（生成号抬升 + 替换 HTTP +
+##    清队列，迟到的完成回调按生成号拒绝）；
+## 2) 先请求服务端中断旧活跃轮次，再执行 `/reset`；
+## 3) 静默丢弃旧轮次的迟到失败/事件，直到下一条用户消息重新开始。
 func reset_session() -> void:
-	current_turn_id = ""
+	var had_active_turn := current_turn_id != "" or _has_chat_traffic()
 	_request_generation += 1
-	_suppress_events = false
-	FrontendLogger.info(editor_interface, "HTTP", "Queueing session reset.", {"session_id": _session_id()})
+	_queue.clear()
+	_replace_chat_http()
+	_busy = false
+	_request_timeout_timer.stop()
+	_cancel_idle_recovery()
+	current_turn_id = ""
+	_suppress_events = true
+	FrontendLogger.warn(editor_interface, "HTTP", "Resetting session behind interruption barrier.", {
+		"session_id": _session_id(),
+		"interrupted_old_turn": had_active_turn,
+	})
+	if had_active_turn:
+		_enqueue("POST", "/chat/interrupt", {"session_id": _session_id()})
 	_enqueue("POST", "/reset", {"session_id": _session_id()})
+
+
+## 是否仍有在途或排队的 `/chat` 请求（聊天或工具结果回传）。
+func _has_chat_traffic() -> bool:
+	if _busy and _inflight_path == "/chat":
+		return true
+	for item_value in _queue:
+		if item_value is Dictionary and str((item_value as Dictionary).get("path", "")) == "/chat":
+			return true
+	return false
 
 
 func start_new_session(previous_session_id: String, new_session_id: String) -> void:

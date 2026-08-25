@@ -58,7 +58,7 @@ func execute(tool_call: Dictionary) -> Dictionary:
 
 	match name:
 		"read_class_docs", "read_class_info", "get_class_info":
-			result = ClassDBReader.get_class_info(str(input.get("class_name", input.get("name", ""))))
+			result = ClassDBReader.query_class_info(input)
 		"read_file", "read_script":
 			result = ProgramTools.read_file(input, file_state_cache)
 		"write_file", "propose_script_edit", "propose_tests", "propose_content_file":

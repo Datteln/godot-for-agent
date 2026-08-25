@@ -185,6 +185,34 @@ def _bounded_args(args: dict[str, Any]) -> dict[str, Any]:
     return bounded
 
 
+def _visible_tool_result_summary(tool: str, result: Any) -> dict[str, Any] | None:
+    """生成可持久化的工具结果摘要。
+
+    Args:
+        tool: 产生结果的工具名。
+        result: 前端回传的原始结果。
+
+    Returns:
+        `read_class_docs` 不含 ClassDB 原文，其他工具保持原有有界参数摘要。
+    """
+    if result is None:
+        return None
+    if tool == "read_class_docs":
+        source = result if isinstance(result, dict) else {}
+        return {
+            "class_name": str(source.get("class_name", "")),
+            "mode": str(source.get("mode", "overview")),
+            "ok": bool(source.get("ok", True)),
+            "error_code": str(source.get("error_code", "")),
+        }
+    if isinstance(result, dict):
+        return _bounded_args(result)
+    text = str(result)
+    if len(text) > _ARGS_VALUE_MAX_CHARS:
+        text = text[:_ARGS_VALUE_MAX_CHARS] + "…(截断)"
+    return {"text": text}
+
+
 class TranscriptWriter:
     """在事实产生时写入权威展示稿，并发布对应 `transcript_patch`。"""
 
@@ -737,16 +765,9 @@ class TranscriptWriter:
             is_error = status == "error"
             payload["is_error"] = is_error
             payload["outcome_status"] = status
-            raw_result = result.get("result")
-            if isinstance(raw_result, dict):
-                payload["result_summary"] = _bounded_args(raw_result)
-            elif raw_result is None:
-                payload["result_summary"] = None
-            else:
-                text = str(raw_result)
-                if len(text) > _ARGS_VALUE_MAX_CHARS:
-                    text = text[:_ARGS_VALUE_MAX_CHARS] + "…(截断)"
-                payload["result_summary"] = {"text": text}
+            payload["result_summary"] = _visible_tool_result_summary(
+                str(payload.get("tool", "")), result.get("result")
+            )
             updated = self._update_entry(
                 session,
                 activity_entry_id,

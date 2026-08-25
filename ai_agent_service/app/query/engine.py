@@ -599,7 +599,7 @@ def _front_tool_summary(name: str, input_args: dict[str, Any], result: dict[str,
         return "\n".join(lines)
     if name == "read_class_docs":
         cls = input_args.get("class_name", "")
-        title = f"Read class docs: {cls}" if cls else "Read class docs"
+        title = f"ClassInfo {cls}" if cls else "ClassInfo"
     elif name == "add_node":
         node_type = input_args.get("type", "")
         node_name = input_args.get("name", "")

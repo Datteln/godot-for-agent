@@ -4,8 +4,8 @@ extends RefCounted
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 
 const MAX_RELOAD_TARGETS := 8
-const RELOADABLE_EXTENSIONS := PackedStringArray(["gd", "tscn", "tres"])
-const SUPPORTED_MODES := PackedStringArray(["editor_visible", "resource_only", "runtime_only"])
+const RELOADABLE_EXTENSIONS := ["gd", "tscn", "tres"]
+const SUPPORTED_MODES := ["editor_visible", "resource_only", "runtime_only"]
 
 
 ## 重载由已批准代码编辑产生的目标，并始终返回可区分的类型化状态。

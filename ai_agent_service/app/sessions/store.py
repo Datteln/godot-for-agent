@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, CompactSnapshot, Frame
+from app.llm.class_docs import sanitize_class_docs_messages
 from app.permissions.engine import SessionAllowGrant
 from app.storage.atomic import atomic_write_json
 
@@ -206,7 +207,12 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
     Returns:
         仅含 JSON 原生类型的字典；`agent` 只保留 `agent_name`，恢复时
         重新从内置 agent 注册表解析，避免持久化大段 prompt 文本。
+
+    持久化边界兜底（任务 4.3）：任何时刻写盘前都确保已被模型消费的
+    `read_class_docs` 结果只以受限占位符存在，完整 ClassDB/API 文本
+    绝不进入会话持久化。
     """
+    sanitize_class_docs_messages(frame.messages)
     return {
         "id": frame.id,
         "agent_name": frame.agent.name,

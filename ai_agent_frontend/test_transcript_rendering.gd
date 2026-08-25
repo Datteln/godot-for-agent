@@ -13,9 +13,41 @@ const TranscriptRenderer = preload("res://addons/ai_agent/transcript/transcript_
 const TranscriptCopy = preload("res://addons/ai_agent/transcript/transcript_copy.gd")
 const LogEntryRenderer = preload("res://addons/ai_agent/ui/log_entry_renderer.gd")
 const TransientNoticeHost = preload("res://addons/ai_agent/ui/transient_notice_host.gd")
+const TranscriptViewport = preload("res://addons/ai_agent/transcript/transcript_viewport.gd")
 
 var _failures := 0
 var _checks := 0
+
+
+class StableMinimumRoot extends Control:
+	func _get_minimum_size() -> Vector2:
+		return Vector2(0, 28)
+
+
+class ViewportStore:
+	var entry := {
+		"entry_id": "thought-layout", "ordinal": 0, "kind": "thought", "state": "thinking",
+		"revision": 1, "payload": {"content": "brief"},
+	}
+
+	func ordered_entry_ids() -> Array:
+		return ["thought-layout"]
+
+	func get_entry(entry_id: String) -> Dictionary:
+		return entry if entry_id == "thought-layout" else {}
+
+
+class ViewportRenderer:
+	var root: Control
+
+	func attach(_mounts: VBoxContainer) -> void:
+		pass
+
+	func mounted_entry_ids() -> Array:
+		return ["thought-layout"]
+
+	func mounted_root(entry_id: String) -> Control:
+		return root if entry_id == "thought-layout" else null
 
 
 func _check(condition: bool, label: String) -> void:
@@ -39,6 +71,7 @@ func _init() -> void:
 	_run_tool_tests()
 	_run_error_and_status_tests()
 	_run_transient_host_tests()
+	_run_viewport_layout_tests()
 	_run_kind_guard_tests()
 	print("transcript rendering checks: %d, failures: %d" % [_checks, _failures])
 	quit(1 if _failures > 0 else 0)
@@ -622,6 +655,32 @@ func _run_transient_host_tests() -> void:
 	waiting_host.show_keyed("waiting", "等待模型响应...", "system")
 	var optimistic_id := str(waiting_timeline.get_child(0).get_meta("transcript_entry_id")) if waiting_timeline.get_child(0).has_meta("transcript_entry_id") else ""
 	_check(waiting_timeline.get_child_count() == 2 and optimistic_id == "optimistic", "transient: waiting follows its optimistic user entry")
+
+
+# ─── 虚拟视口：稳定测量 + transient 挂载位置 ───────────────────────────────
+
+
+func _run_viewport_layout_tests() -> void:
+	var list := VBoxContainer.new()
+	var transient_mount := VBoxContainer.new()
+	var root := StableMinimumRoot.new()
+	# 模拟 RichTextLabel.fit_content 的首帧旧尺寸；它不能写入虚拟 spacer 缓存。
+	root.size = Vector2(640, 14080)
+	var renderer := ViewportRenderer.new()
+	renderer.root = root
+	var store := ViewportStore.new()
+	var viewport := TranscriptViewport.new()
+	viewport.attach(list, renderer, store, ScrollContainer.new(), transient_mount)
+	viewport._measure_mounted()
+	var key := viewport._height_key(store.entry)
+	_check(absf(float(viewport._measurements.get(key, 0.0)) - 28.0) < 0.01, "viewport: caches stable minimum height instead of stale fit-content size")
+	_check(list.get_child_count() == 4, "viewport: spacer, mounts, transient mount, spacer installed")
+	_check(list.get_child(2) == transient_mount, "viewport: transient mount precedes bottom spacer")
+	var host := TransientNoticeHost.new()
+	host.node_factory = LogEntryRenderer.new()
+	host.attach(transient_mount)
+	host.show_notice("显示错误", "error")
+	_check(transient_mount.get_child_count() == 1 and list.get_child(3) != transient_mount, "viewport: error notice is not appended after bottom spacer")
 
 
 # ─── kind 守卫：缺少/未知 kind 一律拒绝 ─────────────────────────────────────

@@ -20,6 +20,9 @@ var overflowed := false
 
 var _pending := {}    # entry_id -> Array[Dictionary]（按到达/合并顺序）
 var _order: Array = []  # entry_id 首次到达顺序
+## 条目首次入队时间（微秒；任务 2.9 投影积压看门狗的脱敏输入）。
+## `_order` 按首次到达排序，队首即最早仍未投影的条目。
+var _first_enqueue_usec := {}  # entry_id -> int
 
 
 func is_empty() -> bool:
@@ -29,7 +32,25 @@ func is_empty() -> bool:
 func clear() -> void:
 	_pending.clear()
 	_order.clear()
+	_first_enqueue_usec.clear()
 	overflowed = false
+
+
+## 暂存中的流式补丁总数（任务 2.9 脱敏诊断：只暴露计数，不含正文）。
+func pending_event_count() -> int:
+	var count := 0
+	for entry_id in _pending.keys():
+		var list_value: Variant = _pending.get(entry_id, null)
+		if list_value is Array:
+			count += (list_value as Array).size()
+	return count
+
+
+## 最早仍未投影条目的入队时间（微秒）；空暂存返回 0。
+func oldest_pending_usec() -> int:
+	if _order.is_empty():
+		return 0
+	return int(_first_enqueue_usec.get(str(_order[0]), 0))
 
 
 ## 暂存一条可合并流式补丁；返回该条目当前暂存事件数。
@@ -39,6 +60,8 @@ func enqueue(entry_id: String, event: Dictionary) -> int:
 	var payload_value: Variant = event.get("payload", {})
 	var payload: Dictionary = payload_value if payload_value is Dictionary else {}
 	var patch_format := str(payload.get("patch_format", "full"))
+	if not _first_enqueue_usec.has(entry_id):
+		_first_enqueue_usec[entry_id] = Time.get_ticks_usec()
 	if patch_format == "full":
 		# 完整补丁自含最新状态：取代该条目全部暂存修订。
 		if not _pending.has(entry_id):
@@ -88,6 +111,7 @@ func take(max_entries: int) -> Array:
 		var entry_id: String = str(_order.pop_front())
 		var list_value: Variant = _pending.get(entry_id, null)
 		_pending.erase(entry_id)
+		_first_enqueue_usec.erase(entry_id)
 		if list_value is Array and not (list_value as Array).is_empty():
 			result.append({"entry_id": entry_id, "events": list_value})
 	return result
@@ -102,3 +126,4 @@ func take_all() -> Array:
 func discard(entry_id: String) -> void:
 	if _pending.erase(entry_id):
 		_order.erase(entry_id)
+		_first_enqueue_usec.erase(entry_id)

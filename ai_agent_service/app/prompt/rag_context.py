@@ -12,7 +12,11 @@ from app.rag.models import SearchResult
 logger = logging.getLogger(__name__)
 _MAX_SNIPPETS = 4
 _TOKEN_BUDGET = 1500
-_HEADER = "相关代码片段（自动检索，仅供参考；写文件前必须用 read_file 读取完整文件）："
+_HEADER = (
+    "相关代码片段（自动检索，仅供参考）：这些文件路径是已定位的候选，修改或引用前必须先用 "
+    "read_file 直接读取，不要对它们再做搜索；只有候选未覆盖时才用源码/配置 glob（如 "
+    "'**/*.gd'）检索，绝不使用 '**/*'。"
+)
 
 
 def _tokens(text: str) -> int:

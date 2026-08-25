@@ -158,15 +158,40 @@ def register_front_tools() -> None:
             schema={
                 "name": "read_class_docs",
                 "description": (
-                    "Read real Godot ClassDB or script-class signatures from the editor. "
-                    "Use before generating code that calls Godot APIs."
+                    "Read a bounded real Godot ClassDB or script-class query from the editor. "
+                    "Use overview first; search for candidates, then request exact members or constants."
                 ),
                 "parameters": _object_schema(
                     {
                         "class_name": {
                             "type": "string",
                             "description": "Godot class name, for example CharacterBody2D.",
-                        }
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["overview", "search", "members", "constants"],
+                            "description": "Bounded query mode. Defaults to overview.",
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Search words used only with mode=search.",
+                        },
+                        "members": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Exact member names for mode=members.",
+                        },
+                        "constants": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Exact constant names for mode=constants.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 12,
+                            "description": "Maximum search results; defaults to 8.",
+                        },
                     },
                     ["class_name"],
                 ),

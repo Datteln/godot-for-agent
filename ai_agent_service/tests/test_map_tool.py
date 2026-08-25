@@ -28,6 +28,24 @@ def test_legacy_map_mutation_names_cannot_register() -> None:
         REGISTRY.update(previous)
 
 
+def test_class_docs_schema_and_visible_summary_are_bounded() -> None:
+    """验证 ClassDB 查询必须显式有界且不会进入可见转录。"""
+    previous = REGISTRY.copy()
+    try:
+        REGISTRY.clear()
+        register_front_tools()
+        parameters = REGISTRY["read_class_docs"].schema["parameters"]
+        assert parameters["properties"]["mode"]["enum"] == [
+            "overview",
+            "search",
+            "members",
+            "constants",
+        ]
+        assert parameters["properties"]["limit"]["maximum"] == 12
+    finally:
+        REGISTRY.clear()
+        REGISTRY.update(previous)
+
 def test_legacy_map_mutation_names_cannot_route_or_dispatch() -> None:
     """验证旧工具名既不在提示路由中，也不在前端 dispatch 中。"""
     root = Path(__file__).parents[2]
@@ -67,8 +85,8 @@ def test_map_observation_tools_remain_read_only_and_reload_is_bounded() -> None:
         REGISTRY.update(previous)
 
 
-def test_map_agent_uses_generic_code_editing_without_map_mutation() -> None:
-    """验证地图 agent 使用通用代码编辑、reload 与诚实证据提示。"""
+def test_map_agent_bootstraps_code_driven_authoring_without_map_mutation() -> None:
+    """验证地图 agent 可建立 @tool 作者入口并保留通用编辑边界。"""
     agent = _agent("map-agent.md")
     for name in (
         "describe_tilemap_selection",
@@ -83,8 +101,24 @@ def test_map_agent_uses_generic_code_editing_without_map_mutation() -> None:
     for legacy_name in ("edit_map", "fill_rect", "paint_from_image_grid"):
         assert legacy_name not in agent.tools
         assert legacy_name not in agent.prompt
-    assert "unsupported_map_authoring_target" in agent.prompt
+    assert "godot-map-authoring" in agent.skills
+    assert "@tool" in agent.prompt
+    assert "generated-only" in agent.prompt
+    assert "read_class_docs" in agent.prompt
+    assert "unsupported_map_authoring_target" not in agent.prompt
     assert "advisory visual evidence" in agent.prompt
+
+
+def test_map_authoring_skill_contains_safe_tool_bootstrap_instructions() -> None:
+    """验证预加载技能明确给出 @tool 骨架和文档优先的 API 规则。"""
+    root = Path(__file__).parents[1]
+    skill = root / "app" / "skills" / "bundled" / "godot-map-authoring" / "SKILL.md"
+    content = skill.read_text(encoding="utf-8")
+
+    assert "@tool" in content
+    assert "generated-only" in content
+    assert "read_class_docs" in content
+    assert "不要根据模型记忆" in content
 
 
 def test_all_authorized_agents_receive_general_map_observation_tools() -> None:

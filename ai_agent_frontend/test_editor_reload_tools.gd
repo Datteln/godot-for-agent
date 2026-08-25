@@ -16,8 +16,10 @@ func _init() -> void:
 	_check(EditorReloadTools._dirty_scene_target(["res://maps/level.tscn"], ["res://maps/level.tscn"]) == "res://maps/level.tscn", "dirty target blocks reload")
 	_check(EditorReloadTools._dirty_scene_target(["res://maps/generator.gd"], ["res://maps/level.tscn"]) == "", "unrelated dirty scene is preserved")
 	_check("runtime_only" in EditorReloadTools.SUPPORTED_MODES, "runtime-only mode is explicitly unavailable rather than executed")
-	var blocked_map_data := ProgramTools._validate_map_authoring_target({"workflow": "code_driven_map"}, "res://maps/level.tscn", "tile_map_data = PackedByteArray()", "tile_map_data = PackedByteArray()")
-	_check(str(blocked_map_data.get("error_code", "")) == "unsupported_map_authoring_target", "serialized map target yields typed rejection")
+	var bootstrap_scene := ProgramTools._validate_map_authoring_target({"workflow": "code_driven_map"}, "res://maps/level.tscn", "tile_map_data = PackedByteArray()", "tile_map_data = PackedByteArray()")
+	_check(bool(bootstrap_scene.get("ok", false)), "scene file remains eligible for an approved @tool bootstrap")
+	var blocked_extension := ProgramTools._validate_map_authoring_target({"workflow": "code_driven_map"}, "res://maps/level.png", "", "")
+	_check(str(blocked_extension.get("error_code", "")) == "unsupported_map_authoring_target", "opaque map asset still yields typed rejection")
 	print("editor reload tool checks: %d, failures: %d" % [_checks, _failures])
 	quit(1 if _failures > 0 else 0)
 

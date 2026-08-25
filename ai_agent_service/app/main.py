@@ -104,6 +104,7 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         coalescing_enabled=resolved_settings.event_stream_coalescing,
         bounded_stream_payloads=resolved_settings.event_stream_bounded_payloads,
         stream_preview_max_chars=resolved_settings.event_stream_preview_max_chars,
+        terminal_patch_max_bytes=resolved_settings.event_terminal_patch_max_bytes,
     )
     recovery_store = RecoveryPointerStore(
         resolved_settings.resolved_recovery_pointer_path(),

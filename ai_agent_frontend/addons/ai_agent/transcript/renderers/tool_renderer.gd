@@ -111,6 +111,8 @@ func _rebuild(root: Control, entry: Dictionary, ctx: RefCounted) -> void:
 ## 原始结果详情：默认折叠，仅保留紧凑摘要；展开动作才渲染详情。
 func _detail_text(entry: Dictionary) -> String:
 	var payload := ctx_payload(entry)
+	if str(payload.get("tool", "")) == "read_class_docs":
+		return ""
 	var summary_value: Variant = payload.get("result_summary")
 	if not (summary_value is Dictionary):
 		return ""

@@ -14,6 +14,9 @@ var leading_threshold_px: float = 480.0
 
 var _list: VBoxContainer
 var _mounts: VBoxContainer
+## 非持久化提示的专用宿主。必须位于 mounted entries 与 bottom spacer 之间，
+## 不能由调用方直接 append 到 _list 末尾，否则会落到虚拟 spacer 之后。
+var _transient_mount: VBoxContainer
 var _top_spacer: Control
 var _bottom_spacer: Control
 var _renderer: RefCounted
@@ -32,7 +35,7 @@ var _eviction_count := 0
 var _last_diagnostics: Dictionary = {}
 
 
-func attach(list: VBoxContainer, renderer: RefCounted, store: RefCounted, scroll: ScrollContainer) -> void:
+func attach(list: VBoxContainer, renderer: RefCounted, store: RefCounted, scroll: ScrollContainer, transient_mount: VBoxContainer = null) -> void:
 	_list = list
 	_renderer = renderer
 	_store = store
@@ -41,8 +44,13 @@ func attach(list: VBoxContainer, renderer: RefCounted, store: RefCounted, scroll
 	_bottom_spacer = Control.new()
 	_mounts = VBoxContainer.new()
 	_mounts.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_transient_mount = transient_mount
+	if _transient_mount == null:
+		_transient_mount = VBoxContainer.new()
+	_transient_mount.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_list.add_child(_top_spacer)
 	_list.add_child(_mounts)
+	_list.add_child(_transient_mount)
 	_list.add_child(_bottom_spacer)
 	_renderer.attach(_mounts)
 
@@ -81,25 +89,32 @@ func apply_entry(entry: Dictionary) -> bool:
 ## 与逐条 `apply_entry` 不同：整批只做一次锚点捕获/恢复、一次窗口推进判定与
 ## 一次 `_render_window` 重排，避免每个流式包都触发一次同步回流。终态/非流式
 ## 条目仍由调用方走 `apply_entry` 立即应用，保证顺序不被批处理延后。
-func apply_batch(entries: Array) -> int:
+##
+## 返回被视口接受的条目 id 数组（任务 2.12）：窗口内挂载成功，或位于当前
+## 虚拟窗口之外（由 spacer 估算代呈）均视为接受；挂载失败会同时发出
+## `renderer_rejected`，该条目不计入返回值。
+func apply_batch(entries: Array) -> Array:
 	if entries.is_empty():
-		return 0
+		return []
 	_capture_anchor()
 	var ids: Array = _store.ordered_entry_ids()
+	var accepted: Array = []
 	var follow_extend := false
-	var rendered := 0
 	for entry_value in entries:
 		if not (entry_value is Dictionary):
 			continue
 		var entry: Dictionary = entry_value
-		var index := ids.find(str(entry.get("entry_id", "")))
+		var entry_id := str(entry.get("entry_id", ""))
+		var index := ids.find(entry_id)
 		if index < 0:
 			continue
 		if _follow_mode and index >= _window_end - overscan:
 			follow_extend = true
+		var entry_accepted := true
 		if index >= _window_start and index < _window_end:
-			if _ensure_mounted(entry):
-				rendered += 1
+			entry_accepted = _ensure_mounted(entry)
+		if entry_accepted:
+			accepted.append(entry_id)
 	if follow_extend:
 		_window_end = ids.size()
 		_window_start = maxi(0, _window_end - max_mounted_roots)
@@ -110,7 +125,7 @@ func apply_batch(entries: Array) -> int:
 				_ensure_mounted(entry)
 	_render_window()
 	_restore_anchor()
-	return rendered
+	return accepted
 
 
 ## 合并旧页后保留当前窗口；若窗口尚未建立则从 Store 初始化。
@@ -252,8 +267,15 @@ func _measure_mounted() -> void:
 	for entry_id in _renderer.mounted_entry_ids():
 		var entry: Dictionary = _store.get_entry(entry_id)
 		var root: Control = _renderer.mounted_root(entry_id)
-		if not entry.is_empty() and root != null and is_instance_valid(root) and root.size.y > 0.0:
-			_measurements[_height_key(entry)] = root.size.y
+		if entry.is_empty() or root == null or not is_instance_valid(root):
+			continue
+		# `size.y` 可能仍是上一帧 RichTextLabel.fit_content 布局留下的旧值：
+		# Thought 折叠时该值会把已隐藏详情的完整高度带入 spacer。容器的组合
+		# 最小尺寸由当前可见子节点决定，是当前 revision/宽度/展示模式下可缓存的
+		# 稳定测量基准。
+		var height := root.get_combined_minimum_size().y
+		if height > 0.0:
+			_measurements[_height_key(entry)] = height
 
 
 func _index_at_offset(ids: Array, offset: float) -> int:
