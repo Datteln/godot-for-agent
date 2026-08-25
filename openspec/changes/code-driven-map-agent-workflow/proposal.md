@@ -6,10 +6,11 @@ Map work remains distinct from ordinary code work: it needs map-oriented plannin
 
 ## What Changes
 
-- Introduce a code-driven map-authoring workflow. The map agent will plan map changes in map terms, edit approved readable project files through the common code-edit path, and report file-level evidence rather than issuing `edit_map`/`fill_rect`/`paint_from_image_grid` mutations.
+- Introduce a code-driven map-authoring workflow. The map agent will plan map changes in map terms, edit approved readable project files through the common code-edit path, and report file-level evidence rather than issuing `edit_map`/`fill_rect`/`paint_from_image_grid` mutations. When a selected hand-painted map lacks a generator, the workflow will first propose a `@tool` builder plus readable layout source instead of ending the request as unsupported.
 - Introduce a minimal Godot observation bridge that reloads explicitly named changed resources or scenes and captures a viewport screenshot for visual verification.
 - **BREAKING**: Delete `edit_map`, `fill_rect`, and `paint_from_image_grid` from tool registration, executor dispatch, implementations, prompts, previews, and tests. No compatibility mode or legacy routing remains. Retain map-specific read tools as general read-only observation capabilities, available to every agent whose effective tools permit them, and use them as the authoritative source of existing map target, layer, coordinate, and tile facts.
 - Preserve the existing confirmation, transcript, permission, path-boundary, stale-file, diff, and Undo behavior of the common code-edit path.
+- Bound map-region observation output and ensure a typed tool failure is returned to the map agent as recoverable evidence, rather than ending the pending request at the transport boundary.
 - Define clear outcomes for reload failure, unavailable visual verification, and successful reload with only advisory screenshot evidence. A screenshot alone must not claim gameplay or semantic correctness.
 
 ## Capabilities
@@ -28,4 +29,6 @@ Map work remains distinct from ordinary code work: it needs map-oriented plannin
 - Map agent definition, coordinator routing, front-tool registry, tool executor, map-mutation UI previews, and map-tool tests.
 - A new narrow frontend reload operation, using Godot editor APIs and scoped to explicitly approved project-relative paths.
 - Existing generic code-edit tools (`read_file`, `apply_text_edit`, file proposals/writes), confirmation UI, transcript entries, and file-state cache become the map authoring path.
+- A curated map-agent authoring guide supplies an editor-safe `@tool` builder recipe, layout format expectations, and required Godot class-documentation checks; the workflow does not rely on latent model knowledge of Godot APIs.
+- Map observation serialization and the generic front-tool error-continuation boundary require additional regression coverage.
 - Map-specific mutation implementations, registrations, UI branches, and related configuration are deleted. Existing read-only map inspection remains registered as a general observation capability, with the map agent as its primary map-authoring consumer.

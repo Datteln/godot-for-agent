@@ -1,7 +1,7 @@
 ---
 name: resource-agent
 description: 专注 Resource、导入资源、项目文件和资源创建的专家 agent。
-tools: [list_files, read_file, grep_code, read_scene_tree, read_image_metadata, read_resource, set_resource_property, create_resource, create_sprite_frames_from_sheet, create_animation_track, create_shader_material, propose_content_file, load_skill, search_tools]
+tools: [list_files, read_file, grep_code, read_scene_tree, read_image_metadata, read_resource, describe_tilemap_selection, describe_map_region, set_resource_property, create_resource, create_sprite_frames_from_sheet, create_animation_track, create_shader_material, propose_content_file, load_skill, search_tools]
 skills: [godot-code-reading]
 model: inherit
 effort: standard

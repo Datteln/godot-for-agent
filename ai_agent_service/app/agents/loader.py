@@ -94,11 +94,6 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
                 meta[key] = int(value)
             except ValueError:
                 meta[key] = 12
-        elif key == "edit_map_max_turns":
-            try:
-                meta[key] = int(value)
-            except ValueError:
-                meta[key] = None
         else:
             meta[key] = _parse_scalar(value)
 
@@ -122,9 +117,6 @@ def load_agent_file(path: Path) -> AgentDefinition:
         model=str(meta.get("model") or "inherit"),
         effort=_parse_effort(meta.get("effort")),
         max_turns=int(meta.get("max_turns") or 12),
-        edit_map_max_turns=(
-            int(meta["edit_map_max_turns"]) if meta.get("edit_map_max_turns") is not None else None
-        ),
         can_delegate=bool(meta.get("can_delegate") or meta.get("can-delegate") or False),
         hooks=hooks if isinstance(hooks, dict) and hooks else None,
     )

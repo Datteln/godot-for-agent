@@ -212,6 +212,7 @@ def register_front_tools() -> None:
                             "type": "string",
                             "description": "Complete replacement file content.",
                         },
+                        "workflow": {"type": "string", "enum": ["standard", "code_driven_map"]},
                     },
                     ["path", "content"],
                 ),
@@ -285,6 +286,7 @@ def register_front_tools() -> None:
                             "type": "boolean",
                             "description": "Replace every occurrence instead of requiring a unique match. Defaults to false.",
                         },
+                        "workflow": {"type": "string", "enum": ["standard", "code_driven_map"]},
                     },
                     ["path", "old_string", "new_string"],
                 ),
@@ -1421,156 +1423,44 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
-            name="edit_map",
+            name="reload_map_targets",
             domain="map",
             side="front",
             reads_project=True,
-            writes_project=True,
-            needs_preview=True,
-            render_kind="map",
+            is_read_only=True,
+            render_kind="json",
             schema={
-                "name": "edit_map",
+                "name": "reload_map_targets",
                 "description": (
-                    "Edit a 2D TileMapLayer/legacy TileMap or a 3D GridMap through Godot's native APIs. "
-                    "Use this tool instead of refusing a map edit or directly rewriting serialized tile/map data. "
-                    "Supports fill, erase, and overlap-safe region copy; all changes are previewed and undoable. "
-                    "For a legacy TileMap with multiple layers, call describe_map_region first to see the real "
-                    "`layers` list and confirm which index is the visible/collidable foreground layer before "
-                    "picking map_layer — do not assume index 0 is the right one."
+                    "Reload explicitly approved code-driven map targets through the Godot editor and, only for "
+                    "a successful editor-visible reload, capture advisory target-scoped viewport evidence. "
+                    "This never executes normal runtime-only generators."
                 ),
                 "parameters": _object_schema(
                     {
-                        "target_path": {
-                            "type": "string",
-                            "description": (
-                                "NodePath relative to the edited scene root. Omit to use the selected map node "
-                                "or the only compatible map node in the scene."
-                            ),
-                        },
-                        "map_layer": {
-                            "type": "integer",
-                            "description": (
-                                "Layer index for a legacy TileMap; ignored by TileMapLayer and GridMap. Defaults "
-                                "to 0 if omitted — confirm this is the intended layer via describe_map_region's "
-                                "`layers` field first, since index 0 is not always the foreground/collidable layer."
-                            ),
-                        },
-                        "operations": {
+                        "targets": {
                             "type": "array",
                             "minItems": 1,
-                            "maxItems": 128,
-                            "description": (
-                                "Ordered map operations. Coordinates use x/y for 2D and x/y/z for 3D. "
-                                "copy reads the complete source region before writing, so overlapping copies are safe."
-                            ),
-                            "items": _object_schema(
-                                {
-                                    "action": {
-                                        "type": "string",
-                                        "enum": ["fill", "erase", "copy"],
-                                    },
-                                    "x": {"type": "integer"},
-                                    "y": {"type": "integer"},
-                                    "z": {"type": "integer"},
-                                    "width": {"type": "integer", "minimum": 1},
-                                    "height": {"type": "integer", "minimum": 1},
-                                    "depth": {"type": "integer", "minimum": 1},
-                                    "source_id": {
-                                        "type": "integer",
-                                        "description": "2D TileSet source id for fill.",
-                                    },
-                                    "atlas_x": {"type": "integer"},
-                                    "atlas_y": {"type": "integer"},
-                                    "alternative_tile": {"type": "integer"},
-                                    "item": {
-                                        "type": "integer",
-                                        "description": "3D MeshLibrary item id for fill.",
-                                    },
-                                    "orientation": {
-                                        "type": "integer",
-                                        "description": "3D GridMap orthogonal orientation index.",
-                                    },
-                                    "from_x": {"type": "integer"},
-                                    "from_y": {"type": "integer"},
-                                    "from_z": {"type": "integer"},
-                                    "to_x": {"type": "integer"},
-                                    "to_y": {"type": "integer"},
-                                    "to_z": {"type": "integer"},
-                                },
-                                ["action"],
-                            ),
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                            "description": "Project-relative changed .gd, .tscn, or .tres targets.",
                         },
-                    },
-                    ["operations"],
-                ),
-            },
-        )
-    )
-    register(
-        ToolDef(
-            name="fill_rect",
-            domain="map",
-            side="front",
-            writes_project=True,
-            needs_preview=True,
-            render_kind="map",
-            schema={
-                "name": "fill_rect",
-                "description": "Fill a rectangle in the selected TileMapLayer after user confirmation.",
-                "parameters": _object_schema(
-                    {
-                        "x": {"type": "integer"},
-                        "y": {"type": "integer"},
-                        "width": {"type": "integer"},
-                        "height": {"type": "integer"},
-                        "source_id": {"type": "integer"},
-                        "atlas_x": {"type": "integer"},
-                        "atlas_y": {"type": "integer"},
-                    },
-                    ["x", "y", "width", "height", "source_id", "atlas_x", "atlas_y"],
-                ),
-            },
-        )
-    )
-    register(
-        ToolDef(
-            name="paint_from_image_grid",
-            domain="map",
-            side="front",
-            reads_project=True,
-            writes_project=True,
-            needs_preview=True,
-            render_kind="map",
-            read_path_args=["image_path"],
-            schema={
-                "name": "paint_from_image_grid",
-                "description": (
-                    "Convert an image or sketch into a bounded TileMap cell grid using a color palette. "
-                    "Requires a selected TileMapLayer and user confirmation."
-                ),
-                "parameters": _object_schema(
-                    {
-                        "image_path": {"type": "string", "description": "Relative or res:// image path."},
-                        "origin_x": {"type": "integer"},
-                        "origin_y": {"type": "integer"},
-                        "max_width": {"type": "integer"},
-                        "max_height": {"type": "integer"},
-                        "palette": {
+                        "approved_paths": {
                             "type": "array",
-                            "description": "Color-to-tile mappings with hex/source_id/atlas_x/atlas_y.",
-                            "items": _object_schema(
-                                {
-                                    "hex": {"type": "string"},
-                                    "source_id": {"type": "integer"},
-                                    "atlas_x": {"type": "integer"},
-                                    "atlas_y": {"type": "integer"},
-                                    "alternative_tile": {"type": "integer"},
-                                },
-                                ["hex", "source_id", "atlas_x", "atlas_y"],
-                            ),
+                            "minItems": 1,
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                            "description": "Affected paths returned by the approved code-edit batch.",
                         },
+                        "reload_mode": {
+                            "type": "string",
+                            "enum": ["editor_visible", "resource_only", "runtime_only"],
+                            "description": "runtime_only reports visual verification as unavailable without execution.",
+                        },
+                        "capture_screenshot": {"type": "boolean"},
+                        "screenshot_mode": {"type": "string", "enum": ["2d", "3d"]},
                     },
-                    ["image_path", "palette"],
+                    ["targets", "approved_paths", "reload_mode"],
                 ),
             },
         )
@@ -1809,6 +1699,7 @@ def register_front_tools() -> None:
                         "path": {"type": "string"},
                         "content": {"type": "string"},
                         "content_type": {"type": "string"},
+                        "workflow": {"type": "string", "enum": ["standard", "code_driven_map"]},
                     },
                     ["path", "content"],
                 ),

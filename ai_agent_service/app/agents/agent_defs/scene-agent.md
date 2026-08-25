@@ -1,7 +1,7 @@
 ---
 name: scene-agent
 description: 专注场景树、节点创建、节点属性和场景结构分析的专家 agent。
-tools: [read_scene_tree, read_runtime_state, validate_scene_state, read_class_docs, describe_map_region, add_node, set_node_property, delete_node, reparent_node, rename_node, instance_scene, duplicate_node, connect_signal, disconnect_signal, add_to_group, remove_from_group, list_node_groups, list_groups, list_node_signals, list_node_methods, save_scene, list_open_scenes, get_current_scene_path, open_scene, capture_viewport_screenshot, bake_navigation_mesh, set_project_setting, read_project_setting, list_autoloads, add_autoload, remove_autoload, list_input_actions, add_input_action, remove_input_action, load_skill, search_tools]
+tools: [read_scene_tree, read_runtime_state, validate_scene_state, read_class_docs, describe_tilemap_selection, describe_map_region, add_node, set_node_property, delete_node, reparent_node, rename_node, instance_scene, duplicate_node, connect_signal, disconnect_signal, add_to_group, remove_from_group, list_node_groups, list_groups, list_node_signals, list_node_methods, save_scene, list_open_scenes, get_current_scene_path, open_scene, capture_viewport_screenshot, bake_navigation_mesh, set_project_setting, read_project_setting, list_autoloads, add_autoload, remove_autoload, list_input_actions, add_input_action, remove_input_action, load_skill, search_tools]
 skills: [godot-code-reading]
 model: inherit
 effort: standard

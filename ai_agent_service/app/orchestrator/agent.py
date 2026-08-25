@@ -646,7 +646,7 @@ async def _handle_frame_turns_exhausted(
     prompt_factory: AgentPromptFactory | None,
     event_callback: Callable[[str, dict[str, Any]], None] | None,
 ) -> ErrorResult | None:
-    """某个轮次预算（总轮数/edit_map 轮数/常规轮数）耗尽时的统一收尾。
+    """某个轮次预算耗尽时的统一收尾。
 
     根帧耗尽时整轮直接报错终止；子帧耗尽时用 `_finish_frame` 收尾并把控制权
     交还父帧，让父 agent 据此判断是否要重新拆分任务。
@@ -1419,8 +1419,6 @@ async def run_turn(
     """
     logger.info("Agent run_turn start session=%s max_turns=%d", session.session_id, max_turns)
     frame_turns: dict[str, int] = {}  # frame_id -> 本次 run_turn 调用内该帧已消耗的总轮数
-    # frame_id -> 其中单独计入 edit_map_max_turns 预算的轮数（tool_calls 仅含 edit_map 时）
-    frame_edit_map_turns: dict[str, int] = {}
     for loop_index in range(max_turns):
         frame = session.top_frame()
         if frame is None:
@@ -1428,12 +1426,9 @@ async def run_turn(
             return ErrorResult(text="会话没有活跃的 agent 帧")
 
         used = frame_turns.get(frame.id, 0)
-        # 这里只做一个宽松的总量护栏（max_turns + edit_map_max_turns），防止帧无限循环；
-        # 哪个预算先耗尽由下面 tool_calls 揭晓后的精确分类检查负责。
-        total_budget = frame.agent.max_turns + (frame.agent.edit_map_max_turns or 0)
-        if used >= total_budget:
+        if used >= frame.agent.max_turns:
             result = await _handle_frame_turns_exhausted(
-                session, frame, "总轮数", total_budget, agent_prompt_factory, event_callback
+                session, frame, "常规轮数", frame.agent.max_turns, agent_prompt_factory, event_callback
             )
             if result is not None:
                 return result
@@ -1642,38 +1637,6 @@ async def run_turn(
             },
         )
 
-        # edit_map 调用按 edit_map_max_turns 单独计算预算，不挤占该 agent 处理其他
-        # 工具（read_scene_tree/截图/规划等）的常规 max_turns 配额；反之亦然。
-        is_edit_map_turn = bool(tool_names) and all(name == "edit_map" for name in tool_names)
-        if is_edit_map_turn and frame.agent.edit_map_max_turns is not None:
-            edit_map_used = frame_edit_map_turns.get(frame.id, 0) + 1
-            frame_edit_map_turns[frame.id] = edit_map_used
-            if edit_map_used > frame.agent.edit_map_max_turns:
-                result = await _handle_frame_turns_exhausted(
-                    session,
-                    frame,
-                    "edit_map 调用次数",
-                    frame.agent.edit_map_max_turns,
-                    agent_prompt_factory,
-                    event_callback,
-                )
-                if result is not None:
-                    return result
-                continue
-        else:
-            general_used = frame_turns.get(frame.id, 0) - frame_edit_map_turns.get(frame.id, 0)
-            if general_used > frame.agent.max_turns:
-                result = await _handle_frame_turns_exhausted(
-                    session,
-                    frame,
-                    "常规轮数",
-                    frame.agent.max_turns,
-                    agent_prompt_factory,
-                    event_callback,
-                )
-                if result is not None:
-                    return result
-                continue
 
         permission_ctx = PermissionContext(
             security=security,
@@ -1708,6 +1671,15 @@ async def run_turn(
                 frame.messages.append(parse_error)
                 continue
             assert args is not None
+
+            # 地图 agent 仍复用普通文本编辑工具；服务端而非模型负责绑定该标记，
+            # 使前端可以启用地图作者目标白名单与序列化地图数据保护。
+            if frame.agent.name == "map-agent" and tool.name in {
+                "apply_text_edit",
+                "propose_script_edit",
+                "propose_content_file",
+            }:
+                args = {**args, "workflow": "code_driven_map"}
 
             decision = check(tool, args, permission_ctx)
             if decision == "deny":
@@ -1829,6 +1801,15 @@ async def run_turn(
                 pending_items.append(_PendingToolMessage(parse_error))
                 continue
             assert args is not None
+
+            # 地图 agent 仍复用普通文本编辑工具；服务端而非模型负责绑定该标记，
+            # 使前端可以启用地图作者目标白名单与序列化地图数据保护。
+            if frame.agent.name == "map-agent" and tool.name in {
+                "apply_text_edit",
+                "propose_script_edit",
+                "propose_content_file",
+            }:
+                args = {**args, "workflow": "code_driven_map"}
 
             decision = check(tool, args, permission_ctx)
             logger.info(

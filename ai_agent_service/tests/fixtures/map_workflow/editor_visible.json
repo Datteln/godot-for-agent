@@ -1,0 +1,19 @@
+{
+  "name": "editor-visible-generator",
+  "approved_edit": {
+    "workflow": "code_driven_map",
+    "path": "res://maps/terrain_generator.gd",
+    "outcome": "applied"
+  },
+  "reload_request": {
+    "targets": ["res://maps/terrain_generator.gd", "res://maps/terrain_preview.tscn"],
+    "approved_paths": ["res://maps/terrain_generator.gd", "res://maps/terrain_preview.tscn"],
+    "reload_mode": "editor_visible",
+    "capture_screenshot": true
+  },
+  "expected": {
+    "reload_status": "reloaded",
+    "visual_evidence": "captured",
+    "semantic_verification": "not_established"
+  }
+}

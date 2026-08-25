@@ -1,7 +1,7 @@
 ---
 name: advisor
 description: 只读架构/设计/排错顾问，不直接修改工程。
-tools: [list_files, read_file, grep_code, search_codebase, read_class_docs, read_scene_tree, read_runtime_state, read_profiler_snapshot, read_debugger_errors, read_image_metadata, load_skill, search_tools]
+tools: [list_files, read_file, grep_code, search_codebase, read_class_docs, read_scene_tree, read_runtime_state, read_profiler_snapshot, read_debugger_errors, read_image_metadata, describe_tilemap_selection, describe_map_region, load_skill, search_tools]
 skills: [godot-code-reading]
 model: inherit
 effort: advisor

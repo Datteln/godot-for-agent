@@ -9,6 +9,7 @@ const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 const ProgramTools = preload("res://addons/ai_agent/tools/program_tools.gd")
 const SceneTools = preload("res://addons/ai_agent/tools/scene_tools.gd")
 const MapTools = preload("res://addons/ai_agent/tools/map_tools.gd")
+const EditorReloadTools = preload("res://addons/ai_agent/tools/editor_reload_tools.gd")
 const ResourceTools = preload("res://addons/ai_agent/tools/resource_tools.gd")
 const ProjectTools = preload("res://addons/ai_agent/tools/project_tools.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
@@ -154,12 +155,16 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = MapTools.describe_selection(editor_interface)
 		"describe_map_region":
 			result = MapTools.describe_map_region(input, editor_interface)
-		"edit_map":
-			result = MapTools.edit_map(input, editor_interface, undo_manager)
-		"fill_rect":
-			result = MapTools.fill_rect(input, editor_interface, undo_manager)
-		"paint_from_image_grid":
-			result = MapTools.paint_from_image_grid(input, editor_interface, undo_manager)
+		"reload_map_targets":
+			result = await EditorReloadTools.reload_targets(input, editor_interface)
+			if str(result.get("status", "")) == "reloaded" and bool(input.get("capture_screenshot", true)):
+				var visual: Dictionary = result.get("visual_evidence", {})
+				if str(visual.get("availability", "")) == "eligible":
+					var screenshot_result := await SceneTools.capture_viewport_screenshot({"mode": str(input.get("screenshot_mode", "2d"))}, editor_interface)
+					if bool(screenshot_result.get("ok", false)):
+						result["visual_evidence"] = {"availability": "captured", "scope": result.get("reloaded_targets", []), "path": screenshot_result.get("path", ""), "width": screenshot_result.get("width", 0), "height": screenshot_result.get("height", 0), "advisory": true, "semantic_verification": "not_established"}
+					else:
+						result["visual_evidence"] = {"availability": "unavailable", "scope": result.get("reloaded_targets", []), "reason": str(screenshot_result.get("error_code", "capture_failed")), "advisory": true, "semantic_verification": "not_established"}
 		"create_resource":
 			result = ResourceTools.create_resource(input, undo_manager)
 		"read_image_metadata":

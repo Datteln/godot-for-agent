@@ -15,6 +15,8 @@ const GIT_COMMAND_TIMEOUT_MS := 15000
 const MAX_READ_SCAN_LINES := 200000
 const DEFAULT_READ_LIMIT_LINES := 2000
 const MAX_READ_LIMIT_LINES := 20000
+const MAP_AUTHORING_EXTENSIONS := PackedStringArray(["gd", "tscn", "tres", "cfg", "json", "csv", "txt"])
+const SERIALIZED_MAP_MARKERS := PackedStringArray(["tile_map_data", "cell_data", "grid_map_data"])
 
 
 static func read_file(input: Dictionary, file_state_cache: Node = null) -> Dictionary:
@@ -150,6 +152,9 @@ static func apply_text_edit(input: Dictionary, undo_manager: Node, file_state_ca
 	else:
 		var idx := before_text.find(old_string)
 		after_text = before_text.substr(0, idx) + new_string + before_text.substr(idx + old_string.length())
+	var map_target_check := _validate_map_authoring_target(input, path, before_text, after_text)
+	if not bool(map_target_check.get("ok", false)):
+		return map_target_check
 
 	if undo_manager == null:
 		return {"ok": false, "message": "undo manager is not available"}
@@ -235,6 +240,9 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 	var before_text := ""
 	if FileAccess.file_exists(ProjectSettings.globalize_path(path)):
 		before_text = FileAccess.get_file_as_string(ProjectSettings.globalize_path(path))
+	var map_target_check := _validate_map_authoring_target(input, path, before_text, after_text)
+	if not bool(map_target_check.get("ok", false)):
+		return map_target_check
 
 	var before_state := {}
 	if file_state_cache != null:
@@ -273,6 +281,31 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 		"mtime_ns": after_state.get("mtime_ns", 0),
 		"known_full_read": true
 	}
+
+
+## 验证 code-driven map 工作流的可编辑文本目标，并拒绝直接改动序列化格子数据。
+static func _validate_map_authoring_target(input: Dictionary, path: String, before_text: String, after_text: String) -> Dictionary:
+	if str(input.get("workflow", "")) != "code_driven_map":
+		return {"ok": true}
+	var extension := path.get_extension().to_lower()
+	if extension not in MAP_AUTHORING_EXTENSIONS:
+		return {
+			"ok": false,
+			"error_code": "unsupported_map_authoring_target",
+			"message": "Code-driven map authoring supports only readable .gd, .tscn, .tres, .cfg, .json, .csv, and .txt targets.",
+			"path": path,
+			"supported_extensions": MAP_AUTHORING_EXTENSIONS,
+		}
+	for marker in SERIALIZED_MAP_MARKERS:
+		if marker in before_text or marker in after_text:
+			return {
+				"ok": false,
+				"error_code": "unsupported_map_authoring_target",
+				"message": "Direct TileMap/GridMap serialized cell-data edits are unsupported; edit a generator or readable configuration target instead.",
+				"path": path,
+				"marker": marker,
+			}
+	return {"ok": true}
 
 
 static func run_tests(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:

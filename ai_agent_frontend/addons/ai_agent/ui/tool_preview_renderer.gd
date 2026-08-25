@@ -19,8 +19,6 @@ static func render_call(call: Dictionary, theme_colors: Dictionary = {}) -> Cont
 	match kind:
 		"diff":
 			box.add_child(_render_diff(call, theme_colors))
-		"map":
-			box.add_child(_render_map_op(call))
 		"run":
 			box.add_child(_render_execution_confirm(call))
 		"list":
@@ -37,8 +35,6 @@ static func infer_render_kind(call: Dictionary) -> String:
 	match str(call.get("name", "")):
 		"propose_script_edit", "propose_tests", "apply_text_edit", "create_shader_material":
 			return "diff"
-		"edit_map", "fill_rect", "paint_from_image_grid":
-			return "map"
 		"run_tests", "run_headless_self_test", "run_system_command", "execute_gd_script", "git_status", "git_diff", "export_project":
 			return "run"
 		"add_node", "set_node_property", "delete_node", "reparent_node", "rename_node", "open_scene", "create_resource", "create_sprite_frames_from_sheet", "batch_rename", "set_project_setting", "instance_scene", "duplicate_node", "connect_signal", "disconnect_signal", "add_to_group", "remove_from_group", "save_scene", "add_autoload", "remove_autoload", "set_resource_property", "bake_navigation_mesh", "add_input_action", "remove_input_action", "create_animation_track":
@@ -128,54 +124,6 @@ static func diff_stats(call: Dictionary) -> Dictionary:
 		elif text.begins_with("- "):
 			removed += 1
 	return {"added": added, "removed": removed}
-
-
-static func _render_map_op(call: Dictionary) -> Control:
-	var input: Dictionary = call.get("input", {})
-	var lines: Array[String] = []
-	if input.has("operations"):
-		lines.append("Target: %s" % str(input.get("target_path", "selected/auto-detected map")))
-		var operations: Array = input.get("operations", [])
-		lines.append("Map operations: %d" % operations.size())
-		for index in range(mini(operations.size(), 12)):
-			var operation = operations[index]
-			if operation is Dictionary:
-				lines.append("%d. %s at (%s, %s, %s), size %sx%sx%s" % [
-					index + 1,
-					str(operation.get("action", "")),
-					str(operation.get("x", operation.get("to_x", 0))),
-					str(operation.get("y", operation.get("to_y", 0))),
-					str(operation.get("z", operation.get("to_z", 0))),
-					str(operation.get("width", 1)),
-					str(operation.get("height", 1)),
-					str(operation.get("depth", 1))
-				])
-		if operations.size() > 12:
-			lines.append("... %d more operation(s)" % (operations.size() - 12))
-	if input.has("x"):
-		lines.append("Area: (%s, %s) %sx%s" % [
-			str(input.get("x", 0)),
-			str(input.get("y", 0)),
-			str(input.get("width", 1)),
-			str(input.get("height", 1))
-		])
-	if input.has("image_path"):
-		lines.append("Image: %s" % str(input.get("image_path", "")))
-		var palette: Array = input.get("palette", [])
-		lines.append("Palette: %d item(s)" % palette.size())
-	if input.has("source_id"):
-		lines.append("Tile: source %s atlas(%s, %s) alt=%s" % [
-			str(input.get("source_id", -1)),
-			str(input.get("atlas_x", 0)),
-			str(input.get("atlas_y", 0)),
-			str(input.get("alternative_tile", 0))
-		])
-	if lines.is_empty():
-		return _render_json(call)
-	var label := Label.new()
-	label.text = "\n".join(lines)
-	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	return label
 
 
 static func _render_execution_confirm(call: Dictionary) -> Control:

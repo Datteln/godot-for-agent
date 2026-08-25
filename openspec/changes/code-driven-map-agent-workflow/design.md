@@ -11,6 +11,7 @@ The product direction is to retain the map agent's domain workflow while making 
 - Preserve a dedicated map-agent workflow that understands map intent, target scenes, generator/configuration code, and visual acceptance criteria.
 - Retain read-only map inspection as a general observation capability so every authorized agent can identify a TileMap/GridMap target, layer, existing cells, and tile identities; the map agent uses those facts before it plans source changes.
 - Make approved edits to readable project files the only normal map-authoring mutation path.
+- Give the map agent a curated, version-checked `@tool` builder recipe and a bootstrap workflow for hand-painted maps that lack a semantic authoring source.
 - Provide a narrow, explicit reload operation and screenshot-based visual verification after a code-edit batch.
 - Preserve existing generic edit protections: project path boundary, read-before-precise-edit, stale-file conflict rejection, confirmation, transcript visibility, and Undo.
 - Make verification outcomes honest: reload and screenshot evidence are distinct from semantic or gameplay correctness.
@@ -45,11 +46,17 @@ Alternative considered: route every map request to the programming agent. Reject
 
 Map authoring will reuse the existing generic read/edit/write proposals and their approval flow instead of granting an LLM unmediated filesystem access. In this product an LLM needs a concrete capability to alter a workspace; the generic code-edit authority is that capability. “No map tools” therefore means no map-specific mutation tools, not no controlled file-write capability at all.
 
-Initial editable targets are readable, project-relative text files such as `.gd`, `.tscn`, `.tres`, and explicitly configured text map data. The map agent MUST not edit opaque/binary resources or serialized TileMap cell blobs. It can generate or modify GDScript and text configuration that populate a map when Godot loads or runs it.
+Initial editable targets are readable, project-relative text files such as `.gd`, `.tscn`, `.tres`, and explicitly configured text map data. The map agent does not construct or guess raw serialized TileMap cell blobs. For a hand-painted target with no semantic source, it first proposes a migration that creates an editor-visible `@tool` builder and readable layout data; it can then generate or modify GDScript and text configuration that populate a map when Godot loads or runs it.
 
 Before planning a change that depends on an existing map, the map agent reads map facts through the retained inspection tools and binds its source-level plan to the returned target and layer. The generic code-edit path remains responsible for writing files; the map read path never grants write authority.
 
 Alternative considered: backend worker direct filesystem writes. Deferred because it would duplicate the current confirmation, stale-file, editor-memory conflict, and Undo guarantees. It can be reconsidered only as a separately specified execution-boundary change.
+
+### 2.1 Give map-agent an explicit `@tool` bootstrap recipe
+
+The map agent will preload a maintained Godot map-authoring guide. It must supply a concrete `@tool` builder skeleton, the role of exported target-layer and layout-path properties, deferred rebuild triggering, `Engine.is_editor_hint()` guarding, a generated-only output layer, and a readable layout representation. The guide will require `read_class_docs` for the selected target type before the agent fills in TileMapLayer, legacy TileMap, or GridMap API calls; the template is a safe starting shape, not an assumed API contract.
+
+For a selected hand-painted map, the first plan is a bootstrap batch: create the builder, create a readable layout/configuration asset, and create or identify a generated-only layer without automatically clearing the original hand-painted layer. After approved creation and editor-visible reload, the agent reports the new authoring entry point. A later approved migration may copy or replace the old layer only after the user has reviewed the explicit conversion plan.
 
 ### 3. Add a narrow editor reload operation
 
@@ -67,13 +74,22 @@ After a successful eligible reload, the map workflow requests a screenshot of th
 
 The map mutation tool definitions, registrations, executor dispatch, `MapTools` mutation implementations, map-agent mutation permissions, `edit_map`-specific budgets, preview rendering branches, prompt instructions, and tests are deleted together. There is no feature flag, disabled compatibility mode, or legacy map-mutation route. Read-only map inspection remains registered as a general observation tool and is granted through each agent's effective read-only tool set. Generic transcript renderers continue to show map fact reads, code edit approvals, reload results, screenshots, and typed errors, so the chat timeline remains the sole visible workflow surface.
 
+### 6. Bound map facts and preserve typed failure evidence
+
+`describe_map_region` is an observation tool, not a bulk map export. It will return a bounded cell budget and compact summaries for empty/repeating regions, together with `truncated` metadata and a suggested smaller follow-up query. The map agent will query progressively around the requested boundary instead of submitting thousands of cells to the model context.
+
+When a map-authoring edit fails with a typed outcome, the generic front-tool continuation contract must return that complete error result to the originating map-agent frame. The agent must then explain the failure, inspect when necessary, or propose a safe alternative. For a hand-painted map without an authoring source, the normal next step is the `@tool` bootstrap plan, not an unsupported-target terminal response. The generic envelope guard is specified in the sibling `tool-error-continuation` change; this change integrates the map-specific prompt, authoring guide, observation, and smoke-test behavior.
+
 ## Risks / Trade-offs
 
-- [Existing hand-painted maps are difficult to alter through source code] → Use retained map inspection to identify the real target/layer/tile facts, then require the first supported use cases to name a generator or readable configuration target; report an unsupported write target rather than editing serialized cell data.
+- [Existing hand-painted maps are difficult to alter through source code] → Use retained map inspection and the preloaded `@tool` bootstrap recipe to create a generated-only authoring entry point before any optional migration of the original layer.
 - [A reload can overwrite or conflict with unsaved editor memory] → Reload checks open/dirty state and fails closed with a clear user action; it never auto-saves or silently discards edits.
 - [A screenshot may show an unrelated viewport or omit runtime-only output] → Bind screenshot requests to the selected target/mode where possible and report its scope; do not claim semantic success.
 - [Deleting map mutation tools breaks existing prompts or callers] → Delete registrations, implementations, metadata, routing, previews, and prompts atomically; preserve read-only inspections and add regression tests that the deleted tool names cannot be resolved. Operational rollback is a source-control revert of the entire change, not an in-product compatibility path.
 - [Generic file edits are broader than map edits] → Keep existing path, stale-file, confirmation, and diff guardrails; use an explicit map-authoring editable-file allowlist.
+- [Large observation payloads cause excessive model latency] → Cap and summarize region observations; require progressive, target-focused reads.
+- [Local tool failure leaves map-agent pending] → Require a complete typed error envelope and map-agent recovery response; never submit a partial tool result.
+- [The model guesses Godot editor APIs] → Require class-documentation reads before completing the supplied builder template, and test the template against supported node types.
 
 ## Migration Plan
 

@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 
 _THOUGHT_PREFIX = "Thought:"
 _ARGS_VALUE_MAX_CHARS = 24_000
+_MAP_WORKFLOW_CONTENT_KEYS: tuple[str, ...] = (
+    "content",
+    "after_text",
+    "before_text",
+    "old_string",
+    "new_string",
+)
 
 EmitCallable = Callable[[str, str, dict[str, Any]], int]
 
@@ -86,6 +93,8 @@ def approval_operation_summary(tool: str, args: dict[str, Any]) -> str:
         一段可读的操作描述，例如 `修改`、`执行命令 ls -la`。
     """
     verb = _APPROVAL_OPERATION_VERBS.get(tool, tool)
+    if args.get("workflow") == "code_driven_map":
+        return f"代码驱动地图批次：{verb}"
     if tool == "run_system_command":
         command = str(args.get("command", "")).strip()
         if command:
@@ -166,6 +175,9 @@ def _bounded_args(args: dict[str, Any]) -> dict[str, Any]:
     """
     bounded: dict[str, Any] = {}
     for key, value in args.items():
+        if args.get("workflow") == "code_driven_map" and key in _MAP_WORKFLOW_CONTENT_KEYS:
+            bounded[key] = f"<地图代码内容已脱敏；{len(str(value))} 字符>"
+            continue
         if isinstance(value, str) and len(value) > _ARGS_VALUE_MAX_CHARS:
             bounded[key] = value[:_ARGS_VALUE_MAX_CHARS] + "…(截断)"
         else:

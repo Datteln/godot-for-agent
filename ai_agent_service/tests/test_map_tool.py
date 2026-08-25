@@ -1,141 +1,138 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from app.agents.loader import load_agent_file
+from app.agents.types import AgentDefinition
 from app.tools.front_tools import register_front_tools
 from app.tools.registry import REGISTRY
+from app.transcript.writer import _bounded_args, approval_operation_summary
 
 
-def test_edit_map_is_registered_as_previewed_map_write() -> None:
+def _agent(name: str) -> AgentDefinition:
+    """加载指定内置 agent 定义。"""
+    return load_agent_file(Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / name)
+
+
+def test_legacy_map_mutation_names_cannot_register() -> None:
+    """验证已删除的地图写工具不再出现在前端注册表。"""
     previous = REGISTRY.copy()
     try:
         REGISTRY.clear()
         register_front_tools()
-        tool = REGISTRY["edit_map"]
-
-        assert tool.side == "front"
-        assert tool.domain == "map"
-        assert tool.reads_project is True
-        assert tool.writes_project is True
-        assert tool.needs_preview is True
-        assert tool.render_kind == "map"
-        assert tool.schema["parameters"]["required"] == ["operations"]
-        actions = tool.schema["parameters"]["properties"]["operations"]["items"]["properties"]["action"]
-        assert actions["enum"] == ["fill", "erase", "copy"]
-        assert "GridMap" in tool.schema["description"]
-        assert "instead of refusing" in tool.schema["description"]
+        for name in ("edit_map", "fill_rect", "paint_from_image_grid"):
+            assert name not in REGISTRY
     finally:
         REGISTRY.clear()
         REGISTRY.update(previous)
 
 
-def test_describe_map_region_is_registered_as_read_only_map_tool() -> None:
+def test_legacy_map_mutation_names_cannot_route_or_dispatch() -> None:
+    """验证旧工具名既不在提示路由中，也不在前端 dispatch 中。"""
+    root = Path(__file__).parents[2]
+    coordinator = (root / "ai_agent_service" / "app" / "agents" / "agent_defs" / "coordinator.md").read_text(encoding="utf-8")
+    executor = (root / "ai_agent_frontend" / "addons" / "ai_agent" / "tools" / "tool_executor.gd").read_text(encoding="utf-8")
+    map_tools = (root / "ai_agent_frontend" / "addons" / "ai_agent" / "tools" / "map_tools.gd").read_text(encoding="utf-8")
+    for name in ("edit_map", "fill_rect", "paint_from_image_grid"):
+        assert name not in coordinator
+        assert '"%s":' % name not in executor
+        assert "func %s(" % name not in map_tools
+
+
+def test_map_observation_tools_remain_read_only_and_reload_is_bounded() -> None:
+    """验证保留的地图事实工具和受限 reload 工具的契约。"""
     previous = REGISTRY.copy()
     try:
         REGISTRY.clear()
         register_front_tools()
-        tool = REGISTRY["describe_map_region"]
+        for name in ("describe_tilemap_selection", "describe_map_region"):
+            tool = REGISTRY[name]
+            assert tool.domain == "map"
+            assert tool.is_read_only is True
+            assert tool.writes_project is False
 
-        assert tool.side == "front"
-        assert tool.domain == "map"
-        assert tool.reads_project is True
-        assert tool.is_read_only is True
-        assert tool.render_kind == "json"
-        assert tool.schema["parameters"]["required"] == []
-        properties = tool.schema["parameters"]["properties"]
-        assert {"target_path", "map_layer", "x", "y", "z", "width", "height", "depth"} <= properties.keys()
+        reload_tool = REGISTRY["reload_map_targets"]
+        assert reload_tool.domain == "map"
+        assert reload_tool.is_read_only is True
+        assert reload_tool.schema["parameters"]["required"] == ["targets", "approved_paths", "reload_mode"]
+        assert reload_tool.schema["parameters"]["properties"]["targets"]["maxItems"] == 8
+        assert reload_tool.schema["parameters"]["properties"]["reload_mode"]["enum"] == [
+            "editor_visible",
+            "resource_only",
+            "runtime_only",
+        ]
     finally:
         REGISTRY.clear()
         REGISTRY.update(previous)
 
 
-def test_map_agent_is_instructed_and_allowed_to_use_edit_map() -> None:
-    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
-    agent = load_agent_file(path)
-
-    assert "edit_map" in agent.tools
-    assert "不要因为" in agent.prompt
-    assert "GridMap" in agent.prompt
-
-
-def test_map_agent_must_read_real_region_before_blending_terrain() -> None:
-    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
-    agent = load_agent_file(path)
-
-    assert "describe_map_region" in agent.tools
-    assert "必须先用 `describe_map_region`" in agent.prompt
-    assert "node_position" in agent.prompt
-
-
-def test_scene_agent_must_read_map_region_before_aligning_nodes() -> None:
-    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "scene-agent.md"
-    agent = load_agent_file(path)
-
-    assert "describe_map_region" in agent.tools
-    assert "node_position" in agent.prompt
+def test_map_agent_uses_generic_code_editing_without_map_mutation() -> None:
+    """验证地图 agent 使用通用代码编辑、reload 与诚实证据提示。"""
+    agent = _agent("map-agent.md")
+    for name in (
+        "describe_tilemap_selection",
+        "describe_map_region",
+        "read_file",
+        "apply_text_edit",
+        "propose_script_edit",
+        "propose_content_file",
+        "reload_map_targets",
+    ):
+        assert name in agent.tools
+    for legacy_name in ("edit_map", "fill_rect", "paint_from_image_grid"):
+        assert legacy_name not in agent.tools
+        assert legacy_name not in agent.prompt
+    assert "unsupported_map_authoring_target" in agent.prompt
+    assert "advisory visual evidence" in agent.prompt
 
 
-def test_coordinator_routes_map_edits_to_native_map_tool() -> None:
-    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "coordinator.md"
-    agent = load_agent_file(path)
-
-    assert "直接调用 `edit_map`" in agent.prompt
-    assert "不得因为 `.tscn`" in agent.prompt
-
-
-def test_coordinator_plan_for_map_steps_stays_high_level() -> None:
-    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "coordinator.md"
-    agent = load_agent_file(path)
-
-    assert "不要写具体的 atlas 坐标" in agent.prompt
-    assert "你没有 `describe_map_region` 工具" in agent.prompt
+def test_all_authorized_agents_receive_general_map_observation_tools() -> None:
+    """验证可使用地图事实的 agent 均没有地图写入权限。"""
+    for name in ("programming-agent.md", "scene-agent.md", "advisor.md", "resource-agent.md"):
+        agent = _agent(name)
+        assert "describe_tilemap_selection" in agent.tools
+        assert "describe_map_region" in agent.tools
+        assert "edit_map" not in agent.tools
 
 
-def test_coordinator_routes_map_analysis_steps_to_map_agent_not_programming_agent() -> None:
-    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "coordinator.md"
-    agent = load_agent_file(path)
-
-    assert "都必须交给 `map-agent`" in agent.prompt
-    assert "即便这一步只是分析或验证" in agent.prompt
-    assert "不要把这类步骤分给 `programming-agent` 或 `advisor`" in agent.prompt
-
-
-def test_map_agent_batches_follow_read_plan_edit_verify_loop() -> None:
-    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
-    agent = load_agent_file(path)
-
-    assert "读边界 → 写块计划 → 小批 `edit_map` → 核对结果 → 必要时重读" in agent.prompt
-    assert "预期 `cells` 数量" in agent.prompt
-    assert "不必每批重读" in agent.prompt
-    assert "更新这一块的计划" in agent.prompt
+def test_coordinator_routes_map_requests_to_code_driven_agent_workflow() -> None:
+    """验证 coordinator 将地图写入明确路由至地图 agent。"""
+    agent = _agent("coordinator.md")
+    assert "委派给 `map-agent`" in agent.prompt
+    assert "代码驱动地图工作流" in agent.prompt
+    assert "通用 programming workflow" in agent.prompt
+    assert "`edit_map`" not in agent.prompt
 
 
-def test_describe_map_region_schema_warns_about_legacy_tilemap_layers() -> None:
-    previous = REGISTRY.copy()
-    try:
-        REGISTRY.clear()
-        register_front_tools()
-        describe_tool = REGISTRY["describe_map_region"]
-        edit_tool = REGISTRY["edit_map"]
-
-        assert "`layers` array" in describe_tool.schema["description"]
-        assert "do not assume map_layer 0" in describe_tool.schema["description"]
-        map_layer_doc = describe_tool.schema["parameters"]["properties"]["map_layer"]["description"]
-        assert "Defaults" in map_layer_doc and "layers" in map_layer_doc
-
-        assert "describe_map_region first" in edit_tool.schema["description"]
-        edit_map_layer_doc = edit_tool.schema["parameters"]["properties"]["map_layer"]["description"]
-        assert "not always the foreground/collidable layer" in edit_map_layer_doc
-    finally:
-        REGISTRY.clear()
-        REGISTRY.update(previous)
+def test_map_approval_identifies_code_driven_batch_without_content() -> None:
+    """验证审批摘要使用地图批次标签且不依赖文件内容。"""
+    summary = approval_operation_summary(
+        "apply_text_edit",
+        {"workflow": "code_driven_map", "path": "maps/generator.gd", "content": "secret"},
+    )
+    assert summary == "代码驱动地图批次：修改"
+    persisted = _bounded_args(
+        {"workflow": "code_driven_map", "path": "maps/generator.gd", "new_string": "sensitive source"}
+    )
+    assert persisted["path"] == "maps/generator.gd"
+    assert persisted["new_string"].startswith("<地图代码内容已脱敏；")
+    assert "sensitive source" not in persisted["new_string"]
 
 
-def test_map_agent_must_check_real_layers_before_picking_map_layer() -> None:
-    path = Path(__file__).parents[1] / "app" / "agents" / "agent_defs" / "map-agent.md"
-    agent = load_agent_file(path)
+def test_map_workflow_end_to_end_fixtures_describe_honest_visual_outcomes() -> None:
+    """验证 editor-visible 与 runtime-only fixture 的证据语义。"""
+    fixture_dir = Path(__file__).parent / "fixtures" / "map_workflow"
+    editor_visible = json.loads((fixture_dir / "editor_visible.json").read_text(encoding="utf-8"))
+    runtime_only = json.loads((fixture_dir / "runtime_only.json").read_text(encoding="utf-8"))
 
-    assert "`layers` 字段" in agent.prompt
-    assert "不要默认 `map_layer=0`" in agent.prompt
-    assert "physics_layer" in agent.prompt
+    assert editor_visible["approved_edit"]["workflow"] == "code_driven_map"
+    assert editor_visible["reload_request"]["targets"] == editor_visible["reload_request"]["approved_paths"]
+    assert editor_visible["expected"] == {
+        "reload_status": "reloaded",
+        "visual_evidence": "captured",
+        "semantic_verification": "not_established",
+    }
+    assert runtime_only["reload_request"]["reload_mode"] == "runtime_only"
+    assert runtime_only["expected"]["reload_status"] == "unavailable"
+    assert runtime_only["expected"]["reason"] == "runtime_only_generator_not_executed"

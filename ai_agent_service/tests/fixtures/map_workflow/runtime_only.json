@@ -1,0 +1,19 @@
+{
+  "name": "runtime-only-generator",
+  "approved_edit": {
+    "workflow": "code_driven_map",
+    "path": "res://maps/runtime_generator.gd",
+    "outcome": "applied"
+  },
+  "reload_request": {
+    "targets": ["res://maps/runtime_generator.gd"],
+    "approved_paths": ["res://maps/runtime_generator.gd"],
+    "reload_mode": "runtime_only",
+    "capture_screenshot": true
+  },
+  "expected": {
+    "reload_status": "unavailable",
+    "visual_evidence": "unavailable",
+    "reason": "runtime_only_generator_not_executed"
+  }
+}
