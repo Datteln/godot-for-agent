@@ -63,8 +63,10 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			result = ProgramTools.read_file(input, file_state_cache)
 		"write_file", "propose_script_edit", "propose_tests", "propose_content_file":
 			result = ProgramTools.write_file(input, undo_manager, file_state_cache, editor_interface)
+			result = await _attach_map_builder_diagnostics(input, result)
 		"apply_text_edit":
 			result = ProgramTools.apply_text_edit(input, undo_manager, file_state_cache, editor_interface)
+			result = await _attach_map_builder_diagnostics(input, result)
 		"read_debugger_errors":
 			result = _read_debugger_errors(input)
 		"read_profiler_snapshot":
@@ -165,6 +167,14 @@ func execute(tool_call: Dictionary) -> Dictionary:
 						result["visual_evidence"] = {"availability": "captured", "scope": result.get("reloaded_targets", []), "path": screenshot_result.get("path", ""), "width": screenshot_result.get("width", 0), "height": screenshot_result.get("height", 0), "advisory": true, "semantic_verification": "not_established"}
 					else:
 						result["visual_evidence"] = {"availability": "unavailable", "scope": result.get("reloaded_targets", []), "reason": str(screenshot_result.get("error_code", "capture_failed")), "advisory": true, "semantic_verification": "not_established"}
+		"rebuild_map_builder":
+			result = await EditorReloadTools.rebuild_map_builder(input, editor_interface)
+			if str(result.get("status", "")) == "rebuilt" and bool(input.get("capture_screenshot", true)):
+				var builder_screenshot := await SceneTools.capture_viewport_screenshot({"mode": str(input.get("screenshot_mode", "2d"))}, editor_interface)
+				if bool(builder_screenshot.get("ok", false)):
+					result["visual_evidence"] = {"availability": "captured", "scope": [result.get("generated_target_path", "")], "path": builder_screenshot.get("path", ""), "width": builder_screenshot.get("width", 0), "height": builder_screenshot.get("height", 0), "advisory": true, "semantic_verification": "not_established"}
+				else:
+					result["visual_evidence"] = {"availability": "unavailable", "scope": [result.get("generated_target_path", "")], "reason": str(builder_screenshot.get("error_code", "capture_failed")), "advisory": true, "semantic_verification": "not_established"}
 		"create_resource":
 			result = ResourceTools.create_resource(input, undo_manager)
 		"read_image_metadata":
@@ -184,6 +194,8 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			return AgentDTO.error_result(tool_call, "Unknown front tool: " + name, "unknown_front_tool")
 
 	var elapsed_ms := Time.get_ticks_msec() - started_at
+	if name in ["reload_map_targets", "rebuild_map_builder"] and str(result.get("status", "")) in ["blocked", "failed", "unavailable"]:
+		result["ok"] = false
 	if bool(result.get("ok", true)):
 		FrontendLogger.info(editor_interface, "ToolExecutor", "Front tool applied.", {
 			"tool": name,
@@ -228,3 +240,23 @@ func _read_debugger_errors(input: Dictionary) -> Dictionary:
 	if max_items > 0 and items.size() > max_items:
 		items = items.slice(0, max_items)
 	return {"ok": true, "items": items}
+
+
+## 将获批地图 builder 写入后的 Godot 编译结果直接带回同一模型回合。
+func _attach_map_builder_diagnostics(input: Dictionary, write_result: Dictionary) -> Dictionary:
+	if str(input.get("workflow", "")) != "code_driven_map" or not bool(write_result.get("ok", false)):
+		return write_result
+	var path := str(write_result.get("path", ""))
+	if path.get_extension().to_lower() != "gd":
+		return write_result
+	# 写入已发生与脚本是否通过 Godot 后续解析是独立事实，不能让后一项覆盖前一项。
+	write_result["write_applied"] = true
+	var validation := await EditorReloadTools.validate_builder_script_after_scan(path, editor_interface)
+	write_result["builder_diagnostics"] = validation.get("diagnostics", [])
+	write_result["post_write_validation"] = validation
+	if bool(validation.get("ok", false)):
+		return write_result
+	validation["write_applied"] = true
+	validation["after_hash"] = write_result.get("after_hash", "")
+	validation["mtime_ns"] = write_result.get("mtime_ns", 0)
+	return validation

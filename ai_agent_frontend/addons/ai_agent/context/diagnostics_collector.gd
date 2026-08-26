@@ -1,6 +1,8 @@
 @tool
 extends RefCounted
 
+const GodotDiagnostics = preload("res://addons/ai_agent/context/godot_diagnostics.gd")
+
 const MAX_ITEMS := 60
 const MAX_LOG_CHARS := 20000
 const MAX_LOG_LINES := 200
@@ -69,13 +71,12 @@ static func _collect_log_file(path: String) -> Array:
 		var line := str(lines[index]).strip_edges()
 		var lower := line.to_lower()
 		if lower.find("script error") >= 0 or lower.find("error:") >= 0 or lower.find("warning:") >= 0 or lower.find("failed") >= 0:
-			result.append({
-				"source": "godot_log",
-				"severity": _severity_from_line(lower),
-				"path": path,
-				"line": index + 1,
-				"message": line
-			})
+			# 日志观察仅供人工/历史排错；它不是本次执行的源位置证据。
+			var item := GodotDiagnostics.unlocated("godot_log_historical", "historical:%s" % path, "", line)
+			item["severity"] = _severity_from_line(lower)
+			item["log_path"] = path
+			item["log_line"] = index + 1
+			result.append(item)
 	return result
 
 

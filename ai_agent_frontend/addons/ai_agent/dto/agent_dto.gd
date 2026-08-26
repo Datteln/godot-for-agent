@@ -45,7 +45,8 @@ static func normalize_execution_result(tool_call: Dictionary, candidate: Variant
 			and str(result.get("frame_id", "")) != ""
 			and status in ["applied", "rejected", "error"]
 		):
-			return result
+			# 后续 UI/HTTP 队列会添加元数据；返回深拷贝，完整嵌套 result 不会被降级为 {}。
+			return result.duplicate(true)
 	var received_keys: Array[String] = []
 	if candidate is Dictionary:
 		for key in (candidate as Dictionary).keys():

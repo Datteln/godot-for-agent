@@ -22,7 +22,10 @@ func _init() -> void:
 		"status": "applied",
 		"result": {"ok": true},
 	}
-	_check(AgentDTO.normalize_execution_result(call, complete) == complete, "complete result passes through unchanged")
+	var normalized_complete := AgentDTO.normalize_execution_result(call, complete)
+	_check(normalized_complete == complete, "complete result passes through unchanged")
+	(complete["result"] as Dictionary)["write_applied"] = false
+	_check(bool((normalized_complete.get("result", {}) as Dictionary).get("write_applied", true)), "normalized result preserves an independent typed payload snapshot")
 	var overview := ClassDBReader.query_class_info({"class_name": "Node", "mode": "overview"})
 	_check(bool(overview.get("ok", false)), "ClassDB overview succeeds")
 	_check(not overview.has("methods"), "overview never enumerates ClassDB methods")

@@ -1492,6 +1492,44 @@ def register_front_tools() -> None:
     )
     register(
         ToolDef(
+            name="rebuild_map_builder",
+            domain="map",
+            side="front",
+            reads_project=True,
+            render_kind="json",
+            schema={
+                "name": "rebuild_map_builder",
+                "description": (
+                    "Ask the Godot editor to invoke only rebuild_from_layout() on an already attached, "
+                    "verified @tool map builder in the currently edited scene. The layout must be part of "
+                    "the approved code-driven map batch. This does not run the game or execute arbitrary scripts."
+                ),
+                "parameters": _object_schema(
+                    {
+                        "builder_node_path": {
+                            "type": "string",
+                            "description": "Scene-relative path of the already attached @tool builder node.",
+                        },
+                        "approved_paths": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                            "description": "Affected paths returned by the approved map code-edit batch; must include the builder layout.",
+                        },
+                        "capture_screenshot": {
+                            "type": "boolean",
+                            "description": "Capture advisory editor evidence only after a successful rebuild.",
+                        },
+                        "screenshot_mode": {"type": "string", "enum": ["2d", "3d"]},
+                    },
+                    ["builder_node_path", "approved_paths"],
+                ),
+            },
+        )
+    )
+    register(
+        ToolDef(
             name="create_resource",
             domain="resource",
             side="front",

@@ -2,6 +2,7 @@
 extends RefCounted
 
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
+const GodotDiagnostics = preload("res://addons/ai_agent/context/godot_diagnostics.gd")
 
 
 static func create_resource(input: Dictionary, undo_manager: Node) -> Dictionary:
@@ -232,7 +233,14 @@ static func create_shader_material(input: Dictionary, undo_manager: Node) -> Dic
 	## 必须先确保磁盘上是新内容再加载，避免拿到 ResourceLoader 缓存的旧 Shader。
 	var shader = ResourceLoader.load(shader_path, "", ResourceLoader.CACHE_MODE_REPLACE)
 	if not (shader is Shader):
-		return {"ok": false, "message": "failed to load shader as Shader: " + shader_path, "error_code": "shader_load_failed"}
+		var execution_id := GodotDiagnostics.operation_id("shader_load")
+		return {
+			"ok": false,
+			"message": "failed to load shader as Shader: " + shader_path,
+			"error_code": "shader_load_failed",
+			"execution_id": execution_id,
+			"diagnostics": [GodotDiagnostics.unlocated("shader_load", execution_id, shader_path, "Godot could not load or compile the shader")],
+		}
 
 	var material := ShaderMaterial.new()
 	material.shader = shader

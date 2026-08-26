@@ -116,18 +116,39 @@ func send_user_message(text: String, context: Dictionary, model = null, client_m
 
 
 func send_tool_results(results: Array, model = null) -> void:
-	FrontendLogger.info(editor_interface, "HTTP", "Queueing tool results.", {"count": results.size()})
+	var submitted_results: Array = []
 	for item in results:
 		if item is Dictionary:
-			item["turn_id"] = current_turn_id
+			var submitted: Dictionary = (item as Dictionary).duplicate(true)
+			submitted["turn_id"] = current_turn_id
+			if not submitted.has("result"):
+				submitted["result"] = {"message": "Frontend omitted a tool result payload."}
+				submitted["status"] = "error"
+				submitted["error_code"] = "front_tool_result_protocol_invalid"
+			submitted_results.append(submitted)
+	FrontendLogger.info(editor_interface, "HTTP", "Queueing tool results.", {"count": submitted_results.size(), "result_keys": _tool_result_key_summary(submitted_results)})
 	var payload := {
 		"session_id": _session_id(),
 		"request_id": _new_request_id(),
 		"model": model,
-		"tool_results": results,
+		"tool_results": submitted_results,
 		"compact_summary_use_llm": _compact_summary_use_llm_override()
 	}
 	_enqueue("POST", "/chat", payload)
+
+
+func _tool_result_key_summary(results: Array) -> Array:
+	var summary: Array = []
+	for item in results:
+		if not (item is Dictionary):
+			continue
+		var result_payload = (item as Dictionary).get("result", null)
+		var result_keys: Array = []
+		if result_payload is Dictionary:
+			for key in (result_payload as Dictionary).keys():
+				result_keys.append(str(key))
+		summary.append({"tool_use_id": str((item as Dictionary).get("tool_use_id", "")), "status": str((item as Dictionary).get("status", "")), "result_keys": result_keys})
+	return summary
 
 
 func _compact_summary_use_llm_override() -> Variant:

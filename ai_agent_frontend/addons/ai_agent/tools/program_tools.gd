@@ -4,6 +4,7 @@ extends RefCounted
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
+const GodotDiagnostics = preload("res://addons/ai_agent/context/godot_diagnostics.gd")
 
 const MAX_STALE_CONTENT_CHARS := 40000
 const MAX_SYSTEM_COMMAND_CHARS := 100000
@@ -288,6 +289,13 @@ static func write_file(input: Dictionary, undo_manager: Node, file_state_cache: 
 static func _validate_map_authoring_target(input: Dictionary, path: String, before_text: String, after_text: String) -> Dictionary:
 	if str(input.get("workflow", "")) != "code_driven_map":
 		return {"ok": true}
+	if not PathUtils.is_res_path(path):
+		return {
+			"ok": false,
+			"error_code": "map_authoring_requires_project_resource",
+			"message": "Code-driven map authoring sources must use res:// project resources.",
+			"path": path,
+		}
 	var extension := path.get_extension().to_lower()
 	if extension not in MAP_AUTHORING_EXTENSIONS:
 		return {
@@ -335,6 +343,7 @@ static func run_tests(input: Dictionary, editor_interface: EditorInterface) -> D
 	})
 	var run_result: Dictionary = await _run_process_with_timeout(executable, args, timeout_ms)
 	var output_text := _read_optional_log(log_path)
+	var execution_id := GodotDiagnostics.operation_id("run_tests")
 	var status := str(run_result.get("status", "failed"))
 	if bool(run_result.get("ok", false)):
 		FrontendLogger.info(editor_interface, "ProgramTools", "Runner process completed.", {
@@ -359,7 +368,9 @@ static func run_tests(input: Dictionary, editor_interface: EditorInterface) -> D
 		"args_setting": args_key,
 		"log_setting": log_key,
 		"timeout_ms": timeout_ms,
-		"output": output_text
+		"output": output_text,
+		"diagnostics": GodotDiagnostics.from_output(output_text, "run_tests", execution_id),
+		"execution_id": execution_id,
 	}
 
 
@@ -417,6 +428,9 @@ static func run_system_command(input: Dictionary, editor_interface: EditorInterf
 		"output": output,
 		"output_truncated": output.length() >= MAX_SYSTEM_COMMAND_OUTPUT_CHARS,
 	}
+	var execution_id := GodotDiagnostics.operation_id("system_command")
+	result["execution_id"] = execution_id
+	result["diagnostics"] = GodotDiagnostics.from_output(output, "system_command", execution_id)
 	if not ok:
 		result["error_code"] = status
 		result["message"] = _describe_system_command_failure(status, exit_code, output)
@@ -431,7 +445,7 @@ static func execute_gd_script(input: Dictionary, editor_interface: EditorInterfa
 	if editor_interface == null:
 		return {"ok": false, "message": "editor_interface is not available", "error_code": "editor_unavailable"}
 	var res_path := PathUtils.to_res_path(str(input.get("path", "")))
-	if res_path == "" or res_path.get_extension().to_lower() != "gd":
+	if res_path == "" or not PathUtils.is_res_path(res_path) or res_path.get_extension().to_lower() != "gd":
 		return {
 			"ok": false,
 			"message": "path must be a project-relative .gd file",
@@ -488,10 +502,41 @@ static func execute_gd_script(input: Dictionary, editor_interface: EditorInterfa
 		"output": output,
 		"output_truncated": output.length() >= MAX_SYSTEM_COMMAND_OUTPUT_CHARS,
 	}
+	var execution_id := GodotDiagnostics.operation_id("execute_gd_script")
+	result["execution_id"] = execution_id
+	result["diagnostics"] = GodotDiagnostics.from_output(output, "execute_gd_script", execution_id, [res_path])
 	if not ok:
 		result["error_code"] = status
 		result["message"] = _describe_system_command_failure(status, exit_code, output)
 	return result
+
+
+## 以临时 SceneTree 入口加载指定脚本，仅捕获当前 Godot 编译输出，不执行目标脚本。
+static func validate_gdscript_resource(res_path: String, editor_interface: EditorInterface) -> Dictionary:
+	if editor_interface == null or not PathUtils.is_res_path(res_path):
+		return {"ok": false, "error_code": "invalid_validation_target"}
+	var execution_id := GodotDiagnostics.operation_id("gdscript_validation")
+	var runner_path := "user://ai_agent_validate_%s.gd" % execution_id.replace(":", "_")
+	var runner_absolute := ProjectSettings.globalize_path(runner_path)
+	var runner := FileAccess.open(runner_absolute, FileAccess.WRITE)
+	if runner == null:
+		return {"ok": false, "error_code": "validation_runner_write_failed", "execution_id": execution_id}
+	runner.store_string("extends SceneTree\nfunc _init():\n\tvar target = ResourceLoader.load(\"%s\", \"Script\", ResourceLoader.CACHE_MODE_IGNORE)\n\tif target is Script:\n\t\tquit((target as Script).reload(true))\n\telse:\n\t\tquit(1)\n" % res_path.replace("\\", "\\\\").replace("\"", "\\\""))
+	runner.close()
+	var project_path := ProjectSettings.globalize_path("res://")
+	var launch := _build_direct_process_launch(OS.get_executable_path(), PackedStringArray(["--headless", "--path", project_path, "--script", runner_absolute]), project_path, "ai_agent_validate")
+	if launch.is_empty():
+		DirAccess.remove_absolute(runner_absolute)
+		return {"ok": false, "error_code": "validation_runner_prepare_failed", "execution_id": execution_id}
+	var run_result: Dictionary = await _run_system_command_launch(launch, 15000)
+	var output := _read_bounded_file(str(launch.get("output_path", "")), MAX_SYSTEM_COMMAND_OUTPUT_CHARS)
+	_cleanup_runner_files(launch)
+	DirAccess.remove_absolute(runner_absolute)
+	var diagnostics := GodotDiagnostics.from_output(output, "gdscript_validation", execution_id, [res_path])
+	var ok := bool(run_result.get("ok", false)) and not _has_godot_error(output)
+	if not ok and diagnostics.is_empty():
+		diagnostics.append(GodotDiagnostics.unlocated("gdscript_validation", execution_id, res_path, "Godot could not compile the script"))
+	return {"ok": ok, "execution_id": execution_id, "output": output, "output_truncated": output.length() >= MAX_SYSTEM_COMMAND_OUTPUT_CHARS, "diagnostics": diagnostics}
 
 
 ## 校验 `--script` 入口的直接基类，避免把只能由编辑器实例化的 EditorScript 交给主循环。
@@ -635,6 +680,9 @@ static func export_project(input: Dictionary, editor_interface: EditorInterface)
 		"output": output,
 		"output_truncated": output.length() >= MAX_SYSTEM_COMMAND_OUTPUT_CHARS,
 	}
+	var execution_id := GodotDiagnostics.operation_id("export_project")
+	result["execution_id"] = execution_id
+	result["diagnostics"] = GodotDiagnostics.from_output(output, "export_project", execution_id)
 	if not ok:
 		result["error_code"] = status
 		result["message"] = _describe_system_command_failure(status, exit_code, output)

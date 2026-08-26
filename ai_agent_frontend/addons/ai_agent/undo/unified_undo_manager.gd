@@ -21,6 +21,7 @@ func begin_batch(description: String) -> void:
 func record_file_write(path: String, before_text: String, after_text: String) -> Error:
 	if not _active:
 		begin_batch("AI file changes")
+	var before_exists := FileAccess.file_exists(ProjectSettings.globalize_path(path))
 	# 必须先确认底层写入真的成功了，再把这次修改记入 undo batch。否则只读目录、
 	# 磁盘满、文件被占用时 `_write_file_text` 只会写一行日志就返回，上层却照样
 	# 报告 ok，模型会基于一个并不存在的改动继续工作（§工具写失败被当成 applied）。
@@ -31,7 +32,8 @@ func record_file_write(path: String, before_text: String, after_text: String) ->
 		"type": "file_write",
 		"path": path,
 		"before": before_text,
-		"after": after_text
+		"after": after_text,
+		"before_exists": before_exists,
 	})
 	return OK
 
@@ -213,7 +215,7 @@ func commit_batch() -> void:
 		match op.get("type", ""):
 			"file_write":
 				undo_redo.add_do_method(self, "_write_file_text", op["path"], op["after"])
-				undo_redo.add_undo_method(self, "_write_file_text", op["path"], op["before"])
+				undo_redo.add_undo_method(self, "_restore_file_text", op["path"], op["before"], op["before_exists"])
 			"binary_file_write":
 				undo_redo.add_do_method(self, "_write_file_bytes", op["path"], op["after"], true)
 				undo_redo.add_undo_method(self, "_write_file_bytes", op["path"], op["before"], op["before_exists"])
@@ -270,7 +272,7 @@ func abort_batch() -> void:
 		var op: Dictionary = _ops[index]
 		match op.get("type", ""):
 			"file_write":
-				_write_file_text(str(op["path"]), str(op["before"]))
+				_restore_file_text(str(op["path"]), str(op["before"]), bool(op.get("before_exists", true)))
 			"binary_file_write":
 				_write_file_bytes(str(op["path"]), op["before"], bool(op["before_exists"]))
 			"node_add":
@@ -377,6 +379,18 @@ func _write_file_text(path: String, text: String) -> Error:
 	if ResourceLoader.exists(path):
 		ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_REPLACE)
 	return OK
+
+
+func _restore_file_text(path: String, text: String, existed_before: bool) -> Error:
+	if existed_before:
+		return _write_file_text(path, text)
+	var absolute := ProjectSettings.globalize_path(path)
+	if not FileAccess.file_exists(absolute):
+		return OK
+	var remove_error := DirAccess.remove_absolute(absolute)
+	if remove_error != OK:
+		FrontendLogger.error(editor_interface, "UndoManager", "Failed to remove newly created text file.", {"path": path, "error": remove_error})
+	return remove_error
 
 
 func _write_file_bytes(path: String, bytes: PackedByteArray, exists: bool) -> Error:

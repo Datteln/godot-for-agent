@@ -518,7 +518,7 @@ static func instance_scene(input: Dictionary, editor_interface: EditorInterface,
 	if parent == null:
 		return {"ok": false, "message": "Parent not found: " + parent_path}
 	var scene_path := PathUtils.to_res_path(str(input.get("scene_path", "")))
-	if scene_path == "" or not (scene_path.get_extension().to_lower() in ["tscn", "scn"]):
+	if scene_path == "" or not PathUtils.is_res_path(scene_path) or not (scene_path.get_extension().to_lower() in ["tscn", "scn"]):
 		return {
 			"ok": false,
 			"message": "scene_path must be a project-relative .tscn/.scn file",
@@ -921,7 +921,7 @@ static func open_scene(input: Dictionary, editor_interface: EditorInterface) -> 
 	if editor_interface == null:
 		return {"ok": false, "message": "EditorInterface is not available"}
 	var path := PathUtils.to_res_path(str(input.get("path", "")))
-	if path == "" or not (path.get_extension().to_lower() in ["tscn", "scn"]):
+	if path == "" or not PathUtils.is_res_path(path) or not (path.get_extension().to_lower() in ["tscn", "scn"]):
 		return {
 			"ok": false,
 			"message": "path must be a project-relative .tscn/.scn scene file",

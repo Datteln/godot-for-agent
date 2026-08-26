@@ -21,26 +21,44 @@ const DENY_WRITE_PREFIXES: PackedStringArray = [
 ]
 
 
-## 将任意输入路径归一化为 res:// 路径；绝对路径、越界路径或空字符串返回 ""。
+## 将相对路径、res:// 与 user:// 规范化为安全的 Godot URI。
+## 相对路径属于项目资源并补为 res://；user:// 保留独立的项目用户数据命名空间。
+## 操作系统绝对路径、空路径与任何越界路径返回 ""。
 static func to_res_path(path: String) -> String:
+	return to_godot_path(path)
+
+
+static func to_godot_path(path: String) -> String:
 	var cleaned := path.strip_edges().replace("\\", "/")
 	if cleaned == "":
 		return ""
-	if cleaned.is_absolute_path():
-		return ""
-	if cleaned.begins_with("user://"):
+	var scheme := "res://"
+	if cleaned.begins_with("res://"):
+		scheme = "res://"
+	elif cleaned.begins_with("user://"):
+		scheme = "user://"
+	elif cleaned.is_absolute_path():
 		return ""
 
-	var relative := cleaned.trim_prefix("res://").trim_prefix("/")
+	var relative := cleaned.trim_prefix(scheme).trim_prefix("/")
 	for part in relative.split("/", false):
 		if part == "..":
 			return ""
-
-	var res_path := cleaned if cleaned.begins_with("res://") else "res://" + relative
-	res_path = res_path.simplify_path()
-	if not res_path.begins_with("res://"):
+	if relative == "":
 		return ""
-	return res_path
+	# 只简化相对部分，避免 String.simplify_path() 改写 Godot URI 的双斜线 scheme。
+	var normalized_relative := relative.simplify_path().trim_prefix("./").trim_prefix("/")
+	if normalized_relative == "" or normalized_relative == "." or normalized_relative.begins_with("../"):
+		return ""
+	return scheme + normalized_relative
+
+
+static func is_res_path(path: String) -> bool:
+	return path.begins_with("res://")
+
+
+static func is_user_path(path: String) -> bool:
+	return path.begins_with("user://")
 
 
 ## 判断给定 res:// 路径是否允许写入（不在 DENY_WRITE_PREFIXES 之内）。

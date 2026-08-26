@@ -413,3 +413,6 @@ ai_map_agent/
 !ai_agent_service/**/*.md
 !openspec/**/*.md
 ai_agent_service/.pytest_*/
+.dsh-plugins/
+.kimi-code/
+.codex/

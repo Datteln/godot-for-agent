@@ -352,6 +352,10 @@ static func format_tool_result_detail(name: String, input: Dictionary, status: S
 			var reload_status := str(inner.get("status", "unavailable"))
 			var evidence: Dictionary = inner.get("visual_evidence", {}) if inner.get("visual_evidence") is Dictionary else {}
 			return "Map reload: %s; visual evidence: %s (advisory only)" % [reload_status, str(evidence.get("availability", "unavailable"))]
+		"rebuild_map_builder":
+			var rebuild_status := str(inner.get("status", "unavailable"))
+			var rebuild_evidence: Dictionary = inner.get("visual_evidence", {}) if inner.get("visual_evidence") is Dictionary else {}
+			return "Map builder rebuild: %s; visual evidence: %s (advisory only)" % [rebuild_status, str(rebuild_evidence.get("availability", "unavailable"))]
 		"write_file", "propose_script_edit", "propose_tests", "propose_content_file":
 			var after_text := str(input.get("content", input.get("after_text", "")))
 			var path := str(inner.get("path", input.get("path", input.get("target_path", ""))))

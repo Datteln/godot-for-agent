@@ -48,7 +48,7 @@ static func add_autoload(input: Dictionary, undo_manager: Node) -> Dictionary:
 	if name == "" or name.contains("/") or name.contains("."):
 		return {"ok": false, "message": "name must be a simple identifier", "error_code": "invalid_name"}
 	var path := PathUtils.to_res_path(str(input.get("path", "")))
-	if path == "" or not (path.get_extension().to_lower() in ["gd", "tscn", "scn", "cs"]):
+	if path == "" or not PathUtils.is_res_path(path) or not (path.get_extension().to_lower() in ["gd", "tscn", "scn", "cs"]):
 		return {
 			"ok": false,
 			"message": "path must be a project-relative script or scene file",
