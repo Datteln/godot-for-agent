@@ -1,4 +1,5 @@
-## 转录同步恢复集成测试（fix-transcript-sync-recovery 任务 3.2 / 3.3 / 3.7 / 3.8）。
+## 转录同步恢复集成测试（fix-transcript-sync-recovery 任务 3.2 / 3.3 / 3.7 / 3.8；
+## fix-transcript-delivery-semantics 任务 3.2 / 3.3 / 3.4）。
 ##
 ## 回归场景：`read_class_docs` 产出 ClassInfo 之后，长 Thought 流式期间的
 ## 实时补丁丢失；其后的 bootstrap 审批与工具活动必须最终按序可见——要么由
@@ -8,6 +9,10 @@
 ## Reset 与排队工具结果竞争四个回归。
 ## 任务 3.8：投影失败不得把 ACK 推进到已提交游标之后；从该游标重连后，
 ## 服务端重放（而非人工历史重载）使缺失条目恰好一次按序可见。
+## 任务 1.3/3.2：续传只由连续 committed_seq 越过基线闭合；截止期到期而
+## 基线未推进时状态机自行升级为快照水合。
+## 任务 2.1/2.2/3.3/3.4：Stop 保留恢复债务并隔离被取消回合的控制效果，
+## 新回合的持久化响应仍然可见。
 extends SceneTree
 
 const ChatEventSocket = preload("res://addons/ai_agent/service/chat_event_socket.gd")
@@ -113,6 +118,11 @@ func _init() -> void:
 	_test_reset_barrier_discards_queued_tool_results()
 	_test_commit_cursor_regression()
 	_test_oversized_packet_guard_and_recovery()
+	_test_resume_deadline_expiry_hydrates()
+	_test_stop_then_send_isolation()
+	_test_cancelled_turn_control_isolation()
+	_test_stale_probe_snapshot_is_rejected()
+	_test_recovery_hydration_forces_tail_scroll()
 	print("checks=%d failures=%d" % [_checks, _failures])
 	quit(1 if _failures > 0 else 0)
 
@@ -148,18 +158,21 @@ func _test_recovery_bounds() -> void:
 	_check(r2.stalled(Time.get_ticks_msec()), "stalled after threshold without progress")
 
 
-## 序列缺口 → 从连续游标续传 → 重放闭合缺口（任务 2.4）。
+## 序列缺口 → 从连续游标续传 → 提交游标越过基线后重放闭合缺口（任务 2.4 / 1.3）。
 func _test_gap_resume_closes_gap() -> void:
 	var client = ChatEventSocket.new()
 	var fake = FakeSocket.new()
 	client._socket = fake
 	client._session_id = "s1"
+	client._stopped = false
 	var gaps: Array[Dictionary] = []
 	client.sequence_gap_detected.connect(func(details: Dictionary): gaps.append(details))
 	client._handle_message({"version": 1, "type": "subscribed", "last_seq": 3, "visible_seq": 3, "visible_updated_at": 1.0})
 	for seq in range(1, 4):
 		client._handle_event(_patch("s1", seq, _entry("e%d" % seq, seq, "assistant", "complete", 1)))
+		client.commit_seq(seq)
 	_check(client.highest_contiguous_seq() == 3, "contiguous before gap")
+	_check(client.committed_seq() == 3, "presented events committed before gap")
 	# 心跳报告服务端可见水位已领先（长 Thought/审批已持久化）。
 	client._handle_message({"version": 1, "type": "heartbeat", "last_seq": 7, "visible_seq": 7, "visible_updated_at": 2.0})
 	client._handle_event(_patch("s1", 7, _entry("e7", 4, "approval", "pending", 1)))
@@ -167,15 +180,23 @@ func _test_gap_resume_closes_gap() -> void:
 
 	var recovery = TranscriptRecovery.new()
 	recovery.notify_server_progress(int(client.server_progress().get("visible_seq", 0)))
-	var action := recovery.begin("sequence_gap", "resume", {})
+	# 进入续传时捕获提交游标基线（任务 1.3）。
+	var action := recovery.begin("sequence_gap", "resume", {"committed_seq": client.committed_seq()})
 	_check(action == "resume", "recovery resumes from contiguous cursor")
+	_check(recovery.baseline_committed_seq() == 3, "resume baseline captures committed cursor")
 	client.recover_from_acknowledged_cursor()
-	# 模拟保留窗口重放：缺口前后的事件重新送达。
+	# 模拟保留窗口重放：缺口前后的事件重新送达（已提交事件被重放丢弃）。
 	for seq in range(4, 8):
 		client._handle_event(_patch("s1", seq, _entry("e%d" % seq, seq, "assistant", "complete", 1)))
+		client.commit_seq(seq)
+		# 可见进度推进（投影/渲染）绝不能单独结束续传回合（任务 1.3）。
 		recovery.notify_visible_progress(int(client.server_progress().get("visible_seq", 0)))
-	_check(client.highest_contiguous_seq() == 7, "replay closed the gap")
-	_check(recovery.state == TranscriptRecovery.State.IDLE, "resume episode finished by visible progress")
+		_check(recovery.state == TranscriptRecovery.State.RESUMING, "visible progress alone does not close resume")
+	_check(client.highest_contiguous_seq() == 7, "replay closed the received gap")
+	# 只有连续 committed_seq 越过基线才闭合续传（任务 1.3）。
+	_check(client.committed_seq() == 7, "replay commits progress")
+	_check(recovery.notify_committed_progress(client.committed_seq()), "committed progress closes resume")
+	_check(recovery.state == TranscriptRecovery.State.IDLE, "resume episode finished by committed progress")
 
 
 ## 重放仍无法闭合缺口 → 升级为权威快照水合（任务 2.4）。
@@ -246,6 +267,7 @@ func _test_classinfo_drop_regression_resume() -> void:
 	var fake = FakeSocket.new()
 	client._socket = fake
 	client._session_id = "map1"
+	client._stopped = false
 	var store = TranscriptStore.new()
 	var projector = TranscriptProjector.new(store)
 	var recovery = TranscriptRecovery.new()
@@ -253,7 +275,10 @@ func _test_classinfo_drop_regression_resume() -> void:
 	client.sequence_gap_detected.connect(func(details: Dictionary): gaps.append(details))
 	client.event_received.connect(func(event: Dictionary):
 		if projector.apply_event(event, projector.generation):
-			recovery.notify_visible_progress(int(client.server_progress().get("visible_seq", 0)))
+			# 真实链路：Store/视口接受后才提交（任务 1.2 / 1.3）；提交游标
+			# 越过基线才闭合续传，投影/渲染推进本身不能宣告恢复健康。
+			client.commit_seq(int(event.get("seq", 0)))
+			recovery.notify_committed_progress(client.committed_seq())
 	)
 
 	var generation := projector.begin_hydration("map1")
@@ -612,3 +637,333 @@ func _test_oversized_packet_guard_and_recovery() -> void:
 	for entry_id in store.ordered_entry_ids():
 		recovered_kinds.append(str(store.get_entry(str(entry_id)).get("kind", "")))
 	_check(recovered_kinds == ["user", "tool_activity", "thought", "approval"], "post-oversized entries recovered in order")
+
+
+## 任务 3.2：续传期间 Store/投影推进但 committed_seq 不推进、也没有第二个
+## 恢复触发时，续传截止期到期必须由状态机自行升级为快照水合——既不能宣告
+## 恢复健康，也不能无限停留在 RESUMING。
+func _test_resume_deadline_expiry_hydrates() -> void:
+	var recovery = TranscriptRecovery.new()
+	# 先给一个宽松阈值验证"截止期未开始不升级"，随后收紧触发到期。
+	recovery.resume_deadline_s = 0.5
+	var escalated: Array[Dictionary] = []
+	var finished: Array[String] = []
+	recovery.recovery_escalated.connect(func(details: Dictionary): escalated.append(details))
+	recovery.recovery_finished.connect(func(detail: String): finished.append(detail))
+	var action := recovery.begin("visible_stall", "resume", {"committed_seq": 5})
+	_check(action == "resume", "3.2: resume begins")
+	_check(recovery.state == TranscriptRecovery.State.RESUMING, "3.2: state resuming")
+	_check(recovery.baseline_committed_seq() == 5, "3.2: baseline captured at resume begin")
+	# Store/投影/渲染水位推进但 committed_seq 停在基线：绝不能宣告恢复健康。
+	recovery.notify_visible_progress(12)
+	_check(recovery.state == TranscriptRecovery.State.RESUMING, "3.2: store/projection progress does not close resume")
+	_check(not recovery.notify_committed_progress(5), "3.2: committed progress at baseline does not close")
+	_check(recovery.state == TranscriptRecovery.State.RESUMING, "3.2: stays resuming without baseline advance")
+	# 替代订阅尚未建立：截止期未开始，不得升级。
+	_check(not recovery.resume_deadline_expired(Time.get_ticks_msec()), "3.2: no deadline before subscription")
+	_check(recovery.escalate_resume_deadline("resume_deadline", {}) == "", "3.2: cannot escalate before deadline")
+	# 替代订阅建立：截止期开始单调计时；到期后状态机自行升级。
+	recovery.resume_deadline_s = 0.02
+	recovery.start_resume_deadline()
+	_check(recovery.resume_deadline_started(), "3.2: deadline started after subscription")
+	OS.delay_msec(40)
+	_check(recovery.resume_deadline_expired(Time.get_ticks_msec()), "3.2: deadline expired without committed progress")
+	_check(recovery.escalate_resume_deadline("resume_deadline", {}) == "hydrate", "3.2: expiry self-escalates to hydration")
+	_check(recovery.state == TranscriptRecovery.State.HYDRATING, "3.2: state hydrating after deadline escalation")
+	_check(escalated.size() == 1, "3.2: escalation diagnostic emitted")
+	_check(finished.is_empty(), "3.2: replay never declared healthy")
+	_check(recovery.baseline_committed_seq() == -1, "3.2: baseline cleared after escalation")
+	recovery.finish("snapshot_hydrated")
+	_check(recovery.state == TranscriptRecovery.State.IDLE, "3.2: hydration finishes episode")
+
+
+class StubCollector:
+	extends Node
+
+	func collect(_domain_hint: String = "any", _referenced_paths: Array = []) -> Dictionary:
+		return {}
+
+	func collect_selection() -> Dictionary:
+		return {}
+
+	func project_files() -> Array:
+		return []
+
+
+class StubTransient:
+	extends RefCounted
+
+	var notices: Array[String] = []
+
+	func show_keyed(_key: String, _text: String, _style: String) -> void:
+		pass
+
+	func discard_keyed(_key: String) -> void:
+		pass
+
+	func show_notice(text: String, _style: String) -> void:
+		notices.append(text)
+
+	func clear_all() -> void:
+		notices.clear()
+
+
+class StubRenderer:
+	extends RefCounted
+
+	func apply_entry(_entry: Dictionary, _scroll_hint := true) -> bool:
+		return true
+
+	func forget_entry(_entry_id: String) -> void:
+		pass
+
+	func clear_all() -> void:
+		pass
+
+	func render_all(_ordered_entries: Array) -> void:
+		pass
+
+	func ensure_mount_container(_list: VBoxContainer) -> void:
+		pass
+
+	func is_mounted(_entry_id: String) -> bool:
+		return false
+
+	func mounted_entry_ids() -> Array:
+		return []
+
+	func mounted_count() -> int:
+		return 0
+
+	func last_failure_reason() -> String:
+		return ""
+
+	func register_preview(_tool_call_id: String, _preview: Control, _stats: Dictionary) -> void:
+		pass
+
+
+class StubViewport:
+	extends RefCounted
+
+	func apply_entry(_entry: Dictionary) -> bool:
+		return true
+
+	func apply_batch(_entries: Array) -> Array:
+		return _entries
+
+	func replace_from_store() -> void:
+		pass
+
+	func merge_older_page() -> void:
+		pass
+
+	func complete_older_page(_before_ordinal: int, _succeeded: bool) -> void:
+		pass
+
+	func notify_scroll(_value: float) -> void:
+		pass
+
+	func return_to_latest() -> void:
+		pass
+
+	func suppress_follow() -> void:
+		pass
+
+	func advance_presentation_epoch() -> void:
+		pass
+
+	func navigation_diagnostics() -> Dictionary:
+		return {}
+
+
+## 装配一个可驱动事件/响应链路的 ChatPanel：不构建完整 UI，但补齐
+## `_on_send` / `_on_interrupt` / `_on_event_received` / `_on_response`
+## 触及的组件与控件桩，并让投影器就绪。返回类型刻意不标注（Variant），
+## 否则 `panel._input` 会被静态解析成 Node 内置的 `_input()` 虚拟方法。
+func _make_stubbed_panel():
+	var panel = ChatPanel.new()
+	panel.editor_interface = null
+	panel._transcript_store = TranscriptStore.new()
+	panel._projector = TranscriptProjector.new(panel._transcript_store)
+	panel._recovery = TranscriptRecovery.new()
+	panel._transcript_renderer = StubRenderer.new()
+	panel._transcript_viewport = StubViewport.new()
+	panel._transient_host = StubTransient.new()
+	panel._collector = StubCollector.new()
+	panel._event_socket = ChatEventSocket.new()
+	panel._event_socket.editor_interface = null
+	panel._event_socket._stopped = true
+	panel._http_client = AgentHttpClient.new()
+	panel._http_client.editor_interface = null
+	panel._http_client.service = FakeService.new()
+	panel._http_client._request_timeout_timer = Timer.new()
+	panel._http_client._idle_recovery_timer = Timer.new()
+	panel._http_client._create_chat_http()
+	panel._send_btn = Button.new()
+	panel._stop_btn = Button.new()
+	panel._commands_btn = Button.new()
+	panel._new_session_btn = Button.new()
+	panel._model_input = LineEdit.new()
+	panel._status = Label.new()
+	panel._input = TextEdit.new()
+	panel._context_bar = HFlowContainer.new()
+	return panel
+
+
+## 任务 3.3：Stop 后立即发送新消息——后端收到新请求、其持久化响应可见、
+## 没有命令被重复执行；恢复状态与基线跨 Stop 保留（任务 2.2）。
+func _test_stop_then_send_isolation() -> void:
+	var panel = _make_stubbed_panel()
+	panel._state = ChatPanel.AgentState.IDLE
+	var generation: int = panel._projector.begin_hydration("default")
+	panel._hydration_generation = generation
+	panel._projector.apply_snapshot(_snapshot("default", 0, []), generation)
+	_check(panel._projector.is_ready(), "3.3: stubbed panel projector ready")
+
+	# 回合 A 活跃：进入续传恢复（基线 3），随后用户 Stop。
+	_check(panel._recovery.begin("sequence_gap", "resume", {"committed_seq": 3}) == "resume", "3.3: recovery begins")
+	_check(panel._recovery.state == TranscriptRecovery.State.RESUMING, "3.3: recovery resuming")
+	panel._http_client.current_turn_id = "tA"
+	panel._on_interrupt()
+	_check(panel._interrupted_locally, "3.3: interrupt barrier set")
+	_check(panel._cancelled_turn_ids.has("tA"), "3.3: cancelled turn recorded")
+	# 任务 2.2：Stop 不得清除续传基线/升级预算/同步债务。
+	_check(panel._recovery.state == TranscriptRecovery.State.RESUMING, "3.3: stop preserves recovery state")
+	_check(panel._recovery.baseline_committed_seq() == 3, "3.3: stop preserves replay baseline")
+
+	# 新消息：屏障解除，新请求入队，恢复状态仍保留。
+	panel._input.text = "new message"
+	panel._on_send()
+	_check(not panel._interrupted_locally, "3.3: new message clears interrupt barrier")
+	_check(panel._state == ChatPanel.AgentState.WAITING_LLM, "3.3: new turn waiting")
+	_check(panel._recovery.state == TranscriptRecovery.State.RESUMING, "3.3: new message does not reset recovery")
+	_check(panel._recovery.baseline_committed_seq() == 3, "3.3: new message does not reset baseline")
+	_check(panel._http_client._inflight_path == "/chat/interrupt", "3.3: stop interrupt request in flight")
+	var queued_chats := 0
+	var queued_interrupts := 0
+	for item_value in panel._http_client._queue:
+		var item: Dictionary = item_value
+		if str(item.get("path", "")) == "/chat":
+			queued_chats += 1
+		elif str(item.get("path", "")) == "/chat/interrupt":
+			queued_interrupts += 1
+	_check(queued_chats == 1, "3.3: exactly one new user request queued")
+	_check(queued_interrupts == 0, "3.3: no duplicate interrupt enqueued")
+	if queued_chats == 1:
+		var chat_payload: Dictionary = panel._http_client._queue[0].get("payload", {})
+		_check(str(chat_payload.get("user_message", "")) == "new message", "3.3: server receives the new request")
+
+	# 迟到回合 A 控制事件：不能改变新回合状态。
+	var stale_model := {
+		"event_id": "default:9", "session_id": "default", "seq": 9,
+		"type": "agent_model_selected", "turn_id": "tA", "payload": {"model": "leak-model"},
+	}
+	panel._on_event_received(stale_model)
+	_check(panel._active_model_name != "leak-model", "3.3: late cancelled-turn control event ignored")
+	_check(panel._state == ChatPanel.AgentState.WAITING_LLM, "3.3: cancelled-turn event cannot change turn state")
+
+	# 回合 A 的持久化展示稿条目：仍作为有序历史投影。
+	var late_entry := _entry("eOld", 5, "thought", "complete", 2, {"content": "late"})
+	late_entry["turn_id"] = "tA"
+	var late_patch := _patch("default", 10, late_entry)
+	panel._on_event_received(late_patch)
+	_check(str(panel._transcript_store.get_entry("eOld").get("kind", "")) == "thought", "3.3: durable cancelled-turn history projected")
+
+	# 回合 B 的持久化响应：可见。
+	var new_entry := _entry("eNew", 6, "assistant", "complete", 1, {"text": "new response"})
+	new_entry["turn_id"] = "tB"
+	var new_patch := _patch("default", 11, new_entry)
+	panel._on_event_received(new_patch)
+	_check(str(panel._transcript_store.get_entry("eNew").get("payload", {}).get("text", "")) == "new response", "3.3: new turn response visible")
+	_check(panel._assistant_completed_this_turn, "3.3: new turn completion patch marks current turn")
+
+	# 迟到回合 A 的 HTTP tool_calls：不执行本地动作。
+	panel._on_response({
+		"type": "tool_calls", "turn_id": "tA",
+		"calls": [{"id": "late-call", "name": "apply_map_edit", "needs_confirm": false}],
+	})
+	_check(panel._state == ChatPanel.AgentState.WAITING_LLM, "3.3: late cancelled-turn tool_calls ignored")
+	_check(panel._pending_calls.is_empty(), "3.3: no approval/tool state mutated by cancelled turn")
+
+
+## 任务 3.4：迟到被取消回合事件不得改变新回合控制状态；其持久化展示稿
+## 条目只作为普通有序历史对账。
+func _test_cancelled_turn_control_isolation() -> void:
+	var panel = _make_stubbed_panel()
+	panel._state = ChatPanel.AgentState.WAITING_LLM
+	var generation: int = panel._projector.begin_hydration("default")
+	panel._hydration_generation = generation
+	panel._projector.apply_snapshot(_snapshot("default", 0, []), generation)
+	panel._cancelled_turn_ids = {"tA": true}
+	panel._interrupted_locally = false
+	panel._assistant_completed_this_turn = false
+
+	# 迟到回合 A 的完成态助手补丁：投影为历史，但不得标记新回合完成。
+	var late_assistant_entry := _entry("eOldA", 1, "assistant", "complete", 1, {"text": "old"})
+	late_assistant_entry["turn_id"] = "tA"
+	var late_assistant := _patch("default", 5, late_assistant_entry)
+	panel._on_event_received(late_assistant)
+	_check(str(panel._transcript_store.get_entry("eOldA").get("kind", "")) == "assistant", "3.4: durable cancelled-turn entry projected")
+	_check(not panel._assistant_completed_this_turn, "3.4: cancelled-turn completion cannot mark new turn")
+
+	# 迟到回合 A 的审批补丁：只作为历史条目，不驱动客户端审批状态。
+	var late_approval_entry := _entry("eOldAppr", 2, "approval", "pending", 1, {"tool": "bootstrap_map_agent"})
+	late_approval_entry["turn_id"] = "tA"
+	var late_approval := _patch("default", 6, late_approval_entry)
+	panel._on_event_received(late_approval)
+	_check(str(panel._transcript_store.get_entry("eOldAppr").get("kind", "")) == "approval", "3.4: durable approval entry reconciled as history")
+	_check(panel._pending_calls.is_empty(), "3.4: approval entry does not drive client approval state")
+	_check(panel._state == ChatPanel.AgentState.WAITING_LLM, "3.4: cancelled-turn events cannot change turn state")
+
+	# 迟到回合 A 的 HTTP tool_calls：不执行本地动作、不进入确认状态。
+	panel._on_response({
+		"type": "tool_calls", "turn_id": "tA",
+		"calls": [{"id": "c1", "name": "apply_map_edit", "needs_confirm": false}],
+	})
+	_check(panel._state == ChatPanel.AgentState.WAITING_LLM, "3.4: late cancelled-turn tool_calls ignored")
+	_check(panel._pending_calls.is_empty(), "3.4: tool_calls of cancelled turn ignored")
+
+	# 空 turn_id / 新回合 turn_id 不被隔离。
+	_check(not panel._is_stale_cancelled_turn_event(""), "3.4: empty turn_id is not isolated")
+	_check(not panel._is_stale_cancelled_turn_event("tB"), "3.4: next turn events are not isolated")
+	panel._clear_cancelled_turn_ids()
+	_check(not panel._is_stale_cancelled_turn_event("tA"), "3.4: cancelled turns clear at a session boundary")
+
+	# 回合 A 条目按 ordinal 有序出现。
+	var ids: Array = panel._transcript_store.ordered_entry_ids()
+	_check(ids.size() == 2, "3.4: cancelled-turn history in ordinal order")
+	_check(str(ids[0]) == "eOldA" and str(ids[1]) == "eOldAppr", "3.4: entries reconciled in ordinal order")
+
+
+## 任务 3.5：旁路 history probe 必须使用请求发起时的水合世代；旧快照迟到时
+## 不能覆盖已经开始的新水合。
+func _test_stale_probe_snapshot_is_rejected() -> void:
+	var panel = _make_stubbed_panel()
+	panel._state = ChatPanel.AgentState.WAITING_LLM
+	var old_generation: int = panel._projector.begin_hydration("default")
+	panel._hydration_generation = old_generation
+	var new_generation: int = panel._projector.begin_hydration("default")
+	panel._hydration_generation = new_generation
+	panel._on_probe_response(
+		_snapshot("default", 4, [_entry("stale", 1, "assistant", "complete", 1, {"text": "old"})]),
+		{"kind": "history_snapshot", "session_id": "default", "hydration_generation": old_generation}
+	)
+	_check(panel._transcript_store.entry_count() == 0, "3.5: stale probe snapshot cannot replace current generation")
+
+
+## 任务 3.6：恢复不是普通历史浏览。即使用户此前上滑，快照替换也必须请求
+## 延迟尾部滚动，并跨后续布局帧保持该请求。
+func _test_recovery_hydration_forces_tail_scroll() -> void:
+	var panel = _make_stubbed_panel()
+	panel._state = ChatPanel.AgentState.WAITING_LLM
+	var generation: int = panel._projector.begin_hydration("default")
+	panel._hydration_generation = generation
+	panel._auto_scroll = false
+	panel._force_scroll_once = false
+	panel._post_final_scroll_frames = 0
+	panel._apply_recovery_history(
+		_snapshot("default", 4, [_entry("recovered", 1, "assistant", "complete", 1, {"text": "visible tail"})])
+	)
+	_check(panel._auto_scroll, "3.6: recovery restores automatic tail follow")
+	_check(panel._force_scroll_once, "3.6: recovery requests a deferred forced tail scroll")
+	_check(panel._post_final_scroll_frames >= 5, "3.6: recovery keeps tail scroll through layout frames")

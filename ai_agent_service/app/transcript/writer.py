@@ -236,6 +236,7 @@ class TranscriptWriter:
         *,
         client_message_id: str | None,
         has_context: bool,
+        turn_id: str | None = None,
     ) -> str:
         """记录一条用户消息条目并确认其 `client_message_id` 身份。
 
@@ -257,6 +258,7 @@ class TranscriptWriter:
                 "client_message_id": client_message_id,
                 "has_context": has_context,
             },
+            turn_id=turn_id,
         )
         self._publish(session.session_id, entry)
         return str(entry["entry_id"])
@@ -370,6 +372,7 @@ class TranscriptWriter:
         cumulative_text: str,
         token_count: int | None,
         response_attempt_id: str = "",
+        turn_id: str | None = None,
     ) -> str:
         """创建/更新一个 `kind=thought` 条目的思考中状态。
 
@@ -404,6 +407,7 @@ class TranscriptWriter:
                     "attempt_content_offset": 0,
                     "attempt_token_offset": 0,
                 },
+                turn_id=turn_id,
                 index_key=key,
             )
             session.transcript_index[f"thought:open:{frame_id}"] = str(entry["entry_id"])
@@ -439,7 +443,9 @@ class TranscriptWriter:
             if token_count is not None:
                 token_offset = int(payload.get("attempt_token_offset", 0))
                 payload["token_count"] = token_offset + max(int(token_count), 0)
-            entry = self._update_entry(session, entry_id, state="thinking", payload=payload)
+            entry = self._update_entry(
+                session, entry_id, state="thinking", payload=payload, turn_id=turn_id
+            )
         self._publish(session.session_id, entry)
         return str(entry["entry_id"])
 

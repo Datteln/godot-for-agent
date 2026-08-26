@@ -37,6 +37,10 @@ var _highest_contiguous_seq := 0
 ## 已提交游标（任务 2.12）：对应事件已被权威 Store 与视口接受呈现。
 ## 只有它可以作为 ACK 与重连订阅的 `after_seq`；接收游标绝不能充当。
 var _committed_seq := 0
+## 重放纪元（任务 1.1）：每次建立新连接 +1。接收游标与连接级去重表都
+## 以连接为作用域；上一连接已接收但未提交的事件在重放时必须重新投递，
+## 因此这里只用于脱敏诊断与测试断言，不参与任何 ACK/订阅决策。
+var _replay_epoch := 0
 ## 已发出 ACK 的最高提交游标，避免重复发送同一序号的确认。
 var _last_acked_seq := 0
 ## 乱序提交的暂存（任务 2.12）：提交按序号连续推进，先到的高序号在此等待。
@@ -167,9 +171,10 @@ func _connect() -> void:
 		return
 	_socket = _new_socket()
 	_subscribe_sent = false
-	# 新连接可能从已提交游标重放未呈现事件：清空连接级去重表，
-	# 让重放事件重新参与投影与提交（Store 层按 event_id 幂等）。
-	_seen_event_ids.clear()
+	# 连接级接收簿记（任务 1.1）：新连接把接收游标与连接级去重表重置到
+	# 已提交游标。接收游标只证明"当前连接内"的有序到达，重放纪元保证
+	# 上一连接已接收但未提交的事件在重放时重新参与投影（Store 幂等兜底）。
+	_reset_connection_bookkeeping()
 	_socket.handshake_headers = _headers()
 	var error: int = _socket.connect_to_url(_websocket_url(), null)
 	if error != OK:
@@ -177,6 +182,18 @@ func _connect() -> void:
 		_schedule_reconnect()
 		return
 	_set_state(STATE_RECONNECTING if _reconnect_delay_s > 1.0 else STATE_CONNECTING)
+
+
+## 连接级接收簿记重置（任务 1.1）：每次建立新连接时调用。
+##
+## 传输去重只作用于单一连接/重放纪元：`_seen_event_ids` 与 `_highest_contiguous_seq`
+## 都从已提交游标重新开始，因此上一连接收到过但从未被 Store/视口接受的
+## 事件（`seq > committed_seq`）在重放时会被重新投递；Store 的 event_id 与
+## revision 幂等规则仍然是最终防重复屏障。
+func _reset_connection_bookkeeping() -> void:
+	_highest_contiguous_seq = _committed_seq
+	_seen_event_ids.clear()
+	_replay_epoch += 1
 
 
 func _read_packets() -> void:
@@ -389,13 +406,20 @@ func server_progress() -> Dictionary:
 
 ## 返回脱敏传输诊断快照（任务 1.1 / 2.12）；只含序号/计数/字节/时间戳。
 func transport_diagnostics() -> Dictionary:
+	# 首个阻塞连续提交的序号（任务 1.2）：接收/暂存存在未提交尾部时，
+	# 它就是从提交游标起第一个挡住进度的 seq；只暴露序号，绝不含正文。
+	var blocking_seq := 0
+	if _highest_contiguous_seq > _committed_seq or not _pending_commits.is_empty():
+		blocking_seq = _committed_seq + 1
 	return {
 		"state": _state,
 		"highest_contiguous_seq": _highest_contiguous_seq,
 		"received_seq": _highest_contiguous_seq,
 		"committed_seq": _committed_seq,
 		"last_acked_seq": _last_acked_seq,
+		"blocking_seq": blocking_seq,
 		"pending_commits": _pending_commits.size(),
+		"replay_epoch": _replay_epoch,
 		"events_received": _diag_events_received,
 		"bytes_received": _diag_bytes_received,
 		"acks_sent": _diag_acks_sent,

@@ -162,6 +162,7 @@ def create_app(settings: AppSettings | None = None, token: str | None = None) ->
         else:
             logger.info("Automatic RAG index build disabled by configuration")
         yield
+        await query_engine.shutdown()
         if auto_build_task is not None and not auto_build_task.done():
             auto_build_task.cancel()
             with suppress(asyncio.CancelledError):

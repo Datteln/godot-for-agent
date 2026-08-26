@@ -96,11 +96,21 @@ The service SHALL NOT silently discard an ordered user-visible transcript event 
 ### Requirement: Visible events are acknowledged only after presentation commit
 The client SHALL maintain separate contiguous `received_seq` and `committed_seq` cursors for each session subscription. It MAY advance `received_seq` after validating ordered packet receipt, but it MUST NOT use that cursor for an ACK or `after_seq` resume request. The client SHALL advance `committed_seq` and ACK only after the corresponding visible event revision has been accepted by the canonical transcript Store and the renderer/viewport has accepted it for presentation. The client MUST subscribe from `committed_seq` after reconnecting.
 
+Every event with `seq > committed_seq` MUST remain eligible for replay even if an earlier socket received its `event_id`; transport de-duplication is scoped to a connection/replay epoch, while Store identity and revision checks prevent duplicate rendering. The server MUST publish user-visible events only from a durable transcript timeline, so a published entry and its cursor remain reconstructable after restart.
+
 If a decoded event is held by a projection batch, rejected by the Projector, rejected by the renderer, or invalidated by the active generation before commit, the client MUST NOT ACK it as committed. It SHALL retain the ordered uncommitted event where possible or reconnect from the prior committed cursor so the service can replay it. Diagnostics MUST distinguish received and committed cursors without recording payload text.
 
 #### Scenario: Projector fails after packet receipt
 - **WHEN** the socket receives and validates visible event sequence 42 but the Projector rejects its entry revision before the viewport accepts it
 - **THEN** `received_seq` MAY be 42, `committed_seq` remains 41, no ACK greater than 41 is sent, and a reconnect subscribes with `after_seq=41`
+
+#### Scenario: Replayed uncommitted event was received on the prior socket
+- **WHEN** a prior socket received sequence 42 but never committed it, and a replacement resumes from `after_seq=41`
+- **THEN** sequence 42 reaches projection again instead of being discarded solely by prior receipt
+
+#### Scenario: Service restarts after publishing a visible event
+- **WHEN** the service publishes a visible user or transcript event then restarts before normal completion
+- **THEN** reconstructed history includes the durable entry and does not reuse or regress its cursor
 
 #### Scenario: Streaming patch awaits its projection window
 - **WHEN** a streamed Thought patch is ordered and held by the projection batcher

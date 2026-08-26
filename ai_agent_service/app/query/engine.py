@@ -1926,7 +1926,11 @@ class QueryEngine:
         self._recovery = recovery_store
         self._cache_engine = cache_engine or CacheDecisionEngine()
         self._cache_metrics = cache_metrics or CacheMetricsCollector()
-        self._transcript = TranscriptWriter(self._emit)
+        self._transcript = TranscriptWriter(self._stage_transcript_event)
+        # 高频流式展示稿不在每个 token 的同步路径写盘；同会话仅保留一个
+        # 延迟检查点任务，下一次检查点会包含这段时间内的最新累计状态。
+        self._stream_checkpoint_tasks: dict[str, asyncio.Task[None]] = {}
+        self._pending_transcript_events: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         # session_id -> 该会话当前所有"正在处理 /chat 请求"的任务集合（通常只有
         # 一个，但用户可能在前一个请求仍卡在 per-session 锁等待时就发出下一条
         # 消息/中断，short-lived 地出现多个；用 set 而不是单个槎位，避免新任务
@@ -1943,9 +1947,10 @@ class QueryEngine:
     ) -> SessionHistoryResponse:
         """返回权威展示稿快照（含原子游标），不再从 frame/事件重建展示语义。
 
-        快照与会话写入共用同一把会话锁：返回时所有
-        `seq <= upto_event_seq` 的可见状态都已反映在条目中。旧会话在首次
-        读取时执行一次性兼容转换并持久化结果。
+        快照不等待贯穿整个模型调用的可变执行锁。展示稿更新和读取均在
+        事件循环中同步完成；这里在没有 ``await`` 的短窗口内复制同一份
+        条目与游标，因此返回的 ``upto_event_seq`` 不会超出响应内条目。
+        旧会话在首次读取时执行一次性兼容转换并持久化结果。
 
         Args:
             session_id: 会话 id。
@@ -1955,62 +1960,70 @@ class QueryEngine:
         Returns:
             携带 `transcript` 快照的历史响应；`items`/`blocks` 保留为空列表。
         """
-        async with self._store.lock_for(session_id):
-            session = self._load_session_seeded(session_id)
-            if self._ensure_transcript_converted(session):
-                self._store.save(session)
-            entries: list[TranscriptEntryDTO] = []
-            for raw_entry in session.transcript_entries:
-                parsed = TranscriptEntryDTO.model_validate(raw_entry)
-                entries.append(parsed)
-            page_limit = max(1, min(limit, 500)) if limit != 0 else 0
-            candidates = (
-                [entry for entry in entries if entry.ordinal < before_ordinal]
-                if before_ordinal is not None
-                else entries
-            )
-            has_more = page_limit > 0 and len(candidates) > page_limit
-            if page_limit > 0:
-                entries = candidates[-page_limit:]
-            else:
-                entries = candidates
-            next_before_ordinal = entries[0].ordinal if has_more and entries else None
-            snapshot = TranscriptSnapshotDTO(
-                session_id=session.session_id,
-                upto_event_seq=session.event_seq,
-                legacy=bool(session.transcript_meta.get("legacy", False)),
-                entries=entries,
-                next_before_ordinal=next_before_ordinal,
-                has_more=has_more,
-            )
-            events_for_context = _persisted_history_events(session)
-            logger.info(
-                "Session history served session=%s entries=%d upto_seq=%d legacy=%s pending=%s",
-                session_id,
-                len(entries),
-                session.event_seq,
-                snapshot.legacy,
-                session.pending_turn_id is not None,
-            )
-            return SessionHistoryResponse(
-                session_id=session.session_id,
-                last_event_seq=session.event_seq,
-                pending_turn_id=session.pending_turn_id,
-                context_used_tokens=_history_context_used_tokens(session, events_for_context),
-                context_token_limit=self._settings.auto_compact_token_threshold,
-                items=[],
-                blocks=[],
-                transcript=snapshot,
-                next_before_ordinal=next_before_ordinal,
-                has_more=has_more,
-            )
+        # 历史快照是公开的持久化切面：先冲刷已经在内存中合并、尚未发布的
+        # 展示稿，不能把“内存较新、磁盘较旧”的条目伪装成权威历史返回。
+        await self._flush_transcript_boundary(session_id)
+        session = self._load_session_seeded(session_id)
+        converted = self._ensure_transcript_converted(session)
+        entries = [
+            TranscriptEntryDTO.model_validate(raw_entry)
+            for raw_entry in session.transcript_entries
+        ]
+        snapshot_cursor = session.event_seq
+        pending_turn_id = session.pending_turn_id
+        legacy = bool(session.transcript_meta.get("legacy", False))
+        events_for_context = _persisted_history_events(session)
+        context_used_tokens = _history_context_used_tokens(session, events_for_context)
+        if converted:
+            await self._store.save_async(session)
+        page_limit = max(1, min(limit, 500)) if limit != 0 else 0
+        candidates = (
+            [entry for entry in entries if entry.ordinal < before_ordinal]
+            if before_ordinal is not None
+            else entries
+        )
+        has_more = page_limit > 0 and len(candidates) > page_limit
+        if page_limit > 0:
+            entries = candidates[-page_limit:]
+        else:
+            entries = candidates
+        next_before_ordinal = entries[0].ordinal if has_more and entries else None
+        snapshot = TranscriptSnapshotDTO(
+            session_id=session.session_id,
+            upto_event_seq=snapshot_cursor,
+            legacy=legacy,
+            entries=entries,
+            next_before_ordinal=next_before_ordinal,
+            has_more=has_more,
+        )
+        logger.info(
+            "Session history served session=%s entries=%d upto_seq=%d legacy=%s pending=%s",
+            session_id,
+            len(entries),
+            snapshot_cursor,
+            snapshot.legacy,
+            pending_turn_id is not None,
+        )
+        return SessionHistoryResponse(
+            session_id=session.session_id,
+            last_event_seq=snapshot_cursor,
+            pending_turn_id=pending_turn_id,
+            context_used_tokens=context_used_tokens,
+            context_token_limit=self._settings.auto_compact_token_threshold,
+            items=[],
+            blocks=[],
+            transcript=snapshot,
+            next_before_ordinal=next_before_ordinal,
+            has_more=has_more,
+        )
 
     def _ensure_transcript_converted(self, session: Session) -> bool:
         """确保会话展示稿已完成一次性初始化；返回本次是否发生了转换。
 
         新会话（无历史帧）转换产物为空，仅打上 `converted` 标记，防止后续
         读取把实时条目误判为旧数据再次转换；旧会话首次触达时把已持久化
-        frame/事件推断出的 block 序列一次性写入展示稿。调用方必须持有会话锁。
+        frame/事件推断出的 block 序列一次性写入展示稿。调用方必须保证本次
+        转换与其它展示稿变更不交错；当前由事件循环中无 await 的短片段保证。
 
         Returns:
             True 表示本次调用执行了转换（含空转换），调用方应持久化会话。
@@ -2059,20 +2072,30 @@ class QueryEngine:
                     )
                     return _response_from_dict(session.request_id_cache[request.request_id])
 
-                # 取消保护快照：本轮可能在追加 assistant 的 tool_calls 后、写入对应
-                # tool result 之前被 interrupt 取消。若让这半截历史留在内存里，下一次
-                # 请求发给 OpenAI 兼容端点会因 tool_call 缺少 tool result 而 400。取消
-                # 时回滚到本轮开始前的内存快照（本轮尚未 save()，磁盘仍是旧版本）。
-                snapshot = copy.deepcopy(session)
+                # 取消时只回滚可能破坏下一次模型请求的执行态（例如半截
+                # tool_call），绝不能回滚已经展示给用户的展示稿、游标或已接受的
+                # 用户消息。执行态快照用于随后做这部分精确修复。
+                execution_snapshot = copy.deepcopy(session)
                 try:
                     response = await self._submit_locked(session, request)
                 except asyncio.CancelledError:
-                    self._store.replace_in_memory(request.session_id, snapshot)
+                    restored = self._restore_execution_after_cancel(
+                        execution_snapshot, session, request
+                    )
+                    self._store.replace_in_memory(request.session_id, restored)
+                    await self._flush_transcript_boundary(request.session_id)
+                    await self._store.save_async(restored)
                     raise
 
                 if request.request_id is not None:
                     session.request_id_cache[request.request_id] = _response_to_dict(response)
-                self._store.save(session)
+                await self._flush_transcript_boundary(request.session_id)
+                if self._events is not None:
+                    self._events.flush_pending_streams(request.session_id)
+                    session.event_seq = max(
+                        session.event_seq, self._events.last_seq(request.session_id)
+                    )
+                await self._store.save_async(session)
                 self._record_recovery(session, response)
                 logger.info(
                     "Chat request completed session=%s response_type=%s pending=%s",
@@ -2094,6 +2117,38 @@ class QueryEngine:
                     tasks.discard(task)
                     if not tasks:
                         del self._active_tasks[request.session_id]
+
+    def _restore_execution_after_cancel(
+        self, execution_snapshot: Session, current: Session, request: ChatRequest
+    ) -> Session:
+        """撤销不完整的模型执行态，同时保留已经可见的持久化事实。
+
+        模型协议不能接收孤立的 ``tool_calls``，因此取消后恢复到本轮开始前
+        的帧栈；但用户已经提交的消息、展示稿条目和事件游标是用户可观察的
+        事实，必须从当前会话带回。这样下一轮既不会触发 tool 协议错误，也
+        不会复用或删除被 Stop 前已经接受的转录身份。
+        """
+        restored = execution_snapshot
+        if request.user_message is not None:
+            frame = restored.top_frame()
+            if frame is not None:
+                frame.messages.append(
+                    {"role": "user", "content": _build_user_content(request)}
+                )
+        restored.turn_counter = max(restored.turn_counter, current.turn_counter)
+        restored.frame_counter = max(restored.frame_counter, current.frame_counter)
+        restored.effort = current.effort
+        restored.output_style = current.output_style
+        restored.rag_context = current.rag_context
+        restored.transcript_entries = current.transcript_entries
+        restored.transcript_entry_counter = current.transcript_entry_counter
+        restored.transcript_index = current.transcript_index
+        restored.transcript_meta = current.transcript_meta
+        restored.transcript_turn_id = current.transcript_turn_id
+        restored.history_event_counter = current.history_event_counter
+        restored.history_events = current.history_events
+        restored.event_seq = max(restored.event_seq, current.event_seq)
+        return restored
 
     async def _submit_locked(self, session: Session, request: ChatRequest) -> ChatResponse:
         """在持有会话锁时执行一次请求。"""
@@ -2210,17 +2265,30 @@ class QueryEngine:
                     session.session_id,
                 )
                 return ChatErrorResponse(text="会话没有活跃的 agent 帧")
+            # 该身份在用户消息被接受时分配，而不是等到前端工具调用出现时。
+            # 所有本轮可见条目都使用它，Stop 后下一轮绝不会复用旧身份。
+            session.transcript_turn_id = session.new_turn_id()
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
             session.pending_verify_candidates.clear()
-            self._emit(
-                session.session_id, "user_submitted", {"has_context": request.context is not None}
-            )
             self._transcript.record_user_message(
                 session,
                 str(request.user_message),
                 client_message_id=request.client_message_id,
                 has_context=request.context is not None,
+                turn_id=session.transcript_turn_id,
             )
+            # 用户提交是不可回滚的短边界：在启动任何模型流之前完成检查点，
+            # 此后才发布接受事件，避免出现“前端已看到、磁盘尚未有”的用户条目。
+            await self._flush_transcript_boundary(session.session_id)
+            self._emit(
+                session.session_id,
+                "user_submitted",
+                {
+                    "has_context": request.context is not None,
+                    "turn_id": session.transcript_turn_id,
+                },
+            )
+            await self._store.save_async(session)
             logger.info(
                 "User turn appended session=%s has_context=%s language_hint=%s",
                 session.session_id,
@@ -2363,7 +2431,7 @@ class QueryEngine:
                     self._transcript.complete_assistant(session, step.text)
                 self._transcript.record_front_tool_calls(
                     session,
-                    turn_id=step.turn_id,
+                    turn_id=session.transcript_turn_id or step.turn_id,
                     calls=[
                         {
                             "id": call.id,
@@ -2951,7 +3019,6 @@ class QueryEngine:
         discarded = 0
         async with self._store.lock_for(session_id):
             session = self._load_session_seeded(session_id)
-            had_pending_plan = session.pending_plan is not None
             session.pending_plan = None
             if session.pending_turn_id is not None:
                 frames = {frame.id: frame for frame in session.agent_stack}
@@ -2974,15 +3041,26 @@ class QueryEngine:
                     ],
                 )
                 session.clear_pending()
-                self._store.save(session)
                 if self._recovery is not None:
                     self._recovery.clear(session_id)
-            elif had_pending_plan:
-                self._store.save(session)
+            # Stop 是持久化边界：先把开放 Thought 结算为当前可见的终态，再把
+            # 中断游标写入同一检查点，确认返回后重启也能还原该历史切面。
+            self._transcript.complete_open_thoughts(session)
+            await self._flush_transcript_boundary(session_id)
+            self._emit(
+                session_id,
+                "turn_interrupted",
+                {
+                    "cancelled": cancelled,
+                    "pending_discarded": discarded,
+                    "turn_id": session.transcript_turn_id,
+                },
+            )
+            if self._events is not None:
+                self._events.flush_pending_streams(session_id)
+                session.event_seq = max(session.event_seq, self._events.last_seq(session_id))
+            await self._store.save_async(session)
 
-        self._emit(
-            session_id, "turn_interrupted", {"cancelled": cancelled, "pending_discarded": discarded}
-        )
         last_seq = self._events.last_seq(session_id) if self._events is not None else 0
         logger.info(
             "Turn interrupted session=%s cancelled=%s pending_discarded=%d last_seq=%d",
@@ -3024,12 +3102,16 @@ class QueryEngine:
                 ],
             )
             session.clear_pending()
-            self._store.save(session)
             response = ChatFinalResponse(
                 text=f"已放弃 {discarded} 个待回传的工具调用，可以继续发送新消息。"
             )
-            self._record_recovery(session, response)
+            await self._flush_transcript_boundary(session_id)
             self._emit(session_id, "pending_discarded", {"count": discarded})
+            if self._events is not None:
+                self._events.flush_pending_streams(session_id)
+                session.event_seq = max(session.event_seq, self._events.last_seq(session_id))
+            await self._store.save_async(session)
+            self._record_recovery(session, response)
             logger.info("Pending tool calls discarded session=%s count=%d", session_id, discarded)
             return response
 
@@ -3373,6 +3455,7 @@ class QueryEngine:
             payload: 编排事件原始载荷。
         """
         writer = self._transcript
+        turn_id = session.transcript_turn_id or session.pending_turn_id
         if event_type == "agent_reasoning_delta":
             writer.update_thought_stream(
                 session,
@@ -3381,6 +3464,7 @@ class QueryEngine:
                 cumulative_text=str(payload.get("text", "")),
                 token_count=payload.get("token_count"),
                 response_attempt_id=str(payload.get("response_attempt_id", "")),
+                turn_id=turn_id,
             )
         elif event_type == "agent_text_delta":
             frame_id = str(payload.get("frame_id", ""))
@@ -3392,7 +3476,7 @@ class QueryEngine:
                 frame_id=frame_id,
                 message_index=message_index,
                 cumulative_text=str(payload.get("text", "")),
-                turn_id=session.pending_turn_id,
+                turn_id=turn_id,
             )
         elif event_type == "assistant_stream_recovery_started":
             writer.begin_thought_recovery(
@@ -3419,7 +3503,7 @@ class QueryEngine:
                     tool=str(payload.get("tool", "")),
                     args=args if isinstance(args, dict) else {},
                     agent=payload.get("agent"),
-                    turn_id=session.pending_turn_id,
+                    turn_id=turn_id,
                 )
         elif event_type == "server_tool_result":
             tool_call_id = str(payload.get("tool_call_id", ""))
@@ -3439,7 +3523,7 @@ class QueryEngine:
                 session,
                 summary=str(payload.get("summary", "")),
                 steps=steps,
-                turn_id=session.pending_turn_id,
+                turn_id=turn_id,
             )
         elif event_type == "plan_step_started":
             writer.record_plan_step(
@@ -3448,7 +3532,7 @@ class QueryEngine:
                 total_steps=int(payload.get("total_steps", 0)),
                 title=str(payload.get("title", "")),
                 completed=False,
-                turn_id=session.pending_turn_id,
+                turn_id=turn_id,
             )
         elif event_type == "plan_step_completed":
             writer.record_plan_step(
@@ -3458,7 +3542,7 @@ class QueryEngine:
                 title=None,
                 completed=True,
                 summary=payload.get("summary"),
-                turn_id=session.pending_turn_id,
+                turn_id=turn_id,
             )
         elif event_type == "verify_started":
             writer.start_verification(
@@ -3466,7 +3550,7 @@ class QueryEngine:
                 tool_use_id=str(payload.get("tool_use_id", "")),
                 file_path=str(payload.get("file_path", "")),
                 phase=str(payload.get("phase", "")),
-                turn_id=session.pending_turn_id,
+                turn_id=turn_id,
             )
         elif event_type == "verify_completed":
             writer.finish_verification(
@@ -3477,6 +3561,96 @@ class QueryEngine:
                 issues_count=int(payload.get("issues_count", 0)),
                 summary=str(payload.get("summary", "")),
             )
+
+
+    def _stage_transcript_event(
+        self, session_id: str, event_type: str, payload: dict[str, Any]
+    ) -> int:
+        """暂存展示稿事件，待匹配的会话检查点成功后再发布。
+
+        Thought/assistant 的中间修订按 ``entry_id`` 合并，其余结构性条目保留
+        顺序。这样既不会把每个 token 都同步写盘，也不会把尚未落盘的内容
+        交给 WebSocket。
+        """
+        pending = self._pending_transcript_events.setdefault(session_id, [])
+        frozen_payload = copy.deepcopy(payload)
+        entry = frozen_payload.get("entry", {})
+        entry_id = str(entry.get("entry_id", "")) if isinstance(entry, dict) else ""
+        state = str(entry.get("state", "")) if isinstance(entry, dict) else ""
+        kind = str(entry.get("kind", "")) if isinstance(entry, dict) else ""
+        is_stream_update = entry_id != "" and (
+            (kind == "thought" and state == "thinking")
+            or (kind == "assistant" and state == "streaming")
+        )
+        if is_stream_update:
+            for index in range(len(pending) - 1, -1, -1):
+                existing = pending[index][1].get("entry", {})
+                if isinstance(existing, dict) and str(existing.get("entry_id", "")) == entry_id:
+                    pending[index] = (event_type, frozen_payload)
+                    self._schedule_stream_checkpoint(session_id)
+                    return 0
+        pending.append((event_type, frozen_payload))
+        self._schedule_stream_checkpoint(session_id)
+        return 0
+
+    def _schedule_stream_checkpoint(self, session_id: str) -> None:
+        """按会话启动一个有界延迟的展示稿检查点任务。"""
+        active = self._stream_checkpoint_tasks.get(session_id)
+        if active is not None and not active.done():
+            return
+        task = asyncio.create_task(
+            self._flush_stream_checkpoint(session_id, delayed=True),
+            name=f"transcript-checkpoint:{session_id}",
+        )
+        self._stream_checkpoint_tasks[session_id] = task
+
+    async def _flush_stream_checkpoint(self, session_id: str, *, delayed: bool) -> None:
+        """写入一批展示稿，再发布与该检查点匹配的事件。"""
+        current_task = asyncio.current_task()
+        try:
+            if delayed:
+                await asyncio.sleep(0.1)
+            while self._pending_transcript_events.get(session_id):
+                pending = self._pending_transcript_events.pop(session_id)
+                session = self._load_session_seeded(session_id)
+                # 发布前先把展示稿本身落盘；这正是 stream 事件的持久化屏障。
+                await self._store.save_async(session)
+                for event_type, payload in pending:
+                    self._emit(session_id, event_type, payload)
+                # `_emit` 分配的游标也必须和已经发布的条目一起持久化。
+                if self._events is not None:
+                    self._events.flush_pending_streams(session_id)
+                    session.event_seq = max(session.event_seq, self._events.last_seq(session_id))
+                await self._store.save_async(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Stream transcript checkpoint failed session=%s", session_id)
+        finally:
+            if self._stream_checkpoint_tasks.get(session_id) is current_task:
+                self._stream_checkpoint_tasks.pop(session_id, None)
+
+    async def _flush_transcript_boundary(self, session_id: str) -> None:
+        """等待在途合并检查点，并在用户可见边界前冲刷剩余展示稿。"""
+        task = self._stream_checkpoint_tasks.get(session_id)
+        if task is not None and not task.done():
+            # 不取消可能已在线程池内写文件的任务：取消协程并不能停止底层
+            # 文件写入，反而会让两个原子替换并发。最多等一个很短的合并窗口。
+            await task
+        await self._flush_stream_checkpoint(session_id, delayed=False)
+
+    async def shutdown(self) -> None:
+        """在受控服务退出前冲刷所有已接受会话的展示稿检查点。"""
+        session_ids = set(self._pending_transcript_events) | set(self._stream_checkpoint_tasks)
+        for session_id in session_ids:
+            await self._flush_transcript_boundary(session_id)
+        for session in self._store.loaded_sessions():
+            if self._events is not None:
+                self._events.flush_pending_streams(session.session_id)
+                session.event_seq = max(
+                    session.event_seq, self._events.last_seq(session.session_id)
+                )
+            await self._store.save_async(session)
 
     def _emit(self, session_id: str, event_type: str, payload: dict[str, Any]) -> int:
         """记录内部事件；未配置事件存储时返回 0。

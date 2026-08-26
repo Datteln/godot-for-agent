@@ -8,7 +8,8 @@ signal idle_recovery_requested(details: Dictionary)
 ## 恢复结束（成功续等或失败转中断）；携带脱敏原因，供 UI/日志展示。
 signal idle_recovery_finished(result: Dictionary)
 ## 恢复期间通过旁路探针取得的响应（不占用主请求队列）。
-signal probe_response_received(response: Dictionary)
+## `context` 是发起请求时捕获的会话/水合世代等关联信息，用于拒绝迟到响应。
+signal probe_response_received(response: Dictionary, context: Dictionary)
 
 const ConfigMigrations = preload("res://addons/ai_agent/config/config_migrations.gd")
 const FrontendLogger = preload("res://addons/ai_agent/logging/frontend_logger.gd")
@@ -427,33 +428,37 @@ func is_idle_recovery_active() -> bool:
 ##
 ## 用于恢复窗口内读取 `/recovery-pointer` 等轻量状态——主队列此刻被仍在跑的
 ## `/chat` 请求占住，正常 `_enqueue` 永远排不出去。探针不复用 `_http`、
-## 不改 `_busy`/生成号，响应经 `probe_response_received` 单独分发。
-func probe_get(path: String) -> void:
-	if _probe_http == null:
-		_probe_http = HTTPRequest.new()
-		_probe_http.name = "RecoveryProbeHttp"
-		add_child(_probe_http)
-		_probe_http.request_completed.connect(_on_probe_completed)
-	if _probe_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-		_probe_http.cancel_request()
-	var err := _probe_http.request(_url(path), _headers(), HTTPClient.METHOD_GET, "")
+## 不改 `_busy`/生成号，响应经 `probe_response_received` 单独分发。每次探针
+## 使用独立 HTTPRequest，并把请求时 context 绑定到回调，防止旧响应冒充新水合。
+func probe_get(path: String, context: Dictionary = {}) -> void:
+	var probe := HTTPRequest.new()
+	probe.name = "RecoveryProbeHttp"
+	add_child(probe)
+	probe.request_completed.connect(_on_probe_completed.bind(context.duplicate(true), probe))
+	_probe_http = probe
+	var err := probe.request(_url(path), _headers(), HTTPClient.METHOD_GET, "")
 	if err != OK:
 		FrontendLogger.warn(editor_interface, "HTTP", "Recovery probe failed to start.", {
 			"path": path,
 			"error": err
 		})
+		probe.queue_free()
 
 
-func _on_probe_completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+func _on_probe_completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray, context: Dictionary, probe: HTTPRequest) -> void:
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
 		FrontendLogger.warn(editor_interface, "HTTP", "Recovery probe failed.", {
 			"code": code,
 			"result": result
 		})
+		if is_instance_valid(probe):
+			probe.queue_free()
 		return
 	var parsed := JSON.parse_string(body.get_string_from_utf8())
 	if parsed is Dictionary:
-		probe_response_received.emit(parsed)
+		probe_response_received.emit(parsed, context)
+	if is_instance_valid(probe):
+		probe.queue_free()
 
 
 func _on_request_timeout() -> void:

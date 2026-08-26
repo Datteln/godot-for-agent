@@ -1,12 +1,16 @@
-## 聊天事件 socket 契约测试（fix-transcript-sync-recovery 更新）。
+## 聊天事件 socket 契约测试（fix-transcript-sync-recovery 更新；
+## fix-transcript-delivery-semantics 任务 3.1）。
 ##
 ## 覆盖：事件去重、接收与提交分离后的 ack 契约（任务 2.12：ACK 只能来自
 ## 已提交游标，接收不确认）、心跳/订阅确认携带的服务端可见进度字段（任务 1.2）、
 ## 序列缺口不再直接水合而是发出脱敏诊断并交给恢复状态机（任务 2.2/2.4）、
-## 恢复路径不重发任何命令（任务 2.5）。
+## 恢复路径不重发任何命令（任务 2.5）、上一连接已接收但未提交的事件在
+## 重连重放时被重新投递（任务 1.1 / 3.1）。
 extends SceneTree
 
 const ChatEventSocket = preload("res://addons/ai_agent/service/chat_event_socket.gd")
+const TranscriptStore = preload("res://addons/ai_agent/transcript/transcript_store.gd")
+const TranscriptProjector = preload("res://addons/ai_agent/transcript/transcript_projector.gd")
 
 var _failures := 0
 var _checks := 0
@@ -103,4 +107,75 @@ func _init() -> void:
 	# 续传入口保持以已提交游标为订阅起点（任务 2.4 / 2.12）。
 	_check(client.highest_contiguous_seq() == 3, "received cursor accessor")
 	_check(client.committed_seq() == 3, "committed cursor is the resume cursor")
+
+	# 任务 3.1：上一连接已接收但未提交的事件，重连重放时必须重新投递；
+	# 进度提交后 Store 保持幂等。
+	_test_received_uncommitted_redelivered_after_reconnect()
 	quit(1 if _failures > 0 else 0)
+
+
+## 任务 3.1：事件在上一连接已接收但从未提交（Store/视口未接受）时，
+## 重连后服务端从已提交游标重放该事件——客户端必须重新投递它参与投影，
+## 而不是仅凭 event_id 曾被接收就丢弃。进度提交后，重放已提交事件被
+## 连接级去重抑制，Store 的 event_id/revision 幂等保证不产生重复条目。
+func _test_received_uncommitted_redelivered_after_reconnect() -> void:
+	var client = ChatEventSocket.new()
+	var fake = FakeSocket.new()
+	client._socket = fake
+	client._session_id = "replay1"
+	client._stopped = false
+	var received: Array[Dictionary] = []
+	client.event_received.connect(func(event: Dictionary): received.append(event))
+	client._handle_message({"version": 1, "type": "subscribed", "last_seq": 0, "visible_seq": 0, "visible_updated_at": 0.0})
+
+	# 事件 1、2 到达并被接收，但从未提交（例如投影器/视口尚未接受）。
+	client._handle_event({"event_id": "replay1:1", "seq": 1, "type": "transcript_patch", "payload": {}})
+	client._handle_event({"event_id": "replay1:2", "seq": 2, "type": "transcript_patch", "payload": {}})
+	_check(received.size() == 2, "3.1: events received on first connection")
+	_check(client.highest_contiguous_seq() == 2, "3.1: received cursor advanced")
+	_check(client.committed_seq() == 0, "3.1: nothing committed before reconnect")
+
+	# 重连：接收簿记重置到已提交游标（任务 1.1），重放纪元递增。
+	var epoch_before: int = client._replay_epoch
+	client._reset_connection_bookkeeping()
+	_check(client._replay_epoch == epoch_before + 1, "3.1: replay epoch advances per connection")
+	_check(client.highest_contiguous_seq() == 0, "3.1: receipt cursor reset to committed on reconnect")
+	_check(client._seen_event_ids.is_empty(), "3.1: connection-scoped dedup cleared on reconnect")
+
+	# 服务端从 after_seq=0 重放 seq1、seq2：即使上一连接已接收也必须重新投递。
+	client._handle_event({"event_id": "replay1:1", "seq": 1, "type": "transcript_patch", "payload": {}})
+	client._handle_event({"event_id": "replay1:2", "seq": 2, "type": "transcript_patch", "payload": {}})
+	_check(received.size() == 4, "3.1: replayed uncommitted events re-delivered")
+	_check(client.highest_contiguous_seq() == 2, "3.1: replay advances receipt cursor again")
+
+	# 进度提交：Store/视口接受后提交游标推进并发送 ACK（任务 1.2 连续提交语义）。
+	client.commit_seq(1)
+	client.commit_seq(2)
+	_check(client.committed_seq() == 2, "3.1: replay commits progress")
+	var ack = JSON.parse_string(fake.sent[fake.sent.size() - 1])
+	_check(ack is Dictionary and int(ack.get("seq", 0)) == 2, "3.1: ack follows committed progress")
+	var diagnostics: Dictionary = client.transport_diagnostics()
+	_check(int(diagnostics.get("committed_seq", -1)) == 2, "3.1: diagnostics expose committed cursor")
+	_check(int(diagnostics.get("blocking_seq", -1)) == 0, "3.1: no blocking seq after contiguous commit")
+
+	# 已提交事件的重放：连接内不再分发。
+	client._handle_event({"event_id": "replay1:1", "seq": 1, "type": "transcript_patch", "payload": {}})
+	client._handle_event({"event_id": "replay1:2", "seq": 2, "type": "transcript_patch", "payload": {}})
+	_check(received.size() == 4, "3.1: already-committed replay suppressed")
+
+	# Store 幂等：同一事件两次投影只产生一个条目。
+	var store = TranscriptStore.new()
+	var projector = TranscriptProjector.new(store)
+	var generation := projector.begin_hydration("replay1")
+	projector.apply_snapshot({
+		"transcript": {
+			"version": 1, "session_id": "replay1", "upto_event_seq": 0,
+			"legacy": false, "entries": [],
+		},
+	}, generation)
+	var entry := {"entry_id": "e1", "ordinal": 1, "kind": "user", "state": "complete", "revision": 1, "payload": {"text": "x"}}
+	var patch1 := {"event_id": "replay1:1", "session_id": "replay1", "seq": 1, "type": "transcript_patch", "payload": {"entry": entry, "stream_key": "e1"}}
+	var patch2 := patch1.duplicate(true)
+	_check(projector.apply_event(patch1, generation), "3.1: first delivery projects")
+	_check(not projector.apply_event(patch2, generation), "3.1: re-delivery deduped by Store")
+	_check(store.entry_count() == 1, "3.1: Store remains idempotent")

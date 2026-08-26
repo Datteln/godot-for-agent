@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -91,6 +92,8 @@ class Session:
     事实的后续迁移（流式增量、工具结果、审批决定）定位到同一条目。"""
     transcript_meta: dict[str, Any] = field(default_factory=dict)
     """展示稿元信息：`legacy`（是否来自旧会话一次性兼容转换）等。"""
+    transcript_turn_id: str | None = None
+    """当前可见用户轮次的稳定身份；同轮展示稿条目共享该值。"""
     event_seq: int = 0
     """会话已发布的最大事件序号（与 WebSocket `seq` 同一空间的持久化值），
     用作展示稿快照的 `upto_event_seq` 原子游标与重启后的序号下限。"""
@@ -323,6 +326,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "transcript_entry_counter": session.transcript_entry_counter,
         "transcript_index": session.transcript_index,
         "transcript_meta": session.transcript_meta,
+        "transcript_turn_id": session.transcript_turn_id,
         "event_seq": session.event_seq,
     }
 
@@ -444,6 +448,11 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         transcript_entry_counter=_as_int(data.get("transcript_entry_counter")),
         transcript_index=transcript_index,
         transcript_meta=transcript_meta,
+        transcript_turn_id=(
+            str(data["transcript_turn_id"])
+            if data.get("transcript_turn_id") is not None
+            else None
+        ),
         event_seq=event_seq,
     )
 
@@ -489,6 +498,7 @@ class SessionStore:
         self._storage_dir = storage_dir
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._write_locks: dict[str, asyncio.Lock] = {}
 
     def lock_for(self, session_id: str) -> asyncio.Lock:
         """返回（必要时创建）某会话的 per-session 锁。
@@ -555,6 +565,34 @@ class SessionStore:
             path,
         )
 
+    async def save_async(self, session: Session) -> None:
+        """异步写入一个冻结的会话检查点。
+
+        JSON 编码和原子替换均在线程池中执行；调用处在关键边界 ``await``
+        此方法，流式路径则可以合并多个更新后再调用。先深拷贝使磁盘快照
+        不会与随后继续到达的模型增量混在一起。
+
+        Args:
+            session: 已在事件循环中完成本次变更的会话。
+        """
+        self._sessions[session.session_id] = session
+        payload = copy.deepcopy(session_to_dict(session))
+        path = self._path_for(session.session_id)
+        write_lock = self._write_locks.get(session.session_id)
+        if write_lock is None:
+            write_lock = asyncio.Lock()
+            self._write_locks[session.session_id] = write_lock
+        async with write_lock:
+            await asyncio.to_thread(atomic_write_json, path, payload)
+        logger.debug(
+            "Session checkpoint saved session=%s frames=%d pending=%s cursor=%d path=%s",
+            session.session_id,
+            len(session.agent_stack),
+            session.pending_turn_id is not None,
+            session.event_seq,
+            path,
+        )
+
     def replace_in_memory(self, session_id: str, session: Session) -> None:
         """仅替换内存态会话，不触碰磁盘。
 
@@ -569,6 +607,10 @@ class SessionStore:
             session: 回滚目标快照。
         """
         self._sessions[session_id] = session
+
+    def loaded_sessions(self) -> list[Session]:
+        """返回当前进程已加载会话的稳定列表，用于受控退出时冲刷检查点。"""
+        return list(self._sessions.values())
 
     def reset(self, session_id: str) -> None:
         """清空指定会话（内存与本地持久化文件）。

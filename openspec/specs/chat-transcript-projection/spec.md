@@ -88,9 +88,19 @@ After a successful replay or snapshot hydration, the client SHALL project and re
 ### Requirement: Rendered progress is not advanced before viewport acceptance
 The client SHALL advance `projected_seq` only after the Projector has accepted the revision into the canonical Store, and SHALL advance `rendered_seq` and the transport `committed_seq` only after the renderer/viewport has accepted the corresponding entry revision for presentation. A streaming patch held by a projection batcher is neither projected, rendered, nor committed. A renderer rejection, an undrained projection batch, or a mismatch between Store and viewport watermarks MUST preserve the uncommitted event for replay and enter the bounded recovery path with a redacted stage-specific diagnostic.
 
+The persisted Store and a successfully applied history snapshot are authoritative over transient socket receipt. During recovery hydration, valid current-generation transcript events received while the snapshot is in flight MUST be retained in an ordered buffer rather than rejected because the Projector is hydrating. Once the snapshot replaces and renders the Store, the client MUST discard buffered events at or below its atomic cursor, apply/replay events above it before replacement subscription, and render no event twice. This recovery tail reveal MUST override a prior manual browsing anchor.
+
 #### Scenario: Streaming Thought remains in a projection batch
 - **WHEN** the transport has acknowledged a Thought patch but the projection batcher has not applied it to the Store
-- **THEN** `received_seq` may advance while `projected_seq` and `rendered_seq` do not, and the client does not report the transcript as healthy
+- **THEN** `received_seq` may advance while `projected_seq`, `rendered_seq`, and `committed_seq` do not, and the client does not report the transcript as healthy
+
+#### Scenario: Snapshot and live delivery overlap
+- **WHEN** recovery obtains a complete snapshot with `upto_event_seq=80` while socket events 79 through 82 exist
+- **THEN** the viewport renders through 80 once from the snapshot and delivers only events after 80 from the replacement path
+
+#### Scenario: Thought continues while history hydration is slow
+- **WHEN** the Projector requests hydration and a current-generation Thought continues before the snapshot returns
+- **THEN** the client retains ordered live patches, applies the snapshot cut once, and presents every post-cut patch
 
 ### Requirement: Virtual viewport layout preserves visible transcript and transient notices
 The client SHALL cache a virtual transcript entry height only after that entry has a stable, valid layout for the current content revision, width, and presentation mode. It MUST invalidate stale measurements when any of those inputs changes and MUST NOT let an invalid transient measurement create a spacer that moves the scroll target beyond the last actual entry. Local waiting, error, and report notices SHALL use a dedicated visible mount that is not separated from transcript content by a virtual spacer; they remain non-durable and outside transcript ordering.

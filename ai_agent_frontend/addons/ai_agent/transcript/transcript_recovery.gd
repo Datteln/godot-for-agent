@@ -1,4 +1,5 @@
-## 转录断档恢复的有界状态机（fix-transcript-sync-recovery 任务 2.4）。
+## 转录断档恢复的有界状态机（fix-transcript-sync-recovery 任务 2.4，
+## fix-transcript-delivery-semantics 任务 1.3 / 2.2 / 2.3）。
 ##
 ## 所有可见转录断档入口（传输序列缺口、服务端保留缺口、背压重同步、
 ## 投影器/渲染器拒绝、可见进度停滞）都收敛到这里，由它决定“从连续游标
@@ -30,16 +31,28 @@ signal recovery_exhausted(details: Dictionary)
 var state: int = State.IDLE
 ## 活跃轮次中判定可见停滞的阈值（秒）；可配置化以便按实测调整。
 var stall_threshold_s := 20.0
+## 续传单调截止期（秒；任务 1.3）。替代订阅建立后开始计时；若续传在
+## 截止期内没有把连续 committed 游标推进到基线之上，状态机自行升级为
+## 快照水合。尚未建立替代订阅时，以整个续传回合的耗时兜底，防止永远
+## 卡在 RESUMING 等待订阅。
+var resume_deadline_s := 20.0
 ## 当前回合的触发原因（脱敏标识）。
 var reason := ""
 ## 最近一次服务端可见水位（由心跳/订阅确认携带）。
 var server_visible_seq := 0
+## 续传基线（任务 1.3）：进入 RESUMING 时捕获的 contiguous committed_seq。
+## 只有连续 committed_seq 严格大于该基线才算续传闭合缺口；接收/投影/
+## 渲染水位推进、Store 变更或心跳都不得单独结束续传。
+var replay_baseline_committed_seq := -1
 
 var _resume_attempts := 0
 var _hydrate_attempts := 0
 var _last_visible_progress_msec := 0
 var _state_since_msec := 0
 var _exhausted_reported := false
+## 替代订阅建立后续传截止期的起点（毫秒）；-1 表示尚未建立（由
+## `start_resume_deadline` 设置）。
+var _resume_deadline_started_msec := -1
 
 
 ## 请求开始一次恢复。返回应执行的动作："resume"、"hydrate"，
@@ -48,7 +61,7 @@ var _exhausted_reported := false
 ## Args:
 ##   trigger: 触发源标识（如 "sequence_gap"、"visible_stall"）。
 ##   preferred: 首选动作；服务端类型化缺口/投影失败应直接 "hydrate"。
-##   watermarks: 调用方当前脱敏水位快照，仅用于诊断日志。
+##   watermarks: 调用方当前脱敏水位快照，用于捕获续传基线（committed_seq）。
 func begin(trigger: String, preferred: String, watermarks: Dictionary = {}) -> String:
 	var action := ""
 	if state == State.HYDRATING:
@@ -74,17 +87,75 @@ func begin(trigger: String, preferred: String, watermarks: Dictionary = {}) -> S
 		state = State.HYDRATING
 		_state_since_msec = Time.get_ticks_msec()
 		_hydrate_attempts += 1
+		_clear_resume_tracking()
 		recovery_escalated.emit(details)
 		return "hydrate"
 	state = State.RESUMING if action == "resume" else State.HYDRATING
 	_state_since_msec = Time.get_ticks_msec()
 	if action == "resume":
 		_resume_attempts += 1
+		# 任务 1.3：进入续传时捕获提交游标基线；截止期在替代订阅建立
+		# 后由 `start_resume_deadline` 启动。
+		replay_baseline_committed_seq = int(watermarks.get("committed_seq", -1))
+		_resume_deadline_started_msec = -1
 	else:
 		_hydrate_attempts += 1
+		_clear_resume_tracking()
 	_exhausted_reported = false
 	recovery_started.emit(action, _diagnostics(trigger, watermarks))
 	return action
+
+
+## 替代订阅建立（服务端 "subscribed" 确认）后启动单调续传截止期（任务 1.3）。
+## 只有处于 RESUMING 时生效；重复调用不重计时。
+func start_resume_deadline() -> void:
+	if state != State.RESUMING:
+		return
+	if _resume_deadline_started_msec < 0:
+		_resume_deadline_started_msec = Time.get_ticks_msec()
+
+
+## 续传截止期是否已到期（任务 1.3）。替代订阅已建立时按建立时刻单调计时；
+## 尚未建立时以整个续传回合的耗时为兜底，避免等待订阅无限期卡死。
+func resume_deadline_expired(now_msec: int) -> bool:
+	if state != State.RESUMING:
+		return false
+	var deadline_ms := int(resume_deadline_s * 1000.0)
+	if _resume_deadline_started_msec >= 0:
+		return now_msec - _resume_deadline_started_msec >= deadline_ms
+	return now_msec - _state_since_msec >= deadline_ms
+
+
+## 提交游标推进通知（任务 1.3）：只有连续 committed_seq 严格大于续传基线
+## 才算闭合续传缺口并结束本回合。返回是否由此结束了续传。
+func notify_committed_progress(committed_seq: int) -> bool:
+	if state != State.RESUMING:
+		return false
+	if committed_seq <= replay_baseline_committed_seq:
+		return false
+	finish("resume_committed_progress")
+	return true
+
+
+## 续传截止期到期而基线未推进时，由恢复状态机自行升级为快照水合
+## （任务 2.3）：不等待第二个序列缺口/报文/停滞触发。返回应执行的
+## 动作（"hydrate"）或空字符串（未到期/预算耗尽）。
+func escalate_resume_deadline(trigger: String, watermarks: Dictionary = {}) -> String:
+	if state != State.RESUMING:
+		return ""
+	if not resume_deadline_expired(Time.get_ticks_msec()):
+		return ""
+	if _hydrate_attempts >= HYDRATE_MAX_ATTEMPTS:
+		_report_exhausted(trigger, watermarks)
+		return ""
+	var details := _diagnostics(trigger, watermarks)
+	state = State.HYDRATING
+	_state_since_msec = Time.get_ticks_msec()
+	_hydrate_attempts += 1
+	reason = trigger
+	_clear_resume_tracking()
+	recovery_escalated.emit(details)
+	return "hydrate"
 
 
 ## 快照水合在超时后仍未完成时的有界重试（任务 2.4）：只有处于 HYDRATING
@@ -115,6 +186,7 @@ func finish(detail: String) -> void:
 	_resume_attempts = 0
 	_hydrate_attempts = 0
 	reason = ""
+	_clear_resume_tracking()
 	recovery_finished.emit(detail)
 
 
@@ -128,30 +200,34 @@ func reset() -> void:
 	server_visible_seq = 0
 	_last_visible_progress_msec = Time.get_ticks_msec()
 	_exhausted_reported = false
+	_clear_resume_tracking()
 
 
 ## 客户端可见进度推进（接收/投影/渲染任一水位前进）：刷新停滞计时，
 ## 并把服务端水位同步到本地。
 ##
-## 若当前处于 RESUMING：重放已经送达了新的可见条目 = 缺口被闭合，
-## 立即结束本回合并重置预算；HYDRATING 的结束由快照应用方显式调用
-## `finish` 表达（水合完成前不会有实时补丁被接受）。
+## 注意（任务 1.3）：可见进度推进本身绝不能结束 RESUMING——续传回合
+## 只由连续 committed_seq 越过基线（`notify_committed_progress`）或快照
+## 水合（`finish`）闭合。接收、Store 变更、投影/渲染水位推进都只是
+## 刷新停滞计时，不能宣告恢复健康。
 func notify_visible_progress(server_seq: int = -1) -> void:
 	_last_visible_progress_msec = Time.get_ticks_msec()
 	if server_seq >= 0:
 		server_visible_seq = maxi(server_visible_seq, server_seq)
-	if state == State.RESUMING:
-		state = State.IDLE
-		_state_since_msec = Time.get_ticks_msec()
-		_resume_attempts = 0
-		_hydrate_attempts = 0
-		reason = ""
-		_exhausted_reported = false
-		recovery_finished.emit("resume_closed_gap")
-	elif state == State.IDLE:
+	if state == State.IDLE:
 		_resume_attempts = 0
 		_hydrate_attempts = 0
 		_exhausted_reported = false
+
+
+## 续传基线（进入 RESUMING 时捕获的 committed_seq；任务 1.3 供测试/诊断）。
+func baseline_committed_seq() -> int:
+	return replay_baseline_committed_seq
+
+
+## 替代订阅是否已建立并启动续传截止期（供诊断/测试）。
+func resume_deadline_started() -> bool:
+	return _resume_deadline_started_msec >= 0
 
 
 ## 服务端心跳/订阅确认带来的可见水位（只含序号，无正文）。
@@ -185,10 +261,18 @@ func _diagnostics(trigger: String, watermarks: Dictionary) -> Dictionary:
 		"resume_attempts": _resume_attempts,
 		"hydrate_attempts": _hydrate_attempts,
 		"server_visible_seq": server_visible_seq,
+		"replay_baseline_committed_seq": replay_baseline_committed_seq,
+		"resume_deadline_started": _resume_deadline_started_msec >= 0,
 	}
 	for key in watermarks:
 		details[str(key)] = watermarks[key]
 	return details
+
+
+## 清空续传回合的基线/截止期簿记（进入水合、结束或会话重置时调用）。
+func _clear_resume_tracking() -> void:
+	replay_baseline_committed_seq = -1
+	_resume_deadline_started_msec = -1
 
 
 func _report_exhausted(trigger: String, watermarks: Dictionary) -> void:

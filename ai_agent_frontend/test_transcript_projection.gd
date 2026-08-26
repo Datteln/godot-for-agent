@@ -57,6 +57,7 @@ func _init() -> void:
 	_run_thought_renderer_test()
 	_run_transient_host_ownership_test()
 	_run_tool_outcome_semantics_test()
+	_run_snapshot_fence_test()
 	print("transcript projection checks: %d, failures: %d" % [_checks, _failures])
 	quit(1 if _failures > 0 else 0)
 
@@ -433,3 +434,87 @@ func _find_descendant_rich(node: Node) -> RichTextLabel:
 		if found != null:
 			return found
 	return null
+
+
+## 任务 3.5 / 2.4：恢复水合的快照栅栏——`upto_event_seq` 之前的条目由完整
+## 快照恰好渲染一次，之后的事件由替代订阅送达；乐观用户条目凭
+## client_message_id 在快照替换中保留或替换。
+func _run_snapshot_fence_test() -> void:
+	var store := TranscriptStore.new()
+	var projector := TranscriptProjector.new(store)
+	# 初始水合（空快照）。
+	var gen1 := projector.begin_hydration("fence")
+	projector.apply_snapshot({
+		"transcript": {"version": 1, "session_id": "fence", "upto_event_seq": 0, "legacy": false, "entries": []},
+	}, gen1)
+	_check(projector.is_ready(), "snapshot-fence: initial hydration ready")
+	# 乐观用户消息（任务 2.4）：恢复前存在。
+	store.add_optimistic_user_entry("pending text", "cm_pending")
+	_check(store.entry_count() == 1, "snapshot-fence: optimistic entry present before recovery")
+
+	# 恢复水合：同会话 begin_hydration 保留乐观条目，快照原子切点 upto=8。
+	var gen2 := projector.begin_hydration("fence", true)
+	var fence_entries: Array = []
+	for index in range(1, 9):
+		fence_entries.append({
+			"entry_id": "f%d" % index, "ordinal": index, "kind": "assistant",
+			"state": "complete", "revision": 1, "turn_id": "t1",
+			"tool_call_id": null, "payload": {"text": "row %d" % index},
+		})
+	var fence_snapshot := {
+		"transcript": {
+			"version": 1, "session_id": "fence", "upto_event_seq": 8,
+			"legacy": false, "entries": fence_entries,
+		},
+	}
+	_check(projector.apply_snapshot(fence_snapshot, gen2), "snapshot-fence: full snapshot accepted")
+	_check(store.upto_event_seq == 8, "snapshot-fence: atomic cut adopted")
+	_check(store.entry_count() == 9, "snapshot-fence: snapshot entries + preserved optimistic")
+	_check(store.ordered_entry_ids().has("optimistic:cm_pending"), "snapshot-fence: unconfirmed optimistic preserved")
+
+	# 快照内事件（seq 8）被重放：不得重复渲染（Store 幂等 + 已见表）。
+	var replay_e8 := _fence_patch(8, "f8", 8)
+	_check(not projector.apply_event(replay_e8, gen2), "snapshot-fence: event at cut not re-rendered")
+	_check(store.entry_count() == 9, "snapshot-fence: events at or before cut render exactly once")
+
+	# 切点之后的事件来自替代订阅：seq 9、10 正常投影。
+	var live_e9 := _fence_patch(9, "f9", 9)
+	var live_e10 := _fence_patch(10, "f10", 10)
+	_check(projector.apply_event(live_e9, gen2), "snapshot-fence: event after cut delivered by subscription")
+	_check(projector.apply_event(live_e10, gen2), "snapshot-fence: second live event delivered")
+	_check(store.entry_count() == 11, "snapshot-fence: live tail appended once")
+	_check(str(store.get_entry("f9").get("entry_id", "")) == "f9", "snapshot-fence: live entry visible")
+
+	# 快照确认乐观 client_message_id 后替换为权威条目（任务 2.4）。
+	var store2 := TranscriptStore.new()
+	var projector2 := TranscriptProjector.new(store2)
+	store2.add_optimistic_user_entry("pending text", "cm_pending")
+	var gen3 := projector2.begin_hydration("fence2", true)
+	var confirming := {
+		"transcript": {
+			"version": 1, "session_id": "fence2", "upto_event_seq": 1, "legacy": false,
+			"entries": [{
+				"entry_id": "eUser", "ordinal": 0, "kind": "user", "state": "complete",
+				"revision": 1, "turn_id": "t1", "tool_call_id": null,
+				"payload": {"text": "pending text", "client_message_id": "cm_pending"},
+			}],
+		},
+	}
+	projector2.apply_snapshot(confirming, gen3)
+	_check(store2.entry_count() == 1, "snapshot-fence: confirmed optimistic replaced by authoritative entry")
+	_check(not store2.ordered_entry_ids().has("optimistic:cm_pending"), "snapshot-fence: confirmed optimistic removed")
+
+
+func _fence_patch(seq: int, entry_id: String, ordinal: int) -> Dictionary:
+	return {
+		"event_id": "fence:%d" % seq, "session_id": "fence", "seq": seq,
+		"type": "transcript_patch",
+		"payload": {
+			"patch_format": "full", "patch_version": 2, "stream_key": entry_id,
+			"entry": {
+				"entry_id": entry_id, "ordinal": ordinal, "kind": "assistant",
+				"state": "complete", "revision": 1, "turn_id": "t1",
+				"tool_call_id": null, "payload": {"text": "row %d" % ordinal},
+			},
+		},
+	}

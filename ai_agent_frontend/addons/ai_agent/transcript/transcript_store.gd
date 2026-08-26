@@ -194,6 +194,23 @@ func clear() -> void:
 	_optimistic.clear()
 
 
+## 取出当前全部乐观用户条目（任务 2.4）：同会话恢复水合前由投影器保存，
+## 快照应用时再凭 client_message_id 对账（未确认的保留、已确认的替换）。
+func optimistic_entries() -> Dictionary:
+	return _optimistic.duplicate(true)
+
+
+## 恢复此前取出的乐观条目（任务 2.4）。
+func restore_optimistic_entries(entries: Dictionary) -> void:
+	for client_message_id in entries.keys():
+		_optimistic[str(client_message_id)] = entries[client_message_id]
+
+
+## 丢弃全部乐观用户条目（会话整体清空路径，如 Reset）。
+func clear_optimistic_entries() -> void:
+	_optimistic.clear()
+
+
 ## 返回按 ordinal 排序的条目 id（乐观条目追加在末尾）。
 func ordered_entry_ids() -> Array:
 	var ids: Array = _order.duplicate()

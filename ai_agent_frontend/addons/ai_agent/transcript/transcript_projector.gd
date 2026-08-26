@@ -33,13 +33,20 @@ func _init(store: RefCounted) -> void:
 
 
 ## 开始一次新的水合：递增 generation、回到 HYDRATING、清空旧展示态。
-func begin_hydration(new_session_id: String) -> int:
+## 同会话的恢复/重水合可传入 `preserve_optimistic` 保留乐观用户条目，
+## 由快照的 client_message_id 对账决定保留还是替换（任务 2.4）。
+func begin_hydration(new_session_id: String, preserve_optimistic := false) -> int:
 	generation += 1
 	state = State.HYDRATING
+	var optimistic := {}
+	if preserve_optimistic:
+		optimistic = _store.optimistic_entries()
 	_store.clear()
 	_entry_formats.clear()
 	_store.session_id = new_session_id
 	_store.generation = generation
+	if preserve_optimistic:
+		_store.restore_optimistic_entries(optimistic)
 	return generation
 
 

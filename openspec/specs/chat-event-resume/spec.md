@@ -69,6 +69,10 @@ The client SHALL treat a lack of usable live patches as a recovery condition bef
 ### Requirement: Active visible transcript stalls recover without replaying commands
 While a chat turn remains active, the client SHALL start one bounded recovery attempt for a visible transcript stall when the service reports a newer visible sequence than the minimum of the client's received, committed, projected, and rendered continuous watermarks, and that lagging visible stage has not advanced within the configured interval. It MUST first reconnect and subscribe from its highest contiguous committed cursor. It MUST NOT resubmit a user message, tool approval, reset, cancellation, or interruption as part of recovery.
 
+When replay begins, the client MUST capture its contiguous `committed_seq` as the replay baseline. Once the replacement subscription is established, it MUST start one monotonic resume deadline. Replay succeeds only if that cursor becomes greater than the baseline; receipt, Store mutation, rendering, heartbeats, or a newer server-visible sequence alone MUST NOT finish recovery. If the deadline expires without baseline progress, recovery MUST transition itself to complete authoritative history hydration and resubscribe from the snapshot's atomic `upto_event_seq` cursor.
+
+Stop MUST retain an unresolved replay obligation, its baseline, and escalation budget. During active-turn hydration, the history snapshot MUST return promptly without waiting for model completion and its cursor MUST be an atomic cut over durable included entries.
+
 #### Scenario: ClassInfo is followed by an unseen bootstrap approval
 - **WHEN** the client last rendered a ClassInfo tool result and the service reports later persisted Thought and approval entries for the same active turn
 - **THEN** the client reconnects from its contiguous cursor and continues the existing turn without submitting the map request again
@@ -76,6 +80,18 @@ While a chat turn remains active, the client SHALL start one bounded recovery at
 #### Scenario: WebSocket accepts an event that never reaches the viewport
 - **WHEN** `received_seq` has advanced after a streamed Thought patch but `projected_seq` or `rendered_seq` remains behind the service `visible_seq` beyond the configured interval
 - **THEN** the client treats the lagging stage as a visible transcript stall and performs bounded resume/snapshot recovery even though no transport sequence gap exists
+
+#### Scenario: Resume cannot close a commit gap after Stop
+- **WHEN** a user stops a turn with `committed_seq` behind received events, starts a new turn, and replay does not advance that cursor
+- **THEN** the client hydrates authoritative history and continues showing the new turn without another user command
+
+#### Scenario: Replay becomes silent after reconnect
+- **WHEN** the replacement subscription is established and the captured committed cursor remains unchanged through the resume deadline
+- **THEN** recovery starts authoritative snapshot hydration without waiting for another trigger
+
+#### Scenario: History is requested while a model turn still streams
+- **WHEN** recovery requests complete transcript history while the service produces a Thought or assistant stream
+- **THEN** the service returns a matching durable transcript cut without waiting for the LLM turn to finish
 
 ### Requirement: Active recovery detects stalled projection and silent subscriptions
 The client SHALL track the age of its oldest pending streaming transcript patch and the freshness of an active WebSocket subscription. A non-empty pending projection set that does not advance projected visible progress within the configured interval, or an Open subscription that exceeds its freshness interval without an expected heartbeat or visible-progress confirmation, MUST trigger one bounded recovery confirmation through the compatible recovery-pointer or history-probe path. The recovery MUST preserve the existing active turn and MUST NOT replay a command.
