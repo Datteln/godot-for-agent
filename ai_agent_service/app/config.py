@@ -250,6 +250,36 @@ class AppSettings(BaseSettings):
         "（即 llm_quick_model，再为空则使用 llm_model）。",
     )
 
+    context_budget_tokens: int = Field(
+        default=200_000,
+        ge=1000,
+        description="整体模型上下文预算（estimate_message_tokens 粗估）；投影上下文超过该预算时，"
+        "压缩边界会触发语义合并（或确定性机械回退），并对记忆记录做范围裁剪。",
+    )
+    context_retained_turns: int = Field(
+        default=8,
+        ge=1,
+        description="模型上下文保留的完整用户轮数量；更早的完整轮在轮次收尾/压缩时按完整轮边界"
+        "（不切开工具协议组）收拢进 [conversation_memory] Markdown 记忆。",
+    )
+    context_active_group_window: int = Field(
+        default=12,
+        ge=1,
+        description="活跃轮协议窗口：一个活跃用户轮内最多以 OpenAI 协议形态保留的完整工具协议组"
+        "数量；窗口溢出时原子移除最老完整组，其 Markdown 结果保留在当前轮工具记忆中。",
+    )
+    context_consolidation_use_llm: bool = Field(
+        default=True,
+        description="压缩边界（整体预算越界/手动 /compact）是否调用 quick 模型做语义合并；"
+        "为 False、调用失败或返回空时，自动回退确定性机械 Markdown 合并。"
+        "普通成功工具轮次永不触发该调用。",
+    )
+    context_consolidation_model: str | None = Field(
+        default=None,
+        description="语义合并使用的模型名；为空时回退 quick effort 模型（llm_quick_model，再为空"
+        "则使用 llm_model）。",
+    )
+
     verify_after_edit: bool = Field(
         default=True,
         description="编辑类 front 工具成功落地后是否自动触发校验；为 False 时完全跳过 Verify 功能。",

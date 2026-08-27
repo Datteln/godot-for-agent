@@ -97,6 +97,11 @@ def sanitize_class_docs_messages(messages: list[dict[str, Any]]) -> int:
         content = message.get("content")
         if not isinstance(content, str) or content == "" or EPHEMERAL_MARK in content:
             continue
+        # Markdown 形态的结果由上下文记忆渲染器产出，本身只含被查询的有界
+        # 成员/常量/匹配（任务 3.5），不再替换为过期占位符；只有旧式 JSON
+        # 正文才需要短暂化。
+        if not content.lstrip().startswith("{"):
+            continue
         message["content"] = class_docs_placeholder(content)
         sanitized += 1
     return sanitized

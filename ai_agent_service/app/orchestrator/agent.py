@@ -12,8 +12,7 @@
 - 无 `tool_calls` 时结束当前帧；根帧结束即整轮结束，子帧结束则把摘要
   回填父帧并继续驱动父帧；
 - 每轮 `llm.chat()` 的 `temperature` 由 `_resolve_effort`/
-  `_resolve_temperature` 按 `Session.effort`/`AgentDefinition.effort`
-  解析得到（§6.5）。
+  `_resolve_temperature` 按会话选择的 `Session.effort` 解析得到（§6.5）。
 """
 
 from __future__ import annotations
@@ -29,6 +28,15 @@ from uuid import uuid4
 
 from app.agents.bundled import get_agent
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
+from app.context.grouping import terminalize_pending_groups
+from app.context.memory import (
+    complete_user_turn,
+    enforce_active_group_window,
+    render_memory_block,
+    sync_current_turn_memory,
+)
+from app.context.projection import ContextProjectionSettings, project_frame_messages
+from app.context.tool_markdown import render_tool_result_markdown
 from app.llm.cache_decision_engine import CacheDecision, CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnapshot
 from app.llm.class_docs import sanitize_class_docs_messages
@@ -173,9 +181,8 @@ EFFORT_THINKING_BUDGET: dict[EffortLevel, int] = {
 def _resolve_effort(session: Session, frame: Frame) -> EffortLevel:
     """解析当前帧应使用的 effort 档位（§6.5）。
 
-    根帧采用 `session.effort`（用户可调整的全局档位）；委派子帧始终使用
-    各自 `AgentDefinition.effort` 的声明值，避免会话级档位覆盖子 agent
-    已校准的默认档位（如 advisor 应始终保持低温）。
+    会话中所有帧（包含委派子 Agent）继承用户当前选择的档位。会话值非法时，
+    回退到当前 Agent 声明的默认档位，以兼容历史会话数据。
 
     Args:
         session: 当前会话。
@@ -184,7 +191,7 @@ def _resolve_effort(session: Session, frame: Frame) -> EffortLevel:
     Returns:
         合法的 `EffortLevel`。
     """
-    if frame.parent_id is None and session.effort in EFFORT_LEVELS:
+    if session.effort in EFFORT_LEVELS:
         return cast(EffortLevel, session.effort)
     return frame.agent.effort
 
@@ -282,19 +289,37 @@ async def _invoke_server_tool(
         return str(exc), True
 
 
-def _tool_message(tool_call_id: str, result: Any, *, is_error: bool = False) -> dict[str, Any]:
-    """构造一条 OpenAI `role=tool` 消息。
+def _tool_message(
+    tool_call_id: str,
+    result: Any,
+    *,
+    is_error: bool = False,
+    tool_name: str = "",
+    tool_args: dict[str, Any] | None = None,
+    origin: str = "server",
+) -> dict[str, Any]:
+    """构造一条 OpenAI `role=tool` 消息（Markdown 形态）。
+
+    工具返回值在进入模型上下文前统一渲染为 Markdown，`role=tool.content`
+    永不携带序列化结果 JSON，包括看似已序列化 JSON 的字符串结果。
 
     Args:
         tool_call_id: 对应的工具调用 id。
-        result: 工具结果；非字符串值会被 `json.dumps`。
-        is_error: 是否作为错误结果回传（`{"error": ...}`），供模型据此改方案。
+        result: 工具结果（字符串或结构化对象）。
+        is_error: 是否作为错误结果回传，供模型据此改方案。
+        tool_name: 工具名，用于分类 Markdown 渲染。
+        tool_args: 工具入参，用于推导目标身份。
 
     Returns:
         可直接 `append` 进 `frame.messages` 的消息字典。
     """
-    body: Any = {"error": result} if is_error else result
-    content = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+    content = render_tool_result_markdown(
+        tool_name or "unknown",
+        tool_args or {},
+        result,
+        is_error=is_error,
+        origin=origin,
+    )
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
 
@@ -505,6 +530,7 @@ async def _continue_delegate_group(
             _tool_message(
                 str(group["tool_call_id"]),
                 {"results": group.get("results", [])},
+                tool_name="delegate_many",
             )
         )
         logger.info(
@@ -583,6 +609,18 @@ async def _recover_empty_final_answer(
     return recovery_turn
 
 
+def _fold_child_frame_memory(done: Frame, text: str) -> str:
+    """把结束子帧的 Markdown 记忆折叠进面向父帧的委派结果（任务 1.2）。
+
+    子帧被弹出前，其长期与当前轮 Markdown 记忆必须随委派结果上送，
+    避免子帧工作产出随帧一起丢失。
+    """
+    memory_block = render_memory_block(done.context_memory)
+    if not memory_block.strip():
+        return text
+    return text + "\n\n" + memory_block
+
+
 async def _finish_frame(
     session: Session,
     text: str,
@@ -611,6 +649,9 @@ async def _finish_frame(
         logger.info("Root frame finished session=%s text_length=%d", session.session_id, len(text))
         if session.pending_plan is not None:
             session.pending_plan = None
+        # 最终轮次完成的机械收尾（任务 3.3）：当前轮 Markdown 工具记忆并入
+        # 长期记忆，全部完成的工具协议消息移出下一轮上下文；不调用摘要模型。
+        complete_user_turn(frame.messages, frame.context_memory)
         return FinalResult(
             text=text,
             frame_id=frame.id,
@@ -631,14 +672,23 @@ async def _finish_frame(
         done.agent.name,
         len(text),
     )
+    folded_text = _fold_child_frame_memory(done, text)
     if done.pending_delegate_group_id is not None:
-        await _continue_delegate_group(session, done, text, prompt_factory, event_callback)
+        await _continue_delegate_group(session, done, folded_text, prompt_factory, event_callback)
         return None
     parent = session.top_frame()
     assert parent is not None
     if done.pending_delegate_call_id is not None:
         _plan_step_completed(session, done, text, event_callback)
-        parent.messages.append(_tool_message(done.pending_delegate_call_id, {"summary": text}))
+        parent.messages.append(
+            _tool_message(
+                done.pending_delegate_call_id,
+                {"summary": folded_text, "agent": done.agent.name},
+                tool_name="delegate",
+                tool_args={"agent": done.agent.name},
+                origin="delegate",
+            )
+        )
     return None
 
 
@@ -1412,6 +1462,7 @@ async def run_turn(
     cache_engine: CacheDecisionEngine | None = None,
     cache_metrics: CacheMetricsCollector | None = None,
     context_token_limit: int | None = None,
+    context_settings: ContextProjectionSettings | None = None,
 ) -> StepResult:
     """驱动当前会话的活跃帧完成一轮（或多轮）编排循环。
 
@@ -1488,12 +1539,49 @@ async def run_turn(
                         "model": resolved_model,
                     },
                 )
+            # 上下文投影（任务 4.1）：system 层 + 命名记忆块 + 近期历史 +
+            # 受保护的活跃轮协议组 + 当前请求；记忆块绝不切分 assistant-tool
+            # 协议序列，投影产物不改动帧的持久化消息。
+            pending_call_ids = (
+                set(session.pending_tool_call_ids)
+                if session.pending_turn_id is not None
+                else set()
+            )
+            if not pending_call_ids:
+                terminalized = terminalize_pending_groups(frame.messages, "reset")
+                if terminalized:
+                    sync_current_turn_memory(
+                        frame.context_memory, frame.messages, origin="system"
+                    )
+            projection = project_frame_messages(
+                frame.messages,
+                frame.context_memory,
+                settings=context_settings,
+                pending_call_ids=pending_call_ids,
+                session_id=session.session_id,
+                frame_id=frame.id,
+            )
+            if projection.violations:
+                logger.error(
+                    "Refusing invalid context projection session=%s frame=%s violations=%s",
+                    session.session_id,
+                    frame.id,
+                    projection.violations,
+                )
+                return ErrorResult(text="会话工具调用协议不完整，已拒绝发送无效模型上下文。")
+            outgoing_messages = projection.messages
+            _emit_orchestration_event(
+                event_callback,
+                "context_audit",
+                {"frame_id": frame.id, "loop": loop_index + 1, **projection.audit},
+            )
+
             cache_decision: CacheDecision | None = None
             if cache_engine is not None and llm.supports_prompt_cache:
                 cache_decision = await cache_engine.decide(
                     session_id=session.session_id,
                     frame_id=frame.id,
-                    messages=frame.messages,
+                    messages=outgoing_messages,
                     tools=visible_tools,
                     project_root=tool_ctx.security.project_root,
                     rag_index_path=tool_ctx.rag_index_path,
@@ -1504,7 +1592,7 @@ async def run_turn(
 
             response_attempt_id = uuid4().hex
             turn = await llm.chat(
-                frame.messages,
+                outgoing_messages,
                 visible_tools,
                 model=resolved_model,
                 temperature=_resolve_temperature(effort),
@@ -1538,9 +1626,9 @@ async def run_turn(
             )
             return ErrorResult(text=str(exc))
 
-        # read_class_docs 短暂事实（任务 4.3）：模型已消费本次请求，文档事实
-        # 立即过期——后续步骤、会话持久化与压缩都只能看到受限占位符，
-        # 完整 ClassDB/API 文本绝不留在会话帧里。
+        # `read_class_docs` 的旧式 JSON 结果在模型消费后被短暂化；新的 Markdown
+        # 查询结果已仅含有界成员/常量/匹配，可作为工具记忆保留，完整 ClassDB/API
+        # 文本绝不留在会话帧里。
         sanitize_class_docs_messages(frame.messages)
 
         # 空正文恢复会继续同一个逻辑 Thought。首次原始流结束仅是 provisional，
@@ -1796,6 +1884,7 @@ async def run_turn(
         front_calls: list[FrontToolCall] = []
         pending_items: list[_PendingItem] = []
         turn_id = session.new_turn_id()
+        known_tool_args: dict[str, dict[str, Any]] = {}
 
         # 第一遍：分类每个 tool call，不执行 server handler（同步、保留顺序）。
         for call in turn.tool_calls:
@@ -1819,6 +1908,7 @@ async def run_turn(
                 pending_items.append(_PendingToolMessage(parse_error))
                 continue
             assert args is not None
+            known_tool_args[call.id] = args
 
             # 地图 agent 仍复用普通文本编辑工具；服务端而非模型负责绑定该标记，
             # 使前端可应用地图作者目标白名单与普通审批路径。
@@ -1974,7 +2064,30 @@ async def run_turn(
                     frame.id,
                     sorted(activated),
                 )
-            frame.messages.append(_tool_message(item.call_id, result, is_error=is_error))
+            frame.messages.append(
+                _tool_message(
+                    item.call_id,
+                    result,
+                    is_error=is_error,
+                    tool_name=item.tool.name,
+                    tool_args=item.args,
+                )
+            )
+
+        # 完成的工具结果立即并入当前轮 Markdown 工具记忆（任务 3.2）；
+        # 活跃轮协议窗口溢出时原子移除最老完整组，Markdown 段落保留。
+        sync_current_turn_memory(
+            frame.context_memory,
+            frame.messages,
+            tool_args=known_tool_args,
+            origin="server",
+        )
+        if context_settings is not None:
+            enforce_active_group_window(
+                frame.messages,
+                frame.context_memory,
+                window=context_settings.active_group_window,
+            )
 
         if front_calls:
             session.set_pending(

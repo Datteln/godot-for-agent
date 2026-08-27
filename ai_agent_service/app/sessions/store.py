@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, CompactSnapshot, Frame
+from app.context.models import ContextMemoryState
 from app.llm.class_docs import sanitize_class_docs_messages
 from app.permissions.engine import SessionAllowGrant
 from app.storage.atomic import atomic_write_json
@@ -211,9 +212,9 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
         仅含 JSON 原生类型的字典；`agent` 只保留 `agent_name`，恢复时
         重新从内置 agent 注册表解析，避免持久化大段 prompt 文本。
 
-    持久化边界兜底（任务 4.3）：任何时刻写盘前都确保已被模型消费的
-    `read_class_docs` 结果只以受限占位符存在，完整 ClassDB/API 文本
-    绝不进入会话持久化。
+    持久化边界兜底：任何时刻写盘前都确保旧式 `read_class_docs` JSON
+    结果只以受限占位符存在；新的有界 Markdown 查询记忆可保留，但完整
+    ClassDB/API 文本绝不进入会话持久化。
     """
     sanitize_class_docs_messages(frame.messages)
     return {
@@ -244,6 +245,7 @@ def _frame_to_dict(frame: Frame) -> dict[str, Any]:
             if frame.compact_snapshot is not None
             else None
         ),
+        "context_memory": frame.context_memory.to_dict(),
     }
 
 
@@ -291,6 +293,9 @@ def _frame_from_dict(data: dict[str, Any], available_tools: set[str]) -> Frame:
         history_anchor_frame_id=data.get("history_anchor_frame_id"),
         history_anchor_message_index=data.get("history_anchor_message_index"),
         compact_snapshot=compact_snapshot,
+        # 新会话格式要求持久化帧包含 Markdown 上下文记忆；缺失字段代表旧格式，
+        # 不再静默降级为一份空记忆，以免丢失模型继续任务所需的事实。
+        context_memory=ContextMemoryState.from_dict(data["context_memory"]),
     )
 
 

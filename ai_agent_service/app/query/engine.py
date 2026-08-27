@@ -59,6 +59,21 @@ from app.api.schemas import (
     VerifyStartedHistoryBlock,
 )
 from app.config import AppSettings
+from app.context.consolidation import render_memory_for_summary, semantic_consolidate
+from app.context.grouping import group_messages, terminalize_pending_groups
+from app.context.memory import (
+    enforce_active_group_window,
+    enforce_memory_budget,
+    mark_verified,
+    mechanical_merge_removed_messages,
+    normalize_editor_context,
+    retain_recent_turns,
+    strip_historical_editor_context,
+    sync_current_turn_memory,
+)
+from app.context.models import ContextMemoryState
+from app.context.projection import ContextProjectionSettings, project_frame_messages
+from app.context.tool_markdown import render_terminal_markdown, render_tool_result_markdown
 from app.events.store import Event, EventStore
 from app.llm.cache_decision_engine import CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector
@@ -94,22 +109,12 @@ from app.transcript.writer import TranscriptWriter
 from app.verify.syntax_check import run_syntax_check
 
 logger = logging.getLogger(__name__)
-_MODEL_LOG_FIELDS = frozenset({"model", "primary_model", "fallback_model"})
-
-
 def _normalize_model_override(model: str | None) -> str | None:
     """清理请求级模型覆盖；空白值等同于未指定。"""
     if model is None:
         return None
     normalized = model.strip()
     return normalized or None
-
-
-def _event_payload_for_log(payload: dict[str, Any]) -> dict[str, Any]:
-    """隐藏事件日志中的模型名，不影响发送给 UI 的原始事件。"""
-    return {
-        key: "<redacted>" if key in _MODEL_LOG_FIELDS else value for key, value in payload.items()
-    }
 
 
 def _response_from_dict(data: dict[str, Any]) -> ChatResponse:
@@ -153,10 +158,27 @@ def _step_to_response(step: StepResult) -> ChatResponse:
     raise TypeError(f"未知编排结果类型：{type(step)!r}")
 
 
-def _tool_message(tool_call_id: str, result: Any, *, is_error: bool = False) -> dict[str, Any]:
-    """构造 OpenAI `role=tool` 消息。"""
-    body: Any = {"error": result} if is_error else result
-    content = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+def _tool_message(
+    tool_call_id: str,
+    result: Any,
+    *,
+    is_error: bool = False,
+    tool_name: str = "",
+    tool_args: dict[str, Any] | None = None,
+    origin: str = "front",
+) -> dict[str, Any]:
+    """构造 OpenAI `role=tool` 消息（Markdown 形态）。
+
+    工具返回值在进入模型上下文前统一渲染为 Markdown，`role=tool.content`
+    永不携带序列化结果 JSON，包括看似已序列化 JSON 的字符串结果。
+    """
+    content = render_tool_result_markdown(
+        tool_name or "unknown",
+        tool_args or {},
+        result,
+        is_error=is_error,
+        origin=origin,
+    )
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
 
@@ -1854,6 +1876,21 @@ def _compact_summary_text(previous: CompactSnapshot | None, messages: list[dict[
     return _wrap_compact_summary(_mechanical_summary_body(previous, messages))
 
 
+def _memory_summary_body(previous: CompactSnapshot | None, state: ContextMemoryState) -> str:
+    """机械摘要正文：旧快照正文 + 帧级 Markdown 记忆渲染（任务 4.2）。
+
+    不含原始消息预览或工具 JSON；同一身份的记录在记忆合并阶段已被最新
+    状态取代，此处仅做确定性渲染。
+    """
+    lines: list[str] = []
+    previous_body = _previous_summary_body(previous)
+    if previous_body:
+        lines.extend(["较早压缩快照：", previous_body, ""])
+    lines.append("会话记忆（Markdown，按身份/新鲜度合并）：")
+    lines.append(render_memory_for_summary(state))
+    return "\n".join(lines)
+
+
 def _compact_digest(summary: str) -> str:
     """计算压缩摘要规范化文本的 SHA-256 指纹。"""
     normalized = "\n".join(line.rstrip() for line in summary.strip().splitlines())
@@ -2009,7 +2046,7 @@ class QueryEngine:
             last_event_seq=snapshot_cursor,
             pending_turn_id=pending_turn_id,
             context_used_tokens=context_used_tokens,
-            context_token_limit=self._settings.auto_compact_token_threshold,
+            context_token_limit=self._settings.context_budget_tokens,
             items=[],
             blocks=[],
             transcript=snapshot,
@@ -2269,6 +2306,31 @@ class QueryEngine:
             # 所有本轮可见条目都使用它，Stop 后下一轮绝不会复用旧身份。
             session.transcript_turn_id = session.new_turn_id()
             frame.messages.append({"role": "user", "content": _build_user_content(request)})
+            # 当前轮记忆身份 + 编辑器上下文归一化（任务 3.4）：历史快照被有界
+            # 事实取代，当前请求保留完整载荷；超出保留数的完整用户轮按轮边界
+            # 收拢进 Markdown 记忆（任务 2.3）。
+            memory_state = frame.context_memory
+            memory_state.current_turn_id = session.transcript_turn_id
+            editor_payload: dict[str, Any] = {}
+            if request.context is not None:
+                editor_payload["context"] = request.context.model_dump(exclude_none=True)
+            if request.language_hint is not None:
+                editor_payload["language_hint"] = request.language_hint
+            if request.engine_version is not None:
+                editor_payload["engine_version"] = request.engine_version
+            if editor_payload:
+                normalize_editor_context(
+                    memory_state, editor_payload, turn_id=session.transcript_turn_id
+                )
+            strip_historical_editor_context(
+                frame.messages, protected_from=len(frame.messages) - 1
+            )
+            retain_recent_turns(
+                frame.messages,
+                memory_state,
+                retained_turns=self._settings.context_retained_turns,
+                protected_from=len(frame.messages) - 1,
+            )
             session.pending_verify_candidates.clear()
             self._transcript.record_user_message(
                 session,
@@ -2304,8 +2366,8 @@ class QueryEngine:
             logger.info(
                 "Auto-compact triggered session=%s threshold=%d keep_recent=%d",
                 session.session_id,
-                self._settings.auto_compact_token_threshold,
-                self._settings.auto_compact_keep_recent,
+                self._settings.context_budget_tokens,
+                self._settings.context_retained_turns,
             )
             await self._compact_locked(
                 session.session_id,
@@ -2381,7 +2443,8 @@ class QueryEngine:
                 event_callback=emit_turn_event,
                 cache_engine=self._cache_engine,
                 cache_metrics=self._cache_metrics,
-                context_token_limit=self._settings.auto_compact_token_threshold,
+                context_token_limit=self._settings.context_budget_tokens,
+                context_settings=self._context_projection_settings(),
             )
         response = _step_to_response(step)
         if isinstance(response, ChatFinalResponse) and session.pending_verify_candidates:
@@ -2420,7 +2483,8 @@ class QueryEngine:
                         event_callback=emit_verify_turn_event,
                         cache_engine=self._cache_engine,
                         cache_metrics=self._cache_metrics,
-                        context_token_limit=self._settings.auto_compact_token_threshold,
+                        context_token_limit=self._settings.context_budget_tokens,
+                        context_settings=self._context_projection_settings(),
                     )
                 response = _step_to_response(step)
         # 轮次收尾：仍在思考中的 Thought 条目一律完成（耗时以收尾时刻计）。
@@ -2644,6 +2708,7 @@ class QueryEngine:
 
         frames = {frame.id: frame for frame in session.agent_stack}
         verify_candidates: list[dict[str, Any]] = []
+        touched_frame_ids: set[str] = set()
         for result in results:
             frame = frames.get(result.frame_id)
             if frame is None:
@@ -2708,7 +2773,17 @@ class QueryEngine:
                     "error_code": result.error_code,
                     "result": result.result,
                 }
-            frame.messages.append(_tool_message(result.tool_use_id, payload, is_error=is_error))
+            frame.messages.append(
+                _tool_message(
+                    result.tool_use_id,
+                    payload,
+                    is_error=is_error,
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    origin="front",
+                )
+            )
+            touched_frame_ids.add(frame.id)
             logger.info(
                 "Tool result appended session=%s turn_id=%s tool=%s status=%s frame=%s",
                 session.session_id,
@@ -2716,6 +2791,18 @@ class QueryEngine:
                 tool_name,
                 result.status,
                 frame.id,
+            )
+
+        # 完成的 front 工具组立即并入当前轮 Markdown 工具记忆（任务 3.2）；
+        # 协议窗口溢出时原子移除最老完整组，Markdown 段落保留。
+        for frame in frames.values():
+            if frame.id not in touched_frame_ids:
+                continue
+            sync_current_turn_memory(frame.context_memory, frame.messages)
+            enforce_active_group_window(
+                frame.messages,
+                frame.context_memory,
+                window=self._settings.context_active_group_window,
             )
 
         self._transcript.record_front_tool_results(
@@ -2899,6 +2986,9 @@ class QueryEngine:
             }
         )
         session.verify_retry_count[path] = 0 if result.passed else retries + 1
+        if result.passed:
+            # 校验通过把同身份工具记录升级为已验证（新鲜度提升，任务 1.1）。
+            mark_verified(frame.context_memory, tool_name=tool_name, target=path)
         logger.info(
             "Verify semantic finished session=%s path=%s passed=%s issues=%d",
             session.session_id,
@@ -3027,12 +3117,22 @@ class QueryEngine:
                     frame = frames.get(str(metadata.get("frame_id", "")))
                     if frame is None:
                         continue
+                    tool_name = str(metadata.get("name", "") or "unknown")
                     frame.messages.append(
-                        _tool_message(
-                            tool_use_id, "用户中断了当前请求，该工具调用结果未回传。", is_error=True
-                        )
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": render_terminal_markdown(
+                                tool_name,
+                                "cancelled",
+                                detail="用户中断了当前请求，该工具调用结果未回传。",
+                            ),
+                        }
                     )
                     discarded += 1
+                # 终结结果并入工具记忆，保证取消路径也留下 Markdown 事实。
+                for frame in frames.values():
+                    sync_current_turn_memory(frame.context_memory, frame.messages)
                 self._transcript.record_front_tool_results(
                     session,
                     results=[
@@ -3089,10 +3189,20 @@ class QueryEngine:
                 frame = frames.get(str(metadata.get("frame_id", "")))
                 if frame is None:
                     continue
+                tool_name = str(metadata.get("name", "") or "unknown")
                 frame.messages.append(
-                    _tool_message(tool_use_id, "用户放弃了该工具调用的结果回传。", is_error=True)
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": render_terminal_markdown(
+                            tool_name,
+                            "rejected",
+                            detail="用户放弃了该工具调用的结果回传。",
+                        ),
+                    }
                 )
                 discarded += 1
+                sync_current_turn_memory(frame.context_memory, frame.messages)
 
             self._transcript.record_front_tool_results(
                 session,
@@ -3139,20 +3249,48 @@ class QueryEngine:
             "Session output style changed session=%s output_style=%s", session_id, output_style
         )
 
+    def _context_projection_settings(self) -> ContextProjectionSettings:
+        """从服务配置构造上下文投影参数（任务 4.4）。"""
+        return ContextProjectionSettings(
+            budget_tokens=self._settings.context_budget_tokens,
+            retained_turns=self._settings.context_retained_turns,
+            active_group_window=self._settings.context_active_group_window,
+        )
+
     def _needs_auto_compact(self, session: Session) -> bool:
-        """判断当前会话是否有任意帧的预估 token 数超过自动压缩阈值。
+        """判断是否需要进入自动收拢边界。
 
         Args:
             session: 当前会话（已追加本轮新消息/工具结果）。
 
         Returns:
-            只要 `agent_stack` 中任意一帧超过 `auto_compact_token_threshold`
-            即返回 True；`compact()` 本身会对所有超过 `keep_recent` 消息数的
-            帧分别处理，这里只需判断"值不值得调用一次"。
+            实际投影超过 `context_budget_tokens` 时必须收拢；保留旧的
+            `auto_compact_token_threshold` 作为更低时的机械预收拢阈值，
+            以避免异常大的原始消息长期滞留。预收拢不会单独触发语义模型。
         """
-        threshold = self._settings.auto_compact_token_threshold
-        return any(
-            estimate_message_tokens(frame.messages) > threshold for frame in session.agent_stack
+        settings = self._context_projection_settings()
+        projection_exceeds_budget = any(
+            estimate_message_tokens(
+                project_frame_messages(
+                    frame.messages,
+                    frame.context_memory,
+                    settings=settings,
+                    pending_call_ids=(
+                        set(session.pending_tool_call_ids)
+                        if session.pending_turn_id is not None
+                        else set()
+                    ),
+                    session_id=session.session_id,
+                    frame_id=frame.id,
+                ).messages
+            )
+            > settings.budget_tokens
+            for frame in session.agent_stack
+        )
+        return projection_exceeds_budget or any(
+            estimate_message_tokens(frame.messages)
+            > self._settings.auto_compact_token_threshold
+            for frame in session.agent_stack
         )
 
     async def compact(
@@ -3184,58 +3322,23 @@ class QueryEngine:
     async def _build_compact_summary(
         self,
         previous: CompactSnapshot | None,
-        old_messages: list[dict[str, Any]],
+        state: ContextMemoryState,
         *,
         use_llm: bool,
     ) -> str:
-        """生成最终压缩摘要：优先 LLM 语义压缩，未启用/失败/空时回退确定性机械拼接。"""
-        if use_llm and old_messages:
-            body = await self._summarize_via_llm(previous, old_messages)
-            if body:
-                return _wrap_compact_summary(body)
-        return _compact_summary_text(previous, old_messages)
+        """生成最终压缩摘要（任务 4.2）：优先语义合并，失败/禁用时机械渲染。
 
-    async def _summarize_via_llm(
-        self, previous: CompactSnapshot | None, old_messages: list[dict[str, Any]]
-    ) -> str | None:
-        """调用 LLM 把旧摘要与本次移除消息综合成单一连贯摘要正文；失败返回 None。
-
-        采用 ``temperature=0`` 与 ``thinking_budget=0``，尽量让同一输入得到稳定输出，
-        从而稳定 `compact_digest`、减少远端缓存版本抖动（§9/§10）。任何 `LLMError`
-        或空响应都被吞掉并返回 None，由调用方回退到机械摘要——压缩绝不因摘要失败
-        而中断本轮请求（§12：失败不得停留在半压缩状态）。
+        合并对象是帧级 Markdown 记忆（按身份/新鲜度组织），不再是原始消息
+        预览或工具 JSON；语义合并仅在压缩边界（整体预算越界/手动 /compact）
+        调用，失败时确定性回退为记忆的机械 Markdown 渲染。
         """
-        source = _mechanical_summary_body(previous, old_messages)
-        if not source.strip():
-            return None
-        instructions = (
-            "你是会话历史压缩器。请把下面这段较早的对话上下文压缩成简洁、忠实的中文摘要，"
-            "保留关键决策、结论、涉及的文件路径与符号、以及尚未完成的事项；不要编造，不要补充原文没有的信息。"
-            "若其中已包含『较早压缩快照』，请把它与新内容融合成单一连贯摘要，不要罗列多份摘要。"
-            "只输出摘要正文，不要添加任何前后缀或标记。"
-        )
-        model = self._settings.compact_summary_model or self._model_for_effort("quick")
-        try:
-            turn = await self._llm.chat(
-                messages=[
-                    {"role": "system", "content": instructions},
-                    {"role": "user", "content": source},
-                ],
-                tools=[],
-                model=model,
-                temperature=0.0,
-                thinking_budget=0,
+        if use_llm:
+            model = (
+                self._settings.context_consolidation_model
+                or self._model_for_effort("quick")
             )
-        except LLMError as exc:
-            logger.warning("Compact LLM summarize failed, falling back to mechanical: %s", exc)
-            return None
-        text = (turn.content or "").strip()
-        if not text:
-            logger.warning(
-                "Compact LLM summarize returned empty content, falling back to mechanical"
-            )
-            return None
-        return text
+            await semantic_consolidate(state, self._llm, model=model)
+        return _wrap_compact_summary(_memory_summary_body(previous, state))
 
     async def _compact_locked(
         self,
@@ -3247,8 +3350,29 @@ class QueryEngine:
         """在已持有会话锁时执行压缩；不要在未持锁路径直接调用。"""
         session = self._store.get_or_create(session_id, self.available_tools)
         trigger: Literal["manual", "auto"] = "auto" if triggered_by == "auto" else "manual"
-        summary_use_llm = (
-            self._settings.compact_summary_use_llm if use_llm is None else use_llm
+        requested_summary_use_llm = (
+            self._settings.context_consolidation_use_llm if use_llm is None else use_llm
+        )
+        projected_over_budget = any(
+            estimate_message_tokens(
+                project_frame_messages(
+                    frame.messages,
+                    frame.context_memory,
+                    settings=self._context_projection_settings(),
+                    pending_call_ids=(
+                        set(session.pending_tool_call_ids)
+                        if session.pending_turn_id is not None
+                        else set()
+                    ),
+                    session_id=session.session_id,
+                    frame_id=frame.id,
+                ).messages
+            )
+            > self._settings.context_budget_tokens
+            for frame in session.agent_stack
+        )
+        summary_use_llm = requested_summary_use_llm and (
+            trigger == "manual" or projected_over_budget
         )
         logger.info(
             "Compacting session session=%s keep_recent=%d triggered_by=%s",
@@ -3265,7 +3389,12 @@ class QueryEngine:
         estimated_tokens_before = 0
         estimated_tokens_after = 0
         backups = [
-            (frame, copy.deepcopy(frame.messages), copy.deepcopy(frame.compact_snapshot))
+            (
+                frame,
+                copy.deepcopy(frame.messages),
+                copy.deepcopy(frame.compact_snapshot),
+                copy.deepcopy(frame.context_memory),
+            )
             for frame in session.agent_stack
         ]
 
@@ -3284,11 +3413,36 @@ class QueryEngine:
             },
         )
 
+        # 压缩前先把无活跃等待方的尾部挂起组终结（取消/超时/重置路径的
+        # 前提）：补齐配对终结结果后才允许进入保留/收拢。
+        live_pending = (
+            set(session.pending_tool_call_ids) if session.pending_turn_id is not None else set()
+        )
+        for frame in session.agent_stack:
+            stale_ids: set[str] = set()
+            for group in group_messages(frame.messages):
+                if group.kind == "tool_group" and not group.complete:
+                    stale_ids.update(
+                        call_id for call_id in group.missing_ids if call_id not in live_pending
+                    )
+            if stale_ids:
+                terminalize_pending_groups(frame.messages, "reset", pending_call_ids=stale_ids)
+                sync_current_turn_memory(frame.context_memory, frame.messages, origin="system")
+
         for frame in session.agent_stack:
             frame_tokens_before = estimate_message_tokens(frame.messages)
             estimated_tokens_before += frame_tokens_before
             frame_changed = False
             anchor = _pending_anchor_index(frame, session.pending_tool_call_ids)
+            retained_removed = retain_recent_turns(
+                frame.messages,
+                frame.context_memory,
+                retained_turns=self._settings.context_retained_turns,
+                protected_from=anchor,
+            )
+            if retained_removed:
+                removed_messages += retained_removed
+                frame_changed = True
             # 超大单条消息的截断独立于"按消息数收拢"逐帧执行：不依赖
             # `len(frame.messages) <= keep + 2` 的早退判断，否则消息数很少但单条
             # 巨大的帧会被完全跳过（见 `_truncate_oversized_message` 文档）。排除
@@ -3306,12 +3460,34 @@ class QueryEngine:
                     frame_changed = True
 
             if len(frame.messages) <= keep + 1:
+                adjusted = enforce_memory_budget(
+                    frame.context_memory,
+                    budget_tokens=self._settings.context_budget_tokens,
+                    baseline_tokens=estimate_message_tokens(frame.messages),
+                )
+                if adjusted or trigger == "manual":
+                    await self._build_compact_summary(
+                        frame.compact_snapshot,
+                        frame.context_memory,
+                        use_llm=summary_use_llm,
+                    )
+                    enforce_memory_budget(
+                        frame.context_memory,
+                        budget_tokens=self._settings.context_budget_tokens,
+                        baseline_tokens=estimate_message_tokens(frame.messages),
+                    )
+                    frame_changed = True
                 estimated_tokens_after += estimate_message_tokens(frame.messages)
                 if frame_changed:
                     modified_frame_ids.append(frame.id)
                 continue
             default_start = max(1, len(frame.messages) - keep)
             keep_from = min(default_start, anchor) if anchor is not None else default_start
+            # 保留边界对齐完整协议组/用户轮（任务 2.3）：绝不切开工具协议组。
+            for group in group_messages(frame.messages):
+                if group.start <= keep_from < group.end and group.start >= 1:
+                    keep_from = group.start
+                    break
             if keep_from <= 1:
                 estimated_tokens_after += estimate_message_tokens(frame.messages)
                 if frame_changed:
@@ -3326,14 +3502,28 @@ class QueryEngine:
             if (
                 trigger == "auto"
                 and len(old_messages) < self._settings.auto_compact_min_new_messages
+                and not projected_over_budget
             ):
                 estimated_tokens_after += estimate_message_tokens(frame.messages)
                 if frame_changed:
                     modified_frame_ids.append(frame.id)
                 continue
+            # 被收拢消息机械并入帧级 Markdown 记忆（按身份/新鲜度），不再保留
+            # 原始消息预览或工具 JSON（任务 4.2）；预算内约束记忆体积。
+            mechanical_merge_removed_messages(frame.context_memory, old_messages)
+            enforce_memory_budget(
+                frame.context_memory,
+                budget_tokens=self._settings.context_budget_tokens,
+                baseline_tokens=estimate_message_tokens(frame.messages[keep_from:]),
+            )
             previous = frame.compact_snapshot
             summary = await self._build_compact_summary(
-                previous, old_messages, use_llm=summary_use_llm
+                previous, frame.context_memory, use_llm=summary_use_llm
+            )
+            enforce_memory_budget(
+                frame.context_memory,
+                budget_tokens=self._settings.context_budget_tokens,
+                baseline_tokens=estimate_message_tokens(frame.messages[keep_from:]),
             )
             digest = _compact_digest(summary)
             revision = (
@@ -3388,9 +3578,10 @@ class QueryEngine:
         try:
             self._store.save(session)
         except Exception:
-            for frame, messages, backup_snapshot in backups:
+            for frame, messages, backup_snapshot, backup_memory in backups:
                 frame.messages = messages
                 frame.compact_snapshot = backup_snapshot
+                frame.context_memory = backup_memory
             raise
         if modified_frame_ids:
             self._cache_engine.invalidate(session_id, modified_frame_ids)
@@ -3659,12 +3850,11 @@ class QueryEngine:
         `EventStore` 从持久化游标继续编号，保证展示稿快照的
         `upto_event_seq` 与 WebSocket `after_seq` 始终同一序号空间。
         """
-        log_payload = _event_payload_for_log(payload)
         logger.debug(
-            "Event emitted session=%s type=%s payload=%s",
+            "Event emitted session=%s type=%s payload_keys=%s",
             session_id,
             event_type,
-            json.dumps(log_payload, ensure_ascii=False, default=str),
+            sorted(payload),
         )
         session = self._store.get_or_create(session_id, self.available_tools)
         if event_type in _PERSISTED_HISTORY_EVENT_TYPES:

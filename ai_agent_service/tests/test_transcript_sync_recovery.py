@@ -520,12 +520,16 @@ class ClassDocsEphemeralFactsTests(unittest.TestCase):
                                 break
                             self.assertNotIn(marker, json.dumps(message, ensure_ascii=False))
 
-                    # 持久化会话帧：模型消费后仅剩短暂占位符。
+                    # 持久化会话帧：结果以有界 Markdown 工具记忆保留（类名/
+                    # 模式/被查询成员名），完整 ClassDB 文本不落盘，也不再使用
+                    # 不透明的过期占位符（optimize-llm-conversation-context 任务 3.5）。
                     session_files = list((root / ".ai_agent_service" / "sessions").glob("*.json"))
                     self.assertTrue(session_files)
                     persisted = "\n".join(path.read_text(encoding="utf-8") for path in session_files)
                     self.assertNotIn(marker, persisted)
-                    self.assertIn(EPHEMERAL_MARK, persisted)
+                    self.assertIn("TileMap", persisted)
+                    self.assertIn("set_cell", persisted)
+                    self.assertIn("tool_records", persisted)
 
 
 class ClassInfoTileMapRegressionTests(unittest.TestCase):

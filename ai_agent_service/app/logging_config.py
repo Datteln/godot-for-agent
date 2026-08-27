@@ -9,6 +9,8 @@ from pathlib import Path
 
 _DEFAULT_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 _VALID_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+_NOISY_DEPENDENCY_LOGGERS = ("openai", "httpx", "httpcore")
+"""可能在 DEBUG 下转储完整请求或响应载荷的第三方日志器。"""
 
 # 单个日志文件最大 10 MB，保留最近 5 个轮转文件。
 _MAX_LOG_BYTES = 10 * 1024 * 1024
@@ -69,6 +71,10 @@ def configure_logging(level: str, log_dir: Path | None = None, console: bool = T
             只依赖文件日志。
     """
     normalized = normalize_log_level(level)
+    # 服务自身允许 DEBUG 用于排障，但 SDK/HTTP 调试日志会包含完整模型请求，
+    # 因此始终限制到 WARNING，避免提示词、工具结果和流式正文被写入磁盘。
+    for logger_name in _NOISY_DEPENDENCY_LOGGERS:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
     root = logging.getLogger()
     if root.handlers:
         root.setLevel(normalized)

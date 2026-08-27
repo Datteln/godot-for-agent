@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+from app.context.models import ContextMemoryState
+
 EffortLevel = Literal["quick", "standard", "deep", "verify", "advisor"]
 
 # 与 `EffortLevel` 字面量保持一致，供运行时校验（如 `agents/loader.py`）使用。
@@ -135,7 +137,9 @@ class Frame:
         depth: 帧深度，根帧为 0，供 `MAX_DEPTH` 防御性约束使用（M2+）。
         active_deferred_tools: 本帧通过 `search_tools` 激活的 deferred 工具名；
             只在本帧内生效，不提升权限、不跨 agent 继承。
-        compact_snapshot: 当前帧最近一次有效压缩的持久化快照；未压缩时为 None。
+        compact_snapshot: 当前帧最近一次有效压缩的持久化快照；未压缩时为 None。
+        context_memory: 帧级 Markdown 会话/工具记忆状态（模型上下文投影的
+            长期来源），与 `messages` 并列持久化；权威可见展示稿不受其影响。
     """
 
     id: str
@@ -150,3 +154,4 @@ class Frame:
     history_anchor_frame_id: str | None = None
     history_anchor_message_index: int | None = None
     compact_snapshot: CompactSnapshot | None = None
+    context_memory: ContextMemoryState = field(default_factory=ContextMemoryState)
