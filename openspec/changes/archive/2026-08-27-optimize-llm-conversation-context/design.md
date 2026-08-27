@@ -4,7 +4,7 @@
 
 The result is a mixed-purpose message list: durable UI history is correct and complete, but prompt history accumulates stale editor snapshots and verbose JSON results. The existing 200k-token automatic compaction retains a fixed recent message count and summarizes older messages, which can split a logical tool protocol group and does not model fact freshness.
 
-The design must preserve the authoritative transcript, existing session persistence, OpenAI tool-call ordering, prompt-cache compatibility, active delegated frames, and current HTTP/WebSocket contracts.
+The design must preserve the authoritative transcript, existing session persistence, OpenAI tool-call ordering, prompt-cache compatibility, active delegated frames, and current HTTP/WebSocket contracts. It must also avoid making resident session memory a second unbounded copy of project files, editor snapshots, diagnostics, or tool output.
 
 ## Goals / Non-Goals
 
@@ -15,6 +15,9 @@ The design must preserve the authoritative transcript, existing session persiste
 - Retain recent history in complete user-turn and tool-protocol groups.
 - Make long-lived context explicit: goals, constraints, decisions, verified facts, completed/pending work, current editor targets, and freshness metadata.
 - Make actual outgoing model messages inspectable through redacted structural diagnostics and deterministic tests.
+- Make source retrieval evidence-led and selector-based so the model receives the smallest useful source fragment, not an opaque or complete payload by default.
+- Keep full volatile evidence recoverable without keeping it resident in memory or model context.
+- Enforce the 200k model-context budget as a pre-provider-request hard gate.
 
 **Non-Goals:**
 
@@ -22,6 +25,7 @@ The design must preserve the authoritative transcript, existing session persiste
 - Persisting or replaying private model reasoning as model context.
 - Guaranteeing that a compressed fact replaces a fresh source read; high-risk actions must still re-read current project state.
 - Introducing a vector database or cross-session memory.
+- Retaining all project files, serialized scene payloads, or tool returns in session RAM merely because they were observed once.
 
 ## Decisions
 
@@ -53,17 +57,41 @@ The durable memory is injected into outgoing requests as one named `[conversatio
 
 Alternative: retain JSON result objects for the recent protocol window. Rejected because JSON adds protocol noise and token overhead without improving readability; Markdown is valid string content for `role=tool` and preserves the useful result information.
 
-### 4. Normalize editor context into replaceable current state
+### 4. Treat tool output as source-aware evidence, not default prompt text
 
-The current user message contains its complete editor-context payload so the active request has full fidelity. At the next safe compaction boundary, extract a bounded canonical editor state and replace superseded historical editor payloads. Facts with the same scene/node/file identity are overwritten by the newer state.
+Every tool result becomes a normalized Markdown evidence record with a stable evidence id, source kind, target/locator, freshness or source fingerprint, concise facts, and an optional sidecar reference. A locator is the exact way to retrieve more evidence: for example a code symbol or line range, configuration key/JSON path, scene node/property/resource id, map bounds/layer, log error id/time window, or runtime node/property set.
 
-Alternative: retain every editor JSON snapshot until global compaction. Rejected because it repeats transient inspector state and makes current targets ambiguous.
+The first result from an inspect/search operation is a manifest or summary containing these locators. The model asks for an exact locator only when its current task needs the detail. `read_file` remains the precise text tool for an already located ordinary text range; it SHALL not become an implicit full-document/large-physical-line reader. A structured, generated, or machine-dense source (for example a long `Packed*Array`, `tile_data`, minified document, or opaque diagnostic dump) yields an identity-bearing Markdown notice and supported follow-up selectors rather than the complete physical line.
 
-### 5. Retain recent complete turns, then compact by budget
+This is a source-semantics policy rather than a new per-tool-category Markdown length cap. The first model-visible representation must be structurally useful and retrievable; a later exact selector is allowed to return the specific bounded evidence necessary to finish the task.
+
+Alternative: rely only on agent prompt wording to request smaller reads. Rejected because prompt guidance cannot make line paging safe for one-line generated data and cannot guarantee that all tool renderers expose their useful fields.
+
+### 5. Use a hybrid, session-scoped Markdown evidence store
+
+The selected storage policy is hybrid:
+
+- Reproducible sources (project files, resources that can be read again, RAG/search candidates) retain in the session only Markdown facts, locator, source fingerprint, and freshness. Their complete content is re-read from the current source when needed.
+- Volatile or non-repeatable sources (front-end/editor observations, unsaved runtime state, debugger/profiler snapshots, diagnostics, and command output) write normalized Markdown evidence to a session-scoped sidecar. Resident session state keeps only the evidence index, summary, locator, freshness, content hash, and sidecar path.
+- Sidecars contain Markdown rather than raw tool-result JSON. Identical normalized content is content-hash deduplicated. They are deleted with a reset/deleted session and are not cross-session memory.
+
+Map observations are volatile evidence. A `describe_map_region` record stores its target path, map layer, observed bounds, scene/editor freshness marker, and semantic Markdown. Before any map mutation the relevant bounds MUST be observed again; previous sidecar evidence can explain prior reasoning but cannot establish current write facts.
+
+Alternative: RAM-only LRU. Rejected because it recreates memory growth and loses evidence after restart. Alternative: write every reproducible file body to disk. Rejected because a locator plus fingerprint preserves recoverability without duplicating the project on disk. Alternative: add SQLite/vector storage. Rejected as unnecessary complexity and cross-session scope expansion.
+
+### 6. Normalize editor context into replaceable current evidence
+
+Before prompt projection, normalize the current editor payload into a Markdown editor-evidence manifest: current selection, scene/node identity, relevant diagnostics count, known files, engine/language facts, and supported front-tool locators. The raw transport payload remains available to frontend/transcript handling but is not copied into the model user message. Facts with the same scene/node/file identity are overwritten by newer evidence.
+
+Alternative: retain every editor JSON snapshot until global compaction. Rejected because it repeats transient inspector state, can be arbitrarily large even in the active request, and makes current targets ambiguous.
+
+### 7. Retain recent complete turns, then compact by a hard outgoing budget
 
 Replace fixed "recent messages" retention with configurable complete user/assistant-turn retention plus a token budget. Prior completed turns contain no raw tool protocol groups; their tool information resides in durable Markdown tool memory. Within the active turn, the system preserves a configurable active-group window (default 12) and folds older groups into current-turn Markdown memory. If the projected overall context exceeds its budget, automatic compact invokes the quick model to merge older Markdown conversation/tool memory by target and freshness; manual compact invokes the same path on demand. No per-tool-category Markdown cap triggers this work. The system prompt, current request, and any pending tool group are protected. The settings also select the quick-consolidation model/feature behavior; disabling it uses mechanical merging only.
 
-The budget decision is made from the exact outgoing projection, including every injected memory section, and is rechecked after semantic consolidation. Normal-turn records are never deduplicated; only an overall-budget compaction may merge records by identity and freshness, after preserving parsed tool arguments needed to identify their targets. A projection with a protocol violation is never sent to the provider: stale terminalization is persisted first, and any remaining violation fails the turn safely.
+Before **every** provider request in an agent loop, calculate a provider-compatible or conservative upper-bound token count over the exact outgoing projection: system layers, tool schemas, RAG, editor evidence, conversation/evidence memory, ordinary messages, and protected protocol groups. If it exceeds the configured limit, first evict prompt detail that has an evidence locator while retaining the fact card and reference; then consolidate older Markdown memory. If it still exceeds the limit, the service fails safely instead of sending an over-budget request. The count is rechecked after every compaction/consolidation.
+
+Normal-turn records are never deduplicated merely due to a count window; only an overall-budget compaction may merge records by identity and freshness, after preserving parsed tool arguments needed to identify their targets. A projection with a protocol violation is never sent to the provider: stale terminalization is persisted first, and any remaining violation fails the turn safely. Matching current-turn evidence MUST NOT be injected into the memory block while its same result remains in a retained raw protocol group, preventing a second model-visible copy.
 
 The pre-existing raw-message threshold may still initiate a **mechanical** early cleanup for anomalously large histories, but it never authorizes quick-model semantic consolidation; that model remains limited to projected-budget overflow and explicit manual compact.
 
@@ -72,7 +100,7 @@ mechanical early-cleanup threshold while keeping their distinct roles: projected
 overflow controls semantic consolidation, whereas the legacy threshold can only cause
 mechanical cleanup.
 
-### 6. Keep diagnostics structural even at DEBUG level
+### 8. Keep diagnostics structural even at DEBUG level
 
 Context audits and internal event logs serve different debugging needs. Context audits retain
 only counts and identities. Generic event emission logging likewise records only the event
@@ -84,7 +112,7 @@ The OpenAI SDK and its HTTP dependencies are pinned to `WARNING` even when the a
 logger is at `DEBUG`, because their DEBUG records can serialize complete outgoing requests.
 This is both a log-volume guard and a prompt/tool-payload confidentiality boundary.
 
-### 7. Make map selection an optional accelerator, not target discovery
+### 9. Make map selection an optional accelerator and map regions semantic evidence
 
 `describe_tilemap_selection` has no target-path parameter and is implemented by the Godot
 front end against the currently selected `TileMapLayer`; it cannot discover a map node and
@@ -96,6 +124,8 @@ Otherwise the agent first confirms a node path from scene facts and issues bound
 returns its known `Select a TileMapLayer first` error, preventing repeated zero-argument
 calls. The error remains a normal Markdown tool result so the OpenAI protocol stays valid.
 
+`describe_map_region` is already a bounded front-end observation; its Markdown renderer MUST preserve the semantic fields that an agent needs: target/type/dimension/layer, coordinate basis, node position, tile/cell size, requested and observed bounds, truncation and next-query metadata, legacy layer metadata, tile identities, and compact row runs. It MUST render a successful observation as map evidence rather than only `ok: true`, and it MUST NOT expose serialized `.tscn` `tile_data` or front-end result JSON. Per-cell detail is only included when the requested bounded region needs exact cell inspection; row runs are the default representation for terrain shape and reuse of real tile identities.
+
 ## Risks / Trade-offs
 
 - [A Markdown tool record is stale or omits a detail] → attach source/freshness metadata, merge records by target, preserve useful excerpts, and require fresh reads before edits or high-risk actions.
@@ -105,6 +135,9 @@ calls. The error remains a normal Markdown tool result so the OpenAI protocol st
 - [A cancellation or client-side terminal path leaves a pending tool call] → synthesize the matching terminal Markdown result before retention/compaction and validate the resulting group.
 - [A child-frame result is lost when its frame is popped] → merge child Markdown memory into the parent delegation result before disposal.
 - [One otherwise-valid result exceeds the hard remaining context window] → retain an identity-bearing range/continuation record and require a bounded follow-up read.
+- [A compact renderer hides the facts that made a tool useful] → define semantic Markdown fields and renderer tests for every structured high-value source; successful map observations must expose bounds and row runs, not just transport status.
+- [Evidence sidecars grow without bound] → store only volatile normalized Markdown, keep reproducible sources as locators, content-hash deduplicate, and remove sidecars when a session is reset or deleted.
+- [The local token estimate is lower than provider accounting] → include tool schemas and all projection layers in a conservative pre-request count, reserve margin, and fail safely if the hard gate cannot make the request fit.
 
 ## Open Questions
 

@@ -19,10 +19,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.context.evidence import reduce_tool_record_detail
 from app.context.grouping import group_messages, terminalize_pending_groups, validate_projection
-from app.context.memory import render_memory_block
+from app.context.memory import enforce_memory_budget, render_memory_block
 from app.context.models import ContextMemoryState
-from app.llm.message_transformer import estimate_message_tokens
+from app.llm.message_transformer import estimate_message_tokens, estimate_request_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,10 @@ def build_context_audit(
     user_messages = sum(1 for message in messages if message.get("role") == "user")
     return {
         "message_count": len(messages),
+        # 保留原字段作为同一会话内的压缩趋势指标，避免把请求包装开销变化
+        # 误判为记忆正文膨胀；硬预算必须读取下面的 conservative_tokens。
         "estimated_tokens": estimate_message_tokens(messages),
+        "conservative_tokens": estimate_request_tokens(messages),
         "retained_turns": user_messages,
         "protocol_groups": len(tool_groups),
         "pending_groups": len(pending_groups),
@@ -90,6 +94,7 @@ def build_context_audit(
         "durable_tool_records": len(state.tool_records),
         "current_turn_records": len(state.current_turn_records),
         "editor_facts": len(state.editor_facts),
+        "evidence_references": len(state.evidence_index),
         "memory_revision": state.revision,
     }
 
@@ -140,7 +145,12 @@ def project_frame_messages(
         else:
             break
 
-    memory_block = render_memory_block(state)
+    # 任务 8.6：仍保留在出站协议组里的结果，不通过记忆块二次注入。
+    retained_call_ids: set[str] = set()
+    for group in group_messages(projected):
+        if group.kind == "tool_group":
+            retained_call_ids.update(group.call_ids)
+    memory_block = render_memory_block(state, exclude_call_ids=retained_call_ids)
     memory_injected = bool(memory_block.strip())
     if memory_injected:
         projected.insert(system_end, {"role": "system", "content": memory_block})
@@ -148,12 +158,13 @@ def project_frame_messages(
     final_violations = validate_projection(projected)
     audit = build_context_audit(projected, state, memory_injected=memory_injected)
     logger.info(
-        "Context audit session=%s frame=%s messages=%d tokens=%d turns=%d groups=%d "
+        "Context audit session=%s frame=%s messages=%d tokens=%d conservative=%d turns=%d groups=%d "
         "pending=%d durable_records=%d current_records=%d memory=%s violations=%d",
         session_id,
         frame_id,
         audit["message_count"],
         audit["estimated_tokens"],
+        audit["conservative_tokens"],
         audit["retained_turns"],
         audit["protocol_groups"],
         audit["pending_groups"],
@@ -163,3 +174,97 @@ def project_frame_messages(
         len(final_violations),
     )
     return ContextProjection(messages=projected, audit=audit, violations=final_violations)
+
+@dataclass
+class BudgetResult:
+    """一次硬性预算门检查的结果。
+
+    Attributes:
+        passed: 投影（含工具 schema）是否落在预算内。
+        estimated_tokens: 最终保守估算的出站总 token 数。
+        budget_tokens: 预算上限。
+        actions: 为满足预算采取的收缩动作描述（仅结构性标识）。
+    """
+
+    passed: bool
+    estimated_tokens: int
+    budget_tokens: int
+    actions: list[str] = field(default_factory=list)
+
+
+def estimate_tools_tokens(tools: list[dict[str, Any]]) -> int:
+    """保守估算工具 schema 的 token 占用（JSON 文本，任务 7.1）。"""
+    if not tools:
+        return 0
+    return estimate_request_tokens([], tools)
+
+
+def apply_hard_budget(
+    projected: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    state: ContextMemoryState,
+    *,
+    budget_tokens: int,
+    memory_index: int | None,
+    retained_call_ids: set[str] | None = None,
+) -> BudgetResult:
+    """出站前的硬性预算门（任务 7.1/8.6）。
+
+    计数覆盖 system 层、记忆块、普通消息、受保护协议组与工具 schema。
+    超预算时依次：收缩有定位符可恢复的记录细节（保留事实卡）→
+    按预算约束记忆记录体积；每次收缩后重渲染记忆块并重新计数。仍超
+    预算时返回 `passed=False`，调用方必须安全失败、不得发送请求。
+
+    Args:
+        projected: 投影后的消息列表（记忆块所在消息会被原地重渲染）。
+        tools: 本次请求可见的工具 schema。
+        state: 帧记忆状态。
+        budget_tokens: 预算（估算 token）。
+        memory_index: 记忆块消息在投影里的下标；None 表示未注入。
+        retained_call_ids: 仍保留协议组的 call id（重渲染时继续排除）。
+
+    Returns:
+        `BudgetResult`。
+    """
+    def _rerender() -> None:
+        if memory_index is not None and 0 <= memory_index < len(projected):
+            block = render_memory_block(state, exclude_call_ids=retained_call_ids or set())
+            if block.strip():
+                projected[memory_index]["content"] = block
+
+    def _total() -> int:
+        return estimate_request_tokens(projected, tools)
+
+    actions: list[str] = []
+    tokens = _total()
+    if tokens <= budget_tokens:
+        return BudgetResult(True, tokens, budget_tokens, actions)
+
+    reduced = reduce_tool_record_detail(state)
+    if reduced:
+        _rerender()
+        actions.append(f"reduced_locator_detail:{reduced}")
+        tokens = _total()
+        if tokens <= budget_tokens:
+            return BudgetResult(True, tokens, budget_tokens, actions)
+
+    memory_baseline = max(_total() - estimate_request_tokens(
+        [projected[memory_index]] if memory_index is not None and 0 <= memory_index < len(projected) else []
+    ), 0)
+    trimmed = enforce_memory_budget(
+        state, budget_tokens=budget_tokens, baseline_tokens=memory_baseline
+    )
+    if trimmed:
+        _rerender()
+        actions.append(f"trimmed_memory_records:{trimmed}")
+        tokens = _total()
+
+    return BudgetResult(tokens <= budget_tokens, tokens, budget_tokens, actions)
+
+def retained_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
+    """收集消息里仍保留的工具协议组的全部 tool_call id（任务 8.6）。"""
+    ids: set[str] = set()
+    for group in group_messages(messages):
+        if group.kind == "tool_group":
+            ids.update(group.call_ids)
+    return ids

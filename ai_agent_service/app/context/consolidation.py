@@ -16,6 +16,7 @@ from typing import Any, Protocol
 
 from app.context.memory import mechanical_merge_removed_messages
 from app.context.models import ContextMemoryState
+from app.llm.message_transformer import estimate_request_tokens
 
 __all__ = [
     "mechanical_merge_removed_messages",
@@ -85,6 +86,7 @@ async def semantic_consolidate(
     llm: _ConsolidationLLM,
     *,
     model: str | None,
+    budget_tokens: int | None = None,
 ) -> bool:
     """用 quick 模型把记忆语义融合成连贯段落（仅压缩边界调用）。
 
@@ -97,12 +99,20 @@ async def semantic_consolidate(
     source = render_memory_for_summary(state)
     if not source.strip():
         return False
+    messages = [
+        {"role": "system", "content": _CONSOLIDATE_INSTRUCTIONS},
+        {"role": "user", "content": source},
+    ]
+    if budget_tokens is not None and estimate_request_tokens(messages) > budget_tokens:
+        logger.warning(
+            "Semantic consolidation request exceeds hard budget; using mechanical merge tokens=%d budget=%d",
+            estimate_request_tokens(messages),
+            budget_tokens,
+        )
+        return False
     try:
         turn = await llm.chat(
-            messages=[
-                {"role": "system", "content": _CONSOLIDATE_INSTRUCTIONS},
-                {"role": "user", "content": source},
-            ],
+            messages=messages,
             tools=[],
             model=model,
             temperature=0.0,

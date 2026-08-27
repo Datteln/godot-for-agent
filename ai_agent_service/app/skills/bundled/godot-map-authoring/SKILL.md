@@ -10,7 +10,7 @@ paths: []
 
 按下面顺序工作：
 
-1. 用 `describe_tilemap_selection` 或小范围 `describe_map_region` 确认真实目标、图层、TileSet/GridMap 事实。大范围结果若 `truncated`，读取 `observed_bounds`、`row_runs` 和 `next_query`，只继续查询所需边界。
+1. 确认真实目标、图层、TileSet/GridMap 事实：`describe_tilemap_selection` 仅当编辑器确实选中了 `TileMapLayer` 时可用（不能发现节点、不支持 legacy TileMap/GridMap）；无选择、legacy 目标或收到无选择错误时，用场景事实确认节点路径后改调小范围 `describe_map_region(target_path=...)`，不要重试无参选择调用。大范围结果若 `truncated`，读取 `observed_bounds`、`row_runs` 和 `next_query`，只继续查询所需边界。
 2. 用 `read_file` 和 `read_scene_tree` 查找已有的 layout、生成器、配置及其挂载节点；编辑器上下文或检索给出的已知路径直接读取，不要重复搜索。确需 `grep_code` 兜底时，`include` 只用源码/配置 glob（如 `**/*.gd`、`**/*.json`、`**/*.cfg`、`**/*.tscn`），绝不使用 `**/*`。已有入口时只编辑这些可读文件，并保留手工图层。
 3. 没有入口时，直接发出 bootstrap 的第一个可审批工具调用；内联审批卡片就是确认，不要先输出“是否继续”或等待额外文字批准。按一次一个工具调用的协议，依次完成下列 bootstrap 批次：
    - 新建人可读的 layout/config（推荐 JSON、CFG 或 GDScript 常量），只表达格子坐标、语义标记和已观察到的 tile 引用；

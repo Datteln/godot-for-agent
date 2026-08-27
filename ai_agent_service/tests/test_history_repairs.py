@@ -18,7 +18,6 @@ from app.orchestrator.agent import (
 )
 from app.query.engine import (
     _assistant_history_blocks,
-    _event_payload_for_log,
     _history_context_used_tokens,
     _normalize_model_override,
     _structured_history_for_frame,
@@ -82,22 +81,48 @@ def test_request_model_override_has_highest_priority() -> None:
     assert selected == "request-model"
 
 
-def test_model_names_are_redacted_from_event_logs() -> None:
-    logged = _event_payload_for_log(
-        {
-            "model": "request-model",
-            "primary_model": "primary-model",
-            "fallback_model": "fallback-model",
-            "loop": 1,
-        }
-    )
+def test_event_logging_is_structural_and_never_dumps_payloads(caplog) -> None:
+    """任务 7.6：事件 DEBUG 日志只含类型与顶层键，绝不序列化载荷值。"""
+    import logging
+    import tempfile
+    from pathlib import Path
 
-    assert logged == {
-        "model": "<redacted>",
-        "primary_model": "<redacted>",
-        "fallback_model": "<redacted>",
-        "loop": 1,
-    }
+    from app.config import AppSettings
+    from app.events.store import EventStore
+    from app.llm.provider import AssistantTurn, LLMProvider
+    from app.query.engine import QueryEngine
+    from app.sessions.store import SessionStore
+
+    class _StubLLM(LLMProvider):
+        @property
+        def supports_tool_calling(self) -> bool:
+            return True
+
+        @property
+        def supports_prompt_cache(self) -> bool:
+            return False
+
+        async def chat(self, *args: object, **kwargs: object) -> AssistantTurn:
+            raise AssertionError("unused")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = QueryEngine(
+            settings=AppSettings(llm_base_url="http://localhost", project_root=Path(tmp)),
+            session_store=SessionStore(Path(tmp) / "sessions"),
+            llm=_StubLLM(),
+            event_store=EventStore(),
+        )
+        with caplog.at_level(logging.DEBUG, logger="app.query.engine"):
+            engine._emit(
+                "s1",
+                "agent_model_selected",
+                {"model": "secret-model", "primary_model": "secret-primary", "loop": 1},
+            )
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "secret-model" not in text
+    assert "secret-primary" not in text
+    assert "payload_keys" in text
 
 
 def test_reasoning_token_count_comes_from_usage() -> None:
@@ -124,6 +149,7 @@ def test_reasoning_event_estimates_then_accepts_exact_token_count() -> None:
         2,
         "f1",
         2,
+        "attempt-1",
     )
     assert callback is not None
 

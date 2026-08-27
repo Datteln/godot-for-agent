@@ -25,6 +25,22 @@ Freshness = Literal["observed", "verified", "superseded"]
 ToolOrigin = Literal["server", "front", "delegate", "system"]
 """工具记录的执行侧来源。"""
 
+EvidenceSourceKind = Literal[
+    "project_file",
+    "rag",
+    "search",
+    "editor",
+    "runtime",
+    "diagnostic",
+    "command",
+    "map",
+    "class_docs",
+]
+"""证据来源类别：可复现来源（项目文件/RAG/检索）与易失来源（编辑器/运行时/诊断/命令/地图）。"""
+
+REPRODUCIBLE_SOURCE_KINDS: frozenset[str] = frozenset({"project_file", "rag", "search"})
+"""可复现来源：会话内只保留事实+定位符+指纹，细节随时从当前来源重新读取。"""
+
 CONVERSATION_MEMORY_BLOCK = "[conversation_memory]"
 """注入 system 层的命名记忆块前缀；缓存观测与测试据此识别该层。"""
 
@@ -175,6 +191,98 @@ class EditorFact:
         )
 
 
+
+
+@dataclass
+class EvidenceRecord:
+    """证据索引记录（任务 8.1）。
+
+    驻留会话状态里只保存索引、摘要、定位符、新鲜度、内容哈希与可选的
+    sidecar 引用——绝不默认保存完整证据正文：可复现来源凭定位符重读，
+    易失来源的正文存放在会话作用域的 Markdown sidecar 文件中。
+
+    Attributes:
+        evidence_id: 帧内唯一证据身份，例如 "ev2"。
+        source_kind: 来源类别（EvidenceSourceKind）。
+        tool_name: 产生证据的工具名。
+        locator: 获取细节的确切方式（符号/行范围、配置键、节点/属性、
+            地图 layer/bounds、日志窗口、运行时字段等）。
+        target: 规范化目标描述。
+        facts: 有界 Markdown 事实卡（摘要，非正文）。
+        fingerprint: 可复现来源的源指纹（供重读前校验新鲜度）。
+        content_hash: 规范化 Markdown 的 SHA-256，用于 sidecar 去重。
+        freshness: 新鲜度。
+        sidecar_ref: 易失证据对应的 sidecar 文件名；可复现来源为 None。
+        turn_id: 产生证据的用户轮次。
+        created_at: 创建时间（UTC ISO-8601）。
+        updated_at: 最近更新时间（UTC ISO-8601）。
+        call_ids: 关联的 tool_call id 列表。
+    """
+
+    evidence_id: str
+    source_kind: str
+    tool_name: str
+    locator: str
+    target: str
+    facts: str
+    fingerprint: str = ""
+    content_hash: str = ""
+    freshness: Freshness = "observed"
+    sidecar_ref: str | None = None
+    turn_id: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+    call_ids: list[str] = field(default_factory=list)
+
+    @property
+    def reproducible(self) -> bool:
+        """是否为可复现来源（不需要 sidecar 正文）。"""
+        return self.source_kind in REPRODUCIBLE_SOURCE_KINDS
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为 JSON 原生字典，供会话持久化。"""
+        return {
+            "evidence_id": self.evidence_id,
+            "source_kind": self.source_kind,
+            "tool_name": self.tool_name,
+            "locator": self.locator,
+            "target": self.target,
+            "facts": self.facts,
+            "fingerprint": self.fingerprint,
+            "content_hash": self.content_hash,
+            "freshness": self.freshness,
+            "sidecar_ref": self.sidecar_ref,
+            "turn_id": self.turn_id,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "call_ids": list(self.call_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EvidenceRecord":
+        """从持久化字典恢复证据索引记录。"""
+        freshness = data.get("freshness", "observed")
+        if freshness not in ("observed", "verified", "superseded"):
+            freshness = "observed"
+        raw_call_ids = data.get("call_ids", [])
+        return cls(
+            evidence_id=str(data.get("evidence_id", "")),
+            source_kind=str(data.get("source_kind", "project_file")),
+            tool_name=str(data.get("tool_name", "")),
+            locator=str(data.get("locator", "")),
+            target=str(data.get("target", "")),
+            facts=str(data.get("facts", "")),
+            fingerprint=str(data.get("fingerprint", "")),
+            content_hash=str(data.get("content_hash", "")),
+            freshness=freshness,
+            sidecar_ref=data.get("sidecar_ref"),
+            turn_id=data.get("turn_id"),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+            call_ids=[str(item) for item in raw_call_ids] if isinstance(raw_call_ids, list) else [],
+        )
+
+
 @dataclass
 class ContextMemoryState:
     """单个 agent 帧持有的模型上下文记忆状态（任务 1.1/1.2）。
@@ -211,6 +319,8 @@ class ContextMemoryState:
     editor_facts: dict[str, EditorFact] = field(default_factory=dict)
     tool_records: list[ToolMemoryRecord] = field(default_factory=list)
     current_turn_records: list[ToolMemoryRecord] = field(default_factory=list)
+    evidence_index: dict[str, EvidenceRecord] = field(default_factory=dict)
+    evidence_counter: int = 0
     current_turn_id: str | None = None
     merged_call_ids: set[str] = field(default_factory=set)
     record_counter: int = 0
@@ -220,6 +330,11 @@ class ContextMemoryState:
         """分配下一个工具记忆记录身份。"""
         self.record_counter += 1
         return f"tm{self.record_counter}"
+
+    def new_evidence_id(self) -> str:
+        """分配下一个证据索引身份。"""
+        self.evidence_counter += 1
+        return f"ev{self.evidence_counter}"
 
     def is_empty(self) -> bool:
         """状态是否不含任何可注入的记忆内容。"""
@@ -234,6 +349,7 @@ class ContextMemoryState:
             and not self.editor_facts
             and not self.tool_records
             and not self.current_turn_records
+            and not self.evidence_index
         )
 
     def add_current_record(self, record: ToolMemoryRecord) -> None:
@@ -286,6 +402,10 @@ class ContextMemoryState:
             "editor_facts": {key: fact.to_dict() for key, fact in self.editor_facts.items()},
             "tool_records": [record.to_dict() for record in self.tool_records],
             "current_turn_records": [record.to_dict() for record in self.current_turn_records],
+            "evidence_index": {
+                key: record.to_dict() for key, record in self.evidence_index.items()
+            },
+            "evidence_counter": self.evidence_counter,
             "current_turn_id": self.current_turn_id,
             "merged_call_ids": sorted(self.merged_call_ids),
             "record_counter": self.record_counter,
@@ -315,6 +435,13 @@ class ContextMemoryState:
                 return []
             return [ToolMemoryRecord.from_dict(item) for item in raw if isinstance(item, dict)]
 
+        evidence_index: dict[str, EvidenceRecord] = {}
+        raw_evidence = data.get("evidence_index", {})
+        if isinstance(raw_evidence, dict):
+            for key, value in raw_evidence.items():
+                if isinstance(value, dict):
+                    evidence_index[str(key)] = EvidenceRecord.from_dict(value)
+
         merged_raw = data.get("merged_call_ids", [])
         return cls(
             goals=_str_list("goals"),
@@ -327,6 +454,8 @@ class ContextMemoryState:
             editor_facts=editor_facts,
             tool_records=_records("tool_records"),
             current_turn_records=_records("current_turn_records"),
+            evidence_index=evidence_index,
+            evidence_counter=int(data.get("evidence_counter", 0) or 0),
             current_turn_id=data.get("current_turn_id"),
             merged_call_ids={str(item) for item in merged_raw} if isinstance(merged_raw, list) else set(),
             record_counter=int(data.get("record_counter", 0) or 0),

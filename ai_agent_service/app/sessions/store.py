@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 from app.agents.bundled import get_agent
 from app.agents.types import AgentDefinition, CompactSnapshot, Frame
+from app.context.evidence import EvidenceSidecarStore
 from app.context.models import ContextMemoryState
 from app.llm.class_docs import sanitize_class_docs_messages
 from app.permissions.engine import SessionAllowGrant
@@ -504,6 +505,7 @@ class SessionStore:
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._write_locks: dict[str, asyncio.Lock] = {}
+        self._evidence_sidecars = EvidenceSidecarStore(storage_dir)
 
     def lock_for(self, session_id: str) -> asyncio.Lock:
         """返回（必要时创建）某会话的 per-session 锁。
@@ -630,6 +632,8 @@ class SessionStore:
             logger.info("Session reset removed persisted file session=%s path=%s", session_id, path)
         else:
             logger.info("Session reset session=%s no persisted file", session_id)
+        # 会话重置/删除时同步清理证据 sidecar（任务 8.2）。
+        self._evidence_sidecars.delete_session(session_id)
 
     def _path_for(self, session_id: str) -> Path:
         """返回某会话对应的本地 JSON 文件路径。

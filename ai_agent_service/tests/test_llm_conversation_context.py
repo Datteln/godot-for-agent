@@ -831,7 +831,8 @@ class SettingsDefaultsTests(unittest.TestCase):
 
     def test_defaults(self) -> None:
         settings = AppSettings(llm_base_url="http://localhost")
-        self.assertEqual(settings.context_budget_tokens, 120_000)
+        # 任务 7.7：默认投影预算与既有机械早清理阈值对齐。
+        self.assertEqual(settings.context_budget_tokens, 200_000)
         self.assertEqual(settings.context_retained_turns, 8)
         self.assertEqual(settings.context_active_group_window, 12)
         self.assertTrue(settings.context_consolidation_use_llm)

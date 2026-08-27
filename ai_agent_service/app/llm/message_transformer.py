@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -104,6 +106,35 @@ def estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
             else:
                 other_bytes += len(char.encode("utf-8"))
     return cjk_chars + (other_bytes + 3) // 4
+
+
+def estimate_request_tokens(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+) -> int:
+    """保守估算完整 provider 请求的输入 token 数。
+
+    此函数用于硬性上下文门，而非缓存阈值。它序列化真实会发送的消息结构与
+    tool schema，因而会计算 assistant tool_calls、角色字段和 content-block
+    元数据；可用时以 tiktoken 计数并加安全余量，缺少 tokenizer 时退化为 UTF-8
+    字节上界，宁可过早收拢也不发送超预算请求。
+    """
+    payload = json.dumps(
+        {"messages": messages, "tools": tools or []},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    try:
+        import tiktoken  # type: ignore[import-not-found]
+
+        raw_tokens = len(tiktoken.get_encoding("cl100k_base").encode(payload))
+        # provider 的消息包装与具体 tokenizer 会产生小幅差异，保留 15% 余量并
+        # 给每条消息预留固定协议开销。
+        return math.ceil(raw_tokens * 1.15) + len(messages) * 8
+    except Exception:
+        # 任何 UTF-8 字节至多按一个 token 计，作为不依赖第三方 tokenizer 的
+        # 保守上界；额外消息开销防止空内容消息低估。
+        return len(payload.encode("utf-8")) + len(messages) * 8
 
 
 def _cap_breakpoints(breakpoints: list[CacheBreakpoint]) -> list[CacheBreakpoint]:

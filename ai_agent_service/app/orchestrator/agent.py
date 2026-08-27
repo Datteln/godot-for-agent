@@ -29,13 +29,19 @@ from uuid import uuid4
 from app.agents.bundled import get_agent
 from app.agents.types import EFFORT_LEVELS, AgentDefinition, EffortLevel, Frame
 from app.context.grouping import terminalize_pending_groups
+from app.context.evidence import EvidenceSidecarStore, register_tool_evidence
 from app.context.memory import (
     complete_user_turn,
     enforce_active_group_window,
     render_memory_block,
     sync_current_turn_memory,
 )
-from app.context.projection import ContextProjectionSettings, project_frame_messages
+from app.context.projection import (
+    ContextProjectionSettings,
+    apply_hard_budget,
+    project_frame_messages,
+    retained_tool_call_ids,
+)
 from app.context.tool_markdown import render_tool_result_markdown
 from app.llm.cache_decision_engine import CacheDecision, CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector, CacheMetricsSnapshot
@@ -55,6 +61,7 @@ EVENT_MATCH_PREVIEW_ITEMS = 20
 logger = logging.getLogger(__name__)
 
 AgentPromptFactory = Callable[[AgentDefinition, str], Awaitable[str]]
+ContextBudgetCompactor = Callable[[Frame], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -545,6 +552,7 @@ async def _continue_delegate_group(
 async def _recover_empty_final_answer(
     llm: LLMProvider,
     frame: Frame,
+    outgoing_messages: list[dict[str, Any]],
     effort: EffortLevel,
     model_selector: Callable[[EffortLevel], str | None] | None,
     model_override: str | None,
@@ -563,6 +571,7 @@ async def _recover_empty_final_answer(
     Args:
         llm: 大模型 provider。
         frame: 当前根帧（挽救只发生在根帧）。
+        outgoing_messages: 已通过协议校验和硬预算门的精确上下文投影。
         effort: 当前 effort 档位。
         model_selector: 按档位选择模型的回调。
         model_override: 请求级模型覆盖。
@@ -579,7 +588,7 @@ async def _recover_empty_final_answer(
     resolved_model = _resolve_request_model(frame.agent, effort, model_selector, model_override)
     try:
         recovery_turn = await llm.chat(
-            frame.messages,
+            outgoing_messages,
             [],
             model=resolved_model,
             temperature=_resolve_temperature(effort),
@@ -1463,6 +1472,8 @@ async def run_turn(
     cache_metrics: CacheMetricsCollector | None = None,
     context_token_limit: int | None = None,
     context_settings: ContextProjectionSettings | None = None,
+    evidence_sidecars: EvidenceSidecarStore | None = None,
+    context_budget_compactor: ContextBudgetCompactor | None = None,
 ) -> StepResult:
     """驱动当前会话的活跃帧完成一轮（或多轮）编排循环。
 
@@ -1476,6 +1487,7 @@ async def run_turn(
         cache_engine: 上下文缓存决策引擎（§16.1）；为 None 或
             `llm.supports_prompt_cache=False` 时不标记任何显式缓存断点。
         cache_metrics: 缓存命中率观测聚合器；为 None 时不记录指标。
+        context_budget_compactor: 硬预算首次收缩仍无法通过时调用的会话内语义收拢器。
 
     Returns:
         `ToolCallsResult`（需前端执行/确认）、`FinalResult`（已得到最终回复）
@@ -1576,6 +1588,88 @@ async def run_turn(
                 {"frame_id": frame.id, "loop": loop_index + 1, **projection.audit},
             )
 
+            # 硬性预算门（任务 7.1）：计数覆盖 system 层、记忆块、消息与工具
+            # schema；超预算先收缩定位符可恢复细节/记忆记录，仍超限则安全失败，
+            # 绝不发送超额请求。
+            if context_settings is not None:
+                memory_index = next(
+                    (
+                        index
+                        for index, message in enumerate(outgoing_messages)
+                        if message.get("role") == "system"
+                        and str(message.get("content", "")).startswith("[conversation_memory]")
+                    ),
+                    None,
+                )
+                budget_result = apply_hard_budget(
+                    outgoing_messages,
+                    visible_tools,
+                    frame.context_memory,
+                    budget_tokens=context_settings.budget_tokens,
+                    memory_index=memory_index,
+                    retained_call_ids=retained_tool_call_ids(outgoing_messages),
+                )
+                if not budget_result.passed and context_budget_compactor is not None:
+                    # 只有精确投影已超限才进入语义收拢边界。收拢可能改变记忆
+                    # 块，故必须从帧状态重新投影、重新校验并重新执行完整硬门。
+                    await context_budget_compactor(frame)
+                    projection = project_frame_messages(
+                        frame.messages,
+                        frame.context_memory,
+                        settings=context_settings,
+                        pending_call_ids=pending_call_ids,
+                        session_id=session.session_id,
+                        frame_id=frame.id,
+                    )
+                    if projection.violations:
+                        logger.error(
+                            "Refusing invalid compacted projection session=%s frame=%s violations=%s",
+                            session.session_id,
+                            frame.id,
+                            projection.violations,
+                        )
+                        return ErrorResult(text="会话工具调用协议不完整，已拒绝发送无效模型上下文。")
+                    outgoing_messages = projection.messages
+                    memory_index = next(
+                        (
+                            index
+                            for index, message in enumerate(outgoing_messages)
+                            if message.get("role") == "system"
+                            and str(message.get("content", "")).startswith("[conversation_memory]")
+                        ),
+                        None,
+                    )
+                    budget_result = apply_hard_budget(
+                        outgoing_messages,
+                        visible_tools,
+                        frame.context_memory,
+                        budget_tokens=context_settings.budget_tokens,
+                        memory_index=memory_index,
+                        retained_call_ids=retained_tool_call_ids(outgoing_messages),
+                    )
+                if not budget_result.passed:
+                    logger.error(
+                        "Context budget exceeded; refusing to send session=%s frame=%s tokens=%d budget=%d",
+                        session.session_id,
+                        frame.id,
+                        budget_result.estimated_tokens,
+                        budget_result.budget_tokens,
+                    )
+                    return ErrorResult(
+                        text="模型上下文超出预算且无法进一步收缩，请压缩会话（/compact）或简化任务后重试"
+                    )
+                if budget_result.actions:
+                    _emit_orchestration_event(
+                        event_callback,
+                        "context_budget_actions",
+                        {
+                            "frame_id": frame.id,
+                            "loop": loop_index + 1,
+                            "actions": budget_result.actions,
+                            "estimated_tokens": budget_result.estimated_tokens,
+                        },
+                    )
+
             cache_decision: CacheDecision | None = None
             if cache_engine is not None and llm.supports_prompt_cache:
                 cache_decision = await cache_engine.decide(
@@ -1665,6 +1759,7 @@ async def run_turn(
             recovered = await _recover_empty_final_answer(
                 llm,
                 frame,
+                outgoing_messages,
                 effort,
                 model_selector,
                 model_override,
@@ -1885,6 +1980,7 @@ async def run_turn(
         pending_items: list[_PendingItem] = []
         turn_id = session.new_turn_id()
         known_tool_args: dict[str, dict[str, Any]] = {}
+        evidence_queue: list[tuple[str, dict[str, Any], Any, str, str]] = []
 
         # 第一遍：分类每个 tool call，不执行 server handler（同步、保留顺序）。
         for call in turn.tool_calls:
@@ -2064,13 +2160,21 @@ async def run_turn(
                     frame.id,
                     sorted(activated),
                 )
-            frame.messages.append(
-                _tool_message(
-                    item.call_id,
+            tool_message = _tool_message(
+                item.call_id,
+                result,
+                is_error=is_error,
+                tool_name=item.tool.name,
+                tool_args=item.args,
+            )
+            frame.messages.append(tool_message)
+            evidence_queue.append(
+                (
+                    item.tool.name,
+                    item.args,
                     result,
-                    is_error=is_error,
-                    tool_name=item.tool.name,
-                    tool_args=item.args,
+                    item.call_id,
+                    str(tool_message.get("content", "")),
                 )
             )
 
@@ -2088,6 +2192,20 @@ async def run_turn(
                 frame.context_memory,
                 window=context_settings.active_group_window,
             )
+        # 记忆同步后登记证据索引（任务 8.2）：可复现来源只留定位符+指纹，
+        # 易失来源把 Markdown 写入会话 sidecar。
+        if evidence_sidecars is not None:
+            for tool_name, tool_args, result, call_id, rendered in evidence_queue:
+                register_tool_evidence(
+                    frame.context_memory,
+                    tool_name=tool_name,
+                    input_args=tool_args,
+                    payload=result,
+                    markdown=rendered,
+                    call_id=call_id,
+                    sidecars=evidence_sidecars,
+                    session_id=session.session_id,
+                )
 
         if front_calls:
             session.set_pending(

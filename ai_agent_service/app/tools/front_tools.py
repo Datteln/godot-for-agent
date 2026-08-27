@@ -1372,7 +1372,15 @@ def register_front_tools() -> None:
             render_kind="json",
             schema={
                 "name": "describe_tilemap_selection",
-                "description": "Describe the selected TileMapLayer, if any.",
+                "description": (
+                    "Describe the editor-selected TileMapLayer, if and only if one is currently "
+                    "selected. Selection-dependent: it cannot discover map nodes and does not "
+                    "support legacy TileMap/GridMap. If no TileMapLayer is selected, or the target "
+                    "is a legacy TileMap/GridMap, do NOT call this tool — confirm the node path "
+                    "from scene facts (read_scene_tree/editor evidence) and call "
+                    "describe_map_region(target_path=...) instead. After a no-selection error, use "
+                    "the target-path fallback rather than retrying this zero-argument call."
+                ),
                 "parameters": _object_schema({}),
             },
         )

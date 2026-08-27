@@ -68,8 +68,6 @@ SCENE_NODE_TOOLS: frozenset[str] = frozenset(
         "open_scene",
         "capture_viewport_screenshot",
         "bake_navigation_mesh",
-        "describe_tilemap_selection",
-        "describe_map_region",
         "reload_map_targets",
         "rebuild_map_builder",
         "set_resource_property",
@@ -96,6 +94,9 @@ CLASS_DOCS_TOOL = "read_class_docs"
 DELEGATE_TOOLS: frozenset[str] = frozenset({"delegate", "delegate_many"})
 """委派类工具。"""
 
+MAP_TOOLS: frozenset[str] = frozenset({"describe_map_region", "describe_tilemap_selection"})
+"""地图观察类工具：渲染为语义 Markdown 证据（任务 8.5）。"""
+
 _GENERIC_MAX_SCALAR_ITEMS = 12
 """通用渲染里标量列表最多保留的条目数（有界通用事实，非按类别长度上限）。"""
 
@@ -108,6 +109,8 @@ def classify_tool(tool_name: str) -> str:
         return "search"
     if tool_name in MUTATION_TOOLS:
         return "mutation"
+    if tool_name in MAP_TOOLS:
+        return "map"
     if tool_name in SCENE_NODE_TOOLS:
         return "scene_node"
     if tool_name in SYSTEM_COMMAND_TOOLS:
@@ -204,7 +207,13 @@ def derive_identity(
             "name",
         )
     if not target:
-        result_target = str(body.get("path") or body.get("node_path") or body.get("scene_path") or "")
+        result_target = str(
+            body.get("path")
+            or body.get("node_path")
+            or body.get("scene_path")
+            or body.get("target")
+            or ""
+        )
         target = result_target
     identity_key = f"{tool_name}::{target or 'global'}"
     return identity_key, target or "(全局)"
@@ -262,6 +271,8 @@ def _render_file_read(tool_name: str, payload: Any) -> str:
     for key in ("offset", "limit", "lines_returned", "total_lines_scanned"):
         if key in body:
             meta.append(f"{key}={body[key]}")
+    if body.get("protected_line_count"):
+        meta.append(f"protected_lines={body['protected_line_count']}（生成/超长行以定位符提示代替）")
     if body.get("has_more"):
         meta.append("has_more=true（可用 offset/limit 续读）")
     if meta:
@@ -469,6 +480,150 @@ def _render_generic(payload: Any) -> str:
     return f"结果：{_scalar(payload)}"
 
 
+def _cell_identity(cell: dict[str, Any]) -> str:
+    """提取一个单元格/网格项的瓦片身份（紧凑表示）。"""
+    if not isinstance(cell, dict):
+        return str(cell)
+    if "item" in cell:
+        return f"item={cell.get('item')} orient={cell.get('orientation', 0)}"
+    source_id = cell.get("source_id", -1)
+    try:
+        if int(source_id) < 0:
+            return "empty"
+    except (TypeError, ValueError):
+        pass
+    atlas = cell.get("atlas_coords") or {}
+    atlas_x = atlas.get("x", "?") if isinstance(atlas, dict) else "?"
+    atlas_y = atlas.get("y", "?") if isinstance(atlas, dict) else "?"
+    return f"source={source_id} atlas=({atlas_x},{atlas_y}) alt={cell.get('alternative_tile', 0)}"
+
+
+def _render_map_region(payload: Any) -> str:
+    """describe_map_region 语义证据（任务 8.5）。
+
+    保留目标/类型/维度/层、坐标基准、节点位置、瓦片尺寸、请求与观察边界、
+    截断与后续查询元数据、legacy 层元数据、瓦片身份与紧凑行连续段；绝不
+    暴露前端结果 JSON 或序列化 `tile_data`。
+    """
+    body = payload if isinstance(payload, dict) else {}
+    if body.get("ok") is False:
+        message = body.get("message") or body.get("error") or "观察失败"
+        lines = [f"- 结果：失败 — {str(message)[:240]}"]
+        constraint = body.get("constraint")
+        max_cells = body.get("max_cells")
+        if constraint or max_cells:
+            lines.append(f"- 约束：max_cells={max_cells}；{constraint}")
+        return "\n".join(lines)
+
+    lines: list[str] = []
+    target = body.get("target")
+    map_type = body.get("type")
+    dimension = body.get("dimension")
+    lines.append(f"- 目标：{target}（{map_type}，{dimension}D）")
+    map_layer = body.get("map_layer")
+    if map_layer is not None:
+        lines.append(f"- legacy 图层：map_layer={map_layer}")
+    node_position = body.get("node_position")
+    if isinstance(node_position, dict):
+        pos = ", ".join(f"{k}={v}" for k, v in node_position.items())
+        lines.append(f"- 节点位置：{pos}")
+    tile_size = body.get("tile_size") or body.get("cell_size")
+    if isinstance(tile_size, dict):
+        size = "x".join(str(v) for v in tile_size.values())
+        basis = "tile_size" if body.get("tile_size") else "cell_size"
+        lines.append(f"- {basis}：{size}")
+        lines.append("- 坐标基准：地图单元格坐标；世界坐标 ≈ 节点位置 + 单元坐标 × 尺寸")
+    requested = body.get("requested_bounds")
+    observed = body.get("observed_bounds")
+    if isinstance(requested, dict):
+        lines.append(f"- 请求范围：{_bounds_text(requested)}")
+    if isinstance(observed, dict):
+        lines.append(f"- 观察范围：{_bounds_text(observed)}")
+    requested_cells = body.get("requested_cells")
+    observed_cells = body.get("observed_cells")
+    if requested_cells is not None:
+        lines.append(f"- 单元数：请求 {requested_cells} / 观察 {observed_cells}")
+    if body.get("truncated"):
+        lines.append("- 截断：是（观察或明细超出单次预算）")
+        next_query = body.get("next_query")
+        if isinstance(next_query, dict):
+            hint = ", ".join(f"{k}={v}" for k, v in next_query.items() if k != "note")
+            lines.append(f"- 后续查询：{hint}")
+        elif isinstance(next_query, str):
+            lines.append(f"- 后续查询：{next_query}")
+    layers = body.get("layers")
+    if isinstance(layers, list) and layers:
+        layer_bits = []
+        for layer in layers[:16]:
+            if isinstance(layer, dict):
+                layer_bits.append(
+                    f"[{layer.get('index')}] {layer.get('name')}（enabled={layer.get('enabled')}）"
+                )
+        if layer_bits:
+            lines.append("- legacy layers：" + "；".join(layer_bits))
+
+    row_runs = body.get("row_runs")
+    if isinstance(row_runs, list) and row_runs:
+        identities: list[str] = []
+        lines.append("- 行连续段（row_runs）：")
+        for run in row_runs[:64]:
+            if not isinstance(run, dict):
+                continue
+            identity = _cell_identity(run)
+            if identity not in identities:
+                identities.append(identity)
+            z_part = f"z={run['z']} " if "z" in run else ""
+            lines.append(
+                f"  - {z_part}y={run.get('y')} x={run.get('x_start')}..{run.get('x_end')}: {identity}"
+            )
+        if identities:
+            lines.append("- 观察到的瓦片身份：" + "；".join(identities[:24]))
+
+    requested_cells_value = requested_cells if isinstance(requested_cells, int) else 9999
+    cells = body.get("cells")
+    if isinstance(cells, list) and cells and requested_cells_value <= 25:
+        lines.append("- 精确单元明细（显式有界观察）：")
+        for cell in cells[:25]:
+            if isinstance(cell, dict):
+                coords = cell.get("coords")
+                lines.append(f"  - {coords}: {_cell_identity(cell)}")
+
+    lines.append("- 变更前必须重新发起有界观察；此证据为当时快照（易失）。")
+    return "\n".join(lines)
+
+
+def _bounds_text(bounds: dict[str, Any]) -> str:
+    """把边界字典压成单行文本。"""
+    keys = ("x", "y", "z", "width", "height", "depth")
+    return ", ".join(f"{k}={bounds[k]}" for k in keys if k in bounds)
+
+
+def _render_tilemap_selection(payload: Any) -> str:
+    """describe_tilemap_selection 结果（任务 7.8）：选择依赖 + 目标路径回退指引。"""
+    body = payload if isinstance(payload, dict) else {}
+    if body.get("ok"):
+        path = body.get("path", "")
+        map_type = body.get("type", "TileMapLayer")
+        return (
+            f"- 已选 {map_type}：{path}\n"
+            f"- 后续观察：describe_map_region(target_path={path!r}, 有界 x/y/width/height)"
+        )
+    message = str(body.get("message", ""))
+    lines = [f"- 结果：不可用 — {message[:200]}"]
+    candidates = body.get("candidates")
+    if isinstance(candidates, list) and candidates:
+        lines.append("- 候选节点：" + ", ".join(str(item) for item in candidates[:12]))
+    lines.append(
+        "- 说明：describe_tilemap_selection 仅在编辑器选中 TileMapLayer 时有效，"
+        "不能用于发现地图节点，也不支持 legacy TileMap/GridMap。"
+    )
+    lines.append(
+        "- 回退：用场景事实（read_scene_tree/editor 证据）确认地图节点路径，然后调用 "
+        "describe_map_region(target_path=...)；不要重复无参调用本工具。"
+    )
+    return "\n".join(lines)
+
+
 def render_tool_result_markdown(
     tool_name: str,
     input_args: dict[str, Any],
@@ -529,6 +684,10 @@ def render_tool_result_markdown(
         body = _render_system_command(tool_name, input_args, body_payload)
     elif tool_name == CLASS_DOCS_TOOL:
         body = _render_class_docs(body_payload)
+    elif tool_name == "describe_map_region":
+        body = _render_map_region(body_payload)
+    elif tool_name == "describe_tilemap_selection":
+        body = _render_tilemap_selection(body_payload)
     elif tool_name in DELEGATE_TOOLS:
         body = _render_delegate(body_payload)
     else:

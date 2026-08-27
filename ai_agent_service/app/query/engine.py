@@ -42,6 +42,7 @@ from app.api.schemas import (
     LogGrepHistoryBlock,
     LogReadHistoryBlock,
     LogTextHistoryBlock,
+    NodeTreeHistoryBlock,
     PlanCreatedHistoryBlock,
     PlanStepDTO,
     SessionHistoryBlock,
@@ -60,6 +61,12 @@ from app.api.schemas import (
 )
 from app.config import AppSettings
 from app.context.consolidation import render_memory_for_summary, semantic_consolidate
+from app.context.evidence import record_evidence
+from app.context.evidence import (
+    EvidenceSidecarStore,
+    reduce_tool_record_detail,
+    register_tool_evidence,
+)
 from app.context.grouping import group_messages, terminalize_pending_groups
 from app.context.memory import (
     enforce_active_group_window,
@@ -69,6 +76,7 @@ from app.context.memory import (
     normalize_editor_context,
     retain_recent_turns,
     strip_historical_editor_context,
+    render_editor_manifest,
     sync_current_turn_memory,
 )
 from app.context.models import ContextMemoryState
@@ -77,7 +85,11 @@ from app.context.tool_markdown import render_terminal_markdown, render_tool_resu
 from app.events.store import Event, EventStore
 from app.llm.cache_decision_engine import CacheDecisionEngine
 from app.llm.cache_observability import CacheMetricsCollector
-from app.llm.message_transformer import estimate_message_tokens, flatten_message_text
+from app.llm.message_transformer import (
+    estimate_message_tokens,
+    estimate_request_tokens,
+    flatten_message_text,
+)
 from app.llm.provider import LLMError, LLMProvider
 from app.orchestrator.agent import (
     EFFORT_TEMPERATURE,
@@ -245,11 +257,30 @@ def _build_user_content(request: ChatRequest) -> str:
 
     if not context_payload:
         return request.user_message
+    # 任务 8.3：模型上下文只收 Markdown 编辑器证据清单（含定位符），
+    # 不再复制原始传输 JSON；前端/展示稿契约不受影响。
     return (
         request.user_message
         + "\n\n[editor_context]\n"
-        + json.dumps(context_payload, ensure_ascii=False, sort_keys=True)
+        + render_editor_manifest(context_payload)
     )
+
+
+def _rag_evidence_facts(context: str) -> str:
+    """从 RAG Markdown 中提取不含源码正文的候选文件与范围清单。"""
+    facts = ["### RAG 候选清单"]
+    for raw_line in context.splitlines():
+        line = raw_line.strip()
+        if line.startswith("--- ") and line.endswith(" ---"):
+            facts.append(f"- 候选文件：`{line[4:-4].strip()}`")
+        elif line.startswith("[") and line.endswith("]"):
+            facts.append(f"- 已定位范围：`{line[1:-1].strip()}`")
+        if len(facts) >= 12:
+            break
+    if len(facts) == 1:
+        facts.append("- 已获得有界 RAG 候选；详情须按文件路径和范围精读。")
+    facts.append("- 后续读取：`read_file(path=..., offset=..., limit=...)`；新检索使用 `search_codebase(query=...)`。")
+    return "\n".join(facts)
 
 
 def _brief_message(message: dict[str, Any]) -> str:
@@ -1252,6 +1283,11 @@ def _tool_history_blocks(
             )
         ]
 
+    if name in {"read_runtime_state", "read_scene_tree"}:
+        tree = inner.get("edited_scene") or inner.get("scene") or inner.get("scene_tree")
+        if isinstance(tree, dict) and tree:
+            return [NodeTreeHistoryBlock(tree=tree, **origin)]
+
     if name == "search_tools":
         return []
 
@@ -1963,6 +1999,8 @@ class QueryEngine:
         self._recovery = recovery_store
         self._cache_engine = cache_engine or CacheDecisionEngine()
         self._cache_metrics = cache_metrics or CacheMetricsCollector()
+        # 会话作用域的证据 sidecar（任务 8.2）：与持久化会话同生命周期。
+        self._evidence_sidecars = EvidenceSidecarStore(settings.resolved_session_store_dir())
         self._transcript = TranscriptWriter(self._stage_transcript_event)
         # 高频流式展示稿不在每个 token 的同步路径写盘；同会话仅保留一个
         # 延迟检查点任务，下一次检查点会包含这段时间内的最新累计状态。
@@ -2311,6 +2349,23 @@ class QueryEngine:
             # 收拢进 Markdown 记忆（任务 2.3）。
             memory_state = frame.context_memory
             memory_state.current_turn_id = session.transcript_turn_id
+            if session.rag_context.strip():
+                record_evidence(
+                    memory_state,
+                    source_kind="rag",
+                    tool_name="rag_context",
+                    locator=(
+                        "read_file(path=候选文件, offset=候选范围起点, limit=有界范围)；"
+                        "需要新候选时 search_codebase(query=当前任务)"
+                    ),
+                    target=(
+                        "rag:"
+                        + hashlib.sha256(session.rag_context.encode("utf-8")).hexdigest()[:16]
+                    ),
+                    facts=_rag_evidence_facts(session.rag_context),
+                    body_markdown=session.rag_context,
+                    fingerprint=hashlib.sha256(session.rag_context.encode("utf-8")).hexdigest(),
+                )
             editor_payload: dict[str, Any] = {}
             if request.context is not None:
                 editor_payload["context"] = request.context.model_dump(exclude_none=True)
@@ -2321,6 +2376,18 @@ class QueryEngine:
             if editor_payload:
                 normalize_editor_context(
                     memory_state, editor_payload, turn_id=session.transcript_turn_id
+                )
+                editor_manifest = render_editor_manifest(editor_payload)
+                record_evidence(
+                    memory_state,
+                    source_kind="editor",
+                    tool_name="editor_context",
+                    locator="read_scene_tree / read_debugger_errors / describe_map_region(target_path=...)",
+                    target=f"turn={session.transcript_turn_id}",
+                    facts=editor_manifest,
+                    body_markdown=editor_manifest,
+                    sidecars=self._evidence_sidecars,
+                    session_id=session.session_id,
                 )
             strip_historical_editor_context(
                 frame.messages, protected_from=len(frame.messages) - 1
@@ -2423,6 +2490,10 @@ class QueryEngine:
                 return
             self._emit(session.session_id, event_type, payload)
 
+        async def compact_for_hard_budget(active_frame: Frame) -> None:
+            """只在精确出站投影超限时收拢帧级 Markdown 记忆。"""
+            await self._consolidate_frame_for_hard_budget(active_frame)
+
         async with self._turn_keepalive(session.session_id):
             step = await run_turn(
                 session=session,
@@ -2445,6 +2516,8 @@ class QueryEngine:
                 cache_metrics=self._cache_metrics,
                 context_token_limit=self._settings.context_budget_tokens,
                 context_settings=self._context_projection_settings(),
+                evidence_sidecars=self._evidence_sidecars,
+                context_budget_compactor=compact_for_hard_budget,
             )
         response = _step_to_response(step)
         if isinstance(response, ChatFinalResponse) and session.pending_verify_candidates:
@@ -2485,6 +2558,8 @@ class QueryEngine:
                         cache_metrics=self._cache_metrics,
                         context_token_limit=self._settings.context_budget_tokens,
                         context_settings=self._context_projection_settings(),
+                        evidence_sidecars=self._evidence_sidecars,
+                        context_budget_compactor=compact_for_hard_budget,
                     )
                 response = _step_to_response(step)
         # 轮次收尾：仍在思考中的 Thought 条目一律完成（耗时以收尾时刻计）。
@@ -2709,6 +2784,7 @@ class QueryEngine:
         frames = {frame.id: frame for frame in session.agent_stack}
         verify_candidates: list[dict[str, Any]] = []
         touched_frame_ids: set[str] = set()
+        evidence_queue: list[tuple[Any, str, dict[str, Any], Any, str, str]] = []
         for result in results:
             frame = frames.get(result.frame_id)
             if frame is None:
@@ -2784,6 +2860,9 @@ class QueryEngine:
                 )
             )
             touched_frame_ids.add(frame.id)
+            evidence_queue.append(
+                (frame, tool_name, tool_args, payload, result.tool_use_id, str(frame.messages[-1].get("content", "")))
+            )
             logger.info(
                 "Tool result appended session=%s turn_id=%s tool=%s status=%s frame=%s",
                 session.session_id,
@@ -2803,6 +2882,18 @@ class QueryEngine:
                 frame.messages,
                 frame.context_memory,
                 window=self._settings.context_active_group_window,
+            )
+        # 记忆同步完成后再登记证据索引（记录可按 call_id 命中，任务 8.2）。
+        for frame, tool_name, tool_args, payload, call_id, rendered in evidence_queue:
+            register_tool_evidence(
+                frame.context_memory,
+                tool_name=tool_name,
+                input_args=tool_args,
+                payload=payload,
+                markdown=rendered,
+                call_id=call_id,
+                sidecars=self._evidence_sidecars,
+                session_id=session.session_id,
             )
 
         self._transcript.record_front_tool_results(
@@ -3257,6 +3348,20 @@ class QueryEngine:
             active_group_window=self._settings.context_active_group_window,
         )
 
+    async def _consolidate_frame_for_hard_budget(self, frame: Frame) -> None:
+        """在精确出站预算超限时收缩并语义合并一帧的 Markdown 记忆。"""
+        await self._build_compact_summary(
+            frame.compact_snapshot,
+            frame.context_memory,
+            use_llm=self._settings.context_consolidation_use_llm,
+            budget_tokens=self._settings.context_budget_tokens,
+        )
+        enforce_memory_budget(
+            frame.context_memory,
+            budget_tokens=self._settings.context_budget_tokens,
+            baseline_tokens=0,
+        )
+
     def _needs_auto_compact(self, session: Session) -> bool:
         """判断是否需要进入自动收拢边界。
 
@@ -3325,6 +3430,7 @@ class QueryEngine:
         state: ContextMemoryState,
         *,
         use_llm: bool,
+        budget_tokens: int | None = None,
     ) -> str:
         """生成最终压缩摘要（任务 4.2）：优先语义合并，失败/禁用时机械渲染。
 
@@ -3332,12 +3438,20 @@ class QueryEngine:
         预览或工具 JSON；语义合并仅在压缩边界（整体预算越界/手动 /compact）
         调用，失败时确定性回退为记忆的机械 Markdown 渲染。
         """
+        # 语义合并前先收缩"定位符可恢复"的细节（任务 8.6）：事实卡保留
+        # 身份/目标/定位符，完整细节可凭定位符重新获取。
+        reduce_tool_record_detail(state)
         if use_llm:
             model = (
                 self._settings.context_consolidation_model
                 or self._model_for_effort("quick")
             )
-            await semantic_consolidate(state, self._llm, model=model)
+            await semantic_consolidate(
+                state,
+                self._llm,
+                model=model,
+                budget_tokens=budget_tokens,
+            )
         return _wrap_compact_summary(_memory_summary_body(previous, state))
 
     async def _compact_locked(
@@ -3470,6 +3584,7 @@ class QueryEngine:
                         frame.compact_snapshot,
                         frame.context_memory,
                         use_llm=summary_use_llm,
+                        budget_tokens=self._settings.context_budget_tokens,
                     )
                     enforce_memory_budget(
                         frame.context_memory,
@@ -3518,7 +3633,10 @@ class QueryEngine:
             )
             previous = frame.compact_snapshot
             summary = await self._build_compact_summary(
-                previous, frame.context_memory, use_llm=summary_use_llm
+                previous,
+                frame.context_memory,
+                use_llm=summary_use_llm,
+                budget_tokens=self._settings.context_budget_tokens,
             )
             enforce_memory_budget(
                 frame.context_memory,

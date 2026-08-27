@@ -555,11 +555,20 @@ def enforce_memory_budget(
     return adjusted
 
 
-def render_memory_block(state: ContextMemoryState) -> str:
+def render_memory_block(
+    state: ContextMemoryState,
+    *,
+    exclude_call_ids: set[str] | None = None,
+) -> str:
     """把记忆状态渲染为命名 system 层 Markdown 块（任务 1.3）。
 
     该块注入在分层 system 层之后、最近对话轮之前；它不修改展示稿条目，
     也不改写持久化的原始 prompt-cache 标记。
+
+    Args:
+        state: 记忆状态。
+        exclude_call_ids: 仍保留在出站协议组里的 tool_call id；对应的当前轮
+            记录不重复注入，避免同一结果出现两份模型可见副本（任务 8.6）。
     """
     if state.is_empty():
         return ""
@@ -590,11 +599,94 @@ def render_memory_block(state: ContextMemoryState) -> str:
                 freshness += "/terminal"
             lines.append(f"### {record.record_id} {record.tool_name} → {record.target}（{freshness}）")
             lines.append(record.markdown)
-    if state.current_turn_records:
+    excluded = exclude_call_ids or set()
+    visible_current = [
+        record
+        for record in state.current_turn_records
+        if not (set(record.call_ids) & excluded)
+    ]
+    if visible_current:
         lines.append("## 当前轮工具记忆")
-        for record in state.current_turn_records:
+        for record in visible_current:
             lines.append(f"### {record.record_id} {record.tool_name} → {record.target}")
             lines.append(record.markdown)
+    return "\n".join(lines)
+
+
+def render_editor_manifest(context_payload: dict[str, Any]) -> str:
+    """把当前编辑器上下文载荷渲染为 Markdown 证据清单（任务 8.3）。
+
+    输出有界的事实与受支持的后续定位符，**不包含**原始传输 JSON：
+    模型拿到的是当前选择/场景身份/诊断计数/已知文件等可直接行动的事实，
+    以及获取细节的前端工具定位符。
+
+    Args:
+        context_payload: `_build_user_content` 打包的上下文载荷。
+
+    Returns:
+        Markdown 形态的编辑器证据清单。
+    """
+    lines: list[str] = ["## 当前编辑器证据"]
+    context = context_payload.get("context")
+    env_bits: list[str] = []
+    engine_version = context_payload.get("engine_version")
+    language_hint = context_payload.get("language_hint")
+    if engine_version:
+        env_bits.append(f"engine={engine_version}")
+    if language_hint:
+        env_bits.append(f"lang={language_hint}")
+    if env_bits:
+        lines.append("- 环境：" + "；".join(env_bits))
+    if not isinstance(context, dict):
+        lines.append("- （本次请求未携带编辑器上下文）")
+        return "\n".join(lines)
+
+    selection = context.get("selection")
+    if isinstance(selection, dict) and selection:
+        bits: list[str] = []
+        for key in ("scene_path", "node_path", "node_type", "script_path", "name"):
+            value = selection.get(key)
+            if isinstance(value, str) and value:
+                bits.append(f"{key}={value}")
+        if bits:
+            lines.append("- 当前选择：" + "；".join(bits[:6]))
+
+    scene_tree = context.get("scene_tree")
+    if isinstance(scene_tree, dict) and scene_tree:
+        root = scene_tree.get("root") or scene_tree.get("name") or ""
+        node_count = scene_tree.get("node_count")
+        summary = f"root={root}" if root else "scene_tree"
+        if node_count is not None:
+            summary += f"；{node_count} 个节点"
+        lines.append(f"- 场景结构：{summary}（细节用 read_scene_tree 按路径查询）")
+
+    debugger_errors = context.get("debugger_errors")
+    if isinstance(debugger_errors, list) and debugger_errors:
+        lines.append(f"- 调试错误：{len(debugger_errors)} 条（细节用 read_debugger_errors）")
+
+    diagnostics = context.get("diagnostics")
+    if isinstance(diagnostics, list) and diagnostics:
+        lines.append(f"- 诊断：{len(diagnostics)} 条")
+
+    files = context.get("project_files") or context.get("referenced_files")
+    if isinstance(files, list) and files:
+        names: list[str] = []
+        for item in files[:_EDITOR_FACT_MAX_ITEMS]:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict):
+                names.append(str(item.get("path") or item.get("name") or ""))
+        more = "…" if len(files) > _EDITOR_FACT_MAX_ITEMS else ""
+        lines.append(f"- 相关文件（{len(files)}）：" + ", ".join(n for n in names if n) + more)
+
+    tile_catalog = context.get("tile_catalog")
+    if isinstance(tile_catalog, list) and tile_catalog:
+        lines.append(f"- 瓦片清单：{len(tile_catalog)} 项（地图域工具据此校验）")
+
+    lines.append("可用后续定位符：")
+    lines.append("- 场景/节点细节：read_scene_tree、set_node_property、read_runtime_state")
+    lines.append("- 地图区域：describe_map_region(target_path=..., 有界 x/y/width/height)")
+    lines.append("- 运行错误：read_debugger_errors；ClassDB API：read_class_docs 有界查询")
     return "\n".join(lines)
 
 
