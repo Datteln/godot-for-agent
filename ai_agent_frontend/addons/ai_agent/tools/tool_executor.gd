@@ -165,7 +165,7 @@ func execute(tool_call: Dictionary) -> Dictionary:
 					var screenshot_input := _automatic_screenshot_input(input)
 					var screenshot_result := await SceneTools.capture_viewport_screenshot(screenshot_input, editor_interface)
 					if bool(screenshot_result.get("ok", false)):
-						result["visual_evidence"] = {"availability": "captured", "scope": result.get("reloaded_targets", []), "path": screenshot_result.get("path", ""), "absolute_path": screenshot_result.get("absolute_path", ""), "width": screenshot_result.get("width", 0), "height": screenshot_result.get("height", 0), "capture_scope": screenshot_result.get("capture_scope", "current_viewport"), "spatial_facts": screenshot_result.get("spatial_facts", {}), "inspection": input.get("inspection", {}), "advisory": true, "semantic_verification": "not_established"}
+						result["visual_evidence"] = {"availability": "captured", "scope": result.get("reloaded_targets", []), "path": screenshot_result.get("path", ""), "absolute_path": screenshot_result.get("absolute_path", ""), "width": screenshot_result.get("width", 0), "height": screenshot_result.get("height", 0), "image_hash": screenshot_result.get("image_hash", ""), "captured_at_unix_ms": screenshot_result.get("captured_at_unix_ms", 0), "capture_scope": screenshot_result.get("capture_scope", "current_viewport"), "spatial_facts": screenshot_result.get("spatial_facts", {}), "inspection": input.get("inspection", {}), "advisory": true, "semantic_verification": "not_established"}
 					else:
 						result["visual_evidence"] = {"availability": "unavailable", "scope": result.get("reloaded_targets", []), "reason": str(screenshot_result.get("error_code", "capture_failed")), "advisory": true, "semantic_verification": "not_established"}
 		"rebuild_map_builder":
@@ -173,9 +173,10 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			if str(result.get("status", "")) == "rebuilt" and bool(input.get("capture_screenshot", true)):
 				var builder_screenshot := await SceneTools.capture_viewport_screenshot(_automatic_screenshot_input(input), editor_interface)
 				if bool(builder_screenshot.get("ok", false)):
-					result["visual_evidence"] = {"availability": "captured", "scope": [result.get("generated_target_path", "")], "path": builder_screenshot.get("path", ""), "absolute_path": builder_screenshot.get("absolute_path", ""), "width": builder_screenshot.get("width", 0), "height": builder_screenshot.get("height", 0), "capture_scope": builder_screenshot.get("capture_scope", "current_viewport"), "spatial_facts": builder_screenshot.get("spatial_facts", {}), "inspection": input.get("inspection", {}), "advisory": true, "semantic_verification": "not_established"}
+					var focused := str(builder_screenshot.get("capture_scope", "current_viewport")) == "map_region"
+					result["visual_evidence"] = {"availability": "captured", "scope": [result.get("generated_target_path", "")], "path": builder_screenshot.get("path", ""), "absolute_path": builder_screenshot.get("absolute_path", ""), "width": builder_screenshot.get("width", 0), "height": builder_screenshot.get("height", 0), "image_hash": builder_screenshot.get("image_hash", ""), "captured_at_unix_ms": builder_screenshot.get("captured_at_unix_ms", 0), "capture_scope": builder_screenshot.get("capture_scope", "current_viewport"), "spatial_facts": builder_screenshot.get("spatial_facts", {}), "inspection": input.get("inspection", {}), "advisory": true, "capture_status": "captured", "focused_capture": focused, "semantic_verification": "not_established", "verification_status": "unverified" if not focused else "pending_deterministic_map_evidence"}
 				else:
-					result["visual_evidence"] = {"availability": "unavailable", "scope": [result.get("generated_target_path", "")], "reason": str(builder_screenshot.get("error_code", "capture_failed")), "advisory": true, "semantic_verification": "not_established"}
+					result["visual_evidence"] = {"availability": "unavailable", "scope": [result.get("generated_target_path", "")], "reason": str(builder_screenshot.get("error_code", "capture_failed")), "advisory": true, "capture_status": "unavailable", "semantic_verification": "not_established", "verification_status": "unverified"}
 		"create_resource":
 			result = ResourceTools.create_resource(input, undo_manager)
 		"read_image_metadata":

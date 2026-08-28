@@ -91,6 +91,8 @@ def normalize_screenshot_references(
             "absolute_path": str(candidate.get("absolute_path", "")).strip(),
             "width": _safe_int(candidate.get("width")),
             "height": _safe_int(candidate.get("height")),
+            "image_hash": str(candidate.get("image_hash", "")),
+            "captured_at_unix_ms": _safe_int(candidate.get("captured_at_unix_ms")),
             "capture_scope": str(candidate.get("capture_scope", "current_viewport")),
             "target": tool_args.get("target", tool_args.get("screenshot_target", {})),
             "inspection": sanitize_inspection(candidate.get("inspection", tool_args.get("inspection", {}))),
@@ -152,7 +154,7 @@ def make_observation(
         可直接持久化和写入上下文的 JSON 原生字典。
     """
     bounded_description = _bounded_text(description, _MAX_DESCRIPTION_CHARS)
-    outcome = "inconclusive" if reference.get("inspection") else "not_requested"
+    outcome = _inspection_outcome(bounded_description, bool(reference.get("inspection")))
     return {
         "observation_id": observation_id,
         "status": status,
@@ -160,11 +162,15 @@ def make_observation(
         "scope": reference.get("scope", ""),
         "advisory": bool(reference.get("advisory", True)),
         "capture_path": reference.get("path", ""),
+        "artifact_locator": reference.get("absolute_path") or reference.get("path", ""),
+        "image_hash": str(reference.get("image_hash", "")),
+        "captured_at_unix_ms": _safe_int(reference.get("captured_at_unix_ms")),
         "width": _safe_int(reference.get("width")),
         "height": _safe_int(reference.get("height")),
         "capture_scope": reference.get("capture_scope", "current_viewport"),
         "inspection": reference.get("inspection", {}),
         "spatial_facts": reference.get("spatial_facts", {}),
+        "provenance": {"provider_class": "configured_asset_understanding", "remote_analysis": True},
         "model": model,
         "description": bounded_description,
         "outcome": outcome,
@@ -191,3 +197,15 @@ def _safe_int(value: Any) -> int:
     if isinstance(value, float):
         return max(0, int(value))
     return 0
+
+
+def _inspection_outcome(description: str, has_inspection: bool) -> str:
+    """从有界视觉描述提取保守的检查结论。"""
+    if not has_inspection:
+        return "not_requested"
+    lowered = description.lower()
+    if "contradicts" in lowered:
+        return "contradicts"
+    if "matches" in lowered:
+        return "matches"
+    return "inconclusive"

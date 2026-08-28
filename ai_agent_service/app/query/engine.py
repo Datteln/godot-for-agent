@@ -107,6 +107,7 @@ from app.prompt.context_builder import ContextBuilder
 from app.prompt.project_context import build_project_context
 from app.prompt.rag_context import build_rag_context
 from app.rag.asset_llm_client import AssetLLMClient, AssetLLMConfig
+from app.visual_observation import make_observation, normalize_screenshot_references, observation_key
 from app.rag.factory import create_codebase_index
 from app.recovery.pointer import RecoveryPointerStore
 from app.security.settings import SecuritySettings, security_settings_from_app
@@ -2665,10 +2666,18 @@ class QueryEngine:
         }.get(effort)
 
     async def _enrich_front_image_result(
-        self, tool_name: str, result: dict[str, Any], security: SecuritySettings
+        self,
+        session: Session,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        result: dict[str, Any],
+        security: SecuritySettings,
     ) -> dict[str, Any]:
-        """为前端读图类工具结果补充多模态语义描述。"""
-        if tool_name not in {"read_image_metadata", "capture_viewport_screenshot"}:
+        """为前端截图创建并持久化有界的视觉观察。"""
+        if tool_name == "read_image_metadata":
+            return await self._enrich_read_image_metadata(result, security)
+        references = normalize_screenshot_references(tool_name, result, tool_args)
+        if not references:
             return result
         enriched = dict(result)
         client = AssetLLMClient(
@@ -2682,25 +2691,75 @@ class QueryEngine:
                 concurrency=1,
             )
         )
-        semantic: dict[str, Any] = {
-            "enabled": client.available,
-            "model": self._settings.asset_understanding_model,
-        }
+        observations: list[dict[str, Any]] = []
+        refresh = bool(tool_args.get("refresh_visual_observation", False))
+        for reference in references:
+            image_path = self._resolve_front_image_path(reference, security)
+            if image_path is None:
+                observations.append(make_observation(reference, status="unavailable", model=self._settings.asset_understanding_model, reason="artifact_expired"))
+                continue
+            try:
+                key = observation_key(image_path, reference, self._settings.asset_understanding_model)
+            except OSError:
+                observations.append(make_observation(reference, status="unavailable", model=self._settings.asset_understanding_model, reason="artifact_expired"))
+                continue
+            existing = session.visual_observations.get(key)
+            if isinstance(existing, dict) and not refresh:
+                observation = dict(existing)
+                observation["reused"] = True
+            elif not client.available:
+                observation = make_observation(reference, status="unavailable", model=self._settings.asset_understanding_model, reason="asset_understanding_not_configured", observation_id=key)
+            else:
+                try:
+                    description = await asyncio.to_thread(client.describe, image_path, "image", reference.get("inspection", {}))
+                    observation = make_observation(reference, status="observed", model=self._settings.asset_understanding_model, description=description, observation_id=key)
+                except asyncio.CancelledError:
+                    observation = make_observation(reference, status="cancelled", model=self._settings.asset_understanding_model, reason="request_cancelled", observation_id=key)
+                    session.visual_observations[key] = observation
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Visual observation failed tool=%s error=%s", tool_name, exc)
+                    observation = make_observation(reference, status="failed", model=self._settings.asset_understanding_model, reason="visual_provider_failed", observation_id=key)
+            session.visual_observations[key] = observation
+            observations.append(observation)
+        enriched["visual_observations"] = observations
+        enriched["remote_visual_analysis"] = {"configured": client.available, "model": self._settings.asset_understanding_model, "leaves_local_process": client.available}
+        if tool_name == "capture_viewport_screenshot" and observations:
+            enriched["semantic"] = {"enabled": client.available, "model": self._settings.asset_understanding_model, "status": observations[0]["status"], "description": observations[0].get("description", "")}
+            if observations[0].get("description"):
+                enriched["semantic_description"] = observations[0]["description"]
+        return enriched
+
+    async def _enrich_read_image_metadata(
+        self, result: dict[str, Any], security: SecuritySettings
+    ) -> dict[str, Any]:
+        """保留普通图片元数据工具既有的语义描述兼容行为。"""
+        enriched = dict(result)
+        client = AssetLLMClient(
+            AssetLLMConfig(
+                enabled=self._settings.asset_understanding_enabled,
+                model=self._settings.asset_understanding_model,
+                endpoint=self._settings.asset_understanding_endpoint,
+                api_key=self._settings.asset_understanding_api_key.get_secret_value(),
+                timeout_s=self._settings.asset_understanding_timeout_s,
+                max_tokens=self._settings.asset_understanding_max_tokens,
+                concurrency=1,
+            )
+        )
+        semantic: dict[str, Any] = {"enabled": client.available, "model": self._settings.asset_understanding_model}
         if not client.available:
             semantic["skipped"] = "asset_understanding_not_configured"
-            enriched["semantic"] = semantic
-            return enriched
-        image_path = self._resolve_front_image_path(enriched, security)
-        if image_path is None:
-            semantic["skipped"] = "image_path_not_readable_by_service"
-            enriched["semantic"] = semantic
-            return enriched
-        description = await asyncio.to_thread(client.describe, image_path, "image")
-        semantic["source_path"] = str(image_path)
-        semantic["description"] = description
+        else:
+            image_path = self._resolve_front_image_path(enriched, security)
+            if image_path is None:
+                semantic["skipped"] = "image_path_not_readable_by_service"
+            else:
+                description = await asyncio.to_thread(client.describe, image_path, "image")
+                semantic["source_path"] = str(image_path)
+                semantic["description"] = description
+                if description:
+                    enriched["semantic_description"] = description
         enriched["semantic"] = semantic
-        if description:
-            enriched["semantic_description"] = description
         return enriched
 
     def _resolve_front_image_path(
@@ -2812,7 +2871,7 @@ class QueryEngine:
                     applied_result = tool.enrich(tool_args, applied_result)
                 if isinstance(applied_result, dict):
                     applied_result = await self._enrich_front_image_result(
-                        tool_name, applied_result, security
+                        session, tool_name, tool_args, applied_result, security
                     )
                 if result.grant_session_allow and tool is not None:
                     session.session_allow.add(make_session_allow_grant(tool, tool_args))
@@ -3201,6 +3260,7 @@ class QueryEngine:
         async with self._store.lock_for(session_id):
             session = self._load_session_seeded(session_id)
             session.pending_plan = None
+            self._finalize_pending_visual_observations(session, "request_cancelled")
             if session.pending_turn_id is not None:
                 frames = {frame.id: frame for frame in session.agent_stack}
                 for tool_use_id in sorted(session.pending_tool_call_ids):
@@ -3261,6 +3321,14 @@ class QueryEngine:
             last_seq,
         )
         return InterruptResponse(ok=True, cancelled=cancelled, last_event_seq=last_seq)
+
+    def _finalize_pending_visual_observations(self, session: Session, reason: str) -> None:
+        """把会话中遗留的视觉观察收敛为终态，避免历史显示为运行中。"""
+        for observation in session.visual_observations.values():
+            if not isinstance(observation, dict) or observation.get("status") != "pending":
+                continue
+            observation["status"] = "cancelled"
+            observation["reason"] = reason[:300]
 
     async def discard_pending(self, session_id: str) -> ChatResponse:
         """放弃当前会话待回传的前端工具调用，保留其余会话历史。

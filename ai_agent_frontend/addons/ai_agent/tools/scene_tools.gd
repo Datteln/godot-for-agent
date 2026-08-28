@@ -906,6 +906,11 @@ static func _capture_2d_target(viewport: Viewport, target: Dictionary, input: Di
 		viewport.canvas_transform = prior_transform
 	if bool(result.get("ok", false)):
 		result["spatial_facts"] = resolved.get("spatial_facts", {})
+		result["requested_target"] = target.duplicate(true)
+		result["resolved_target"] = {
+			"capture_scope": resolved.get("capture_scope", "current_viewport"),
+			"world_rect": _rect2_payload(target_rect),
+		}
 	return result
 
 
@@ -1002,7 +1007,7 @@ static func _write_screenshot_image(image: Image, input: Dictionary) -> Dictiona
 	var err := image.save_png(absolute)
 	if err != OK:
 		return {"ok": false, "message": "Failed to save screenshot (error %d)" % err, "error_code": "save_failed"}
-	return {"ok": true, "path": output_path, "absolute_path": absolute, "width": image.get_width(), "height": image.get_height()}
+	return {"ok": true, "path": output_path, "absolute_path": absolute, "width": image.get_width(), "height": image.get_height(), "image_hash": image.get_data().sha256_text(), "captured_at_unix_ms": Time.get_unix_time_from_system() * 1000.0}
 
 
 static func _resolve_2d_target(target: Dictionary, viewport: Viewport, editor_interface: EditorInterface) -> Dictionary:
@@ -1020,6 +1025,7 @@ static func _resolve_2d_target(target: Dictionary, viewport: Viewport, editor_in
 	var root := editor_interface.get_edited_scene_root()
 	if root == null:
 		return {"ok": false, "message": "No edited scene root", "error_code": "scene_unavailable"}
+	var scene_path := str(root.scene_file_path)
 	var path := str(target.get("path", "")).strip_edges()
 	var node := root.get_node_or_null(NodePath(path))
 	if node == null:
@@ -1050,7 +1056,13 @@ static func _resolve_2d_target(target: Dictionary, viewport: Viewport, editor_in
 	var needs_frame := not Rect2(Vector2.ZERO, viewport_size).encloses(initial_rect)
 	var final_transform := _canvas_transform_for_rect(world_rect, viewport_size, padding) if needs_frame else viewport.canvas_transform
 	var crop_rect := _world_rect_to_viewport(world_rect, final_transform).grow(padding)
+	if target_type == "map_region":
+		var map_rect := _world_rect_to_viewport(region["rect"], final_transform)
+		if map_rect.size.x <= 0.0 or map_rect.size.y <= 0.0 or not crop_rect.intersects(map_rect):
+			return {"ok": false, "message": "Focused map crop does not intersect the requested map bounds", "error_code": "map_crop_mismatch"}
+		facts["focused_capture"] = {"coordinate_space": "viewport_px", "source": "resolved_target", "available": true, "value": "intersects_requested_map_bounds"}
 	facts["viewport_rect_px"] = {"coordinate_space": "viewport_px", "source": "resolved_target", "available": true, "value": _rect2_payload(crop_rect)}
+	facts["scene_path"] = {"coordinate_space": "scene", "source": "editor", "available": not scene_path.is_empty(), "value": scene_path}
 	return {"ok": true, "world_rect": world_rect, "crop_rect_px": Rect2i(Vector2i(crop_rect.position.floor()), Vector2i(crop_rect.size.ceil())), "needs_frame": needs_frame, "padding": padding, "capture_scope": target_type, "spatial_facts": facts}
 
 
@@ -1087,10 +1099,22 @@ static func _canvas_item_world_rect(node: Node) -> Dictionary:
 static func _tilemap_world_rect(node: Node, target: Dictionary) -> Dictionary:
 	if not node.has_method("map_to_local"):
 		return {"ok": false, "message": "map_region target must resolve to TileMapLayer or TileMap", "error_code": "invalid_target"}
+	if not target.has("map_layer") or not (target.get("map_layer") is int):
+		return {"ok": false, "message": "map_region requires an explicit integer map_layer", "error_code": "missing_map_layer"}
+	var map_layer := int(target.get("map_layer"))
+	if node.has_method("get_layers_count"):
+		var layer_count := int(node.call("get_layers_count"))
+		if map_layer < 0 or map_layer >= layer_count:
+			return {"ok": false, "message": "map_region.map_layer is outside the TileMap layer range", "error_code": "invalid_map_layer"}
+	elif map_layer != 0:
+		return {"ok": false, "message": "TileMapLayer only accepts map_layer 0", "error_code": "invalid_map_layer"}
 	var bounds_value := target.get("cell_bounds", {})
 	if not (bounds_value is Dictionary):
 		return {"ok": false, "message": "map_region.cell_bounds must be an object", "error_code": "invalid_target"}
 	var bounds: Dictionary = bounds_value
+	for field in ["x", "y", "width", "height"]:
+		if not (bounds.get(field) is int):
+			return {"ok": false, "message": "map_region.cell_bounds must contain finite integer x, y, width, and height", "error_code": "invalid_target"}
 	var width := int(bounds.get("width", 0))
 	var height := int(bounds.get("height", 0))
 	if width <= 0 or height <= 0:
@@ -1107,7 +1131,7 @@ static func _tilemap_world_rect(node: Node, target: Dictionary) -> Dictionary:
 	var world_rect := local_rect
 	if node is Node2D:
 		world_rect = (node as Node2D).global_transform * local_rect
-	return {"ok": true, "rect": world_rect, "spatial_facts": {"map_layer": {"coordinate_space": "map_layer", "source": "target", "available": true, "value": int(target.get("map_layer", 0))}, "cell_bounds": {"coordinate_space": "map_cells", "source": "request", "available": true, "value": {"x": start.x, "y": start.y, "width": width, "height": height}}, "map_local_rect": {"coordinate_space": "map_local", "source": "TileMap.map_to_local", "available": true, "value": _rect2_payload(local_rect)}}}
+	return {"ok": true, "rect": world_rect, "spatial_facts": {"map_layer": {"coordinate_space": "map_layer", "source": "target", "available": true, "value": map_layer}, "cell_bounds": {"coordinate_space": "map_cells", "source": "request", "available": true, "value": {"x": start.x, "y": start.y, "width": width, "height": height}}, "map_local_rect": {"coordinate_space": "map_local", "source": "TileMap.map_to_local", "available": true, "value": _rect2_payload(local_rect)}}}
 
 
 static func _visible_world_aabb(root: Node) -> Dictionary:

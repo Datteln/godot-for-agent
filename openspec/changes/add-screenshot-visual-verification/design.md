@@ -27,9 +27,9 @@ Extend the screenshot contract with an optional `target` union:
 
 - `viewport_rect`: a bounded pixel rectangle within the currently captured viewport; it never changes editor framing.
 - `canvas_item`: a scene-relative `CanvasItem` or `Control` node path plus bounded pixel padding.
-- `map_region`: a `TileMap`/`TileMapLayer` path, explicit layer where applicable, cell bounds, and bounded cell padding.
+- `map_region`: a `TileMap`/`TileMapLayer` path, required explicit layer, finite cell bounds, and bounded cell padding for map-verification evidence.
 
-The frontend resolves node/map facts against the currently edited scene, derives the 2D canvas rectangle, frames that rectangle if it is off-screen, waits for the editor to settle, captures the viewport, and crops the exact target rectangle. The observation includes edited-scene identity, requested target, resolved target bounds, viewport/crop coordinate spaces, editor transform, screenshot hash, and capture timestamp. It MUST restore the prior selection and 2D viewport transform after capture, including failure paths.
+The frontend resolves node/map facts against the currently edited scene, derives the 2D canvas rectangle, frames that rectangle if it is off-screen, waits for the editor to settle, captures the viewport, and crops the exact target rectangle. A map-verification request with no layer, an invalid layer, missing/invalid bounds, unreadable pixels, or a crop that does not intersect the requested map-local rectangle fails explicitly; it must not silently default to layer 0 or fall back to a whole-viewport image. The observation includes edited-scene identity, requested target, resolved target bounds, viewport/crop coordinate spaces, editor transform, screenshot hash, and capture timestamp. It MUST restore the prior selection and 2D viewport transform after capture, including failure paths.
 
 The target union additionally accepts `node_3d`: a `Node3D` path, `viewport_index`, optional `view_direction` (`current`, six-axis direction, or `isometric`), and bounded padding. The frontend accepts a `VisualInstance3D` or a Node3D containing visible descendants, merges finite world AABBs, and calculates a camera position that contains the target bounding sphere at the active projection and viewport aspect ratio. It records the original camera transform, projection, selection, and a viewport-state version, waits for the projected bounds to settle, captures, then restores only if the transaction still owns that viewport.
 
@@ -69,6 +69,10 @@ The current turn and later retained context receive a Markdown observation summa
 
 Map completion requires deterministic `describe_map_region` evidence matching the declared target layer, bounds, and expected cells. A visual observation may support user-facing review and identify obvious mismatches, but cannot independently mark a tile-placement task complete. A future task may define visual-only acceptance criteria explicitly; that is outside this change.
 
+### 7.1 Classify map rebuilds truthfully and bind focused evidence to changes
+
+`rebuild_map_builder` is a mutating operation whenever it can clear, set, or erase TileMap cells; its registration and permission routing must reflect that fact. A rebuild result SHALL include changed-cell bounds, or an explicit `changed_bounds_unavailable` status. Only a target-aware screenshot that resolves those bounds and passes local spatial validation can be attached as focused map-verification evidence. A generic editor viewport screenshot remains diagnostic evidence and cannot be elevated to verification merely because a PNG was saved or a visual model returned a description.
+
 ### 8. Bound cost, privacy, and artifact lifetime
 
 Deduplicate observations within a session by image hash, normalized target, rubric, and vision-model identity. Reuse a terminal observation only when all identifiers match; a changed viewport/crop or explicit refresh creates a new record. Before remote analysis, the visible tool result and context summary identify the configured model/provider class and that the screenshot leaves the local process. A configuration switch disables remote analysis while retaining local capture.
@@ -85,6 +89,8 @@ Screenshots retain their existing temporary local-file behavior. Each observatio
 - [Target framing disturbs the user's editor] → use short 2D/3D transactions, viewport leases and finally-style restoration; cancel 3D capture rather than restore over a user-changed camera.
 - [Public Godot APIs cannot manipulate the 3D editor camera] → prove the API path first and use a controlled version-limited editor-plugin bridge if necessary.
 - [A visual description follows the wrong target] → attach exact resolved crop bounds, scene identity, target revision/facts, hash, and timestamp to every observation.
+- [Map captures default to the background layer or an unrelated viewport] → require explicit layer and finite bounds, then reject non-intersecting or unreadable captures before visual observation.
+- [A rebuild executes as a nominally read-only tool] → classify it as mutating, report changed bounds, and route it through the appropriate permission path.
 - [Editor content is sent to an external provider unexpectedly] → disclose provider use at capture time and expose a configuration switch that yields a durable `unavailable` result.
 
 ## Migration Plan

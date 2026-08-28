@@ -329,11 +329,11 @@ class OpenAICompatibleProvider:
             LLMError: 连接失败、超时或端点返回错误状态码时抛出。
         """
         if thinking_budget > 0:
-            extra_body: dict[str, Any] | None = {"enable_thinking": True, "thinking_budget": thinking_budget}
+            extra_body: dict[str, Any] | None = {"enable_thinking": True, "thinking_budget": thinking_budget, "enable_search": True}
         elif thinking_budget == 0:
-            extra_body = None
+            extra_body = {"enable_search": True}
         else:
-            extra_body = {"enable_thinking": True}
+            extra_body = {"enable_thinking": True, "enable_search": True}
 
         # 显式上下文缓存：断点位置由编排层的 CacheDecisionEngine 决定，这里只
         # 负责把标记写进请求体；标记加在消息副本上，不污染调用方持有的

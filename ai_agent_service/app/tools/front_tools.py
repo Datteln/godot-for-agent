@@ -1124,7 +1124,7 @@ def register_front_tools() -> None:
                             "description": (
                                 "Optional bounded target. type=viewport_rect uses rect {x,y,width,height}; "
                                 "canvas_item uses a scene-relative CanvasItem/Control path; map_region uses path, "
-                                "cell_bounds {x,y,width,height}, optional map_layer and padding; node_3d uses a "
+                                "cell_bounds {x,y,width,height}, required explicit map_layer and padding; node_3d uses a "
                                 "scene-relative Node3D path, optional viewport_index, view_direction, and padding. "
                                 "Coordinates and bounds are calculated by the editor, never inferred from pixels."
                             ),
@@ -1139,6 +1139,12 @@ def register_front_tools() -> None:
                                 "padding": {"type": "number", "minimum": 0, "maximum": 256},
                             },
                             "required": ["type"],
+                            "allOf": [
+                                {
+                                    "if": {"properties": {"type": {"const": "map_region"}}},
+                                    "then": {"required": ["path", "cell_bounds", "map_layer"]},
+                                }
+                            ],
                         },
                         "inspection": {
                             "type": "object",
@@ -1538,6 +1544,8 @@ def register_front_tools() -> None:
             domain="map",
             side="front",
             reads_project=True,
+            writes_project=True,
+            needs_preview=True,
             render_kind="json",
             schema={
                 "name": "rebuild_map_builder",
@@ -1561,7 +1569,7 @@ def register_front_tools() -> None:
                         },
                         "capture_screenshot": {
                             "type": "boolean",
-                            "description": "Capture advisory editor evidence only after a successful rebuild.",
+                            "description": "Capture diagnostic editor evidence only after a successful rebuild. A focused map_region target is required for visual verification.",
                         },
                         "screenshot_mode": {"type": "string", "enum": ["2d", "3d"]},
                         "screenshot_target": {"type": "object", "description": "Optional target object accepted by capture_viewport_screenshot."},

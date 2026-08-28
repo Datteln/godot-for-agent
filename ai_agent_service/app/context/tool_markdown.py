@@ -360,6 +360,31 @@ def _render_scene_node(tool_name: str, input_args: dict[str, Any], payload: Any)
     for key in ("ok", "message", "summary", "result", "nodes", "warnings"):
         if key in body:
             lines.append(f"{key}: {_scalar(body[key])}")
+    observations = body.get("visual_observations")
+    if isinstance(observations, list):
+        for observation in observations[:2]:
+            if not isinstance(observation, dict):
+                continue
+            lines.append(
+                "视觉观察："
+                f"状态={_scalar(observation.get('status'))}；"
+                f"范围={_scalar(observation.get('capture_scope'))}；"
+                f"advisory={_scalar(observation.get('advisory'))}"
+            )
+            description = observation.get("description")
+            if isinstance(description, str) and description.strip():
+                lines.append(f"视觉结论：{description.strip()[:2000]}")
+            reason = observation.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                lines.append(f"视觉限制：{reason.strip()[:300]}")
+    visual = body.get("visual_evidence")
+    if isinstance(visual, dict):
+        lines.append(
+            "地图视觉证据："
+            f"capture={_scalar(visual.get('capture_status', visual.get('availability')))}；"
+            f"semantic={_scalar(visual.get('semantic_verification', 'not_established'))}；"
+            f"deterministic={_scalar(visual.get('verification_status', 'unverified'))}"
+        )
     return "\n".join(lines)
 
 

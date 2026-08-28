@@ -109,6 +109,18 @@ def test_map_agent_bootstraps_code_driven_authoring_without_map_mutation() -> No
     assert "advisory visual evidence" in agent.prompt
 
 
+def test_map_agent_teaches_incremental_preservation_before_bootstrap() -> None:
+    """验证局部地图请求先采用保留既有内容的心智模型。"""
+    agent = _agent("map-agent.md")
+
+    assert "先判断编辑尺度" in agent.prompt
+    assert "局部增量编辑" in agent.prompt
+    assert "既有地图是用户已经创作的作品" in agent.prompt
+    assert "重新写回用户没有点名的既有结构" in agent.prompt
+    assert "独立增量层" in agent.prompt
+    assert "保持性复盘" in agent.prompt
+
+
 def test_map_authoring_skill_contains_safe_tool_bootstrap_instructions() -> None:
     """验证预加载技能明确给出 @tool 骨架和文档优先的 API 规则。"""
     root = Path(__file__).parents[1]
@@ -119,6 +131,11 @@ def test_map_authoring_skill_contains_safe_tool_bootstrap_instructions() -> None
     assert "generated-only" in content
     assert "read_class_docs" in content
     assert "不要根据模型记忆" in content
+    assert "先理解要保留什么" in content
+    assert "从现有草地右端延伸 10 格" in content
+    assert "塔仍是要保留的事实" in content
+    assert "根据宽度、难度和种子重新生成这一区域" in content
+    assert "不完整的迁移，不是扩建" in content
 
 
 def test_all_authorized_agents_receive_general_map_observation_tools() -> None:

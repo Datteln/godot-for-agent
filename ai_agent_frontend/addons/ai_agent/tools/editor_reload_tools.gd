@@ -159,6 +159,7 @@ static func rebuild_map_builder(input: Dictionary, editor_interface: EditorInter
 	return {
 		"ok": true,
 		"status": "rebuilt",
+		"mutation": {"mutating": true, "kind": "tilemap_cells"},
 		"scene": scene_root.scene_file_path,
 		"builder_node_path": builder_path,
 		"builder_script": script_path,
@@ -166,6 +167,7 @@ static func rebuild_map_builder(input: Dictionary, editor_interface: EditorInter
 		"generated_target_path": str(generated_target.get_path()),
 		"before_generated_cells": before_cells,
 		"after_generated_cells": _cell_count(generated_target),
+		"changed_cell_bounds": {"status": "unavailable", "reason": "builder_does_not_report_exact_cell_delta"},
 		"builder_result": invocation_result,
 	}
 
