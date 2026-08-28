@@ -1007,7 +1007,10 @@ static func _write_screenshot_image(image: Image, input: Dictionary) -> Dictiona
 	var err := image.save_png(absolute)
 	if err != OK:
 		return {"ok": false, "message": "Failed to save screenshot (error %d)" % err, "error_code": "save_failed"}
-	return {"ok": true, "path": output_path, "absolute_path": absolute, "width": image.get_width(), "height": image.get_height(), "image_hash": image.get_data().sha256_text(), "captured_at_unix_ms": Time.get_unix_time_from_system() * 1000.0}
+	var hasher := HashingContext.new()
+	hasher.start(HashingContext.HASH_SHA256)
+	hasher.update(image.get_data())
+	return {"ok": true, "path": output_path, "absolute_path": absolute, "width": image.get_width(), "height": image.get_height(), "image_hash": hasher.finish().hex_encode(), "captured_at_unix_ms": Time.get_unix_time_from_system() * 1000.0}
 
 
 static func _resolve_2d_target(target: Dictionary, viewport: Viewport, editor_interface: EditorInterface) -> Dictionary:
@@ -1034,6 +1037,7 @@ static func _resolve_2d_target(target: Dictionary, viewport: Viewport, editor_in
 	var world_rect := Rect2()
 	var fact_key := "canvas_rect"
 	var facts: Dictionary = {}
+	var region: Dictionary = {}
 	if target_type == "canvas_item":
 		if not (node is CanvasItem):
 			return {"ok": false, "message": "canvas_item target must resolve to CanvasItem", "error_code": "invalid_target"}
@@ -1043,7 +1047,7 @@ static func _resolve_2d_target(target: Dictionary, viewport: Viewport, editor_in
 		world_rect = bounds["rect"].grow(padding)
 		facts[fact_key] = {"coordinate_space": "canvas", "source": "scene_node", "available": true, "value": _rect2_payload(world_rect)}
 	elif target_type == "map_region":
-		var region := _tilemap_world_rect(node, target)
+		region = _tilemap_world_rect(node, target)
 		if not bool(region.get("ok", false)):
 			return region
 		world_rect = region["rect"].grow(padding)
