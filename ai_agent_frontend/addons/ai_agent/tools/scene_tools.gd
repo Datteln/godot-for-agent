@@ -3,6 +3,11 @@ extends RefCounted
 
 const PathUtils = preload("res://addons/ai_agent/tools/path_utils.gd")
 
+const _MAX_TARGET_PADDING := 256.0
+const _MIN_3D_PADDING := 1.0
+const _MAX_3D_PADDING := 3.0
+static var _viewport_3d_leases: Dictionary = {}
+
 
 ## 节点路径相对于"被编辑场景的根节点"而非 `node.get_path()` 的 SceneTree 绝对路径。
 ## 在编辑器里运行时，被编辑场景是挂在编辑器自身视口树很深的位置下的，
@@ -875,16 +880,111 @@ static func capture_viewport_screenshot(input: Dictionary, editor_interface: Edi
 		viewport = editor_interface.get_editor_viewport_2d()
 	if viewport == null:
 		return {"ok": false, "message": "Requested editor viewport is not available", "error_code": "viewport_unavailable"}
+	var target_value := input.get("target", {})
+	if not (target_value is Dictionary):
+		return {"ok": false, "message": "target must be an object", "error_code": "invalid_target"}
+	var target: Dictionary = target_value
+	if target.is_empty():
+		return await _capture_viewport_image(viewport, input, {})
+	if mode == "3d":
+		return await _capture_3d_target(viewport, target, input, editor_interface)
+	return await _capture_2d_target(viewport, target, input, editor_interface)
 
-	var tree := editor_interface.get_base_control().get_tree()
+
+static func _capture_2d_target(viewport: Viewport, target: Dictionary, input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var resolved := _resolve_2d_target(target, viewport, editor_interface)
+	if not bool(resolved.get("ok", false)):
+		return resolved
+	var prior_transform: Transform2D = viewport.canvas_transform
+	var changed_transform := false
+	var target_rect: Rect2 = resolved["world_rect"]
+	if bool(resolved.get("needs_frame", false)):
+		viewport.canvas_transform = _canvas_transform_for_rect(target_rect, viewport.get_visible_rect().size, float(resolved.get("padding", 16.0)))
+		changed_transform = true
+	var result := await _capture_viewport_image(viewport, input, resolved)
+	if changed_transform:
+		viewport.canvas_transform = prior_transform
+	if bool(result.get("ok", false)):
+		result["spatial_facts"] = resolved.get("spatial_facts", {})
+	return result
+
+
+static func _capture_3d_target(viewport: Viewport, target: Dictionary, input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	if str(target.get("type", "")) != "node_3d":
+		return {"ok": false, "message": "3D target.type must be node_3d", "error_code": "invalid_target"}
+	var viewport_index := int(target.get("viewport_index", input.get("viewport_index", 0)))
+	var lease_key := str(viewport.get_instance_id())
+	if _viewport_3d_leases.has(lease_key):
+		return {"ok": false, "message": "A 3D framing transaction is already active for this viewport", "error_code": "viewport_busy"}
+	var resolved := _resolve_3d_target(target, editor_interface)
+	if not bool(resolved.get("ok", false)):
+		return resolved
+	var camera := viewport.get_camera_3d()
+	if camera == null:
+		return {"ok": false, "message": "The editor 3D camera is not available through this viewport", "error_code": "target_unavailable"}
+	var lease := "%s:%d" % [lease_key, Time.get_ticks_usec()]
+	_viewport_3d_leases[lease_key] = lease
+	var prior_transform: Transform3D = camera.global_transform
+	var prior_projection := int(camera.projection)
+	var prior_fov := float(camera.fov)
+	var prior_size := float(camera.size)
+	var applied_transform := _camera_transform_for_aabb(camera, resolved["world_aabb"], viewport.get_visible_rect().size, target)
+	if applied_transform == null:
+		_viewport_3d_leases.erase(lease_key)
+		return {"ok": false, "message": "Could not calculate a finite editor camera transform", "error_code": "bounds_unavailable"}
+	camera.global_transform = applied_transform
+	var result := await _capture_viewport_image(viewport, input, resolved)
+	var lease_is_current := str(_viewport_3d_leases.get(lease_key, "")) == lease
+	var user_changed_view := not camera.global_transform.is_equal_approx(applied_transform)
+	if lease_is_current:
+		_viewport_3d_leases.erase(lease_key)
+		if not user_changed_view:
+			camera.projection = prior_projection
+			camera.fov = prior_fov
+			camera.size = prior_size
+			camera.global_transform = prior_transform
+	if user_changed_view:
+		return {"ok": false, "message": "The editor 3D view changed while target capture was active", "error_code": "editor_view_changed"}
+	if bool(result.get("ok", false)):
+		var facts: Dictionary = resolved.get("spatial_facts", {})
+		facts["camera"] = {
+			"coordinate_space": "world_3d",
+			"source": "editor_viewport_camera",
+			"available": true,
+			"viewport_index": viewport_index,
+			"transform": _transform3d_payload(applied_transform),
+			"projection": prior_projection,
+			"fov": prior_fov,
+			"size": prior_size,
+		}
+		result["spatial_facts"] = facts
+	return result
+
+
+static func _capture_viewport_image(viewport: Viewport, input: Dictionary, resolved: Dictionary) -> Dictionary:
+	var tree := viewport.get_tree()
 	if tree != null:
 		await tree.process_frame
 		await tree.process_frame
-
 	var image := viewport.get_texture().get_image()
 	if image == null:
 		return {"ok": false, "message": "Failed to capture viewport image", "error_code": "capture_failed"}
+	var crop: Rect2i = resolved.get("crop_rect_px", Rect2i())
+	if crop.size.x > 0 and crop.size.y > 0:
+		var image_rect := Rect2i(Vector2i.ZERO, image.get_size())
+		crop = crop.intersection(image_rect)
+		if crop.size.x <= 0 or crop.size.y <= 0:
+			return {"ok": false, "message": "Resolved target is outside the captured viewport", "error_code": "target_outside_viewport"}
+		image = image.get_region(crop)
+	var output := _write_screenshot_image(image, input)
+	if bool(output.get("ok", false)):
+		output["capture_scope"] = resolved.get("capture_scope", "current_viewport")
+		if crop.size.x > 0 and crop.size.y > 0:
+			output["viewport_rect_px"] = _rect2i_payload(crop)
+	return output
 
+
+static func _write_screenshot_image(image: Image, input: Dictionary) -> Dictionary:
 	var output_arg := str(input.get("output_path", "")).strip_edges()
 	var output_path := ""
 	var absolute := ""
@@ -898,12 +998,235 @@ static func capture_viewport_screenshot(input: Dictionary, editor_interface: Edi
 		if not PathUtils.is_write_allowed(output_path):
 			return {"ok": false, "message": "output_path is not writable: " + output_path, "error_code": "path_denied"}
 		absolute = ProjectSettings.globalize_path(output_path)
-
 	DirAccess.make_dir_recursive_absolute(absolute.get_base_dir())
 	var err := image.save_png(absolute)
 	if err != OK:
 		return {"ok": false, "message": "Failed to save screenshot (error %d)" % err, "error_code": "save_failed"}
 	return {"ok": true, "path": output_path, "absolute_path": absolute, "width": image.get_width(), "height": image.get_height()}
+
+
+static func _resolve_2d_target(target: Dictionary, viewport: Viewport, editor_interface: EditorInterface) -> Dictionary:
+	var target_type := str(target.get("type", ""))
+	var viewport_size := viewport.get_visible_rect().size
+	if target_type == "viewport_rect":
+		var rect_result := _rect2_from_input(target.get("rect", {}))
+		if not bool(rect_result.get("ok", false)):
+			return rect_result
+		var rect: Rect2 = rect_result["rect"]
+		return {
+			"ok": true, "world_rect": rect, "crop_rect_px": Rect2i(rect.position, rect.size), "capture_scope": "viewport_rect",
+			"spatial_facts": {"viewport_rect_px": {"coordinate_space": "viewport_px", "source": "request", "available": true, "value": _rect2_payload(rect)}}
+		}
+	var root := editor_interface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "message": "No edited scene root", "error_code": "scene_unavailable"}
+	var path := str(target.get("path", "")).strip_edges()
+	var node := root.get_node_or_null(NodePath(path))
+	if node == null:
+		return {"ok": false, "message": "Target node not found: " + path, "error_code": "target_missing"}
+	var padding := clampf(float(target.get("padding", 16.0)), 0.0, _MAX_TARGET_PADDING)
+	var world_rect := Rect2()
+	var fact_key := "canvas_rect"
+	var facts: Dictionary = {}
+	if target_type == "canvas_item":
+		if not (node is CanvasItem):
+			return {"ok": false, "message": "canvas_item target must resolve to CanvasItem", "error_code": "invalid_target"}
+		var bounds := _canvas_item_world_rect(node)
+		if not bool(bounds.get("ok", false)):
+			return bounds
+		world_rect = bounds["rect"].grow(padding)
+		facts[fact_key] = {"coordinate_space": "canvas", "source": "scene_node", "available": true, "value": _rect2_payload(world_rect)}
+	elif target_type == "map_region":
+		var region := _tilemap_world_rect(node, target)
+		if not bool(region.get("ok", false)):
+			return region
+		world_rect = region["rect"].grow(padding)
+		facts = region["spatial_facts"]
+	else:
+		return {"ok": false, "message": "2D target.type must be viewport_rect, canvas_item, or map_region", "error_code": "invalid_target"}
+	if world_rect.size.x <= 0.0 or world_rect.size.y <= 0.0:
+		return {"ok": false, "message": "Target has no finite 2D bounds", "error_code": "bounds_unavailable"}
+	var initial_rect := _world_rect_to_viewport(world_rect, viewport.canvas_transform)
+	var needs_frame := not Rect2(Vector2.ZERO, viewport_size).encloses(initial_rect)
+	var final_transform := _canvas_transform_for_rect(world_rect, viewport_size, padding) if needs_frame else viewport.canvas_transform
+	var crop_rect := _world_rect_to_viewport(world_rect, final_transform).grow(padding)
+	facts["viewport_rect_px"] = {"coordinate_space": "viewport_px", "source": "resolved_target", "available": true, "value": _rect2_payload(crop_rect)}
+	return {"ok": true, "world_rect": world_rect, "crop_rect_px": Rect2i(Vector2i(crop_rect.position.floor()), Vector2i(crop_rect.size.ceil())), "needs_frame": needs_frame, "padding": padding, "capture_scope": target_type, "spatial_facts": facts}
+
+
+static func _resolve_3d_target(target: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var root := editor_interface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "message": "No edited scene root", "error_code": "scene_unavailable"}
+	var path := str(target.get("path", "")).strip_edges()
+	var node := root.get_node_or_null(NodePath(path))
+	if node == null:
+		return {"ok": false, "message": "Target node not found: " + path, "error_code": "target_missing"}
+	if not (node is Node3D):
+		return {"ok": false, "message": "node_3d target must resolve to Node3D", "error_code": "invalid_target"}
+	var aabb_result := _visible_world_aabb(node)
+	if not bool(aabb_result.get("ok", false)):
+		return aabb_result
+	var target_node: Node3D = node
+	var world_aabb: AABB = aabb_result["aabb"]
+	var target_path := _relative_path(root, node)
+	return {"ok": true, "world_aabb": world_aabb, "capture_scope": "node_3d", "spatial_facts": {"world_aabb": {"coordinate_space": "world_3d", "source": "VisualInstance3D.get_aabb", "available": true, "value": _aabb_payload(world_aabb)}, "target_origin": {"coordinate_space": "world_3d", "source": "Node3D.global_position", "available": true, "value": _vector3_payload(target_node.global_position)}, "target": target_path, "scene_path": str(root.scene_file_path)}}
+
+
+static func _canvas_item_world_rect(node: Node) -> Dictionary:
+	if node is Control:
+		var control: Control = node
+		return {"ok": true, "rect": control.get_global_rect()}
+	if node is Node2D and node.has_method("get_rect"):
+		var local_rect: Rect2 = node.call("get_rect")
+		var node_2d: Node2D = node
+		return {"ok": true, "rect": node_2d.global_transform * local_rect}
+	return {"ok": false, "message": "Target CanvasItem has no finite drawable rect", "error_code": "bounds_unavailable"}
+
+
+static func _tilemap_world_rect(node: Node, target: Dictionary) -> Dictionary:
+	if not node.has_method("map_to_local"):
+		return {"ok": false, "message": "map_region target must resolve to TileMapLayer or TileMap", "error_code": "invalid_target"}
+	var bounds_value := target.get("cell_bounds", {})
+	if not (bounds_value is Dictionary):
+		return {"ok": false, "message": "map_region.cell_bounds must be an object", "error_code": "invalid_target"}
+	var bounds: Dictionary = bounds_value
+	var width := int(bounds.get("width", 0))
+	var height := int(bounds.get("height", 0))
+	if width <= 0 or height <= 0:
+		return {"ok": false, "message": "map_region.cell_bounds width and height must be positive", "error_code": "invalid_target"}
+	var start := Vector2i(int(bounds.get("x", 0)), int(bounds.get("y", 0)))
+	var end := start + Vector2i(width - 1, height - 1)
+	var first: Vector2 = node.call("map_to_local", start)
+	var last: Vector2 = node.call("map_to_local", end)
+	var tile_size := Vector2(1.0, 1.0)
+	if "tile_set" in node and node.tile_set != null:
+		var size: Vector2i = node.tile_set.tile_size
+		tile_size = Vector2(size)
+	var local_rect := Rect2(first - tile_size * 0.5, (last - first).abs() + tile_size)
+	var world_rect := local_rect
+	if node is Node2D:
+		world_rect = (node as Node2D).global_transform * local_rect
+	return {"ok": true, "rect": world_rect, "spatial_facts": {"map_layer": {"coordinate_space": "map_layer", "source": "target", "available": true, "value": int(target.get("map_layer", 0))}, "cell_bounds": {"coordinate_space": "map_cells", "source": "request", "available": true, "value": {"x": start.x, "y": start.y, "width": width, "height": height}}, "map_local_rect": {"coordinate_space": "map_local", "source": "TileMap.map_to_local", "available": true, "value": _rect2_payload(local_rect)}}}
+
+
+static func _visible_world_aabb(root: Node) -> Dictionary:
+	var boxes: Array[AABB] = []
+	_collect_visible_aabbs(root, boxes)
+	if boxes.is_empty():
+		return {"ok": false, "message": "Target Node3D has no visible geometry with finite bounds", "error_code": "target_not_visual"}
+	var merged: AABB = boxes[0]
+	for box in boxes.slice(1):
+		merged = merged.merge(box)
+	if not _finite_vector3(merged.position) or not _finite_vector3(merged.end):
+		return {"ok": false, "message": "Target world bounds are not finite", "error_code": "bounds_unavailable"}
+	return {"ok": true, "aabb": merged}
+
+
+static func _collect_visible_aabbs(node: Node, boxes: Array[AABB]) -> void:
+	if node is VisualInstance3D:
+		var visual: VisualInstance3D = node
+		if visual.visible:
+			var local_box := visual.get_aabb()
+			if local_box.size.length() > 0.0:
+				boxes.append(_transform_aabb(local_box, visual.global_transform))
+	for child in node.get_children():
+		if child is Node:
+			_collect_visible_aabbs(child, boxes)
+
+
+static func _transform_aabb(box: AABB, transform: Transform3D) -> AABB:
+	var result := AABB(transform * box.position, Vector3.ZERO)
+	for x in [0.0, box.size.x]:
+		for y in [0.0, box.size.y]:
+			for z in [0.0, box.size.z]:
+				result = result.expand(transform * (box.position + Vector3(x, y, z)))
+	return result
+
+
+static func _camera_transform_for_aabb(camera: Camera3D, box: AABB, viewport_size: Vector2, target: Dictionary) -> Variant:
+	if viewport_size.x <= 0.0 or viewport_size.y <= 0.0:
+		return null
+	var direction := _view_direction(str(target.get("view_direction", "current")), camera)
+	if direction.length_squared() <= 0.000001:
+		return null
+	var center := box.get_center()
+	var radius := maxf(0.01, box.size.length() * 0.5)
+	var padding := clampf(float(target.get("padding", 1.2)), _MIN_3D_PADDING, _MAX_3D_PADDING)
+	var aspect := viewport_size.x / viewport_size.y
+	if int(camera.projection) == Camera3D.PROJECTION_ORTHOGONAL:
+		camera.size = maxf(box.size.y, box.size.x / aspect) * padding
+		return _look_at_transform(center - direction * maxf(radius * 2.0, 1.0), center)
+	var vertical_fov := deg_to_rad(maxf(1.0, float(camera.fov)))
+	var horizontal_fov := 2.0 * atan(tan(vertical_fov * 0.5) * aspect)
+	var limiting_half_fov := maxf(0.01, minf(vertical_fov, horizontal_fov) * 0.5)
+	var distance := radius * padding / sin(limiting_half_fov)
+	return _look_at_transform(center - direction * distance, center)
+
+
+static func _view_direction(value: String, camera: Camera3D) -> Vector3:
+	match value:
+		"front": return Vector3(0, 0, 1)
+		"back": return Vector3(0, 0, -1)
+		"left": return Vector3(-1, 0, 0)
+		"right": return Vector3(1, 0, 0)
+		"top": return Vector3(0, 1, 0)
+		"bottom": return Vector3(0, -1, 0)
+		"isometric": return Vector3(1, 1, 1).normalized()
+		_: return -camera.global_transform.basis.z.normalized()
+
+
+static func _look_at_transform(position: Vector3, target: Vector3) -> Transform3D:
+	var transform := Transform3D(Basis.IDENTITY, position)
+	transform = transform.looking_at(target, Vector3.UP)
+	return transform
+
+
+static func _canvas_transform_for_rect(rect: Rect2, viewport_size: Vector2, padding: float) -> Transform2D:
+	var available := viewport_size - Vector2.ONE * maxf(0.0, padding * 2.0)
+	var zoom := minf(available.x / rect.size.x, available.y / rect.size.y)
+	zoom = clampf(zoom, 0.05, 16.0)
+	return Transform2D(Vector2(zoom, 0.0), Vector2(0.0, zoom), viewport_size * 0.5 - rect.get_center() * zoom)
+
+
+static func _world_rect_to_viewport(rect: Rect2, transform: Transform2D) -> Rect2:
+	return transform * rect
+
+
+static func _rect2_from_input(value: Variant) -> Dictionary:
+	if not (value is Dictionary):
+		return {"ok": false, "message": "rect must be an object with x/y/width/height", "error_code": "invalid_target"}
+	var rect: Dictionary = value
+	for key in ["x", "y", "width", "height"]:
+		if typeof(rect.get(key)) not in [TYPE_INT, TYPE_FLOAT]:
+			return {"ok": false, "message": "rect.%s must be numeric" % key, "error_code": "invalid_target"}
+	if float(rect["width"]) <= 0.0 or float(rect["height"]) <= 0.0:
+		return {"ok": false, "message": "rect width and height must be positive", "error_code": "invalid_target"}
+	return {"ok": true, "rect": Rect2(float(rect["x"]), float(rect["y"]), float(rect["width"]), float(rect["height"]))}
+
+
+static func _finite_vector3(value: Vector3) -> bool:
+	return is_finite(value.x) and is_finite(value.y) and is_finite(value.z)
+
+
+static func _vector3_payload(value: Vector3) -> Dictionary:
+	return {"x": value.x, "y": value.y, "z": value.z}
+
+
+static func _rect2_payload(value: Rect2) -> Dictionary:
+	return {"x": value.position.x, "y": value.position.y, "width": value.size.x, "height": value.size.y}
+
+
+static func _rect2i_payload(value: Rect2i) -> Dictionary:
+	return {"x": value.position.x, "y": value.position.y, "width": value.size.x, "height": value.size.y}
+
+
+static func _aabb_payload(value: AABB) -> Dictionary:
+	return {"position": _vector3_payload(value.position), "size": _vector3_payload(value.size)}
+
+
+static func _transform3d_payload(value: Transform3D) -> Dictionary:
+	return {"origin": _vector3_payload(value.origin), "basis": {"x": _vector3_payload(value.basis.x), "y": _vector3_payload(value.basis.y), "z": _vector3_payload(value.basis.z)}}
 
 
 static func _set_owner_preserving_scene_instances(node: Node, owner: Node) -> void:

@@ -162,17 +162,18 @@ func execute(tool_call: Dictionary) -> Dictionary:
 			if str(result.get("status", "")) == "reloaded" and bool(input.get("capture_screenshot", true)):
 				var visual: Dictionary = result.get("visual_evidence", {})
 				if str(visual.get("availability", "")) == "eligible":
-					var screenshot_result := await SceneTools.capture_viewport_screenshot({"mode": str(input.get("screenshot_mode", "2d"))}, editor_interface)
+					var screenshot_input := _automatic_screenshot_input(input)
+					var screenshot_result := await SceneTools.capture_viewport_screenshot(screenshot_input, editor_interface)
 					if bool(screenshot_result.get("ok", false)):
-						result["visual_evidence"] = {"availability": "captured", "scope": result.get("reloaded_targets", []), "path": screenshot_result.get("path", ""), "width": screenshot_result.get("width", 0), "height": screenshot_result.get("height", 0), "advisory": true, "semantic_verification": "not_established"}
+						result["visual_evidence"] = {"availability": "captured", "scope": result.get("reloaded_targets", []), "path": screenshot_result.get("path", ""), "absolute_path": screenshot_result.get("absolute_path", ""), "width": screenshot_result.get("width", 0), "height": screenshot_result.get("height", 0), "capture_scope": screenshot_result.get("capture_scope", "current_viewport"), "spatial_facts": screenshot_result.get("spatial_facts", {}), "inspection": input.get("inspection", {}), "advisory": true, "semantic_verification": "not_established"}
 					else:
 						result["visual_evidence"] = {"availability": "unavailable", "scope": result.get("reloaded_targets", []), "reason": str(screenshot_result.get("error_code", "capture_failed")), "advisory": true, "semantic_verification": "not_established"}
 		"rebuild_map_builder":
 			result = await EditorReloadTools.rebuild_map_builder(input, editor_interface)
 			if str(result.get("status", "")) == "rebuilt" and bool(input.get("capture_screenshot", true)):
-				var builder_screenshot := await SceneTools.capture_viewport_screenshot({"mode": str(input.get("screenshot_mode", "2d"))}, editor_interface)
+				var builder_screenshot := await SceneTools.capture_viewport_screenshot(_automatic_screenshot_input(input), editor_interface)
 				if bool(builder_screenshot.get("ok", false)):
-					result["visual_evidence"] = {"availability": "captured", "scope": [result.get("generated_target_path", "")], "path": builder_screenshot.get("path", ""), "width": builder_screenshot.get("width", 0), "height": builder_screenshot.get("height", 0), "advisory": true, "semantic_verification": "not_established"}
+					result["visual_evidence"] = {"availability": "captured", "scope": [result.get("generated_target_path", "")], "path": builder_screenshot.get("path", ""), "absolute_path": builder_screenshot.get("absolute_path", ""), "width": builder_screenshot.get("width", 0), "height": builder_screenshot.get("height", 0), "capture_scope": builder_screenshot.get("capture_scope", "current_viewport"), "spatial_facts": builder_screenshot.get("spatial_facts", {}), "inspection": input.get("inspection", {}), "advisory": true, "semantic_verification": "not_established"}
 				else:
 					result["visual_evidence"] = {"availability": "unavailable", "scope": [result.get("generated_target_path", "")], "reason": str(builder_screenshot.get("error_code", "capture_failed")), "advisory": true, "semantic_verification": "not_established"}
 		"create_resource":
@@ -231,7 +232,19 @@ func _result_artifacts(result: Dictionary) -> Array:
 	var artifacts: Array = []
 	if result.has("path"):
 		artifacts.append(result["path"])
+	var visual: Variant = result.get("visual_evidence", {})
+	if visual is Dictionary and str(visual.get("path", "")) != "":
+		artifacts.append(visual.get("path"))
 	return artifacts
+
+
+func _automatic_screenshot_input(input: Dictionary) -> Dictionary:
+	var screenshot_input := {"mode": str(input.get("screenshot_mode", "2d"))}
+	if input.get("screenshot_target") is Dictionary:
+		screenshot_input["target"] = input.get("screenshot_target")
+	if input.get("inspection") is Dictionary:
+		screenshot_input["inspection"] = input.get("inspection")
+	return screenshot_input
 
 
 func _read_debugger_errors(input: Dictionary) -> Dictionary:

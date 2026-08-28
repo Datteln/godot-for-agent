@@ -84,6 +84,8 @@ class Session:
     history_event_counter: int = 0
     history_events: list[dict[str, Any]] = field(default_factory=list)
     rag_context: str = ""
+    visual_observations: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """按稳定观察键缓存的终态截图观察；只保留元数据和有界描述，不保存图片字节。"""
     transcript_entries: list[dict[str, Any]] = field(default_factory=list)
     """权威可见展示稿条目，按 `ordinal`（= 创建顺序）排列；每个条目是
     `app.transcript.models.TranscriptEntryDTO` 的 JSON 字典形态。"""
@@ -328,6 +330,7 @@ def session_to_dict(session: Session) -> dict[str, Any]:
         "history_event_counter": session.history_event_counter,
         "history_events": session.history_events,
         "rag_context": session.rag_context,
+        "visual_observations": session.visual_observations,
         "transcript_entries": session.transcript_entries,
         "transcript_entry_counter": session.transcript_entry_counter,
         "transcript_index": session.transcript_index,
@@ -450,6 +453,11 @@ def session_from_dict(data: dict[str, Any], available_tools: set[str]) -> Sessio
         history_event_counter=history_event_counter,
         history_events=history_events,
         rag_context=str(data.get("rag_context", "")),
+        visual_observations={
+            str(key): value
+            for key, value in _as_dict(data.get("visual_observations")).items()
+            if isinstance(value, dict)
+        },
         transcript_entries=transcript_entries,
         transcript_entry_counter=_as_int(data.get("transcript_entry_counter")),
         transcript_index=transcript_index,
