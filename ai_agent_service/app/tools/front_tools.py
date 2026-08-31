@@ -1123,8 +1123,10 @@ def register_front_tools() -> None:
                             "type": "object",
                             "description": (
                                 "Optional bounded target. type=viewport_rect uses rect {x,y,width,height}; "
-                                "canvas_item uses a scene-relative CanvasItem/Control path; map_region uses path, "
-                                "cell_bounds {x,y,width,height}, required explicit map_layer and padding; node_3d uses a "
+                                "canvas_item uses a scene-relative CanvasItem/Control path; map_region is dimension-aware: "
+                                "2D TileMap/TileMapLayer uses cell_bounds {x,y,width,height} plus required explicit "
+                                "map_layer, while 3D GridMap uses cell_bounds {x,y,z,width,height,depth} and must not "
+                                "include map_layer. node_3d uses a "
                                 "scene-relative Node3D path, optional viewport_index, view_direction, and padding. "
                                 "Coordinates and bounds are calculated by the editor, never inferred from pixels."
                             ),
@@ -1132,7 +1134,7 @@ def register_front_tools() -> None:
                                 "type": {"type": "string", "enum": ["viewport_rect", "canvas_item", "map_region", "node_3d"]},
                                 "path": {"type": "string"},
                                 "rect": _object_schema({"x": {"type": "number"}, "y": {"type": "number"}, "width": {"type": "number"}, "height": {"type": "number"}}),
-                                "cell_bounds": _object_schema({"x": {"type": "integer"}, "y": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"}}),
+                                "cell_bounds": _object_schema({"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "depth": {"type": "integer"}}),
                                 "map_layer": {"type": "integer"},
                                 "viewport_index": {"type": "integer"},
                                 "view_direction": {"type": "string", "enum": ["current", "front", "back", "left", "right", "top", "bottom", "isometric"]},
@@ -1142,7 +1144,7 @@ def register_front_tools() -> None:
                             "allOf": [
                                 {
                                     "if": {"properties": {"type": {"const": "map_region"}}},
-                                    "then": {"required": ["path", "cell_bounds", "map_layer"]},
+                                    "then": {"required": ["path", "cell_bounds"]},
                                 }
                             ],
                         },
@@ -1411,13 +1413,11 @@ def register_front_tools() -> None:
             schema={
                 "name": "describe_tilemap_selection",
                 "description": (
-                    "Describe the editor-selected TileMapLayer, if and only if one is currently "
-                    "selected. Selection-dependent: it cannot discover map nodes and does not "
-                    "support legacy TileMap/GridMap. If no TileMapLayer is selected, or the target "
-                    "is a legacy TileMap/GridMap, do NOT call this tool — confirm the node path "
-                    "from scene facts (read_scene_tree/editor evidence) and call "
-                    "describe_map_region(target_path=...) instead. After a no-selection error, use "
-                    "the target-path fallback rather than retrying this zero-argument call."
+                    "Describe an editor-selected TileMapLayer, legacy TileMap, or GridMap. The result "
+                    "includes the concrete type, dimension, and the matching bounded-region parameters for "
+                    "describe_map_region/capture_viewport_screenshot. If no compatible map node is selected, "
+                    "the tool auto-detects only when exactly one compatible map node exists; otherwise use "
+                    "scene facts to choose a path and call describe_map_region(target_path=...)."
                 ),
                 "parameters": _object_schema({}),
             },

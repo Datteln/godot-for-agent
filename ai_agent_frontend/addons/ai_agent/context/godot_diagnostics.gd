@@ -18,7 +18,7 @@ static func from_output(output: String, source: String, execution_id: String, af
 	var lines := output.split("\n")
 	for index in range(lines.size()):
 		var raw := str(lines[index]).strip_edges()
-		if not _is_diagnostic_line(raw):
+		if not is_diagnostic_line(raw):
 			continue
 		var location := _location_from_text(raw)
 		if str(location.get("resource_path", "")) == "" and index + 1 < lines.size():
@@ -55,13 +55,14 @@ static func unlocated(source: String, execution_id: String, resource_path: Strin
 	}
 
 
-static func _is_diagnostic_line(line: String) -> bool:
+static func is_diagnostic_line(line: String) -> bool:
 	var lower := line.to_lower()
-	return line.begins_with("ERROR:") or line.begins_with("SCRIPT ERROR:") or lower.find("parse error") >= 0 or lower.find("parser error") >= 0 or lower.find("compile error") >= 0
+	return line.begins_with("ERROR:") or line.begins_with("SCRIPT ERROR:") or line.begins_with("错误") or line.begins_with("脚本错误") or lower.find("parse error") >= 0 or lower.find("parser error") >= 0 or lower.find("compile error") >= 0
 
 
 static func _severity(line: String) -> String:
-	return "warning" if line.to_lower().find("warning") >= 0 and line.to_lower().find("error") < 0 else "error"
+	var lower := line.to_lower()
+	return "warning" if (lower.find("warning") >= 0 or line.find("警告") >= 0) and lower.find("error") < 0 and line.find("错误") < 0 else "error"
 
 
 static func _message(line: String) -> String:
@@ -74,10 +75,16 @@ static func _location_from_text(text: String) -> Dictionary:
 	if regex.compile("(res://[^\\s:)]+)(?::(\\d+))?(?::(\\d+))?") != OK:
 		return {}
 	var match := regex.search(text)
-	if match == null:
+	if match != null:
+		return {
+			"resource_path": str(match.get_string(1)),
+			"line": int(match.get_string(2)) if match.get_string(2).is_valid_int() else 0,
+			"column": int(match.get_string(3)) if match.get_string(3).is_valid_int() else 0,
+		}
+	var localized := RegEx.new()
+	if localized.compile("[\\(（]\\s*(\\d+)\\s*[,，]\\s*(\\d+)\\s*[\\)）]") != OK:
 		return {}
-	return {
-		"resource_path": str(match.get_string(1)),
-		"line": int(match.get_string(2)) if match.get_string(2).is_valid_int() else 0,
-		"column": int(match.get_string(3)) if match.get_string(3).is_valid_int() else 0,
-	}
+	var localized_match := localized.search(text)
+	if localized_match == null:
+		return {}
+	return {"resource_path": "", "line": int(localized_match.get_string(1)), "column": int(localized_match.get_string(2))}

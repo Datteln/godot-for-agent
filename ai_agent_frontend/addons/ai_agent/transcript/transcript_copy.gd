@@ -63,6 +63,14 @@ static func is_approval_resolved(state: String) -> bool:
 ## 旧条目缺失时仅回退到同为持久化 typed 字段的 tool/args/decision，
 ## 仍不可得时显式标注"未提供"。
 static func approval_result_line(payload: Dictionary) -> String:
+	if str(payload.get("decision", "")) == "error":
+		var error_summary := str(payload.get("error_summary", "")).strip_edges()
+		if error_summary != "":
+			return "%s：%s — %s" % [
+				approval_resolution_text(payload),
+				approval_operation_text(payload),
+				error_summary,
+			]
 	return "%s：%s %s" % [
 		approval_resolution_text(payload),
 		approval_operation_text(payload),

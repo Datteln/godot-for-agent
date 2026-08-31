@@ -11,11 +11,6 @@ const SUPPORTED_MODES := ["editor_visible", "resource_only", "runtime_only"]
 const FIXED_BUILDER_METHOD := "rebuild_from_layout"
 const READABLE_LAYOUT_EXTENSIONS := ["json", "cfg", "csv", "txt"]
 
-# 仅在本编辑器会话内记录失败状态。文件内容、布局或场景身份变更会产生新 fingerprint，
-# 因此不会把已修复的 builder 永久锁住。
-static var _failed_builder_fingerprints: Dictionary = {}
-
-
 ## 重载由已批准代码编辑产生的目标，并始终返回可区分的类型化状态。
 static func reload_targets(input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
@@ -46,10 +41,23 @@ static func reload_targets(input: Dictionary, editor_interface: EditorInterface)
 			"visual_evidence": {"availability": "unavailable", "reason": "runtime_only_generator_not_executed"},
 		}
 
-	var dirty_scenes := _normalized_paths(editor_interface.get_unsaved_scenes())
+	var can_observe_unsaved_scenes := editor_interface.has_method("get_unsaved_scenes")
+	var dirty_scenes := _unsaved_scene_paths(editor_interface)
 	var dirty_target := _dirty_scene_target(targets, dirty_scenes)
 	if dirty_target != "":
 		return _failure("blocked", "reload_blocked_dirty_editor_state", "The target scene has unsaved editor changes; save or discard them manually before reloading", dirty_target)
+	var open_scenes := _normalized_paths(editor_interface.get_open_scenes())
+	var closed_scenes := _closed_scene_targets(targets, open_scenes)
+	if not closed_scenes.is_empty():
+		return {
+			"ok": false,
+			"status": "blocked",
+			"error_code": "reload_scene_not_open",
+			"message": "Open every target scene with open_scene before reload_map_targets; no target was reloaded.",
+			"targets": targets,
+			"open_scene_paths": closed_scenes,
+			"next_action": "open_scene",
+		}
 
 	var filesystem := editor_interface.get_resource_filesystem()
 	if filesystem == null:
@@ -62,12 +70,8 @@ static func reload_targets(input: Dictionary, editor_interface: EditorInterface)
 
 	var reloaded: Array = []
 	var unavailable: Array = []
-	var open_scenes := _normalized_paths(editor_interface.get_open_scenes())
 	for target in ordered_targets:
 		if target.get_extension().to_lower() == "tscn":
-			if target not in open_scenes:
-				unavailable.append({"target": target, "reason": "scene_not_open"})
-				continue
 			editor_interface.reload_scene_from_path(target)
 			reloaded.append(target)
 		else:
@@ -83,7 +87,7 @@ static func reload_targets(input: Dictionary, editor_interface: EditorInterface)
 	if reloaded.is_empty():
 		return {"ok": false, "status": "unavailable", "error_code": "no_eligible_open_scene", "targets": targets, "reload_mode": mode, "unavailable_targets": unavailable, "visual_evidence": {"availability": "unavailable", "reason": "no_eligible_open_scene"}}
 	var visual_availability := "eligible" if mode == "editor_visible" and _contains_scene(reloaded) else "unavailable"
-	return {"ok": true, "status": "reloaded", "targets": targets, "reloaded_targets": reloaded, "unavailable_targets": unavailable, "reload_mode": mode, "execution_id": GodotDiagnostics.operation_id("resource_reload"), "diagnostics": [], "visual_evidence": {"availability": visual_availability, "reason": "editor_viewport_can_only_evidence_open_reloaded_scenes" if visual_availability == "eligible" else "resource_reload_has_no_target_scoped_viewport"}}
+	return {"ok": true, "status": "reloaded", "targets": targets, "reloaded_targets": reloaded, "unavailable_targets": unavailable, "reload_mode": mode, "execution_id": GodotDiagnostics.operation_id("resource_reload"), "diagnostics": [], "warnings": [] if can_observe_unsaved_scenes else ["This Godot version cannot report unsaved scene paths; save affected scenes before reloading."], "visual_evidence": {"availability": visual_availability, "reason": "editor_viewport_can_only_evidence_open_reloaded_scenes" if visual_availability == "eligible" else "resource_reload_has_no_target_scoped_viewport"}}
 
 
 ## 在当前编辑场景中调用已挂载 @tool builder 的固定重建接口。
@@ -110,24 +114,27 @@ static func rebuild_map_builder(input: Dictionary, editor_interface: EditorInter
 	var raw_script_path := str(script.resource_path)
 	if not PathUtils.is_res_path(PathUtils.to_godot_path(raw_script_path)):
 		return _failure("blocked", "builder_script_not_project_resource", "The attached builder script must use a res:// project resource", raw_script_path)
+	if not PathUtils.to_godot_path(raw_script_path).begins_with(PathUtils.MAP_LAYOUT_PREFIX):
+		return _failure("blocked", "builder_script_outside_layout_dir", "The attached builder script must live under res://map_layouts/", raw_script_path)
 	var script_observation := _script_path_observation(raw_script_path)
 	var script_path := str(script_observation.get("normalized_resource_path", ""))
 	if script_path == "" or not bool(script_observation.get("exists", false)):
 		return _builder_script_missing(raw_script_path)
 	var script_text := FileAccess.get_file_as_string(ProjectSettings.globalize_path(script_path))
-	var preliminary_fingerprint := _builder_fingerprint(script_text, "", scene_root.scene_file_path, builder_path)
 	if script_text.strip_edges().is_empty():
-		return _remember_builder_failure(_failure("failed", "authoring_entry_point_missing", "The attached builder script is empty", script_path), preliminary_fingerprint, script_path)
+		return _failure("failed", "authoring_entry_point_missing", "The attached builder script is empty", script_path)
 	var script_validation := await validate_builder_script_after_scan(script_path, editor_interface)
 	if not bool(script_validation.get("ok", false)):
-		return _remember_builder_failure(script_validation, preliminary_fingerprint, script_path)
+		return script_validation
 	if script_text.find("func %s" % FIXED_BUILDER_METHOD) == -1:
-		return _remember_builder_failure(_failure("failed", "builder_script_invalid", "The on-disk builder script lacks the fixed rebuild interface", script_path), preliminary_fingerprint, script_path)
+		return _failure("failed", "builder_script_invalid", "The on-disk builder script lacks the fixed rebuild interface", script_path)
 	if not builder.has_method(FIXED_BUILDER_METHOD):
-		return _remember_builder_failure(_failure("blocked", "builder_instance_stale", "The on-disk builder defines rebuild_from_layout(), but the attached editor node still exposes an older script instance; reload the approved dependent scene before rebuilding", builder_path), preliminary_fingerprint, script_path)
+		return _failure("blocked", "builder_instance_stale", "The on-disk builder defines rebuild_from_layout(), but the attached editor node still exposes an older script instance; reload the approved dependent scene before rebuilding", builder_path)
 	var layout_path := PathUtils.to_godot_path(str(builder.get("layout_path")))
 	if not PathUtils.is_res_path(layout_path):
 		return _failure("blocked", "builder_layout_not_project_resource", "The builder layout must use a res:// project resource", str(builder.get("layout_path")))
+	if not layout_path.begins_with(PathUtils.MAP_LAYOUT_PREFIX):
+		return _failure("blocked", "builder_layout_outside_layout_dir", "The builder layout must live under res://map_layouts/", str(builder.get("layout_path")))
 	if layout_path.get_extension().to_lower() not in READABLE_LAYOUT_EXTENSIONS:
 		return _failure("blocked", "builder_layout_path_invalid", "The builder must expose a readable layout_path", builder_path)
 	if layout_path not in approved_paths:
@@ -136,13 +143,9 @@ static func rebuild_map_builder(input: Dictionary, editor_interface: EditorInter
 	if not FileAccess.file_exists(layout_absolute):
 		return _failure("failed", "layout_missing", "The approved builder layout does not exist", layout_path)
 	var layout_text := FileAccess.get_file_as_string(layout_absolute)
-	var fingerprint := _builder_fingerprint(script_text, layout_text, scene_root.scene_file_path, builder_path)
-	var repeated_failure := _prior_builder_failure(fingerprint)
-	if not repeated_failure.is_empty():
-		return repeated_failure
 	var layout_validation := _validate_layout(layout_path, layout_text)
 	if not bool(layout_validation.get("ok", false)):
-		return _remember_builder_failure(layout_validation, fingerprint, layout_path)
+		return layout_validation
 	var generated_path: NodePath = builder.get("generated_target_path")
 	if generated_path.is_empty():
 		return _failure("blocked", "generated_target_missing", "The builder must expose generated_target_path", builder_path)
@@ -154,8 +157,7 @@ static func rebuild_map_builder(input: Dictionary, editor_interface: EditorInter
 	var before_cells := _cell_count(generated_target)
 	var invocation_result = builder.call(FIXED_BUILDER_METHOD)
 	if not (invocation_result is Dictionary) or not bool(invocation_result.get("ok", false)):
-		return _remember_builder_failure(_failure("failed", "builder_rebuild_failed", "rebuild_from_layout() did not return a successful typed result", builder_path), fingerprint, builder_path)
-	_failed_builder_fingerprints.erase(fingerprint)
+		return _failure("failed", "builder_rebuild_failed", "rebuild_from_layout() did not return a successful typed result", builder_path)
 	return {
 		"ok": true,
 		"status": "rebuilt",
@@ -173,6 +175,12 @@ static func rebuild_map_builder(input: Dictionary, editor_interface: EditorInter
 
 
 ## 将路径数组规范化为受项目边界保护的 res:// 路径。
+static func _unsaved_scene_paths(editor_interface: EditorInterface) -> Array[String]:
+	if editor_interface == null or not editor_interface.has_method("get_unsaved_scenes"):
+		return []
+	return _normalized_paths(editor_interface.call("get_unsaved_scenes"))
+
+
 static func _normalized_paths(value: Variant) -> Array[String]:
 	var paths: Array[String] = []
 	if not (value is Array):
@@ -226,11 +234,11 @@ static func validate_builder_script(script_path: String, editor_interface: Edito
 		return _with_path_observation(_with_diagnostics(_failure("failed", "authoring_entry_point_missing", "The builder script is empty", normalized_path), [_fallback_diagnostic(normalized_path, "The builder script is empty")]), observation)
 	var loaded := ResourceLoader.load(normalized_path, "Script", ResourceLoader.CACHE_MODE_REPLACE)
 	if not (loaded is Script):
-		return _with_path_observation(_with_diagnostics(_failure("failed", "builder_script_compile_failed", "Godot could not load the builder script", normalized_path), await _current_builder_diagnostics(normalized_path, editor_interface, "Godot could not load the builder script")), observation)
+		return await _builder_compile_failure("Godot could not load the builder script", normalized_path, observation, editor_interface)
 	var reload_error := (loaded as Script).reload(true)
 	if reload_error != OK:
 		var message := "Godot could not compile the builder script: %s" % error_string(reload_error)
-		return _with_path_observation(_with_diagnostics(_failure("failed", "builder_script_compile_failed", message, normalized_path), await _current_builder_diagnostics(normalized_path, editor_interface, message)), observation)
+		return await _builder_compile_failure(message, normalized_path, observation, editor_interface)
 	return _with_path_observation({"ok": true, "path": normalized_path, "diagnostics": []}, observation)
 
 
@@ -289,6 +297,31 @@ static func _current_builder_diagnostics(script_path: String, editor_interface: 
 	return diagnostics
 
 
+## 统一 map builder 编译失败的修复信息；每次调用均来自当前磁盘版本的即时解析。
+static func _builder_compile_failure(message: String, script_path: String, observation: Dictionary, editor_interface: EditorInterface) -> Dictionary:
+	var diagnostics := await _current_builder_diagnostics(script_path, editor_interface, message)
+	return _builder_compile_failure_result(message, script_path, observation, diagnostics)
+
+
+static func _builder_compile_failure_result(message: String, script_path: String, observation: Dictionary, diagnostics: Array) -> Dictionary:
+	var result := _failure("failed", "builder_script_compile_failed", message, script_path)
+	result["path"] = script_path
+	result["next_action"] = "fix_builder_script"
+	result["raw_diagnostic"] = _bounded_raw_diagnostic(diagnostics, message)
+	return _with_path_observation(_with_diagnostics(result, diagnostics), observation)
+
+
+static func _bounded_raw_diagnostic(diagnostics: Array, fallback_message: String) -> String:
+	var lines: Array[String] = []
+	for item in diagnostics:
+		if item is Dictionary:
+			var raw := str(item.get("raw_text", item.get("message", ""))).strip_edges()
+			if raw != "":
+				lines.append(raw)
+	var combined := "\n".join(lines)
+	return (combined if combined != "" else fallback_message).left(4000)
+
+
 static func _fallback_diagnostic(script_path: String, message: String) -> Dictionary:
 	return GodotDiagnostics.unlocated("builder_validation", GodotDiagnostics.operation_id("builder_validation"), script_path, message)
 
@@ -298,34 +331,15 @@ static func _with_diagnostics(result: Dictionary, diagnostics: Array) -> Diction
 	return result
 
 
-static func _builder_fingerprint(script_text: String, layout_text: String, scene_path: String, builder_path: String) -> String:
-	return "%s:%s:%s:%s" % [script_text.sha256_text(), layout_text.sha256_text(), scene_path, builder_path]
-
-
-static func _prior_builder_failure(fingerprint: String) -> Dictionary:
-	if not _failed_builder_fingerprints.has(fingerprint):
-		return {}
-	var previous: Dictionary = _failed_builder_fingerprints[fingerprint]
-	return {
-		"ok": false,
-		"status": "blocked",
-		"error_code": "builder_repair_required",
-		"message": "The same builder source/layout/scene state already failed; submit an approved repair before retrying execution",
-		"target": previous.get("target", ""),
-		"prior_error_code": previous.get("error_code", ""),
-		"failed_builder_fingerprint": fingerprint,
-		"repair_required": true,
-	}
-
-
-static func _remember_builder_failure(result: Dictionary, fingerprint: String, repair_target: String) -> Dictionary:
-	_failed_builder_fingerprints[fingerprint] = {"error_code": result.get("error_code", "builder_rebuild_failed"), "target": repair_target}
-	result["failed_builder_fingerprint"] = fingerprint
-	result["repair_required"] = true
-	return result
-
-
 ## 返回会被 reload 覆盖的脏场景；没有冲突时返回空字符串。
+static func _closed_scene_targets(targets: Array[String], open_scenes: Array[String]) -> Array[String]:
+	var closed: Array[String] = []
+	for target in targets:
+		if target.get_extension().to_lower() == "tscn" and target not in open_scenes:
+			closed.append(target)
+	return closed
+
+
 static func _dirty_scene_target(targets: Array[String], dirty_scenes: Array[String]) -> String:
 	for target in targets:
 		if target.get_extension().to_lower() == "tscn" and target in dirty_scenes:

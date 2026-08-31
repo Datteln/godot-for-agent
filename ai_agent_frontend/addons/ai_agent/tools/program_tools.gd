@@ -305,6 +305,15 @@ static func _validate_map_authoring_target(input: Dictionary, path: String, befo
 			"path": path,
 			"supported_extensions": MAP_AUTHORING_EXTENSIONS,
 		}
+	var is_layout_or_builder := extension in ["gd", "json", "cfg", "csv", "txt"]
+	if is_layout_or_builder and not path.begins_with(PathUtils.MAP_LAYOUT_PREFIX):
+		return {
+			"ok": false,
+			"error_code": "map_authoring_requires_layout_dir",
+			"message": "Code-driven map layout and builder files must live under res://map_layouts/.",
+			"path": path,
+			"required_prefix": PathUtils.MAP_LAYOUT_PREFIX,
+		}
 	return {"ok": true}
 
 

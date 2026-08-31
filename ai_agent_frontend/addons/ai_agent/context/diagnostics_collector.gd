@@ -70,20 +70,21 @@ static func _collect_log_file(path: String) -> Array:
 	for index in range(start, lines.size()):
 		var line := str(lines[index]).strip_edges()
 		var lower := line.to_lower()
-		if lower.find("script error") >= 0 or lower.find("error:") >= 0 or lower.find("warning:") >= 0 or lower.find("failed") >= 0:
+		if GodotDiagnostics.is_diagnostic_line(line) or lower.find("warning:") >= 0 or line.begins_with("警告") or lower.find("failed") >= 0:
 			# 日志观察仅供人工/历史排错；它不是本次执行的源位置证据。
-			var item := GodotDiagnostics.unlocated("godot_log_historical", "historical:%s" % path, "", line)
-			item["severity"] = _severity_from_line(lower)
+			var parsed := GodotDiagnostics.from_output(line, "godot_log_historical", "historical:%s" % path)
+			var item: Dictionary = parsed[0] if not parsed.is_empty() else GodotDiagnostics.unlocated("godot_log_historical", "historical:%s" % path, "", line)
+			item["severity"] = _severity_from_line(lower, line)
 			item["log_path"] = path
 			item["log_line"] = index + 1
 			result.append(item)
 	return result
 
 
-static func _severity_from_line(lower: String) -> String:
-	if lower.find("error") >= 0 or lower.find("failed") >= 0:
+static func _severity_from_line(lower: String, raw: String) -> String:
+	if lower.find("error") >= 0 or raw.find("错误") >= 0 or lower.find("failed") >= 0:
 		return "error"
-	if lower.find("warning") >= 0:
+	if lower.find("warning") >= 0 or raw.find("警告") >= 0:
 		return "warning"
 	return "info"
 

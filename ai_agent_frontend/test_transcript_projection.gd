@@ -129,6 +129,7 @@ func _run_tool_outcome_semantics_test() -> void:
 	_check(str(unselected.get("status", "")) == "rejected" and str(unselected.get("decision_source", "")) == "unselected", "decision: mixed batch unselected call is rejected")
 	var approval_error := {"kind": "approval", "state": "error", "payload": {"decision": "error", "error_code": "invalid_path", "operation_summary": "打开场景", "affected_paths": ["res://bad.txt"]}}
 	_check(TranscriptCopy.canonical_text(approval_error).contains("执行失败（invalid_path）"), "decision: approval error is not rendered as rejection")
+	_check(TranscriptCopy.approval_result_line({"decision": "error", "tool": "rebuild_map_builder", "error_code": "generated_target_missing", "error_summary": "The builder must expose generated_target_path"}).contains("The builder must expose generated_target_path"), "decision: approval error shows the typed error summary")
 	var activity_reject := {"kind": "tool_activity", "state": "resolved", "payload": {"outcome_status": "rejected", "tool": "open_scene", "args": {}}}
 	_check(TranscriptCopy.canonical_text(activity_reject).contains("已拒绝"), "decision: rejected activity is distinct from execution failure")
 

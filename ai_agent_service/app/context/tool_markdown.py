@@ -624,24 +624,26 @@ def _bounds_text(bounds: dict[str, Any]) -> str:
 
 
 def _render_tilemap_selection(payload: Any) -> str:
-    """describe_tilemap_selection 结果（任务 7.8）：选择依赖 + 目标路径回退指引。"""
+    """渲染维度感知的地图选择结果与下一步有界观察提示。"""
     body = payload if isinstance(payload, dict) else {}
     if body.get("ok"):
         path = body.get("path", "")
         map_type = body.get("type", "TileMapLayer")
+        dimension = int(body.get("dimension", 2))
+        bounds = body.get("region_bounds_fields", [])
+        bounds_text = ", ".join(str(item) for item in bounds) if isinstance(bounds, list) else "x, y, width, height"
+        map_layer = "不适用" if not body.get("map_layer_applicable", True) else "需要明确 map_layer（TileMapLayer 使用 0）"
         return (
-            f"- 已选 {map_type}：{path}\n"
-            f"- 后续观察：describe_map_region(target_path={path!r}, 有界 x/y/width/height)"
+            f"- 已选 {map_type}（{dimension}D）：{path}\n"
+            f"- 有界区域参数：{bounds_text}；map_layer：{map_layer}\n"
+            f"- 后续观察：describe_map_region(target_path={path!r}, 使用上述有限边界)"
         )
     message = str(body.get("message", ""))
     lines = [f"- 结果：不可用 — {message[:200]}"]
     candidates = body.get("candidates")
     if isinstance(candidates, list) and candidates:
         lines.append("- 候选节点：" + ", ".join(str(item) for item in candidates[:12]))
-    lines.append(
-        "- 说明：describe_tilemap_selection 仅在编辑器选中 TileMapLayer 时有效，"
-        "不能用于发现地图节点，也不支持 legacy TileMap/GridMap。"
-    )
+    lines.append("- 支持类型：TileMapLayer、legacy TileMap、GridMap；结果会标明二维或三维区域参数。")
     lines.append(
         "- 回退：用场景事实（read_scene_tree/editor 证据）确认地图节点路径，然后调用 "
         "describe_map_region(target_path=...)；不要重复无参调用本工具。"

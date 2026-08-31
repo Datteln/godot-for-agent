@@ -915,8 +915,8 @@ static func _capture_2d_target(viewport: Viewport, target: Dictionary, input: Di
 
 
 static func _capture_3d_target(viewport: Viewport, target: Dictionary, input: Dictionary, editor_interface: EditorInterface) -> Dictionary:
-	if str(target.get("type", "")) != "node_3d":
-		return {"ok": false, "message": "3D target.type must be node_3d", "error_code": "invalid_target"}
+	if not str(target.get("type", "")) in ["node_3d", "map_region"]:
+		return {"ok": false, "message": "3D target.type must be node_3d or map_region", "error_code": "invalid_target"}
 	var viewport_index := int(target.get("viewport_index", input.get("viewport_index", 0)))
 	var lease_key := str(viewport.get_instance_id())
 	if _viewport_3d_leases.has(lease_key):
@@ -940,14 +940,18 @@ static func _capture_3d_target(viewport: Viewport, target: Dictionary, input: Di
 	camera.global_transform = applied_transform
 	var result := await _capture_viewport_image(viewport, input, resolved)
 	var lease_is_current := str(_viewport_3d_leases.get(lease_key, "")) == lease
-	var user_changed_view := not camera.global_transform.is_equal_approx(applied_transform)
+	var restoration := _restore_3d_camera_after_capture(
+		camera,
+		applied_transform,
+		prior_transform,
+		prior_projection,
+		prior_fov,
+		prior_size,
+		lease_is_current
+	)
+	var user_changed_view := bool(restoration.get("user_changed_view", false))
 	if lease_is_current:
 		_viewport_3d_leases.erase(lease_key)
-		if not user_changed_view:
-			camera.projection = prior_projection
-			camera.fov = prior_fov
-			camera.size = prior_size
-			camera.global_transform = prior_transform
 	if user_changed_view:
 		return {"ok": false, "message": "The editor 3D view changed while target capture was active", "error_code": "editor_view_changed"}
 	if bool(result.get("ok", false)):
@@ -963,7 +967,33 @@ static func _capture_3d_target(viewport: Viewport, target: Dictionary, input: Di
 			"size": prior_size,
 		}
 		result["spatial_facts"] = facts
+		result["requested_target"] = target.duplicate(true)
+		result["resolved_target"] = {
+			"capture_scope": resolved.get("capture_scope", "node_3d"),
+			"world_aabb": _aabb_payload(resolved["world_aabb"]),
+		}
+		if resolved.has("warnings"):
+			result["warnings"] = resolved["warnings"]
 	return result
+
+
+## 将 3D 取景事务后的相机恢复逻辑集中起来，便于验证 map_region 与 node_3d 共用同一恢复契约。
+static func _restore_3d_camera_after_capture(
+	camera: Camera3D,
+	applied_transform: Transform3D,
+	prior_transform: Transform3D,
+	prior_projection: int,
+	prior_fov: float,
+	prior_size: float,
+	lease_is_current: bool
+) -> Dictionary:
+	var user_changed_view := not camera.global_transform.is_equal_approx(applied_transform)
+	if lease_is_current and not user_changed_view:
+		camera.projection = prior_projection
+		camera.fov = prior_fov
+		camera.size = prior_size
+		camera.global_transform = prior_transform
+	return {"user_changed_view": user_changed_view, "restored": lease_is_current and not user_changed_view}
 
 
 static func _capture_viewport_image(viewport: Viewport, input: Dictionary, resolved: Dictionary) -> Dictionary:
@@ -1078,6 +1108,8 @@ static func _resolve_3d_target(target: Dictionary, editor_interface: EditorInter
 	var node := root.get_node_or_null(NodePath(path))
 	if node == null:
 		return {"ok": false, "message": "Target node not found: " + path, "error_code": "target_missing"}
+	if str(target.get("type", "")) == "map_region":
+		return _gridmap_region_world_aabb(node, target, root)
 	if not (node is Node3D):
 		return {"ok": false, "message": "node_3d target must resolve to Node3D", "error_code": "invalid_target"}
 	var aabb_result := _visible_world_aabb(node)
@@ -1087,6 +1119,83 @@ static func _resolve_3d_target(target: Dictionary, editor_interface: EditorInter
 	var world_aabb: AABB = aabb_result["aabb"]
 	var target_path := _relative_path(root, node)
 	return {"ok": true, "world_aabb": world_aabb, "capture_scope": "node_3d", "spatial_facts": {"world_aabb": {"coordinate_space": "world_3d", "source": "VisualInstance3D.get_aabb", "available": true, "value": _aabb_payload(world_aabb)}, "target_origin": {"coordinate_space": "world_3d", "source": "Node3D.global_position", "available": true, "value": _vector3_payload(target_node.global_position)}, "target": target_path, "scene_path": str(root.scene_file_path)}}
+
+
+static func _gridmap_region_world_aabb(node: Node, target: Dictionary, root: Node) -> Dictionary:
+	if node.get_class() != "GridMap":
+		return {"ok": false, "message": "3D map_region target must resolve to GridMap", "error_code": "invalid_target"}
+	if target.has("map_layer"):
+		return {"ok": false, "message": "map_layer is not applicable to a 3D GridMap map_region", "error_code": "map_layer_not_applicable"}
+	var bounds_result := _gridmap_cell_bounds(target.get("cell_bounds", {}))
+	if not bool(bounds_result.get("ok", false)):
+		return bounds_result
+	var grid: GridMap = node
+	var start: Vector3i = bounds_result["start"]
+	var width := int(bounds_result["width"])
+	var height := int(bounds_result["height"])
+	var depth := int(bounds_result["depth"])
+	var cell_size: Vector3 = grid.cell_size
+	if not _finite_vector3(cell_size) or cell_size.x <= 0.0 or cell_size.y <= 0.0 or cell_size.z <= 0.0:
+		return {"ok": false, "message": "GridMap cell_size must be finite and positive", "error_code": "bounds_unavailable"}
+	var first: Vector3 = grid.map_to_local(start)
+	var last: Vector3 = grid.map_to_local(start + Vector3i(width - 1, height - 1, depth - 1))
+	var half_cell := cell_size * 0.5
+	var local_min := Vector3(minf(first.x, last.x), minf(first.y, last.y), minf(first.z, last.z)) - half_cell
+	var local_max := Vector3(maxf(first.x, last.x), maxf(first.y, last.y), maxf(first.z, last.z)) + half_cell
+	var local_aabb := AABB(local_min, local_max - local_min)
+	var world_aabb := _transform_aabb(local_aabb, grid.global_transform)
+	if not _finite_vector3(world_aabb.position) or not _finite_vector3(world_aabb.end):
+		return {"ok": false, "message": "GridMap world bounds are not finite", "error_code": "bounds_unavailable"}
+	var occupancy := _gridmap_occupancy(grid, start, width, height, depth)
+	var warnings: Array[String] = []
+	if int(occupancy.get("occupied_cells", 0)) == 0:
+		warnings.append("requested GridMap region has no occupied cells; screenshot is visual evidence only")
+	if bool(occupancy.get("truncated", false)):
+		warnings.append("GridMap occupancy count was truncated; screenshot still frames the complete requested region")
+	var facts := {
+		"cell_bounds": {"coordinate_space": "gridmap_cells", "source": "request", "available": true, "value": _vector3i_bounds_payload(start, width, height, depth)},
+		"map_local_aabb": {"coordinate_space": "gridmap_local", "source": "GridMap.map_to_local", "available": true, "value": _aabb_payload(local_aabb)},
+		"world_aabb": {"coordinate_space": "world_3d", "source": "GridMap.global_transform", "available": true, "value": _aabb_payload(world_aabb)},
+		"cell_size": {"coordinate_space": "gridmap_local", "source": "GridMap.cell_size", "available": true, "value": _vector3_payload(cell_size)},
+		"occupancy": {"coordinate_space": "gridmap_cells", "source": "GridMap.get_cell_item", "available": true, "value": occupancy},
+		"target": _relative_path(root, grid),
+		"scene_path": str(root.scene_file_path),
+	}
+	return {"ok": true, "world_aabb": world_aabb, "capture_scope": "map_region", "spatial_facts": facts, "warnings": warnings}
+
+
+static func _gridmap_cell_bounds(value: Variant) -> Dictionary:
+	if not (value is Dictionary):
+		return {"ok": false, "message": "3D map_region.cell_bounds must be an object", "error_code": "invalid_cell_bounds"}
+	var bounds: Dictionary = value
+	for field in ["x", "y", "z", "width", "height", "depth"]:
+		if not (bounds.get(field) is int):
+			return {"ok": false, "message": "3D map_region.cell_bounds must contain integer x, y, z, width, height, and depth", "error_code": "invalid_cell_bounds"}
+	var width := int(bounds["width"])
+	var height := int(bounds["height"])
+	var depth := int(bounds["depth"])
+	if width <= 0 or height <= 0 or depth <= 0:
+		return {"ok": false, "message": "3D map_region.cell_bounds width, height, and depth must be positive", "error_code": "invalid_cell_bounds"}
+	return {"ok": true, "start": Vector3i(int(bounds["x"]), int(bounds["y"]), int(bounds["z"])), "width": width, "height": height, "depth": depth}
+
+
+static func _gridmap_occupancy(grid: GridMap, start: Vector3i, width: int, height: int, depth: int) -> Dictionary:
+	const MAX_OCCUPANCY_SCAN := 4096
+	var scanned := 0
+	var occupied := 0
+	for z_offset in range(depth):
+		for y_offset in range(height):
+			for x_offset in range(width):
+				if scanned >= MAX_OCCUPANCY_SCAN:
+					return {"occupied_cells": occupied, "scanned_cells": scanned, "truncated": true}
+				if grid.get_cell_item(start + Vector3i(x_offset, y_offset, z_offset)) != GridMap.INVALID_CELL_ITEM:
+					occupied += 1
+				scanned += 1
+	return {"occupied_cells": occupied, "scanned_cells": scanned, "truncated": false}
+
+
+static func _vector3i_bounds_payload(start: Vector3i, width: int, height: int, depth: int) -> Dictionary:
+	return {"x": start.x, "y": start.y, "z": start.z, "width": width, "height": height, "depth": depth}
 
 
 static func _canvas_item_world_rect(node: Node) -> Dictionary:

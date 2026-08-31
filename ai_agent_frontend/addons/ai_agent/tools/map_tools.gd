@@ -10,33 +10,64 @@ const MAX_SUMMARY_RUNS := 256
 
 static func describe_selection(editor_interface: EditorInterface) -> Dictionary:
 	if editor_interface == null:
-		return {"ok": false, "message": "EditorInterface is not available"}
+		return {"ok": false, "message": "EditorInterface is not available", "error_code": "editor_unavailable"}
 	var root := editor_interface.get_edited_scene_root()
 	for node in editor_interface.get_selection().get_selected_nodes():
-		if node != null and node.get_class() == "TileMapLayer":
+		if node != null and _is_map_node(node):
 			var path := str(root.get_path_to(node)) if root != null else str(node.get_path())
-			return {"ok": true, "path": path, "type": "TileMapLayer"}
+			return _describe_selected_map_node(node, path, false)
 
 	if root == null:
-		return {"ok": false, "message": "Select a TileMapLayer first"}
+		return _unsupported_selection_result([])
 	var found: Array = []
-	_collect_tilemap_layers(root, found)
+	_collect_map_nodes(root, found)
 	if found.size() == 1:
 		var node: Node = found[0]
-		return {"ok": true, "path": str(root.get_path_to(node)), "type": "TileMapLayer", "auto_detected": true}
+		return _describe_selected_map_node(node, str(root.get_path_to(node)), true)
 	if found.size() > 1:
-		var paths: Array = []
+		var paths: Array[String] = []
 		for n in found:
 			paths.append(str(root.get_path_to(n)))
-		return {"ok": false, "message": "Multiple TileMapLayer nodes found, select one", "candidates": paths}
-	return {"ok": false, "message": "Select a TileMapLayer first"}
+		return _unsupported_selection_result(paths, "Multiple compatible map nodes found; select one")
+	return _unsupported_selection_result([])
 
 
-static func _collect_tilemap_layers(node: Node, out: Array) -> void:
-	if node.get_class() == "TileMapLayer":
-		out.append(node)
-	for child in node.get_children():
-		_collect_tilemap_layers(child, out)
+static func _describe_selected_map_node(node: Node, path: String, auto_detected: bool) -> Dictionary:
+	var node_type := node.get_class()
+	var dimension := 3 if node_type == "GridMap" else 2
+	var bounds_fields: Array[String] = ["x", "y", "z", "width", "height", "depth"] if dimension == 3 else ["x", "y", "width", "height"]
+	var requires_map_layer := node_type in ["TileMapLayer", "TileMap"]
+	var result := {
+		"ok": true,
+		"path": path,
+		"type": node_type,
+		"dimension": dimension,
+		"region_bounds_fields": bounds_fields,
+		"map_layer_applicable": requires_map_layer,
+		"next_step": {
+			"describe_map_region": {"target_path": path, "bounds_fields": bounds_fields},
+			"capture_viewport_screenshot": {"mode": "3d" if dimension == 3 else "2d", "target_type": "map_region", "bounds_fields": bounds_fields},
+		},
+	}
+	if requires_map_layer:
+		result["next_step"]["describe_map_region"]["map_layer"] = "select explicitly for TileMap; TileMapLayer uses 0"
+		result["next_step"]["capture_viewport_screenshot"]["map_layer"] = "required (TileMapLayer uses 0)"
+	else:
+		result["next_step"]["describe_map_region"]["map_layer"] = "not applicable"
+		result["next_step"]["capture_viewport_screenshot"]["map_layer"] = "not applicable"
+	if auto_detected:
+		result["auto_detected"] = true
+	return result
+
+
+static func _unsupported_selection_result(candidates: Array[String], message := "Select a TileMapLayer, TileMap, or GridMap first") -> Dictionary:
+	return {
+		"ok": false,
+		"message": message,
+		"error_code": "unsupported_selection",
+		"supported_types": ["TileMapLayer", "TileMap", "GridMap"],
+		"candidates": candidates,
+	}
 
 
 ## 只读地查询一小块现有地图区域的真实瓦片/网格数据，外加地图节点自身的坐标系数。

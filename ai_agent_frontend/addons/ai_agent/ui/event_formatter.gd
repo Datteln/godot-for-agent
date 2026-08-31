@@ -372,6 +372,10 @@ static func format_tool_result_detail(name: String, input: Dictionary, status: S
 			return summary
 		"read_debugger_errors":
 			var items: Array = inner.get("items", []) if inner.get("items") is Array else []
+			var error_count := int(inner.get("error_count", 0))
+			var warning_count := int(inner.get("warning_count", 0))
+			if error_count > 0:
+				return "Collected %d error(s) and %d warning(s)" % [error_count, warning_count]
 			return ui_text.get("tool_items_count", "Returned %s item(s)") % items.size()
 		"set_project_setting", "add_autoload", "remove_autoload":
 			return ui_text.get("tool_done_path", "Done: `%s`") % str(inner.get("key", input.get("key", input.get("name", ""))))

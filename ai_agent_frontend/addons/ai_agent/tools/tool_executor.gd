@@ -253,7 +253,22 @@ func _read_debugger_errors(input: Dictionary) -> Dictionary:
 	var items: Array = DiagnosticsCollector.collect(editor_interface)
 	if max_items > 0 and items.size() > max_items:
 		items = items.slice(0, max_items)
-	return {"ok": true, "items": items}
+	var error_count := 0
+	var warning_count := 0
+	for item in items:
+		if not (item is Dictionary):
+			continue
+		match str(item.get("severity", "")):
+			"error": error_count += 1
+			"warning": warning_count += 1
+	return {
+		"ok": true,
+		"items": items,
+		"has_errors": error_count > 0,
+		"error_count": error_count,
+		"warning_count": warning_count,
+		"message": "%d error(s), %d warning(s) collected" % [error_count, warning_count],
+	}
 
 
 ## 将获批地图 builder 写入后的 Godot 编译结果直接带回同一模型回合。

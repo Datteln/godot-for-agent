@@ -21,6 +21,10 @@ const DENY_WRITE_PREFIXES: PackedStringArray = [
 ]
 
 
+## 代码驱动地图工作流生成的布局与构建器文件的固定存放目录。
+const MAP_LAYOUT_PREFIX := "res://map_layouts/"
+
+
 ## 将相对路径、res:// 与 user:// 规范化为安全的 Godot URI。
 ## 相对路径属于项目资源并补为 res://；user:// 保留独立的项目用户数据命名空间。
 ## 操作系统绝对路径、空路径与任何越界路径返回 ""。

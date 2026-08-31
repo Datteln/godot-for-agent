@@ -28,8 +28,8 @@ paths: []
 1. 确认真实目标、图层、TileSet/GridMap 事实：`describe_tilemap_selection` 仅当编辑器确实选中了 `TileMapLayer` 时可用（不能发现节点、不支持 legacy TileMap/GridMap）；无选择、legacy 目标或收到无选择错误时，用场景事实确认节点路径后改调小范围 `describe_map_region(target_path=...)`，不要重试无参选择调用。大范围结果若 `truncated`，读取 `observed_bounds`、`row_runs` 和 `next_query`，只继续查询所需边界。
 2. 用 `read_file` 和 `read_scene_tree` 查找已有的 layout、生成器、配置及其挂载节点；编辑器上下文或检索给出的已知路径直接读取，不要重复搜索。确需 `grep_code` 兜底时，`include` 只用源码/配置 glob（如 `**/*.gd`、`**/*.json`、`**/*.cfg`、`**/*.tscn`），绝不使用 `**/*`。已有入口时只编辑这些可读文件，并保留手工图层。
 3. 根据编辑尺度选择作者入口。局部请求先保留人工地图，并优先使用现有的增量入口；没有入口时，可提出只写入新增格子的独立增量层，但不能把“缺少入口”当作复写原图的理由。明确生成/迁移任务时，直接发出 bootstrap 的第一个可审批工具调用；内联审批卡片就是确认，不要先输出“是否继续”或等待额外文字批准。按一次一个工具调用的协议，依次完成下列 bootstrap 批次：
-   - 新建人可读的 layout/config（推荐 JSON、CFG 或 GDScript 常量），只表达格子坐标、语义标记和已观察到的 tile 引用；
-   - 新建带 `@tool` 的 builder 脚本；它暴露生成目标和 layout 路径，并在编辑器中由明确的重建动作驱动；
+   - 新建人可读的 layout/config（推荐 JSON、CFG 或 GDScript 常量），只表达格子坐标、语义标记和已观察到的 tile 引用；layout 与 builder 文件**一律写入固定目录 `res://map_layouts/`**（前端校验强制，其它目录会被拒绝）；
+   - 在 `res://map_layouts/` 下新建带 `@tool` 的 builder 脚本；它暴露生成目标和 layout 路径（`layout_path` 指向 `res://map_layouts/` 下的布局文件），并在编辑器中由明确的重建动作驱动；
    - builder `.gd` 写入结果没有编译错误后，下一步必须在已读取场景上发出普通审批的 `apply_text_edit`：新增或指定一个 generated-only 图层/节点，挂载 builder 脚本，设置 `generated_target_path`、`layout_path`，并明确写入 `generated_target_is_generated_only = true`。该场景编辑获批前，不得 reload 或 rebuild。不要覆盖已有手工 TileMapLayer、TileMap 或 GridMap；迁移旧内容前必须取得用户明确批准。
 4. 在填入任何具体 Godot 调用前，必须先调用 `read_class_docs` 查询实际目标类型：先 `overview`，不清楚成员名时先 `search`，然后以 `members` 只请求将调用的精确签名（如 legacy TileMap 的 `set_cell`、`clear_layer`）。仅在已确认的专用 generated-only 目标中，才按文档实现清空、读取 layout、设置 cell/mesh 和编辑器重建；局部人工地图编辑应保持为新增差量，而不是重现未变内容。不要凭记忆猜 API，也绝不请求完整 ClassDB。
 5. builder 至少使用这种编辑器安全骨架，并根据第 4 步的文档补全具体实现：
