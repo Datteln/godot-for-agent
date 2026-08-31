@@ -85,8 +85,9 @@ godot-for-agent/
 │   │   ├── agents/            # Agent 定义 (markdown frontmatter)
 │   │   │   └── agent_defs/    # coordinator, programming-agent, scene-agent, map-agent, resource-agent, advisor
 │   │   ├── api/               # FastAPI 路由 & DTO
+│   │   ├── context/           # 模型内存与可见转录分离（分组/证据/投影/合并）
 │   │   ├── doctor/            # 服务自检
-│   │   ├── events/            # 实时事件存储
+│   │   ├── events/            # 实时事件存储 + WebSocket 订阅
 │   │   ├── llm/               # LLM Provider / Prompt 缓存 / 消息变换
 │   │   ├── lsp/               # LSP 状态
 │   │   ├── mcp/               # MCP stdio 服务器
@@ -102,9 +103,12 @@ godot-for-agent/
 │   │   ├── security/          # 路径沙箱 & 安全配置
 │   │   ├── sessions/          # 会话持久化
 │   │   ├── skills/            # Skill 目录扫描
+│   │   ├── storage/           # 原子文件写入
 │   │   ├── tools/             # 工具注册表
 │   │   │   └── server_tools/  # 服务端工具实现 (read_file, grep_code, list_files, search_codebase, search_tools, load_skill)
-│   │   └── verify/            # 编辑后语法/语义校验
+│   │   ├── transcript/        # 权威聊天展示稿契约（快照/补丁/兼容转换）
+│   │   ├── verify/            # 编辑后语法/语义校验
+│   │   └── visual_observation.py  # 截图视觉观察规范化/校验
 │   ├── tests/
 │   └── pyproject.toml
 └── ai_agent_frontend/         # Godot 4 前端插件
@@ -114,10 +118,11 @@ godot-for-agent/
         ├── dto/               # GDScript DTO
         ├── logging/           # 前端日志
         ├── recovery/          # 恢复指针
-        ├── service/           # HTTP 客户端 & 服务管理器
+        ├── service/           # HTTP 客户端 & WebSocket 事件通道 & 服务管理器
         ├── state/             # Agent 事件日志 & 状态存储
-        ├── tools/             # 前端工具 (map/scene/resource/program)
-        ├── ui/                # 聊天面板/命令面板/Doctor/Memory/扩展/预览确认/恢复提示/Markdown 渲染
+        ├── tools/             # 前端工具 (core/program/scene/project/map/resource)
+        ├── transcript/        # 展示稿 Store / 投影器 / 虚拟视口 / 渲染器
+        ├── ui/                # 聊天面板/命令面板/Doctor/Memory/扩展/预览确认/恢复提示/转录视口/Markdown 渲染
         └── undo/              # 统一 UndoRedo 管理
 ```
 
@@ -127,20 +132,22 @@ godot-for-agent/
 
 | 领域 | 能力 |
 | --- | --- |
-| **对话** | `/chat` 三态响应（`tool_calls` / `final` / `error`）、SSE 事件流轮询、中断、丢弃 pending、会话重置 |
+| **对话** | `/chat` 三态响应（`tool_calls` / `final` / `error`）、WebSocket 实时事件流（断线续传、背压重同步）、中断、丢弃 pending、会话重置 |
+| **转录** | 服务端权威聊天展示稿（快照 + 增量补丁）、客户端投影渲染、虚拟视口分页导航 |
 | **多智能体** | 6 个专业 Agent + `delegate` / `delegate_many` 委派 + `create_plan` 计划 |
-| **工具** | 30+ 前端/服务端工具，统一注册、权限闸、预览确认、UndoRedo |
-| **RAG** | BM25 基线 + 可选 Embedding(FAISS) + Symbol + 场景图/信号图 + 混合检索 + 交叉编码器重排 + 查询路由 |
+| **工具** | 67 个前端/服务端工具（61 front + 6 server），统一注册、权限闸、预览确认、UndoRedo |
+| **地图** | 代码驱动地图工作流：2D/3D 区域事实读取、@tool builder 重建、目标重载、截图视觉证据门禁、固定生成目录 |
+| **RAG** | BM25 基线 + 可选 Embedding(FAISS) + Symbol + 场景图/信号图 + 混合检索 + 交叉编码器重排 + 查询路由 + 启动自动增量构建与文件监视 |
 | **LLM** | OpenAI 兼容、5 级 effort 模型、thinking 预算、fallback 降级、prompt 缓存（三级降级） |
 | **安全** | 路径沙箱、4 种权限模式、信任模型、deny/allow 规则、会话级 allow、预览确认 |
-| **验证** | 编辑后自动语法快检 (Godot CLI) + LLM 语义校验 + 自动修复重试 |
+| **验证** | 编辑后自动语法快检 (Godot CLI) + LLM 语义校验 + 自动修复重试 + 截图视觉验证门禁 |
 | **扩展** | Skill / OutputStyle / 自定义 Agent（markdown frontmatter 模式） |
-| **记忆** | 项目级 JSON 持久化记忆（`/memory` GET/POST） |
+| **记忆** | 项目级 JSON 持久化记忆（`/memory` GET/POST、save/delete/clear/list） |
 | **恢复** | 崩溃恢复指针（`/recovery-pointer`），前端检测后提示恢复 |
 | **MCP** | `python -m app --mcp-stdio` 提供只读/服务端工具的 stdio JSON-RPC 入口 |
 | **Doctor** | 服务自检（`/doctor`）：LLM 连通性、工具注册、Skill/OutputStyle/Memory 状态 |
-| **前端 UI** | 聊天面板、命令面板、Doctor 面板、Memory 面板、扩展面板、预览确认、内联工具确认、恢复提示 |
-| **M3** | Headless 自测、运行时状态读取、Profiler 快照、图片元数据、图片网格绘制 TileMap、精灵表生成 SpriteFrames、内容文件生成 |
+| **前端 UI** | 聊天面板、命令面板、Doctor 面板、Memory 面板、扩展面板、预览确认、内联工具确认、恢复提示、转录视口导航 |
+| **M3 自动化** | Headless 自测、运行时状态读取、Profiler 快照、截图捕获与视觉观察、图片元数据、精灵表生成 SpriteFrames、内容文件生成、导出项目 |
 
 <!-- 📸 在此处插入功能演示 GIF -->
 <!-- ![功能演示](docs/images/demo.gif) -->
@@ -187,15 +194,15 @@ python -m app
 | `GET` | `/doctor` | 服务自检报告 |
 | `GET` | `/skills` | 列出已注册的 Skill |
 | `GET` | `/output-styles` | 列出已注册的 OutputStyle |
-| `GET` | `/chat/events` | 事件流轮询（长轮询，`session_id` + `after` seq） |
-| `GET` | `/sessions/{session_id}/history` | 获取会话历史消息 |
+| `WS` | `/chat/events/ws` | WebSocket 实时事件订阅：先发 `subscribe`（含 `after_seq` 断点续传），推流事件并支持 ack/心跳/`history_gap`/`resync_required` |
+| `GET` | `/sessions/{session_id}/history` | 获取会话权威展示稿快照（`limit` / `before_ordinal` 分页，`upto_event_seq` 原子游标） |
 | `GET` | `/recovery-pointer` | 读取崩溃恢复指针 |
 | `GET` | `/commands` | 列出可用命令 |
 | `POST` | `/commands/{name}` | 执行命令（`doctor` / `rebuild_index` / `compact` / `set_effort` / `set_output_style` / `refresh_extensions`） |
 | `GET` | `/memory` | 读取项目级记忆 |
-| `POST` | `/memory` | 写入/更新记忆条目 |
+| `POST` | `/memory` | 记忆操作（`save` / `delete` / `clear` / `list`） |
 
-所有端点（除 `/health` 可选外）需在请求头中携带 Bearer token：
+所有端点（含 `/health`）均需在请求头中携带 Bearer token（WebSocket 握手使用相同的 Authorization 头）：
 
 ```http
 Authorization: Bearer <your-token>
@@ -207,7 +214,10 @@ Authorization: Bearer <your-token>
 {
   "session_id": "uuid-string",
   "user_message": "帮我创建一个玩家角色脚本",     // 与 tool_results 二选一
-  "tool_results": [],                             // 回传前端工具执行结果
+  "tool_results": [],                             // 回传前端工具执行结果（含 status/artifact_refs/grant_session_allow）
+  "request_id": "req-1",                          // 可选：请求幂等标识
+  "client_message_id": "cm-1",                    // 可选：客户端稳定消息身份，供乐观条目对账
+  "language_hint": "zh",                          // 可选：语言提示
   "context": {                                    // 前端采集的结构化上下文
     "selection": {},
     "scene_tree": {},
@@ -219,39 +229,43 @@ Authorization: Bearer <your-token>
   },
   "permission_mode": "default",                   // 可选：default/plan/auto_approve/read_only
   "effort": "standard",                           // 可选：quick/standard/deep/verify/advisor
-  "output_style": "default"                       // 可选：OutputStyle 名称
+  "output_style": "default",                       // 可选：OutputStyle 名称
+  "model": "gpt-4o-mini",                          // 可选：覆盖本次请求的模型
+  "compact_summary_use_llm": null                  // 可选：本次压缩摘要是否用 LLM（null=沿用服务端配置）
 }
 ```
 
 #### `/chat` 三态响应
 
 ```jsonc
-// 1. tool_calls — 需要前端执行工具
+// 1. tool_calls — 需要前端执行/确认工具
 {
-  "status": "tool_calls",
-  "tool_calls": [
+  "type": "tool_calls",
+  "turn_id": "turn-xxx",
+  "text": "我正在为你创建玩家脚本…",            // 可选：工具调用前的说明
+  "calls": [
     {
-      "tool_use_id": "call_xxx",
-      "frame_id": "f1",
+      "id": "call_xxx",
       "name": "propose_script_edit",
-      "args": { "file_path": "res://scripts/player.gd", "diff": "..." }
+      "input": { "file_path": "res://scripts/player.gd", "diff": "..." },
+      "needs_confirm": true,
+      "frame_id": "f1",
+      "agent": "coordinator",
+      "render_kind": "diff"
     }
-  ],
-  "turn_id": "turn-xxx"
+  ]
 }
 
 // 2. final — 最终文本回复
 {
-  "status": "final",
-  "message": "已为你创建了玩家角色脚本...",
-  "turn_id": "turn-xxx"
+  "type": "final",
+  "text": "已为你创建了玩家角色脚本..."
 }
 
 // 3. error — 出错
 {
-  "status": "error",
-  "error_code": "llm_unreachable",
-  "error_message": "..."
+  "type": "error",
+  "text": "..."
 }
 ```
 
@@ -260,8 +274,8 @@ Authorization: Bearer <your-token>
 | 命令 | 说明 | 参数 |
 | --- | --- | --- |
 | `doctor` | 返回当前服务自检报告 | 无 |
-| `rebuild_index` | 重建本地 RAG 检索索引 | `include`（glob，默认 `**/*`）、`max_files`（默认 4000） |
-| `compact` | 压缩指定 session 的早期上下文 | `session_id` |
+| `rebuild_index` | 重建本地 RAG 检索索引 | `include`（glob，默认 `**/*`）、`max_files`（默认 4000）、`incremental`（默认 true） |
+| `compact` | 压缩指定 session 的早期上下文 | `session_id`、`keep_recent`（默认 12）、`use_llm`（默认沿用服务端配置） |
 | `set_effort` | 设置当前 session 的 effort 档位 | `effort`（quick/standard/deep/verify/advisor） |
 | `set_output_style` | 设置当前 session 的 OutputStyle | `output_style`（样式名） |
 | `refresh_extensions` | 重新扫描 Skill 与 OutputStyle 目录 | 无 |
@@ -326,6 +340,7 @@ Invoke-RestMethod `
 | `AI_AGENT_LOG_LEVEL` | `DEBUG` | 日志等级：DEBUG/INFO/WARNING/ERROR/CRITICAL |
 | `AI_AGENT_LOG_DIR` | `logs` | 日志文件存储目录 |
 | `AI_AGENT_MAX_TURNS` | `36` | 单次消息的 agent 循环全局上限 |
+| `AI_AGENT_MANAGED_PROCESS` | `false` | 是否由 Godot 插件托管启动（禁用控制台日志，仅文件日志，避免管道阻塞） |
 
 #### 权限 & 安全
 
@@ -335,6 +350,35 @@ Invoke-RestMethod `
 | `AI_AGENT_TRUSTED_PROJECT` | `false` | 工程是否已被用户标记为受信任 |
 | `AI_AGENT_DENY_RULES` | `[]` | 显式 deny 规则（JSON 数组，始终生效） |
 | `AI_AGENT_ALLOW_RULES` | `[]` | 显式 allow 规则（JSON 数组，仅 trusted 生效） |
+
+#### 事件 & 转录（WebSocket）
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `AI_AGENT_EVENT_OUTBOUND_QUEUE_SIZE` | `128` | 单个 WebSocket 订阅的有界事件队列容量 |
+| `AI_AGENT_EVENT_OUTBOUND_MAX_BYTES` | `524288` | 单个订阅待发事件的序列化字节预算，超出转入重同步 |
+| `AI_AGENT_EVENT_STREAM_COALESCING` | `true` | 流式补丁 latest-wins 合并与字节预算控制 |
+| `AI_AGENT_EVENT_STREAM_BOUNDED_PAYLOADS` | `true` | 增长型正文实时补丁使用追加增量/受限预览 |
+| `AI_AGENT_EVENT_STREAM_PREVIEW_MAX_CHARS` | `800` | 受限预览表示携带的最大正文字符数 |
+| `AI_AGENT_EVENT_TERMINAL_PATCH_MAX_BYTES` | `32768` | 终态非流式展示稿补丁的序列化字节预算 |
+| `AI_AGENT_EVENT_HEARTBEAT_INTERVAL_S` | `20.0` | 空闲 WebSocket 连接的协议心跳间隔（秒） |
+| `AI_AGENT_TURN_KEEPALIVE_INTERVAL_S` | `15.0` | 活跃轮次无正文流时的进展事件间隔（秒） |
+
+#### 自动压缩 & 上下文预算
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `AI_AGENT_AUTO_COMPACT_ENABLED` | `true` | 驱动 LLM 前自动检查会话体积并触发压缩 |
+| `AI_AGENT_AUTO_COMPACT_TOKEN_THRESHOLD` | `200000` | 自动压缩的预估 token 阈值 |
+| `AI_AGENT_AUTO_COMPACT_KEEP_RECENT` | `12` | 自动压缩保留的最近消息数 |
+| `AI_AGENT_AUTO_COMPACT_MIN_NEW_MESSAGES` | `8` | 自动压缩防抖门槛（本次可收拢旧消息数的下限） |
+| `AI_AGENT_COMPACT_SUMMARY_USE_LLM` | `true` | 压缩摘要是否调用 LLM 语义合并（失败回退机械拼接） |
+| `AI_AGENT_COMPACT_SUMMARY_MODEL` | *(空=用 quick 模型)* | 压缩摘要使用的模型名 |
+| `AI_AGENT_CONTEXT_BUDGET_TOKENS` | `200000` | 整体模型上下文预算（投影上下文超限触发语义合并与记忆裁剪） |
+| `AI_AGENT_CONTEXT_RETAINED_TURNS` | `8` | 上下文保留的完整用户轮数量，更早轮次收拢进记忆 |
+| `AI_AGENT_CONTEXT_ACTIVE_GROUP_WINDOW` | `12` | 活跃轮内最多保留的完整工具协议组数量 |
+| `AI_AGENT_CONTEXT_CONSOLIDATION_USE_LLM` | `true` | 压缩边界是否调用 quick 模型做语义合并 |
+| `AI_AGENT_CONTEXT_CONSOLIDATION_MODEL` | *(空=用 quick 模型)* | 语义合并使用的模型名 |
 
 #### 存储路径
 
@@ -361,6 +405,10 @@ Invoke-RestMethod `
 | `AI_AGENT_RERANK_MODEL` | *(空=跳过)* | 交叉编码器重排模型名 |
 | `AI_AGENT_RERANK_TIMEOUT_S` | `2.0` | 重排请求超时（秒，上限 2.0） |
 | `AI_AGENT_RAG_QUERY_ROUTER_ENABLED` | `true` | 是否启用查询路由 |
+| `AI_AGENT_RAG_AUTO_BUILD_ENABLED` | `true` | 服务启动后后台自动增量构建 RAG/全部索引 |
+| `AI_AGENT_RAG_AUTO_WATCH_INTERVAL_S` | `1.0` | 文件监视轮询间隔（秒） |
+| `AI_AGENT_RAG_AUTO_WATCH_DEBOUNCE_S` | `0.75` | 文件变更去抖时间（秒） |
+| `AI_AGENT_RAG_AUTO_WATCH_SCAN_TIMEOUT_S` | `10.0` | 单轮目录扫描超时（秒，不影响事件循环） |
 | `AI_AGENT_RAG_TOKEN_BUDGET` | `1500` | RAG 注入 prompt 的 token 预算（下限 128） |
 | `AI_AGENT_GRAPH_MAX_DEPTH` | `2` | 图检索最大深度（0–8） |
 | `AI_AGENT_GRAPH_MAX_NEIGHBORS` | `5` | 图检索每节点最大邻居数（1–100） |
@@ -375,6 +423,7 @@ Invoke-RestMethod `
 | `AI_AGENT_ASSET_UNDERSTANDING_API_KEY` | *(空)* | 资产理解 API key |
 | `AI_AGENT_ASSET_UNDERSTANDING_TIMEOUT_S` | `10.0` | 资产理解请求超时（秒） |
 | `AI_AGENT_ASSET_UNDERSTANDING_MAX_TOKENS` | `500` | 资产理解最大输出 token |
+| `AI_AGENT_ASSET_UNDERSTANDING_CONCURRENCY` | `3` | 资产理解并发数 |
 
 #### 验证系统
 
@@ -399,11 +448,13 @@ Invoke-RestMethod `
 | **coordinator** | 主控协调者 | standard | 12 | 所有工具 + `delegate` / `delegate_many` / `create_plan` |
 | **programming-agent** | 代码专家 | deep | 10 | 脚本编写、调试、测试、重构 |
 | **scene-agent** | 场景专家 | standard | 8 | 场景树操作、节点属性、信号连接 |
-| **map-agent** | 地图专家 | standard | 8 | TileMap 编辑、关卡绘制、瓦片填充 |
+| **map-agent** | 地图专家 | standard | 8 | 地图事实读取（TileMap/GridMap）、代码驱动生成器编辑、重建与视觉证据验证 |
 | **resource-agent** | 资源专家 | standard | 8 | 资源创建、精灵表、内容文件 |
 | **advisor** | 只读顾问 | advisor | 10 | 架构分析、设计建议、问题诊断（不写工程） |
 
 **Agent 帧（Frame）模型**：每次对话创建根帧（coordinator），委派时创建子帧，子帧有独立消息上下文、独立轮数预算，执行完毕后结果回流父帧。
+
+**代码驱动地图工作流**：agent 用 `describe_map_region` / `read_scene_tree` 等只读工具收集地基事实 → 编辑布局/生成器代码（`apply_text_edit` / `propose_content_file`，布局文件固定输出到 `res://map_layouts/`）→ 经 `reload_map_targets`（编辑器内重载目标，可附带证据截图）或 `rebuild_map_builder`（调用场景中已挂载 @tool builder 的 `rebuild_from_layout()`）落地 → 用 `capture_viewport_screenshot` 捕获 2D/3D 视口截图作为视觉证据门禁。
 
 **Effort 档位**：`quick` / `standard` / `deep` / `verify` / `advisor`，每档可独立配置模型和 thinking 预算。
 
@@ -414,10 +465,10 @@ Invoke-RestMethod `
 
 ### 工具系统
 
-工具分为 **server**（Python 侧执行）和 **front**（Godot 侧执行），统一在 `app/tools/registry.py` 注册。每个 `ToolDef` 携带：
+工具分为 **server**（Python 侧执行，6 个）和 **front**（Godot 侧执行，61 个），统一在 `app/tools/registry.py` 注册。每个 `ToolDef` 携带：
 
 - `side`：`server` 或 `front`
-- `domain`：`core` / `program` / `scene` / `map` / `resource`
+- `domain`：`core` / `program` / `scene` / `project` / `map` / `resource`
 - 风险元数据：`reads_project` / `writes_project` / `executes_process` / `uses_network`
 - `needs_preview`：是否需要前端预览确认
 - `render_kind`：前端渲染类型（`diff` / `list` / `run` / `log` / `map` 等）
@@ -442,25 +493,55 @@ Invoke-RestMethod `
 | `delegate` | core | ✗ | ✗ | 委派任务给子 Agent |
 | `delegate_many` | core | ✗ | ✗ | 并行委派多个子 Agent |
 | `create_plan` | core | ✗ | ✗ | 创建结构化执行计划 |
+| `read_class_docs` | program | ✗ | ✗ | 读取 ClassDB 文档 |
+| `read_debugger_errors` | program | ✗ | ✗ | 读取调试器错误 |
+| `read_profiler_snapshot` | program | ✗ | ✗ | 读取 Profiler 快照 |
 | `propose_script_edit` | program | ✓ | ✗ | 提议脚本 diff 编辑 |
 | `propose_tests` | program | ✓ | ✗ | 提议测试代码 |
 | `apply_text_edit` | program | ✓ | ✗ | 应用文本编辑 |
-| `write_file` | program | ✓ | ✗ | 写入文件 |
-| `read_class_docs` | program | ✗ | ✗ | 读取 ClassDB 文档 |
-| `read_debugger_errors` | program | ✗ | ✗ | 读取调试器错误 |
-| `read_runtime_state` | program | ✗ | ✗ | 读取运行时节点状态 |
-| `read_profiler_snapshot` | program | ✗ | ✗ | 读取 Profiler 快照 |
-| `run_tests` | program | ✗ | ✓ | 运行项目测试 |
+| `run_tests` | program | ✗ | ✓ | 运行项目测试（可执行文件与参数来自 EditorSettings） |
 | `run_headless_self_test` | program | ✗ | ✓ | Headless 自测 |
+| `run_system_command` | program | ✓ | ✓ | 运行系统命令（须预览确认，受 `system_command_timeout_ms` 约束） |
+| `execute_gd_script` | program | ✗ | ✓ | 以 `--headless --script` 运行项目内 GDScript（受 `gd_script_timeout_ms` 约束） |
+| `git_status` | program | ✗ | ✗ | 读取 git 工作区状态 |
+| `git_diff` | program | ✗ | ✗ | 读取 git diff |
+| `export_project` | program | ✗ | ✓ | 按 preset 导出项目（受 `export_timeout_ms` 约束） |
 | `read_scene_tree` | scene | ✗ | ✗ | 读取场景树结构 |
+| `read_runtime_state` | scene | ✗ | ✗ | 读取运行时节点状态 |
+| `validate_scene_state` | scene | ✗ | ✗ | 校验场景状态 |
+| `list_open_scenes` | scene | ✗ | ✗ | 列出已打开场景 |
+| `get_current_scene_path` | scene | ✗ | ✗ | 获取当前场景路径 |
+| `list_node_groups` / `list_groups` | scene | ✗ | ✗ | 列出节点/场景分组 |
+| `list_node_signals` / `list_node_methods` | scene | ✗ | ✗ | 列出节点信号 / 方法 |
+| `open_scene` | scene | ✓ | ✗ | 打开场景 |
+| `save_scene` | scene | ✓ | ✗ | 保存场景 |
 | `add_node` | scene | ✓ | ✗ | 添加场景节点 |
 | `set_node_property` | scene | ✓ | ✗ | 设置节点属性 |
-| `describe_tilemap_selection` | map | ✗ | ✗ | 描述 TileMap 选区 |
-| `fill_rect` | map | ✓ | ✗ | 填充 TileMap 矩形区域 |
-| `paint_from_image_grid` | map | ✓ | ✗ | 从图片网格绘制 TileMap |
-| `create_resource` | resource | ✓ | ✗ | 创建 Godot 资源 |
+| `delete_node` | scene | ✓ | ✗ | 删除节点 |
+| `reparent_node` | scene | ✓ | ✗ | 重挂节点 |
+| `rename_node` | scene | ✓ | ✗ | 重命名节点 |
+| `instance_scene` | scene | ✓ | ✗ | 实例化场景 |
+| `duplicate_node` | scene | ✓ | ✗ | 复制节点 |
+| `connect_signal` / `disconnect_signal` | scene | ✓ | ✗ | 连接 / 断开信号 |
+| `add_to_group` / `remove_from_group` | scene | ✓ | ✗ | 添加到 / 移出分组 |
+| `capture_viewport_screenshot` | scene | ✗ | ✗ | 捕获 2D/3D 视口截图（可附 `inspection` 视觉观察要求） |
+| `bake_navigation_mesh` | scene | ✓ | ✗ | 烘焙导航网格 |
+| `read_project_setting` | project | ✗ | ✗ | 读取项目设置 |
+| `list_autoloads` / `list_input_actions` / `list_export_presets` | project | ✗ | ✗ | 列出自动加载 / 输入动作 / 导出预设 |
+| `set_project_setting` | project | ✓ | ✗ | 设置项目设置 |
+| `add_autoload` / `remove_autoload` | project | ✓ | ✗ | 添加 / 移除自动加载 |
+| `add_input_action` / `remove_input_action` | project | ✓ | ✗ | 添加 / 移除输入动作 |
+| `describe_tilemap_selection` | map | ✗ | ✗ | 描述 TileMapLayer / legacy TileMap / GridMap 选区（含区域参数） |
+| `describe_map_region` | map | ✗ | ✗ | 读取 2D/3D 地图区域已放置瓦片/格子（≤400 cells，自动分区） |
+| `reload_map_targets` | map | ✗ | ✗ | 编辑器内重载已批准的代码驱动地图目标并捕获证据截图 |
+| `rebuild_map_builder` | map | ✓ | ✗ | 调用场景中已挂载 @tool builder 的 `rebuild_from_layout()` |
 | `read_image_metadata` | resource | ✗ | ✗ | 读取图片元数据 |
+| `read_resource` | resource | ✗ | ✗ | 读取资源文件 |
+| `create_resource` | resource | ✓ | ✗ | 创建 Godot 资源 |
+| `set_resource_property` | resource | ✓ | ✗ | 修改资源属性 |
 | `create_sprite_frames_from_sheet` | resource | ✓ | ✗ | 精灵表生成 SpriteFrames |
+| `create_animation_track` | resource | ✓ | ✗ | 创建动画轨道 |
+| `create_shader_material` | resource | ✓ | ✗ | 创建着色器材质 |
 | `propose_content_file` | resource | ✓ | ✗ | 生成内容文件 |
 
 <!-- 📸 在此处插入工具预览确认截图 -->
@@ -497,6 +578,7 @@ graph LR
 | **图融合** | 利用图结构扩展相关节点 |
 | **查询路由器** | 智能分发查询到最合适的检索器 |
 | **交叉编码器重排** | 可选的二次精排（`rerank_model` 配置） |
+| **启动自动构建** | 服务启动时后台增量构建全部索引，随后文件监视自动增量更新（`rag_auto_build_enabled` / watch 相关配置） |
 
 ---
 
@@ -545,7 +627,7 @@ graph TD
 - server 工具只能访问 `AI_AGENT_PROJECT_ROOT` 内路径
 - `.git/`、`.godot/` 默认禁止读写，`addons/` 默认禁止写入
 - 所有写工程和执行进程的工具必须经前端确认
-- `run_tests`、`run_headless_self_test` 只读取本地 EditorSettings 配置，模型不能传任意命令
+- `run_tests`、`run_headless_self_test` 只读取本地 EditorSettings 配置，模型不能传任意命令；`run_system_command` / `execute_gd_script` / `export_project` 同样须经前端确认，且受超时与路径边界约束
 - Agent、Skill、OutputStyle 只是提示词/配置资产，不能授予新权限
 
 ---
@@ -573,6 +655,8 @@ tags: [godot, gameplay]
 具体指令...
 ```
 
+格式与上述示例一致。Agent 定义可通过 `skills:` 字段引用内置 Skill：`bundled:godot-code-reading`（Godot API / 工程代码阅读）、`bundled:godot-map-authoring`（代码驱动地图生成），也可用 `load_skill` 工具加载。
+
 #### OutputStyle
 
 ```text
@@ -596,7 +680,7 @@ description: 简洁输出风格
 
 ### 验证系统
 
-编辑类工具（`propose_script_edit`、`write_file`、`apply_text_edit`、`propose_tests`、`propose_content_file`）成功落地后自动触发两阶段校验：
+编辑类工具成功落地后自动触发两阶段校验（触发集由 `AI_AGENT_VERIFY_TRIGGER_TOOLS` 配置，默认含 `propose_script_edit`、`apply_text_edit`、`propose_tests`、`propose_content_file` 等）：
 
 | 阶段 | 方式 | 说明 |
 | --- | --- | --- |
@@ -605,14 +689,19 @@ description: 简洁输出风格
 
 校验失败时自动尝试修复，单文件最多重试 `verify_max_retries`（默认 2）次。
 
+#### 截图视觉验证
+
+`capture_viewport_screenshot` 按 2D/3D 模式捕获编辑器视口截图，并可附带 `inspection`（`question` / `focus` / `expected_conditions` / `dimensions`，由服务端 `visual_observation.py` 校验规范化）。地图工作流以截图 + 视觉观察作为落地门禁：`reload_map_targets` / `rebuild_map_builder` 成功后自动捕获目标作用域截图，供模型核对布局、连通性、可见性等维度。
+
 ---
 
 ### 会话与恢复
 
-- **会话持久化**：`session_store_dir` 目录下按 session_id 存储对话历史
+- **事件通道**：认证 WebSocket（`/chat/events/ws`）订阅实时事件，支持首条 `subscribe` 断点续传（`after_seq`）、ack 确认、心跳，以及类型化缺口信号（`history_gap`：游标领先/保留窗口缺口）与背压重同步（`resync_required`）
+- **权威展示稿**：服务端持久化聊天展示稿（快照 + 增量补丁），`/sessions/{id}/history` 返回带 `upto_event_seq` 原子游标的快照，前端通过虚拟视口分页导航长会话（`before_ordinal` 向前翻页）
 - **恢复指针**：`recovery_pointer.json` 记录最后事件序号和 pending turn
 - **前端检测**：插件启动时读取恢复指针，若存在且 `project_hash` 匹配则提示用户恢复
-- **压缩**：`compact` 命令压缩早期上下文，保留 pending 和 agent_stack
+- **压缩**：`compact` 命令或自动压缩（`auto_compact_*`）收拢早期上下文，保留 pending 和 agent_stack；可用 LLM 语义压缩摘要（`compact_summary_use_llm`）
 
 ---
 
@@ -629,7 +718,7 @@ description: 简洁输出风格
 ### 记忆系统
 
 - **存储**：项目级 JSON 文件（`memory_store_path`）
-- **读写**：`GET /memory` 读取、`POST /memory` 写入
+- **读写**：`GET /memory` 列表、`POST /memory` 支持 `save` / `delete` / `clear` / `list` 动作；条目带 `scope` 与 `tags`
 - **不保存**：token、API key 或完整敏感对话
 - **前端面板**：Memory 面板可视化查看
 
@@ -685,6 +774,8 @@ Project > Project Settings > Plugins > AI Agent
 | **预览确认面板** | `preview_confirm_panel.gd` | 写工具的 diff 预览与确认/拒绝 |
 | **内联工具确认** | `inline_tool_confirmation.gd` | 聊天流中的内联工具确认卡片 |
 | **恢复提示** | `recovery_prompt.gd` | 崩溃恢复提示对话框 |
+| **转录视口** | `transcript_viewport.gd` | 长会话展示稿的虚拟视口分页导航（follow / 向前翻页） |
+| **瞬态提示宿主** | `transient_notice_host.gd` | 聊天气泡外的非持久化提示展示 |
 
 辅助渲染：
 
@@ -696,6 +787,7 @@ Project > Project Settings > Plugins > AI Agent
 | **事件格式化器** | `event_formatter.gd` | 事件类型 → 可读文本 |
 | **聊天面板主题** | `chat_panel_theme.gd` | 聊天面板主题/配色 |
 | **聊天面板文本** | `chat_panel_text.gd` | 文本处理/复制/选择 |
+| **转录渲染器** | `transcript/renderers/*` | 展示稿条目类型（文本/工具/审批/校验/错误等）→ 可渲染节点 |
 
 <!-- 📸 在此处插入聊天面板截图 -->
 <!-- ![聊天面板](docs/images/chat-panel.png) -->
@@ -725,6 +817,7 @@ Project > Project Settings > Plugins > AI Agent
 | **ClassDB 阅读器** | `classdb_reader.gd` | 读取 Godot 内置类文档 |
 | **诊断采集器** | `diagnostics_collector.gd` | 采集编辑器诊断错误/警告 |
 | **文件状态缓存** | `file_state_cache.gd` | 缓存已读文件内容，避免重复 IO |
+| **Godot 诊断** | `godot_diagnostics.gd` | 运行子进程（测试/自测/命令）的耗时、退出码与输出诊断 |
 
 每轮对话时，前端自动采集上下文并通过 `ChatRequest.context` 发送给后端。
 
@@ -735,10 +828,12 @@ Project > Project Settings > Plugins > AI Agent
 | 模块 | 文件 | 工具 |
 | --- | --- | --- |
 | **工具执行器** | `tool_executor.gd` | 接收后端 `tool_calls`，分发到对应模块执行 |
-| **编程工具** | `program_tools.gd` | `propose_script_edit`、`write_file`、`apply_text_edit`、`propose_tests` |
-| **场景工具** | `scene_tools.gd` | `read_scene_tree`、`add_node`、`set_node_property` |
-| **地图工具** | `map_tools.gd` | `describe_tilemap_selection`、`fill_rect`、`paint_from_image_grid` |
-| **资源工具** | `resource_tools.gd` | `create_resource`、`read_image_metadata`、`create_sprite_frames_from_sheet`、`propose_content_file` |
+| **编程工具** | `program_tools.gd` | `propose_script_edit`、`apply_text_edit`、`propose_tests`、`run_tests`、`run_headless_self_test`、`run_system_command`、`execute_gd_script`、`git_status`、`git_diff`、`export_project` 等 |
+| **场景工具** | `scene_tools.gd` | `read_scene_tree`、`add_node`、`set_node_property`、`delete_node`、`reparent_node`、`rename_node`、`connect_signal`、`capture_viewport_screenshot`、`bake_navigation_mesh` 等 |
+| **地图工具** | `map_tools.gd` | `describe_tilemap_selection`、`describe_map_region`（2D/3D 区域读取） |
+| **编辑器重载工具** | `editor_reload_tools.gd` | `reload_map_targets`、`rebuild_map_builder`（编辑器可见/资源/运行时重载与 @tool builder 重建） |
+| **项目工具** | `project_tools.gd` | `set_project_setting`、`add_autoload`、`add_input_action`、`list_export_presets` 等项目级工具 |
+| **资源工具** | `resource_tools.gd` | `create_resource`、`read_resource`、`read_image_metadata`、`create_sprite_frames_from_sheet`、`create_animation_track`、`create_shader_material`、`propose_content_file` |
 | **路径工具** | `path_utils.gd` | `res://` ↔ 绝对路径互转 |
 
 ---
@@ -788,6 +883,10 @@ Project > Project Settings > Plugins > AI Agent
 | `ai_agent/output_style` | string | `default` | OutputStyle 名称 |
 | `ai_agent/trusted_project_extensions` | bool | `false` | 是否信任项目扩展（允许项目级 Skill） |
 | `ai_agent/show_recovery_prompt` | bool | `true` | 是否显示崩溃恢复提示 |
+| `ai_agent/request_timeout_sec` | float | `30.0` | 常规 HTTP 请求超时（秒） |
+| `ai_agent/chat_request_timeout_sec` | float | `360.0` | 单轮对话请求超时（秒） |
+| `ai_agent/chat_request_hard_cap_sec` | float | `1800.0` | 对话请求硬上限（秒） |
+| `ai_agent/chat_idle_recovery_window_sec` | float | `30.0` | 无事件空闲窗口（秒），超时触发空闲恢复/中断 |
 | `ai_agent/session_history_json` | string | *(空)* | 会话历史 JSON（内部缓存） |
 
 #### LLM 配置
@@ -804,6 +903,8 @@ Project > Project Settings > Plugins > AI Agent
 | `ai_agent/llm_advisor_model` | string | *(空=用 llm_model)* | advisor effort 模型 |
 | `ai_agent/llm_fallback_model` | string | *(空=不降级)* | 主模型不可用时的降级模型 |
 | `ai_agent/llm_request_timeout_s` | float | `60.0` | 单次 LLM 请求超时（秒） |
+| `ai_agent/compact_summary_use_llm` | string | `default` | 压缩摘要是否用 LLM 语义合并：`default` / `on` / `off` |
+| `ai_agent/compact_summary_model` | string | *(空=quick 模型)* | 压缩摘要使用的模型名 |
 
 #### RAG & Embedding
 
@@ -818,6 +919,9 @@ Project > Project Settings > Plugins > AI Agent
 | `ai_agent/rerank_model` | string | *(空=跳过)* | 交叉编码器重排模型名 |
 | `ai_agent/rerank_timeout_s` | float | `2.0` | 重排请求超时（秒） |
 | `ai_agent/rag_query_router_enabled` | bool | `true` | 是否启用查询路由 |
+| `ai_agent/rag_auto_build_enabled` | bool | `true` | 服务启动后自动增量构建索引 |
+| `ai_agent/rag_auto_watch_interval_s` | float | `1.0` | 文件监视轮询间隔（秒） |
+| `ai_agent/rag_auto_watch_debounce_s` | float | `0.75` | 文件变更去抖时间（秒） |
 | `ai_agent/rag_token_budget` | int | `1500` | RAG 注入 prompt 的 token 预算 |
 | `ai_agent/graph_max_depth` | int | `2` | 图检索最大深度 |
 | `ai_agent/graph_max_neighbors` | int | `5` | 图检索每节点最大邻居数 |
@@ -832,17 +936,18 @@ Project > Project Settings > Plugins > AI Agent
 | `ai_agent/asset_understanding_api_key` | string | *(空)* | 资产理解 API key |
 | `ai_agent/asset_understanding_timeout_s` | float | `10.0` | 资产理解请求超时（秒） |
 | `ai_agent/asset_understanding_max_tokens` | int | `500` | 资产理解最大输出 token |
+| `ai_agent/asset_understanding_concurrency` | int | `3` | 资产理解并发数 |
 
 #### 日志 & 事件
 
 | EditorSettings key | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `ai_agent/log_level` | string | `info` | 日志等级：`debug` / `info` / `warning` / `error` |
+| `ai_agent/log_level` | string | `info` | 日志等级：`debug` / `info` / `warning` / `error` / `off` |
 | `ai_agent/log_to_file` | bool | `true` | 是否写入日志文件 |
 | `ai_agent/log_file_path` | string | `res://logs/ai_agent_frontend.log` | 前端日志文件路径 |
-| `ai_agent/enable_event_stream` | bool | `true` | 是否启用事件流轮询 |
-| `ai_agent/event_poll_interval_sec` | float | `1.0` | 事件轮询间隔（秒） |
 | `ai_agent/enable_lsp_diagnostics` | bool | `true` | 是否启用 LSP 诊断采集 |
+
+事件流通过 WebSocket（`/chat/events/ws`）常驻推送，无需单独开关。
 
 #### 测试 & Headless
 
@@ -855,6 +960,9 @@ Project > Project Settings > Plugins > AI Agent
 | `ai_agent/headless_args` | string | *(空)* | Headless runner 参数 |
 | `ai_agent/headless_output_log` | string | *(空)* | Headless 输出日志路径 |
 | `ai_agent/runner_timeout_ms` | int | `120000` | Runner 超时（毫秒） |
+| `ai_agent/system_command_timeout_ms` | int | `120000` | `run_system_command` 超时（毫秒） |
+| `ai_agent/gd_script_timeout_ms` | int | `60000` | `execute_gd_script` 超时（毫秒） |
+| `ai_agent/export_timeout_ms` | int | `600000` | `export_project` 超时（毫秒） |
 
 <!-- 📸 在此处插入 EditorSettings 配置截图 -->
 <!-- ![EditorSettings](docs/images/editor-settings.png) -->
@@ -867,7 +975,7 @@ Project > Project Settings > Plugins > AI Agent
 - server 工具只能访问 `AI_AGENT_PROJECT_ROOT` 内路径
 - `.git/`、`.godot/` 默认禁止读写，`addons/` 默认禁止写入
 - 所有写工程和执行进程的工具必须经前端预览确认
-- `run_tests`、`run_headless_self_test` 只读取本地 EditorSettings 中配置的可执行文件和参数，模型不能传任意命令
+- `run_tests`、`run_headless_self_test` 只读取本地 EditorSettings 中配置的可执行文件和参数；`run_system_command` / `execute_gd_script` / `export_project` 须经前端确认，参数受超时与路径边界约束
 - Agent、Skill、OutputStyle 只是提示词/配置资产，不能授予新权限，也不能绕过权限闸
 - Token 来源：`--token-stdin`（推荐，通过 stdin 传入）、`AI_AGENT_AUTH_TOKEN` 环境变量、或自动生成一次性 token
 
@@ -914,7 +1022,8 @@ python -m pytest tests/
 | --- | --- |
 | LLM 不可达 | 检查 `AI_AGENT_LLM_BASE_URL` 和 `AI_AGENT_LLM_API_KEY`；用 `/doctor` 诊断 |
 | 工具被拒绝 | 检查权限模式和路径沙箱；确认 `AI_AGENT_PROJECT_ROOT` 指向正确的工程根目录 |
-| 索引为空 | 执行 `/commands/rebuild_index` 重建 RAG 索引 |
+| 索引为空 | 执行 `/commands/rebuild_index` 重建 RAG 索引；或确认自动增量构建（`rag_auto_build_enabled`）已开启 |
 | 插件连不上服务 | 检查 `ai_agent/service_url` 和 `ai_agent/auto_start_service`；查看服务是否已启动 |
 | Token 不匹配 | 确认前端和后端使用相同的 auth token |
+| 事件流断开 | 确认服务运行且 token 一致；WebSocket 会以 `after_seq` 自动断线续传，`history_gap` / `resync_required` 时前端自动重新水合 |
 | 恢复提示异常 | 删除 `.ai_agent_service/recovery_pointer.json` 清除恢复指针 |
